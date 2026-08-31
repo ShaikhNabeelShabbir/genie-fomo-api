@@ -1,0 +1,33 @@
+# Render Blueprint — test/staging deploy.
+# New > Blueprint > connect this repo. Render reads this file and prompts for the
+# secrets marked `sync: false`. See PROD-STEPS.md for Railway / Fly / plain Docker.
+services:
+  - type: web
+    name: genie-fomo-api
+    runtime: node
+    plan: free
+    # Do NOT set PORT — Render injects it and settings.ts reads process.env.PORT.
+    # --include=dev is required: Render sets NODE_ENV=production, and under that npm
+    # omits devDependencies — which is where typescript/tsc lives, so the build fails.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    # /v1/health is deliberately the one unauthenticated route, so this probe keeps
+    # passing after GENIE_API_KEY is set.
+    healthCheckPath: /v1/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Prompted for in the dashboard on first deploy — never stored in the repo.
+      - key: ETHERSCAN_KEY
+        sync: false
+      - key: HELIUS_SOLANA_KEY
+        sync: false
+      - key: BITQUERY_KEY
+        sync: false
+      # There is no cache and no rate limit, and every call spends real provider
+      # quota — so a test deploy gets a generated key rather than open access.
+      - key: GENIE_API_KEY
+        generateValue: true
+      # Comma-separated browser origins. Blank means any origin.
+      - key: CORS_ORIGINS
+        sync: false

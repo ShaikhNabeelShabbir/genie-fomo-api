@@ -1,0 +1,35 @@
+# Fly.io — test deploy. Builds the repo Dockerfile on a remote builder.
+# Secrets are NOT set here; use `fly secrets set` (see PROD-STEPS.md).
+
+# Must be globally unique across Fly — change it if `fly launch` says it's taken.
+app = "genie-fomo-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  # Matches EXPOSE 8787 in the Dockerfile and the PORT default in settings.ts.
+  # Do not set a PORT secret unless you change this to match.
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # 0 lets the machine sleep when idle. Fly cold-starts in ~1s, so unlike a Render
+  # free instance this stays usable; set to 1 if you want zero added latency.
+  min_machines_running = 0
+
+  # /v1/health is the one route with no auth middleware, so this keeps passing
+  # after GENIE_API_KEY is set.
+  [[http_service.checks]]
+    method = "GET"
+    path = "/v1/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # 256mb is the default and is tight once a Solana DAS scan pages 20k accounts
+  # into memory. 512mb costs cents and removes the OOM risk.
+  memory = "512mb"
