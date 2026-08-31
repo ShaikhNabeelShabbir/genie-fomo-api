@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+*.tsbuildinfo
+
+# build_directory.py output — regenerate with a fresh FOMO_TOKEN
+raw/
+data/wallets.json
+__pycache__/

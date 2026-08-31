@@ -1,0 +1,30 @@
+{
+  "name": "genie-fomo-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Resolve a fomo.family trader to the wallet they actually trade from, then pull that wallet's transactions across Robinhood, Ethereum, BSC, Base and Solana.",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "start:dev": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "./scripts/smoke.sh"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}
