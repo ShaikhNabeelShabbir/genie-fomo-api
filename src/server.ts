@@ -119,14 +119,20 @@ app.get("/v1/traders", auth, (req, res) => {
 /**
  * ENDPOINT 1 — username to the wallets they actually trade from.
  *
- * Returns just the addresses and how much to trust them. `confidence` ships even in the
- * slim shape on purpose: `confirmed` (two independent tokens agreed) and `high-candidate`
- * (one tight, unrivalled match) are safe to act on, anything else is a guess the service
- * itself will not scan. An address without it reads as a fact when it is not one.
+ * The response mirrors fomoscan's `/v2/user/handle/{handle}` field-for-field, so a caller
+ * can point at either. The VALUES differ on purpose: fomoscan returns the wallet fomo
+ * provisioned for the user, which holds none of their positions, while these are the
+ * wallets the trading actually happens from — resolved live from on-chain holder data.
  *
- * `?verbose=true` returns the full trader profile, per-match evidence and provider notes —
- * the shape this endpoint used to return by default, kept for debugging a resolution.
+ * Because the shape has nowhere to put a confidence rating, only `confirmed` addresses
+ * are published. Anything weaker resolves to null rather than shipping a guess in a field
+ * that reads as fact. `?verbose=true` shows every candidate with its confidence, the
+ * per-match evidence and provider notes.
+ *
+ * `id` and `banner` have no source in the directory, and `twitter` is empty for every
+ * trader in it, so all three are null rather than invented.
  */
+const nonEmpty = (v: string | undefined) => (v && v.trim() ? v.trim() : null);
 app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
   const t = directory.get(req.params.handle);
   if (!t) {
@@ -144,10 +150,20 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
     return;
   }
 
+  // Only a `confirmed` match is published: two independent token positions agreed on the
+  // same wallet. `high-candidate` and below are withheld here — see the note above.
+  const confirmed = (x: Resolution) => (x.confidence === "confirmed" ? x.address : null);
+
   res.json({
+    id: null,
     handle: t.handle,
-    evm: { address: r.evm.address, confidence: r.evm.confidence },
-    solana: { address: r.solana.address, confidence: r.solana.confidence },
+    name: t.name ?? null,
+    bio: nonEmpty(t.bio),
+    banner: null,
+    profilePicture: nonEmpty(t.avatar),
+    twitter: nonEmpty(t.twitter),
+    solanaAddress: confirmed(r.solana),
+    evmAddress: confirmed(r.evm),
   });
 });
 

@@ -23,6 +23,9 @@ export type Trader = {
   trades?: number;
   followers?: number;
   verified?: boolean;
+  avatar?: string;
+  bio?: string;
+  twitter?: string;
   holdings?: Holding[];
 };
 
