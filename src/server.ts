@@ -5,7 +5,9 @@ import cors from "cors";
 import * as directory from "./directory.js";
 import type { Trader } from "./directory.js";
 import { resolveAll } from "./resolvers.js";
+import type { Resolution } from "./resolvers.js";
 import { fetchTransactions } from "./transactions.js";
+import { buildTrades, replay, summarise } from "./pnl.js";
 import {
   API_KEY, CORS_ORIGINS, PORT, haveBitquery, haveEtherscan, haveHelius,
 } from "./settings.js";
@@ -15,6 +17,8 @@ import {
  *
  *   GET /v1/traders/{handle}/wallets       username -> the wallets they actually trade from
  *   GET /v1/traders/{handle}/transactions  those wallets -> their live transactions
+ *   GET /v1/traders/{handle}/trades        those transfers -> paired trades with per-trade PnL
+ *   GET /v1/traders/{handle}/performance   the scorecard: realised vs unrealised, win rate
  *
  * Both resolve on every request. The input file is the raw build_directory.py output;
  * the real addresses are derived live from on-chain holder data each time, so responses
@@ -208,6 +212,156 @@ app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
     resolve_ms: r.elapsed_ms,
     fetch_ms: tx.elapsed_ms,
     pulled_at: tx.pulled_at,
+  });
+});
+
+/**
+ * Resolution is the slow part — 4-30s of holder queries — and a wallet address barely
+ * changes. Caching it keeps /trades and /performance usable interactively. In production
+ * this belongs in the nightly job that pre-resolves the whole directory.
+ */
+const RESOLVE_TTL_MS = 15 * 60_000;
+type Resolved = { evm: Resolution; solana: Resolution; elapsed_ms: number };
+const resolveCache = new Map<string, { at: number; value: Resolved }>();
+
+async function resolveCached(t: Trader): Promise<Resolved & { cached: boolean }> {
+  const hit = resolveCache.get(t.handle);
+  if (hit && Date.now() - hit.at < RESOLVE_TTL_MS) return { ...hit.value, cached: true };
+  const value = await resolveAll(t);
+  resolveCache.set(t.handle, { at: Date.now(), value });
+  return { ...value, cached: false };
+}
+
+const usableConfidence = new Set(["confirmed", "high-candidate"]);
+
+/**
+ * The PnL pipeline: resolve -> fetch OLDEST FIRST with native legs -> group by tx_hash ->
+ * classify -> replay carrying a cost pool per token.
+ *
+ * The `order: "asc"` is not cosmetic. A sell can only be settled against purchases that
+ * came before it, so the replay has to see them first. Any sell whose buy predates the
+ * fetched window reports `realized_pnl_usd: null` with `basis_not_in_window` rather than
+ * a zero basis, which would book the whole proceeds as profit.
+ */
+async function analyse(t: Trader, req: Request) {
+  const limit = Math.min(Math.max(Number(req.query.limit ?? 300) || 300, 1), 2000);
+  const pages = Math.min(Math.max(Number(req.query.pages ?? 5) || 5, 1), 20);
+  const wanted = String(req.query.chain ?? "")
+    .split(",").map((c) => c.trim()).filter(Boolean);
+
+  const r = await resolveCached(t);
+  const evmAddr = usableConfidence.has(r.evm.confidence) ? r.evm.address : null;
+  const solAddr = usableConfidence.has(r.solana.confidence) ? r.solana.address : null;
+
+  const tx = await fetchTransactions(
+    evmAddr, solAddr, wanted.length ? wanted : null, limit,
+    { order: "asc", includeNative: true, pages },
+  );
+
+  const built = Date.now();
+  const trades = await buildTrades(tx.transfers);
+
+  // Mark open positions with the price fomo already publishes per holding — free, and
+  // the only current price available without a paid feed.
+  const marks = new Map<string, number>();
+  for (const h of t.holdings ?? []) {
+    if (h.tokenAddress && typeof h.price === "number") {
+      marks.set(h.tokenAddress.toLowerCase(), h.price);
+    }
+  }
+
+  const { trades: settled, positions } = replay(trades, marks);
+  const summary = summarise(settled, positions);
+
+  const notes = [...r.evm.notes, ...r.solana.notes];
+  if (evmAddr === null && r.evm.confidence !== "no-evm-holdings") {
+    notes.push(`EVM not scanned — resolution was '${r.evm.confidence}'`);
+  }
+  if (solAddr === null && r.solana.confidence !== "no-sol-holdings") {
+    notes.push(`Solana not scanned — resolution was '${r.solana.confidence}'`);
+  }
+  if (summary.coverage.sells_without_basis > 0) {
+    notes.push(
+      `${summary.coverage.sells_without_basis} sell(s) have no purchase inside the fetched ` +
+      `window — raise ?pages= to reach further back, or accept them as unpriceable`,
+    );
+  }
+  if (summary.coverage.positions_unmarked > 0) {
+    notes.push(
+      `${summary.coverage.positions_unmarked} open position(s) have no current price in the ` +
+      `directory, so their unrealised PnL is excluded from the totals`,
+    );
+  }
+
+  return {
+    trader: { handle: t.handle, name: t.name, rank: t.rank },
+    scanned_wallets: {
+      evm: { address: evmAddr, confidence: r.evm.confidence, skipped: evmAddr === null },
+      solana: { address: solAddr, confidence: r.solana.confidence, skipped: solAddr === null },
+    },
+    chains: tx.chains,
+    summary,
+    trades: settled,
+    positions,
+    notes,
+    timings: {
+      resolve_ms: r.cached ? 0 : r.elapsed_ms,
+      resolve_cached: r.cached,
+      fetch_ms: tx.elapsed_ms,
+      price_and_replay_ms: Date.now() - built,
+    },
+    pulled_at: tx.pulled_at,
+  };
+}
+
+/**
+ * ENDPOINT 3 — transfers paired into trades, each with its own profit or loss.
+ *
+ * `?kind=buy,sell` filters, `?order=` sets display order only (the replay is always
+ * oldest-first). A trade with `pnl_status: "unavailable"` is one we genuinely cannot
+ * settle; the reason says why. Never read a null there as a zero.
+ */
+app.get("/v1/traders/:handle/trades", auth, async (req, res) => {
+  const t = directory.get(req.params.handle);
+  if (!t) {
+    res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
+    return;
+  }
+  const out = await analyse(t, req);
+
+  const kinds = String(req.query.kind ?? "")
+    .split(",").map((k) => k.trim()).filter(Boolean);
+  let rows = kinds.length ? out.trades.filter((x) => kinds.includes(x.kind)) : out.trades;
+  if (String(req.query.order ?? "desc") !== "asc") rows = [...rows].reverse();
+
+  res.json({
+    ...out,
+    basis_method: out.summary.basis_method,
+    count: rows.length,
+    trades: rows,
+    ...(String(req.query.include_positions ?? "") === "true" ? {} : { positions: undefined }),
+  });
+});
+
+/** ENDPOINT 4 — the scorecard, without the trade list. */
+app.get("/v1/traders/:handle/performance", auth, async (req, res) => {
+  const t = directory.get(req.params.handle);
+  if (!t) {
+    res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
+    return;
+  }
+  const out = await analyse(t, req);
+  res.json({
+    trader: out.trader,
+    scanned_wallets: out.scanned_wallets,
+    chains: out.chains,
+    ...out.summary,
+    /** What fomo claims, for contrast — computed above, reported here, never mixed. */
+    fomo_reported_pnl_30d: t.pnl ?? null,
+    positions: out.positions,
+    notes: out.notes,
+    timings: out.timings,
+    pulled_at: out.pulled_at,
   });
 });
 

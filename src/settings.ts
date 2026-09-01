@@ -70,6 +70,8 @@ export type EvmChain = {
   rpc: string;
   explorer: string;
   etherscanChainId: number | null;
+  /** Gas token — what a fee is denominated in, and the native leg of a swap. */
+  nativeSymbol: string;
 };
 
 export const EVM_CHAINS: Record<number, EvmChain> = {
@@ -80,6 +82,7 @@ export const EVM_CHAINS: Record<number, EvmChain> = {
     rpc: "https://rpc.mainnet.chain.robinhood.com",
     explorer: "https://robinhoodchain.blockscout.com",
     etherscanChainId: null,
+    nativeSymbol: "ETH",
   },
   1: {
     name: "ethereum",
@@ -88,6 +91,7 @@ export const EVM_CHAINS: Record<number, EvmChain> = {
     rpc: "https://ethereum-rpc.publicnode.com",
     explorer: "https://etherscan.io",
     etherscanChainId: 1,
+    nativeSymbol: "ETH",
   },
   56: {
     name: "bsc",
@@ -96,6 +100,7 @@ export const EVM_CHAINS: Record<number, EvmChain> = {
     rpc: "https://bsc-dataseed.binance.org",
     explorer: "https://bscscan.com",
     etherscanChainId: 56,
+    nativeSymbol: "BNB",
   },
   8453: {
     name: "base",
@@ -104,6 +109,7 @@ export const EVM_CHAINS: Record<number, EvmChain> = {
     rpc: "https://mainnet.base.org",
     explorer: "https://basescan.org",
     etherscanChainId: 8453,
+    nativeSymbol: "ETH",
   },
 };
 

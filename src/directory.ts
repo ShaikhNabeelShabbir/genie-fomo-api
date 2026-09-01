@@ -5,6 +5,8 @@ export type Holding = {
   tokenAddress?: string;
   networkId?: number;
   humanAmount?: number;
+  /** Current USD price, used to mark open positions in the PnL replay. */
+  price?: number;
   value?: number;
   pnl?: number;
   imageUrl?: string | null;
