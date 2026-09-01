@@ -100,9 +100,10 @@ app.get("/v1/health", (_req, res) => {
 /**
  * The whole board, in fomoscan's `/v2/leaderboard/traders` shape.
  *
- * No pagination, matching that endpoint: a board is a fixed ranking, and slicing it while
- * the envelope has no `total` would silently hand back a truncated list that looks whole.
- * `?q=` still filters, and `count` always describes the entries actually returned.
+ * `?q=` filters and `?limit=` takes the top N; `count` always describes the entries
+ * actually returned. When a limit truncates the board, `total` appears alongside it — a
+ * caller who asked for 3 of 150 should be able to see the 150. Without a limit the whole
+ * board comes back and `total` is absent, matching fomoscan's un-paginated envelope.
  *
  * `memberCount`, `marketCap`, `price` and `liquidity` belong to the clan and token boards
  * that share this entry shape — they are null on a trader board, not missing data. `id` is
@@ -115,13 +116,19 @@ app.get("/v1/health", (_req, res) => {
 app.get("/v1/traders", auth, (req, res) => {
   const q = String(req.query.q ?? "");
   const meta = directory.meta();
-  const { rows } = directory.search(q, Number.MAX_SAFE_INTEGER, 0);
+  const { rows: board } = directory.search(q, Number.MAX_SAFE_INTEGER, 0);
+
+  // Absent, unparseable or non-positive limits all mean "the whole board".
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+  const rows = limit === null ? board : board.slice(0, limit);
 
   res.json({
     board: "traders",
     window: meta.window ?? null,
     capturedAt: meta.generated_at ?? null,
     count: rows.length,
+    ...(rows.length < board.length ? { total: board.length } : {}),
     entries: rows.map((t) => ({
       rank: t.rank ?? null,
       id: null,
