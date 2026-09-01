@@ -112,8 +112,14 @@ app.get("/v1/traders", auth, (req, res) => {
 
 /**
  * ENDPOINT 1 — username to the wallets they actually trade from.
- * Always returns the confidence and the evidence: `confirmed` (two independent tokens
- * agreed) and `high-candidate` (one tight, unrivalled match) are not interchangeable.
+ *
+ * Returns just the addresses and how much to trust them. `confidence` ships even in the
+ * slim shape on purpose: `confirmed` (two independent tokens agreed) and `high-candidate`
+ * (one tight, unrivalled match) are safe to act on, anything else is a guess the service
+ * itself will not scan. An address without it reads as a fact when it is not one.
+ *
+ * `?verbose=true` returns the full trader profile, per-match evidence and provider notes —
+ * the shape this endpoint used to return by default, kept for debugging a resolution.
  */
 app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
   const t = directory.get(req.params.handle);
@@ -122,10 +128,20 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
     return;
   }
   const r = await resolveAll(t);
+
+  if (String(req.query.verbose ?? "") === "true") {
+    res.json({
+      trader: publicTrader(t),
+      resolved_wallets: { evm: r.evm, solana: r.solana },
+      elapsed_ms: r.elapsed_ms,
+    });
+    return;
+  }
+
   res.json({
-    trader: publicTrader(t),
-    resolved_wallets: { evm: r.evm, solana: r.solana },
-    elapsed_ms: r.elapsed_ms,
+    handle: t.handle,
+    evm: { address: r.evm.address, confidence: r.evm.confidence },
+    solana: { address: r.solana.address, confidence: r.solana.confidence },
   });
 });
 
