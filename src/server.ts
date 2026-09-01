@@ -8,6 +8,8 @@ import { resolveAll } from "./resolvers.js";
 import type { Resolution } from "./resolvers.js";
 import { fetchTransactions } from "./transactions.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
+import { asQuote } from "./prices.js";
+import type { Transfer } from "./transactions.js";
 import {
   API_KEY, CORS_ORIGINS, PORT, haveBitquery, haveEtherscan, haveHelius,
 } from "./settings.js";
@@ -153,7 +155,43 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
  * ENDPOINT 2 — the resolved wallets' live transactions.
  * Read `chains[]` before trusting an empty list: `count: 0, error: null` means no
  * activity, while `count: 0, error: "..."` means that chain could not be reached.
+ *
+ * Slim by default; `?verbose=true` returns the full row this used to emit. What the slim
+ * shape drops is duplication rather than information — see `slimTransfer`.
  */
+/**
+ * One transfer, without the parts that repeat something else in the same row.
+ *
+ *   time + time_iso  -> one ISO timestamp; the epoch copy said nothing extra
+ *   from + to        -> `counterparty`, since `side` already says which end we are
+ *   explorer_url     -> dropped; it is `chain` + `tx_hash` reassembled
+ *   token            -> a REAL symbol or null. Solana rows carried "EPjF…Dt1v", which is a
+ *                       truncated mint dressed up as a ticker: it reads like information
+ *                       and is not. Known mints now resolve properly (that one is USDC).
+ *   type/source      -> kept only when Helius actually decoded them
+ */
+function slimTransfer(t: Transfer) {
+  const known = asQuote(t.chain, t.contract, t.token);
+  const symbol = known ? known.symbol
+    : t.token && !t.token.includes("…") ? t.token
+    : null;
+  const decoded = t.type && t.type !== "UNKNOWN" ? t.type : null;
+  const via = t.source && t.source !== "UNKNOWN" ? t.source : null;
+
+  return {
+    chain: t.chain,
+    tx_hash: t.tx_hash,
+    time: t.time_iso,
+    token: symbol,
+    contract: t.contract,
+    amount: t.amount,
+    side: t.side,
+    counterparty: t.side === "in" ? t.from : t.to,
+    ...(decoded ? { type: decoded } : {}),
+    ...(via ? { source: via } : {}),
+  };
+}
+
 app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
   const t = directory.get(req.params.handle);
   if (!t) {
@@ -164,6 +202,8 @@ app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit ?? 100) || 100, 1), 300);
   const side = String(req.query.side ?? "");
   const includeEvidence = String(req.query.include_evidence ?? "") === "true";
+  // Evidence is a debugging aid, so asking for it implies the full shape.
+  const verbose = String(req.query.verbose ?? "") === "true" || includeEvidence;
   const wanted = String(req.query.chain ?? "")
     .split(",").map((c) => c.trim()).filter(Boolean);
 
@@ -181,15 +221,17 @@ app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
     ? tx.transfers.filter((x) => x.side === side)
     : tx.transfers;
 
+  // `confidence` stays even when slim: an address without it reads as a fact when it is
+  // a probabilistic match. `skipped` is dropped because `address: null` already says so.
   const scanned: Record<string, unknown> = {
     evm: {
-      address: evmAddr, confidence: evm.confidence, method: evm.method,
-      skipped: evmAddr === null,
+      address: evmAddr, confidence: evm.confidence,
+      ...(verbose ? { method: evm.method, skipped: evmAddr === null } : {}),
       ...(includeEvidence ? { matches: evm.matches } : {}),
     },
     solana: {
       address: solAddr, confidence: solana.confidence,
-      skipped: solAddr === null,
+      ...(verbose ? { skipped: solAddr === null } : {}),
       ...(includeEvidence ? { matches: solana.matches } : {}),
     },
   };
@@ -207,11 +249,12 @@ app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
     scanned_wallets: scanned,
     chains: tx.chains,
     count: rows.length,
-    transfers: rows,
+    transfers: verbose ? rows : rows.map(slimTransfer),
     notes,
-    resolve_ms: r.elapsed_ms,
-    fetch_ms: tx.elapsed_ms,
-    pulled_at: tx.pulled_at,
+    // Timings are diagnostics, not part of the answer.
+    ...(verbose
+      ? { resolve_ms: r.elapsed_ms, fetch_ms: tx.elapsed_ms, pulled_at: tx.pulled_at }
+      : {}),
   });
 });
 
