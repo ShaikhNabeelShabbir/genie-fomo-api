@@ -200,8 +200,7 @@ realistic loop is: build locally, ship the file.
 # on your machine
 cd api-ts
 export FOMO_TOKEN="…"              # fresh from fomo.family cookies
-python3 build_directory.py
-cp data/wallets.json data/wallet.full.data.json
+python3 build_directory.py                        # writes data/wallet.full.data.json
 git commit -am "refresh directory" && git push      # triggers a redeploy
 ```
 

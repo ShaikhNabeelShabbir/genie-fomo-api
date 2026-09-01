@@ -8,7 +8,7 @@ End-to-end: pull the fomo leaderboard, produce the directory file, serve it.
   fomo leaderboard              reads the directory file
   (needs FOMO_TOKEN)            resolves each trader LIVE on request
         ↓                       returns real wallets + transactions
-  data/wallets.json  ─────────────────────↑
+  data/wallet.full.data.json  ────────────↑
   raw/leaderboard.json (kept for --offline reruns)
 ```
 
@@ -68,8 +68,8 @@ python3 build_directory.py
 Output:
 
 ```
-data/wallets.json        the directory
-raw/leaderboard.json     the untouched API response
+data/wallet.full.data.json   the directory
+raw/leaderboard.json         the untouched API response
 ```
 
 ### Options
@@ -104,25 +104,11 @@ pull, not fresher ones.
 
 ---
 
-## Step 3 — Point the API at the output
+## Step 3 — Confirm the API picked it up
 
-**The filenames do not match, and this is the step people miss.**
-
-| | |
-| --- | --- |
-| the script writes | `data/wallets.json` |
-| the API reads by default | `data/wallet.full.data.json` |
-
-So a successful script run does **not** change what the API serves until you connect them.
-Pick one:
-
-```bash
-# A — tell the API where to look (preferred; keeps both files)
-echo 'WALLETS_FILE=./data/wallets.json' >> .env
-
-# B — overwrite the shipped file
-cp data/wallets.json data/wallet.full.data.json
-```
+The script writes `data/wallet.full.data.json`, which is exactly the file the API reads by
+default — so there is nothing to wire up. The directory is re-read whenever the file's
+mtime changes, so a rebuild goes live on the next request without a restart.
 
 Confirm which file is actually loaded:
 
@@ -131,11 +117,12 @@ curl -s localhost:8787/v1/health | jq '.directory'
 ```
 
 ```jsonc
-{ "file": "/…/api-ts/data/wallets.json", "traders": 150, "window": "30d",
+{ "file": "/…/api-ts/data/wallet.full.data.json", "traders": 150, "window": "30d",
   "generated_at": 1788018815 }
 ```
 
-If `file` is not what you expect, the API is serving something else.
+Check that `generated_at` moved — that is the run you just did. If you keep the
+directory somewhere else, point `WALLETS_FILE` at it instead.
 
 ---
 
@@ -470,7 +457,7 @@ A cron entry, remembering that the token expires hourly and so cannot be baked i
 | `401` / `403` from fomo | token expired — they last about an hour, grab a new one |
 | `431 Request Header Fields Too Large` | cookie auth instead of Bearer; the script already uses Bearer |
 | `Leaderboard fetch failed` | expired token, or no network |
-| Script succeeded but the API shows old data | the filename mismatch in **Step 3** |
+| Script succeeded but the API shows old data | `WALLETS_FILE` points somewhere else — check **Step 3** |
 | `traders: 0` at `/v1/health` | `WALLETS_FILE` points at a missing or malformed file |
 | `ModuleNotFoundError: requests` | `pip install requests` |
 
@@ -486,6 +473,6 @@ and `topHoldings`. All 150 traders come from that single request.
 provisioned wallets that hold none of the trader's positions — the API derives the real
 ones live by matching reported position sizes against on-chain holders. See `README.md`.
 
-**Overwrites.** Each run replaces `data/wallets.json` wholesale. If a previous run of the
+**Overwrites.** Each run replaces `data/wallet.full.data.json` wholesale. If a previous run of the
 separate resolver scripts had written resolution fields into that file, they are wiped.
 That does not affect this API, which ignores those fields and resolves live anyway.

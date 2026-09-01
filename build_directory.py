@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-build_directory.py  —  builds data/wallets.json for the genie-fomo app.
+build_directory.py  —  builds data/wallet.full.data.json for the genie-fomo app.
 
 Runs LOCALLY with your fomo token. Walks the 30d leaderboard, resolves each handle to
 its wallet(s) + profile info, and writes a cached directory the Next.js app reads.
-The token NEVER leaves your machine and is NEVER committed — only wallets.json ships.
+The token NEVER leaves your machine and is NEVER committed — only the directory ships.
 
 Reuses ether_scan1.py's Bearer-auth approach (the fix for the cookie 431).
 
 SETUP
   export FOMO_TOKEN="your_privy_token"     # from fomo.family cookies; expires ~hourly
-  python3 build_directory.py               # -> data/wallets.json  (+ raw/ dumps for debugging)
+  python3 build_directory.py               # -> data/wallet.full.data.json  (+ raw/ dumps)
 
-  python3 build_directory.py --offline     # no token: rebuild data/wallets.json from the
+  python3 build_directory.py --offline     # no token: rebuild the directory from the
                                            # raw/leaderboard.json already on disk
 
 Re-run on a cadence (daily, or before a demo) to refresh names — the leaderboard reshuffles.
@@ -30,6 +30,9 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 
 RAW = pathlib.Path("raw"); RAW.mkdir(exist_ok=True)
 DATA = pathlib.Path("data"); DATA.mkdir(exist_ok=True)
+# The filename the API reads by default (see src/settings.ts). Writing straight to it
+# means a run is live on the next request — there is no copy step left to forget.
+OUT = DATA / "wallet.full.data.json"
 
 
 def fomo_get(path):
@@ -121,9 +124,9 @@ def extract_entries(lb):
 
 def write_directory(entries):
     json.dump({"window": WINDOW, "generated_at": int(time.time()), "traders": entries},
-              open(DATA / "wallets.json", "w"), indent=2)
+              open(OUT, "w"), indent=2)
     resolved = sum(1 for d in entries if d["evm"] or d["sol"])
-    print(f"\nwrote data/wallets.json — {resolved}/{len(entries)} resolved to a wallet.")
+    print(f"\nwrote {OUT} — {resolved}/{len(entries)} resolved to a wallet.")
 
 
 def main():
