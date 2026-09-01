@@ -174,6 +174,13 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
  *
  * Slim by default; `?verbose=true` returns the full row this used to emit. What the slim
  * shape drops is duplication rather than information — see `slimTransfer`.
+ *
+ * Only `confirmed` wallets are scanned, so the addresses in `wallets` are exactly the
+ * addresses the transfers came from — a caller can always tell whose activity this is.
+ * The trade-off is coverage: `confirmed` needs two independent token positions to agree,
+ * and 138 of the 150 traders hold fewer than two Solana tokens in the snapshot, so their
+ * Solana activity is not reachable through this endpoint. /trades and /performance still
+ * accept `high-candidate`, because the PnL replay is where that Solana history matters.
  */
 /**
  * One transfer, without the parts that repeat something else in the same row.
@@ -228,29 +235,38 @@ app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
 
   // Only scan an address we actually trust. A weak match would attribute someone else's
   // transactions to this trader, which is worse than returning nothing.
-  const usable = new Set(["confirmed", "high-candidate"]);
-  const evmAddr = usable.has(evm.confidence) ? evm.address : null;
-  const solAddr = usable.has(solana.confidence) ? solana.address : null;
+  const evmAddr = evm.confidence === "confirmed" ? evm.address : null;
+  const solAddr = solana.confidence === "confirmed" ? solana.address : null;
 
   const tx = await fetchTransactions(evmAddr, solAddr, wanted.length ? wanted : null, limit);
   const rows = side === "in" || side === "out"
     ? tx.transfers.filter((x) => x.side === side)
     : tx.transfers;
 
-  // `confidence` stays even when slim: an address without it reads as a fact when it is
-  // a probabilistic match. `skipped` is dropped because `address: null` already says so.
+  // Verbose keeps every candidate and its confidence, including the ones withheld below.
   const scanned: Record<string, unknown> = {
     evm: {
       address: evmAddr, confidence: evm.confidence,
-      ...(verbose ? { method: evm.method, skipped: evmAddr === null } : {}),
+      method: evm.method, skipped: evmAddr === null,
       ...(includeEvidence ? { matches: evm.matches } : {}),
     },
     solana: {
       address: solAddr, confidence: solana.confidence,
-      ...(verbose ? { skipped: solAddr === null } : {}),
+      skipped: solAddr === null,
       ...(includeEvidence ? { matches: solana.matches } : {}),
     },
   };
+
+  // Slim shape: since only confirmed wallets are scanned, `confidence` would be the same
+  // constant on every row, so the address alone carries it. Unconfirmed chains are absent
+  // rather than null — there is no wallet here to talk about.
+  const wallets: Record<string, string> = {};
+  if (evmAddr) wallets.evm = evmAddr;
+  if (solAddr) wallets.solana = solAddr;
+
+  // A chain that failed is not a chain with no activity. Reported only when it happens,
+  // so a healthy response stays minimal but a degraded one is never silently short.
+  const failed = tx.chains.filter((c) => c.error);
 
   const notes = [...evm.notes, ...solana.notes];
   if (evmAddr === null && evm.confidence !== "no-evm-holdings") {
@@ -260,17 +276,25 @@ app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
     notes.push(`Solana not scanned — resolution was '${solana.confidence}'`);
   }
 
+  if (verbose) {
+    res.json({
+      trader: { handle: t.handle, name: t.name, rank: t.rank },
+      scanned_wallets: scanned,
+      chains: tx.chains,
+      count: rows.length,
+      transfers: rows,
+      notes,
+      resolve_ms: r.elapsed_ms,
+      fetch_ms: tx.elapsed_ms,
+      pulled_at: tx.pulled_at,
+    });
+    return;
+  }
+
   res.json({
-    trader: { handle: t.handle, name: t.name, rank: t.rank },
-    scanned_wallets: scanned,
-    chains: tx.chains,
-    count: rows.length,
-    transfers: verbose ? rows : rows.map(slimTransfer),
-    notes,
-    // Timings are diagnostics, not part of the answer.
-    ...(verbose
-      ? { resolve_ms: r.elapsed_ms, fetch_ms: tx.elapsed_ms, pulled_at: tx.pulled_at }
-      : {}),
+    wallets,
+    transfers: rows.map(slimTransfer),
+    ...(failed.length ? { errors: failed } : {}),
   });
 });
 
