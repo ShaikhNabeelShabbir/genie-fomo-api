@@ -97,21 +97,45 @@ app.get("/v1/health", (_req, res) => {
   });
 });
 
+/**
+ * The whole board, in fomoscan's `/v2/leaderboard/traders` shape.
+ *
+ * No pagination, matching that endpoint: a board is a fixed ranking, and slicing it while
+ * the envelope has no `total` would silently hand back a truncated list that looks whole.
+ * `?q=` still filters, and `count` always describes the entries actually returned.
+ *
+ * `memberCount`, `marketCap`, `price` and `liquidity` belong to the clan and token boards
+ * that share this entry shape — they are null on a trader board, not missing data. `id` is
+ * null because the directory carries no UUID for a trader; fomoscan mints its own.
+ *
+ * `capturedAt` is when build_directory.py read the leaderboard, in epoch SECONDS, straight
+ * from the file. It is not a live sample: fomoscan re-reads FOMO every 30s, this is one
+ * snapshot that ages until the pipeline is re-run.
+ */
 app.get("/v1/traders", auth, (req, res) => {
   const q = String(req.query.q ?? "");
-  const limit = Math.min(Math.max(Number(req.query.limit ?? 25) || 25, 1), 200);
-  const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
-  const { rows, total } = directory.search(q, limit, offset);
+  const meta = directory.meta();
+  const { rows } = directory.search(q, Number.MAX_SAFE_INTEGER, 0);
+
   res.json({
-    total,
-    limit,
-    offset,
-    traders: rows.map((t) => ({
+    board: "traders",
+    window: meta.window ?? null,
+    capturedAt: meta.generated_at ?? null,
+    count: rows.length,
+    entries: rows.map((t) => ({
+      rank: t.rank ?? null,
+      id: null,
       handle: t.handle,
-      name: t.name,
-      rank: t.rank,
-      pnl_30d: t.pnl,
-      holdings: (t.holdings ?? []).length,
+      label: t.name ?? null,
+      avatarUrl: nonEmpty(t.avatar),
+      pnl: t.pnl ?? null,
+      volume: t.volume ?? null,
+      followers: t.followers ?? null,
+      numTrades: t.trades ?? null,
+      memberCount: null,
+      marketCap: null,
+      price: null,
+      liquidity: null,
     })),
   });
 });
