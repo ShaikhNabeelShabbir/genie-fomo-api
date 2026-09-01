@@ -153,8 +153,9 @@ app.get("/v1/traders", auth, (req, res) => {
  * that reads as fact. `?verbose=true` shows every candidate with its confidence, the
  * per-match evidence and provider notes.
  *
- * `id` and `banner` have no source in the directory, and `twitter` is empty for every
- * trader in it, so all three are null rather than invented.
+ * `id` is omitted entirely: fomoscan mints its own UUID per user and the directory has no
+ * equivalent, so there is nothing to key on. `banner` has no source either, and `twitter`
+ * is empty for all 150 traders — both stay as null rather than being invented.
  */
 const nonEmpty = (v: string | undefined) => (v && v.trim() ? v.trim() : null);
 app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
@@ -179,7 +180,6 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
   const confirmed = (x: Resolution) => (x.confidence === "confirmed" ? x.address : null);
 
   res.json({
-    id: null,
     handle: t.handle,
     name: t.name ?? null,
     bio: nonEmpty(t.bio),
