@@ -18,6 +18,13 @@ export type Trader = {
   rank?: number;
   evm?: string;
   sol?: string;
+  /** Wallets resolved by an independent third party (see `src`). Deliberately separate
+   *  from evm/sol, which mean "the wallet fomo provisioned" and hold none of the
+   *  positions. Used to corroborate our own resolution, never as an answer on its own. */
+  src_evm?: string;
+  src_sol?: string;
+  /** Which third party produced src_evm/src_sol, e.g. "fomoapi.io". */
+  src?: string;
   pnl?: number;
   volume?: number;
   trades?: number;

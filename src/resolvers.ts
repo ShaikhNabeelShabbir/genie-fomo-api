@@ -432,7 +432,7 @@ async function allHolders(mint: string, maxPages = 20): Promise<[string, number]
   return [...totals.entries()].sort((a, b) => b[1] - a[1]);
 }
 
-async function solBalanceOf(owner: string, mint: string): Promise<number> {
+export async function solBalanceOf(owner: string, mint: string): Promise<number> {
   const res = await solRpc("getTokenAccountsByOwner", [
     owner, { mint }, { encoding: "jsonParsed" },
   ]);
@@ -534,6 +534,127 @@ export async function resolveSolana(trader: Trader): Promise<Resolution> {
     candidates_considered: candidates.size,
     notes,
   };
+}
+
+/**
+ * Verify a candidate address instead of searching for one.
+ *
+ * When something else already proposes an address — a third-party resolver, a cached
+ * answer — we do not need holder lists. Asking the chain "does THIS wallet hold the
+ * reported positions" is a plain balanceOf: free, keyless, and it reaches BSC and Base,
+ * which have no free holder source. Holder-list search is what spends Bitquery points, so
+ * this path costs nothing.
+ *
+ * Two tiers of evidence, because the reported amounts go stale:
+ *
+ *   exact   the balance matches the reported size within TOLERANCE. Strongest — position
+ *           sizes carry 12+ significant digits, so a match is effectively unique.
+ *   holds   the wallet holds a nonzero amount of a token the trader is reported to hold,
+ *           but the size has drifted. Weaker alone, decisive in aggregate: the chance of
+ *           an unrelated wallet holding three of the same obscure memecoins is nil.
+ *
+ * This second tier is what makes verification survive a stale feed. An active trader's
+ * balances move constantly, but the *set* of tokens they hold moves far more slowly.
+ */
+const VERIFY_MAX_CALLS = 10;   // bound the RPC cost per chain
+
+type Evidence = { exact: Match[]; holds: Match[] };
+
+function gradeEvidence(address: string, ev: Evidence): Resolution {
+  const { exact, holds } = ev;
+  const matches = [...exact, ...holds];
+  const corroborations = exact.length + holds.length;
+
+  // Same bar as resolveEvm: two independent tokens agreeing is `confirmed`. An exact
+  // size match counts on its own; drifted holdings need a third to reach the same
+  // confidence, since each one is weaker evidence.
+  let confidence: string;
+  if (exact.length >= 2 || (exact.length >= 1 && holds.length >= 1) || holds.length >= 3) {
+    confidence = "confirmed";
+  } else if (corroborations >= 1) {
+    confidence = "high-candidate";
+  } else {
+    confidence = "unverified";
+  }
+
+  return {
+    address: corroborations ? address : null,
+    confidence,
+    matches,
+    best_off_by: exact.length ? score(exact) : undefined,
+    method: "balanceOf",
+    candidates_considered: 1,
+    notes: holds.length && !exact.length
+      ? [`verified by token overlap only — ${holds.length} reported token(s) held, sizes drifted`]
+      : [],
+  };
+}
+
+export async function verifyCandidate(
+  trader: Trader,
+  evmCandidate: string | null,
+  solCandidate: string | null,
+): Promise<{ evm: Resolution; solana: Resolution; elapsed_ms: number }> {
+  const started = Date.now();
+  const holdings = trader.holdings ?? [];
+  const none = (why: string): Resolution =>
+    ({ address: null, confidence: why, matches: [], notes: [] });
+
+  /** Enough evidence to stop spending calls. */
+  const done = (ev: Evidence) =>
+    ev.exact.length >= 2 || (ev.exact.length >= 1 && ev.holds.length >= 1) || ev.holds.length >= 3;
+
+  const collect = async (
+    rows: Holding[],
+    chainOf: (h: Holding) => string,
+    balance: (h: Holding) => Promise<number | null>,
+  ): Promise<Evidence> => {
+    const ev: Evidence = { exact: [], holds: [] };
+    let calls = 0;
+    // Largest positions first: they are the least likely to have been closed outright.
+    const ordered = [...rows].sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+    for (const h of ordered) {
+      if (done(ev) || calls >= VERIFY_MAX_CALLS) break;
+      calls++;
+      const bal = await balance(h);
+      if (!bal || bal <= 0) continue;
+      const target = h.humanAmount!;
+      const off = Math.abs(bal - target) / target;
+      const m: Match = {
+        chain: chainOf(h), token: h.tokenAddress!, reported: target,
+        onchain: bal, off_by: off, via: off <= TOLERANCE ? "balanceOf" : "balanceOf/holds",
+      };
+      (off <= TOLERANCE ? ev.exact : ev.holds).push(m);
+    }
+    return ev;
+  };
+
+  const evmJob = async (): Promise<Resolution> => {
+    if (!evmCandidate) return none("no-candidate");
+    const rows = holdings.filter(
+      (h) => h.networkId !== undefined && EVM_CHAINS[h.networkId] &&
+             h.tokenAddress && (h.humanAmount ?? 0) > 0);
+    if (!rows.length) return none("no-evm-holdings");
+    return gradeEvidence(evmCandidate, await collect(
+      rows,
+      (h) => EVM_CHAINS[h.networkId!].name,
+      (h) => balanceOf(h.networkId!, h.tokenAddress!, evmCandidate),
+    ));
+  };
+
+  const solJob = async (): Promise<Resolution> => {
+    if (!solCandidate) return none("no-candidate");
+    if (!haveHelius()) return none("no-helius-key");
+    const rows = holdings.filter(
+      (h) => h.networkId === SOLANA_NETWORK_ID && h.tokenAddress && (h.humanAmount ?? 0) > 0);
+    if (!rows.length) return none("no-sol-holdings");
+    return gradeEvidence(solCandidate, await collect(
+      rows, () => "solana", (h) => solBalanceOf(solCandidate, h.tokenAddress!),
+    ));
+  };
+
+  const [evm, solana] = await Promise.all([evmJob(), solJob()]);
+  return { evm, solana, elapsed_ms: Date.now() - started };
 }
 
 /** Both chains in parallel — different providers, different quotas. */

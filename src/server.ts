@@ -4,7 +4,7 @@ import cors from "cors";
 
 import * as directory from "./directory.js";
 import type { Trader } from "./directory.js";
-import { resolveAll } from "./resolvers.js";
+import { resolveAll, verifyCandidate } from "./resolvers.js";
 import type { Resolution } from "./resolvers.js";
 import { fetchTransactions } from "./transactions.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
@@ -164,6 +164,35 @@ app.get("/v1/traders", auth, (req, res) => {
  * equivalent, so there is nothing to key on. `banner` has no source either, and `twitter`
  * is empty for all 150 traders — both stay as null rather than being invented.
  */
+/**
+ * Resolution, verification first — used by every route that needs an address.
+ *
+ * When the directory carries a candidate address, asking "does this wallet hold the
+ * reported positions" is a plain balanceOf: free, and it reaches BSC and Base. Holder-list
+ * search is what spends Bitquery points, and on a directory sourced from fomoapi (~96
+ * positions per trader rather than fomo's 3) it is also what turns a request into minutes
+ * of DAS paging. So it runs only for chains verification could not settle.
+ */
+async function resolvePreferVerified(
+  t: Trader,
+): Promise<{ evm: Resolution; solana: Resolution; elapsed_ms: number;
+             candidate: Awaited<ReturnType<typeof verifyCandidate>> | null }> {
+  const candidate = t.src_evm || t.src_sol
+    ? await verifyCandidate(t, t.src_evm || null, t.src_sol || null)
+    : null;
+  // Any on-chain evidence beats falling back: a verified `high-candidate` is a real
+  // answer, while holder-list search may be quota-blocked and return nothing at all.
+  const evmOk = !!candidate?.evm.address;
+  const solOk = !!candidate?.solana.address;
+  const full = evmOk && solOk ? null : await resolveAll(t);
+  return {
+    evm: evmOk ? candidate!.evm : full!.evm,
+    solana: solOk ? candidate!.solana : full!.solana,
+    elapsed_ms: (candidate?.elapsed_ms ?? 0) + (full?.elapsed_ms ?? 0),
+    candidate,
+  };
+}
+
 const nonEmpty = (v: string | undefined) => (v && v.trim() ? v.trim() : null);
 app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
   const t = directory.get(req.params.handle);
@@ -171,20 +200,33 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
     res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
     return;
   }
-  const r = await resolveAll(t);
+  const r = await resolvePreferVerified(t);
+  const cand = r.candidate;
 
   if (String(req.query.verbose ?? "") === "true") {
     res.json({
       trader: publicTrader(t),
       resolved_wallets: { evm: r.evm, solana: r.solana },
+      third_party: t.src
+        ? { source: t.src, evm: t.src_evm || null, solana: t.src_sol || null,
+            verified_evm: cand?.evm.confidence ?? null,
+            verified_solana: cand?.solana.confidence ?? null }
+        : null,
       elapsed_ms: r.elapsed_ms,
     });
     return;
   }
 
-  // Only a `confirmed` match is published: two independent token positions agreed on the
-  // same wallet. `high-candidate` and below are withheld here — see the note above.
-  const confirmed = (x: Resolution) => (x.confidence === "confirmed" ? x.address : null);
+  // A `confirmed` match publishes on its own: two independent token positions agreed on
+  // the same wallet. A weaker match publishes only when an independent third-party
+  // resolver landed on the same address — a different method reaching the same answer is
+  // the same standard of evidence, and it is what lets a directory built without position
+  // data still produce a trustworthy address. Disagreement publishes nothing.
+  const publishable = (x: Resolution, thirdParty?: string) => {
+    if (x.confidence === "confirmed") return x.address;
+    if (!x.address || !thirdParty) return null;
+    return x.address.toLowerCase() === thirdParty.toLowerCase() ? x.address : null;
+  };
 
   res.json({
     handle: t.handle,
@@ -193,8 +235,8 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
     banner: null,
     profilePicture: nonEmpty(t.avatar),
     twitter: nonEmpty(t.twitter),
-    solanaAddress: confirmed(r.solana),
-    evmAddress: confirmed(r.evm),
+    solanaAddress: publishable(r.solana, t.src_sol),
+    evmAddress: publishable(r.evm, t.src_evm),
   });
 });
 
@@ -261,7 +303,7 @@ app.get("/v1/traders/:handle/transactions", auth, async (req, res) => {
   const wanted = String(req.query.chain ?? "")
     .split(",").map((c) => c.trim()).filter(Boolean);
 
-  const r = await resolveAll(t);
+  const r = await resolvePreferVerified(t);
   const { evm, solana } = r;
 
   // Only scan an address we actually trust. A weak match would attribute someone else's
@@ -341,7 +383,7 @@ const resolveCache = new Map<string, { at: number; value: Resolved }>();
 async function resolveCached(t: Trader): Promise<Resolved & { cached: boolean }> {
   const hit = resolveCache.get(t.handle);
   if (hit && Date.now() - hit.at < RESOLVE_TTL_MS) return { ...hit.value, cached: true };
-  const value = await resolveAll(t);
+  const value = await resolvePreferVerified(t);
   resolveCache.set(t.handle, { at: Date.now(), value });
   return { ...value, cached: false };
 }
