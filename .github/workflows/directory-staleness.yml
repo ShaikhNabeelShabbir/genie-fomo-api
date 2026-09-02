@@ -1,0 +1,61 @@
+name: directory staleness check
+
+# Fails — and so emails you — when the live API is serving a directory older than the
+# threshold. This is the alarm for a silently dead refresh pipeline, which is the failure
+# mode that actually bites: the service stays "healthy" and returns 200 the whole time.
+#
+# Needs no secret. /v1/health is deliberately the one unauthenticated route.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'        # 09:00 UTC, a few hours after the refresh runs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: https://genie-fomo-api.onrender.com
+  MAX_AGE_HOURS: '36'          # a daily refresh plus a full missed run
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check directory freshness
+        run: |
+          set -euo pipefail
+
+          # The free instance sleeps when idle, so the first request may be a ~50s cold
+          # start. Retry before concluding the service is down.
+          for attempt in 1 2 3; do
+            if curl -sf --max-time 90 "$BASE_URL/v1/health" -o /tmp/health.json; then
+              break
+            fi
+            echo "attempt $attempt failed, retrying…"
+            sleep 15
+          done
+
+          if [ ! -s /tmp/health.json ]; then
+            echo "::error::$BASE_URL/v1/health is unreachable after 3 attempts"
+            exit 1
+          fi
+
+          traders=$(jq -r '.directory.traders // 0' /tmp/health.json)
+          gen=$(jq -r '.directory.generated_at // 0' /tmp/health.json)
+          age_h=$(( ( $(date -u +%s) - gen ) / 3600 ))
+
+          echo "traders: $traders   generated_at: $gen   age: ${age_h}h" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$traders" -eq 0 ]; then
+            echo "::error::the live API is serving 0 traders — WALLETS_FILE is missing or malformed"
+            exit 1
+          fi
+
+          if [ "$age_h" -gt "$MAX_AGE_HOURS" ]; then
+            echo "::error::directory is ${age_h}h old (limit ${MAX_AGE_HOURS}h) — the refresh workflow has stopped working"
+            exit 1
+          fi
+
+          echo "ok: directory is ${age_h}h old, serving $traders traders"
