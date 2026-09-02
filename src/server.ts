@@ -8,6 +8,7 @@ import { resolveAll, verifyCandidate } from "./resolvers.js";
 import type { Resolution } from "./resolvers.js";
 import { fetchTransactions } from "./transactions.js";
 import * as hyperliquid from "./hyperliquid.js";
+import * as pumpfun from "./pumpfun.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
 import { asQuote } from "./prices.js";
 import type { Transfer } from "./transactions.js";
@@ -574,6 +575,68 @@ app.get("/v1/hyperliquid/traders", auth, async (req, res) => {
       roi: r.roi,
       volume: r.volume,
     })),
+  });
+});
+
+
+/**
+ * pump.fun leaderboard — same envelope as /v1/hyperliquid/traders.
+ *
+ * `Transaction.Signer` is the trader's wallet, so like Hyperliquid there is no resolution
+ * step. Two fields exist here that the other boards do not need:
+ *
+ *   coverageFrom  how far back the data actually reaches. Our Bitquery plan only serves
+ *                 the `realtime` dataset (~12h), so this is a "trading now" board rather
+ *                 than a 7d/30d ranking. Stated rather than implied.
+ *   minTrades     raw volume ranking surfaces wash trades and mispriced tokens — one
+ *                 wallet showed 3 trades and $94M. Defaults to 10; ?minTrades=0 disables.
+ */
+app.get("/v1/pumpfun/traders", auth, async (req, res) => {
+  let board;
+  try {
+    board = await pumpfun.leaderboard();
+  } catch (e) {
+    res.status(502).json({
+      detail: `pumpfun leaderboard unavailable: ${e instanceof Error ? e.message : String(e)}`,
+    });
+    return;
+  }
+
+  const askedMin = Number(req.query.minTrades);
+  const minTrades = Number.isFinite(askedMin) && askedMin >= 0 ? Math.floor(askedMin) : 10;
+  const ranked = board.rows.filter((r) => r.trades >= minTrades);
+
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+  const page = limit === null ? ranked : ranked.slice(0, limit);
+
+  // Only the page gets profile lookups, so ?limit=2 costs two calls rather than 200.
+  const profiles = await pumpfun.resolveProfiles(page.map((r) => r.address));
+
+  res.json({
+    board: "pumpfun",
+    protocols: pumpfun.PROTOCOL_NAMES,
+    coverageFrom: board.coverageFrom,
+    capturedAt: Math.floor(board.at / 1000),
+    count: page.length,
+    ranked: ranked.length,
+    total: board.rows.length,
+    minTrades,
+    entries: page.map((r, i) => {
+      const p = profiles.get(r.address);
+      return {
+        rank: i + 1,
+        address: r.address,
+        label: p?.label ?? null,
+        // pump.fun auto-assigns a handle to every wallet, so a label alone proves nothing.
+        // `registered` is what says a human actually claimed the account.
+        registered: p?.registered ?? false,
+        followers: p?.followers ?? null,
+        twitter: p?.twitter ?? null,
+        volumeUsd: r.volumeUsd,
+        trades: r.trades,
+      };
+    }),
   });
 });
 
