@@ -52,6 +52,7 @@ export const WALLETS_FILE = process.env.WALLETS_FILE ?? defaultWalletsFile();
 export const ETHERSCAN_KEY = (process.env.ETHERSCAN_KEY ?? "").trim();
 export const BITQUERY_KEY = (process.env.BITQUERY_KEY ?? "").trim();
 export const HELIUS_KEY = (process.env.HELIUS_SOLANA_KEY ?? process.env.HELIUS_KEY ?? "").trim();
+export const GMGN_KEY = (process.env.GMGN_API_KEY ?? "").trim();
 /** When set, requests must send X-API-Key. Unset means open, for local development. */
 export const API_KEY = (process.env.GENIE_API_KEY ?? "").trim();
 export const PORT = Number(process.env.PORT ?? 8787);
@@ -116,6 +117,7 @@ export const EVM_CHAINS: Record<number, EvmChain> = {
 export const haveBitquery = () => !!BITQUERY_KEY;
 export const haveHelius = () => !!HELIUS_KEY;
 export const haveEtherscan = () => !!ETHERSCAN_KEY;
+export const haveGmgn = () => !!GMGN_KEY;
 
 export const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";

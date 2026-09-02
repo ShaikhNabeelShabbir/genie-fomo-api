@@ -9,6 +9,7 @@ import type { Resolution } from "./resolvers.js";
 import { fetchTransactions } from "./transactions.js";
 import * as hyperliquid from "./hyperliquid.js";
 import * as pumpfun from "./pumpfun.js";
+import * as gmgn from "./gmgn.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
 import { asQuote } from "./prices.js";
 import type { Transfer } from "./transactions.js";
@@ -637,6 +638,67 @@ app.get("/v1/pumpfun/traders", auth, async (req, res) => {
         trades: r.trades,
       };
     }),
+  });
+});
+
+
+/**
+ * gmgn.ai trader board — same envelope as the hyperliquid and pumpfun boards.
+ *
+ * The wallets come pre-curated by gmgn as smart money or KOLs, which is what makes this
+ * board different in kind: our pump.fun board ranks raw volume and returns 183 bots out
+ * of 200, whereas these are wallets someone has already classified as worth watching.
+ * KOL rows also carry a real twitter identity rather than an auto-generated handle.
+ *
+ *   ?limit=2                 first N rows
+ *   ?cohort=smartmoney|kol   which cohort to rank (default smartmoney)
+ *   ?chain=sol               chain (default sol)
+ */
+app.get("/v1/gmgn/traders", auth, async (req, res) => {
+  const cohort = String(req.query.cohort ?? "smartmoney");
+  if (!gmgn.isCohort(cohort)) {
+    res.status(400).json({
+      detail: `unknown cohort '${cohort}' — use one of ${gmgn.COHORTS.join(", ")}`,
+    });
+    return;
+  }
+  const chain = String(req.query.chain ?? "sol");
+
+  let board;
+  try {
+    board = await gmgn.leaderboard(chain);
+  } catch (e) {
+    res.status(502).json({
+      detail: `gmgn leaderboard unavailable: ${e instanceof Error ? e.message : String(e)}`,
+    });
+    return;
+  }
+
+  const rows = board.byCohort.get(cohort) ?? [];
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+  const page = limit === null ? rows : rows.slice(0, limit);
+
+  res.json({
+    board: "gmgn",
+    chain,
+    cohort,
+    capturedAt: Math.floor(board.at / 1000),
+    count: page.length,
+    ranked: rows.length,
+    entries: page.map((r, i) => ({
+      rank: i + 1,
+      address: r.address,
+      label: r.label,
+      twitter: r.twitter,
+      avatarUrl: r.avatar,
+      tags: r.tags,
+      volumeUsd: r.volumeUsd,
+      trades: r.trades,
+      buys: r.buys,
+      sells: r.sells,
+      lastSeen: r.lastSeen,
+    })),
   });
 });
 
