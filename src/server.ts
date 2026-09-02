@@ -7,6 +7,7 @@ import type { Trader } from "./directory.js";
 import { resolveAll, verifyCandidate } from "./resolvers.js";
 import type { Resolution } from "./resolvers.js";
 import { fetchTransactions } from "./transactions.js";
+import * as hyperliquid from "./hyperliquid.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
 import { asQuote } from "./prices.js";
 import type { Transfer } from "./transactions.js";
@@ -518,6 +519,61 @@ app.get("/v1/traders/:handle/performance", auth, async (req, res) => {
     notes: out.notes,
     timings: out.timings,
     pulled_at: out.pulled_at,
+  });
+});
+
+
+/**
+ * Hyperliquid leaderboard — the same `board` envelope as /v1/traders.
+ *
+ * No resolution step: Hyperliquid publishes `ethAddress` directly, so there is no
+ * provisioned wallet to see through. `roi` is included because it is the honest measure —
+ * absolute pnl flatters whoever deployed the most capital.
+ *
+ *   ?limit=2            first N rows (absent/invalid means the whole retained board)
+ *   ?window=day|week|month|allTime   which performance window to rank by (default day)
+ */
+app.get("/v1/hyperliquid/traders", auth, async (req, res) => {
+  const w = String(req.query.window ?? "day");
+  if (!hyperliquid.isWindow(w)) {
+    res.status(400).json({
+      detail: `unknown window '${w}' — use one of ${hyperliquid.WINDOWS.join(", ")}`,
+    });
+    return;
+  }
+
+  let board;
+  try {
+    board = await hyperliquid.leaderboard();
+  } catch (e) {
+    res.status(502).json({
+      detail: `hyperliquid leaderboard unavailable: ${e instanceof Error ? e.message : String(e)}`,
+    });
+    return;
+  }
+
+  const rows = board.byWindow.get(w) ?? [];
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+  const page = limit === null ? rows : rows.slice(0, limit);
+
+  res.json({
+    board: "hyperliquid",
+    window: w,
+    capturedAt: Math.floor(board.at / 1000),
+    count: page.length,
+    // `total` is every trader on the feed; `ranked` is what we retain per window.
+    total: board.total,
+    ranked: rows.length,
+    entries: page.map((r, i) => ({
+      rank: i + 1,
+      address: r.address,
+      label: r.label,
+      accountValue: r.accountValue,
+      pnl: r.pnl,
+      roi: r.roi,
+      volume: r.volume,
+    })),
   });
 });
 
