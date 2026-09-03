@@ -10,11 +10,14 @@ import { fetchTransactions } from "./transactions.js";
 import * as hyperliquid from "./hyperliquid.js";
 import * as pumpfun from "./pumpfun.js";
 import * as gmgn from "./gmgn.js";
+import { portfolio, tokenBoard, chainName } from "./metrics.js";
+import { banked, haveFomoapi } from "./fomoapi.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
 import { asQuote } from "./prices.js";
 import type { Transfer } from "./transactions.js";
 import {
-  API_KEY, CORS_ORIGINS, PORT, haveBitquery, haveEtherscan, haveHelius,
+  API_KEY, CORS_ORIGINS, PORT, EVM_CHAINS, SOLANA_NETWORK_ID,
+  haveBitquery, haveEtherscan, haveHelius,
 } from "./settings.js";
 
 /**
@@ -852,6 +855,126 @@ app.get("/v1/gmgn/traders/:handle/transactions", auth, async (req, res) => {
     });
   } catch (e) {
     res.status(502).json({ detail: `gmgn unavailable: ${e instanceof Error ? e.message : e}` });
+  }
+});
+
+
+/**
+ * PARAMETERS.md T11 + T13 — position count and concentration.
+ *
+ * Computed entirely from the directory snapshot: no API call, no key, no rate limit. The
+ * two ship together by rule, because position count alone inverts the truth — `unipcs`
+ * holds 95 coins with 97% of the money in one of them, and "95 positions" reads as
+ * diversified to anyone who does not check.
+ *
+ * `coverage` is not decoration: ~22% of rows in the snapshot carry no price, and a share
+ * quoted without saying what it covers is the quiet way to mislead.
+ */
+app.get("/v1/traders/:handle/portfolio", auth, (req, res) => {
+  const t = directory.get(req.params.handle);
+  if (!t) {
+    res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
+    return;
+  }
+  res.json({ handle: t.handle, name: t.name ?? null, ...portfolio(t) });
+});
+
+
+/**
+ * PARAMETERS.md K1 + K4 — which tokens the leaders are crowding into, and who holds them.
+ *
+ * Computed by inverting the snapshot's `holdings[]`; no API call. Quote assets (USDC, USDT,
+ * wrapped natives) are excluded and that is not a preference — 85 of 100 leaders hold USDC,
+ * so leaving them in makes the top of the board the currency rather than a trade.
+ *
+ * Crowding is reported, never recommended. 34 of 150 traders once held the same honeypot:
+ * consensus can mean a good call or a coordinated pump, and this number cannot tell them
+ * apart.
+ *
+ *   ?limit=10        page size (absent = whole board)
+ *   ?minHolders=2    drop tokens only one leader holds (default 1)
+ *   ?chain=solana    filter to one chain
+ */
+app.get("/v1/tokens", auth, (req, res) => {
+  const meta = directory.meta();
+  const traders = directory.all();
+
+  const chainQ = String(req.query.chain ?? "").trim().toLowerCase();
+  let chain: number | null = null;
+  if (chainQ) {
+    const hit = [SOLANA_NETWORK_ID, ...Object.keys(EVM_CHAINS).map(Number)]
+      .find((id) => chainName(id) === chainQ);
+    if (hit === undefined) {
+      res.status(400).json({ detail: `unknown chain '${chainQ}'` });
+      return;
+    }
+    chain = hit;
+  }
+
+  const askedMin = Number(req.query.minHolders);
+  const minHolders = Number.isFinite(askedMin) && askedMin >= 1 ? Math.floor(askedMin) : 1;
+  const { rows, totalTokens, excluded, traderCount } = tokenBoard(traders, { chain, minHolders });
+
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+  const page = limit === null ? rows : rows.slice(0, limit);
+
+  res.json({
+    board: "tokens",
+    chain: chainQ || "all",
+    capturedAt: meta.generated_at ?? null,
+    traders: traderCount,
+    count: page.length,
+    ranked: rows.length,
+    totalTokens,
+    minHolders,
+    /**
+     * Stablecoins and wrapped natives dropped before ranking — the currency, not a trade.
+     * `tokens` is how many distinct assets were dropped; `positions` is how many holding
+     * rows they covered. Measured: 5 assets across 157 positions.
+     */
+    excludedQuoteAssets: excluded,
+    entries: page.map((r, i) => ({ rank: i + 1, ...r })),
+  });
+});
+
+
+/**
+ * PARAMETERS.md T1 — banked versus on paper.
+ *
+ * The spine of the trust model. A profit that is entirely unrealised may be a honeypot
+ * mark: the measured case was $95,577,723 of "profit" on $41 of volume, cost basis $9.87,
+ * in a token nobody had ever sold. Realized and unrealised are never merged into one
+ * "profit" figure here.
+ *
+ * Costs one fomoapi call per trader (cached 10 min). fomoapi serves trades live and reports
+ * its own unavailability — that is passed through as `available` rather than being rendered
+ * as a zero.
+ */
+app.get("/v1/traders/:handle/pnl", auth, async (req, res) => {
+  const t = directory.get(req.params.handle);
+  if (!t) {
+    res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
+    return;
+  }
+  if (!haveFomoapi()) {
+    res.status(503).json({ detail: "FOMOAPI_KEY is not set — T1 needs fomoapi /trades" });
+    return;
+  }
+  try {
+    const b = await banked(t.handle);
+    if (!b) {
+      res.status(404).json({ detail: `fomoapi has no trades for '${t.handle}'` });
+      return;
+    }
+    res.json({ handle: t.handle, name: t.name ?? null, source: "fomoapi /v2/users/{handle}/trades", ...b });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    res.status(502).json({
+      detail: /timed out|abort/i.test(msg)
+        ? "fomoapi /trades did not respond in time — it serves trades live and is currently slow"
+        : `fomoapi unavailable: ${msg}`,
+    });
   }
 });
 
