@@ -702,6 +702,159 @@ app.get("/v1/gmgn/traders", auth, async (req, res) => {
   });
 });
 
+
+/**
+ * Per-trader routes for the three wallet-first platforms.
+ *
+ * The `:handle` segment is a WALLET ADDRESS, not a username. Unlike fomo — which
+ * publishes a provisioned wallet and hides the real one, hence resolvers.ts — these
+ * platforms use the address as the identity. Nothing is resolved here; a lookup is a
+ * lookup. Hyperliquid additionally accepts a leaderboard displayName as a convenience,
+ * since ~1,400 of its accounts set one.
+ */
+
+// ---------------------------------------------------------------- hyperliquid
+
+app.get("/v1/hyperliquid/traders/:handle/wallets", auth, async (req, res) => {
+  const askedW = Number(req.query.limit);
+  const limit = Number.isFinite(askedW) && askedW >= 1 ? Math.floor(askedW) : null;
+  try {
+    const address = await hyperliquid.resolveHandle(req.params.handle);
+    if (!address) {
+      res.status(404).json({ detail: `no hyperliquid trader '${req.params.handle}'` });
+      return;
+    }
+    res.json({
+      platform: "hyperliquid",
+      handle: req.params.handle,
+      // The address IS the account: margin and positions live on Hyperliquid's own L1,
+      // so this is not queryable through the EVM chains in settings.ts.
+      address,
+      chain: "hyperliquid-l1",
+      // A big account can hold 30+ positions, so ?limit trims them the same way it does
+      // everywhere else rather than dumping the lot.
+      account: await hyperliquid.account(address, limit),
+    });
+  } catch (e) {
+    res.status(502).json({ detail: `hyperliquid unavailable: ${e instanceof Error ? e.message : e}` });
+  }
+});
+
+app.get("/v1/hyperliquid/traders/:handle/transactions", auth, async (req, res) => {
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 2000) : 100;
+  try {
+    const address = await hyperliquid.resolveHandle(req.params.handle);
+    if (!address) {
+      res.status(404).json({ detail: `no hyperliquid trader '${req.params.handle}'` });
+      return;
+    }
+    const rows = await hyperliquid.fills(address, limit);
+    res.json({
+      platform: "hyperliquid", handle: req.params.handle, address,
+      count: rows.length, transactions: rows,
+    });
+  } catch (e) {
+    res.status(502).json({ detail: `hyperliquid unavailable: ${e instanceof Error ? e.message : e}` });
+  }
+});
+
+// ------------------------------------------------------------------- pump.fun
+
+app.get("/v1/pumpfun/traders/:handle/wallets", auth, async (req, res) => {
+  try {
+    const p = (await pumpfun.resolveProfiles([req.params.handle])).get(req.params.handle);
+    res.json({
+      platform: "pumpfun", handle: req.params.handle,
+      // The resolved wallet, which is NOT the path param when a username was passed.
+      address: p?.address ?? null,
+      chain: "solana",
+      label: p?.label ?? null,
+      // pump.fun auto-assigns a handle to every wallet, so `registered` is what says a
+      // human actually claimed it. Most high-volume wallets are bots and have neither.
+      registered: p?.registered ?? false,
+      followers: p?.followers ?? null,
+      twitter: p?.twitter ?? null,
+    });
+  } catch (e) {
+    res.status(502).json({ detail: `pumpfun unavailable: ${e instanceof Error ? e.message : e}` });
+  }
+});
+
+app.get("/v1/pumpfun/traders/:handle/transactions", auth, async (req, res) => {
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 100) : 50;
+  try {
+    const address = await pumpfun.resolveHandle(req.params.handle);
+    if (!address) {
+      res.status(404).json({ detail: `no pumpfun trader '${req.params.handle}'` });
+      return;
+    }
+    const rows = await pumpfun.trades(address, limit);
+    res.json({
+      platform: "pumpfun", handle: req.params.handle, address,
+      protocols: pumpfun.PROTOCOL_NAMES,
+      // Bounded by Bitquery's ~12h realtime window — an empty list may mean "not trading
+      // recently" rather than "never traded".
+      count: rows.length, transactions: rows,
+    });
+  } catch (e) {
+    res.status(502).json({ detail: `pumpfun unavailable: ${e instanceof Error ? e.message : e}` });
+  }
+});
+
+// ----------------------------------------------------------------------- gmgn
+
+app.get("/v1/gmgn/traders/:handle/wallets", auth, async (req, res) => {
+  const chain = String(req.query.chain ?? "sol");
+  try {
+    // Accepts a name (label or twitter) as well as an address — see gmgn.resolveHandle.
+    const address = await gmgn.resolveHandle(req.params.handle, chain);
+    if (!address) {
+      res.status(404).json({
+        detail: `no gmgn trader '${req.params.handle}' — pass a wallet address, or a `
+          + `label/twitter of a wallet currently on a cohort board`,
+      });
+      return;
+    }
+    // wallet_stats is the only endpoint across all four platforms that returns realized
+    // PnL already computed, so it is the wallet view rather than a bare identity echo.
+    const [stats, ident] = await Promise.all([
+      gmgn.walletStats(address, chain, String(req.query.period ?? "7d")),
+      gmgn.profile(address, chain).catch(() => null),
+    ]);
+    res.json({
+      platform: "gmgn", handle: req.params.handle, address, chain,
+      label: ident?.label ?? null,
+      twitter: ident?.twitter ?? null,
+      tags: ident?.tags ?? [],
+      stats,
+    });
+  } catch (e) {
+    res.status(502).json({ detail: `gmgn unavailable: ${e instanceof Error ? e.message : e}` });
+  }
+});
+
+app.get("/v1/gmgn/traders/:handle/transactions", auth, async (req, res) => {
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 100) : 50;
+  const chain = String(req.query.chain ?? "sol");
+  try {
+    const address = await gmgn.resolveHandle(req.params.handle, chain);
+    if (!address) {
+      res.status(404).json({ detail: `no gmgn trader '${req.params.handle}'` });
+      return;
+    }
+    const rows = await gmgn.walletActivity(address, chain, limit);
+    res.json({
+      platform: "gmgn", handle: req.params.handle, address, chain,
+      count: rows.length, transactions: rows,
+    });
+  } catch (e) {
+    res.status(502).json({ detail: `gmgn unavailable: ${e instanceof Error ? e.message : e}` });
+  }
+});
+
 app.use((_req, res) => res.status(404).json({ detail: "not found" }));
 
 const server = app.listen(PORT, () => {

@@ -106,3 +106,79 @@ export async function leaderboard(): Promise<Cache> {
 }
 
 export const isWindow = (v: string): v is Window => (WINDOWS as readonly string[]).includes(v);
+
+// ------------------------------------------------------- per-trader lookups
+
+const INFO = "https://api.hyperliquid.xyz/info";
+
+async function info(body: Record<string, unknown>): Promise<any> {
+  const r = await fetch(INFO, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!r.ok) throw new Error(`hyperliquid HTTP ${r.status}`);
+  return r.json();
+}
+
+/**
+ * Resolve a leaderboard displayName to its address, so callers can use either.
+ * Only ~1,400 of 44,590 accounts set one, so this is a convenience, not a real handle
+ * system — Hyperliquid's identity IS the address.
+ */
+export async function resolveHandle(handle: string): Promise<string | null> {
+  if (/^0x[0-9a-fA-F]{40}$/.test(handle)) return handle.toLowerCase();
+  const board = await leaderboard();
+  const needle = handle.trim().toLowerCase();
+  for (const rows of board.byWindow.values()) {
+    const hit = rows.find((r) => (r.label ?? "").toLowerCase() === needle);
+    if (hit) return hit.address;
+  }
+  return null;
+}
+
+/** Live account state: margin and open positions, keyed by the address itself. */
+export async function account(address: string, limit: number | null = null) {
+  const s = await info({ type: "clearinghouseState", user: address });
+  const positions = (s?.assetPositions ?? []).map((p: any) => ({
+    coin: p?.position?.coin ?? null,
+    size: Number(p?.position?.szi) || 0,
+    entryPx: Number(p?.position?.entryPx) || null,
+    positionValue: Number(p?.position?.positionValue) || 0,
+    unrealizedPnl: Number(p?.position?.unrealizedPnl) || 0,
+    leverage: p?.position?.leverage?.value ?? null,
+  }));
+  return {
+    accountValue: Number(s?.marginSummary?.accountValue) || 0,
+    totalMarginUsed: Number(s?.marginSummary?.totalMarginUsed) || 0,
+    withdrawable: Number(s?.withdrawable) || 0,
+    openPositions: positions.length,
+    // Largest first, so a ?limit shows the positions that actually matter.
+    positions: (limit === null
+      ? positions
+      : [...positions].sort((a, b) => Math.abs(b.positionValue) - Math.abs(a.positionValue))
+          .slice(0, limit)),
+  };
+}
+
+/** Recent fills. Hyperliquid caps this at 2000 and returns newest-last. */
+export async function fills(address: string, limit: number) {
+  const rows = (await info({ type: "userFills", user: address })) as any[];
+  const list = Array.isArray(rows) ? rows : [];
+  return list
+    .slice(-limit)
+    .reverse()
+    .map((f) => ({
+      coin: f?.coin ?? null,
+      side: f?.side === "B" ? "buy" : f?.side === "A" ? "sell" : (f?.side ?? null),
+      dir: f?.dir ?? null,
+      price: Number(f?.px) || 0,
+      size: Number(f?.sz) || 0,
+      fee: Number(f?.fee) || 0,
+      closedPnl: Number(f?.closedPnl) || 0,
+      time: Number(f?.time) || 0,
+      timeIso: f?.time ? new Date(Number(f.time)).toISOString() : null,
+      hash: f?.hash ?? null,
+    }));
+}

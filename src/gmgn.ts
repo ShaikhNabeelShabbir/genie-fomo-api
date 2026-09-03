@@ -50,6 +50,31 @@ export type Row = {
 };
 
 type Board = { at: number; byCohort: Map<Cohort, Row[]> };
+
+/**
+ * Names seen across ALL refreshes, not just the current one.
+ *
+ * The cohort endpoints return roughly the last 100 trades, so a wallet is only on the
+ * board while it is actively trading — "jrus" resolved one minute and 404'd the next.
+ * Searching a live feed is therefore useless as a lookup. This map accumulates every
+ * identity we have ever seen and never evicts, so a name stays findable after the wallet
+ * goes quiet. Keyed by both label and twitter handle, lowercased.
+ *
+ * In-memory, so it resets on restart and rebuilds as boards refresh. Persisting it would
+ * make lookups durable across deploys — worth doing if this becomes load-bearing.
+ */
+const known = new Map<string, Row>();
+
+function remember(rows: Row[]): void {
+  for (const r of rows) {
+    if (r.label) known.set(r.label.toLowerCase(), r);
+    if (r.twitter) known.set(r.twitter.toLowerCase(), r);
+    known.set(r.address.toLowerCase(), r);
+  }
+}
+
+/** How many identities the process has accumulated so far. */
+export const knownCount = () => new Set([...known.values()].map((r) => r.address)).size;
 let cache: Board | null = null;
 let inflight: Promise<Board> | null = null;
 
@@ -114,7 +139,9 @@ async function load(chain: string): Promise<Board> {
   for (const [i, c] of COHORTS.entries()) {
     if (i) await sleep(GAP_MS);   // stay under 1 req/s
     try {
-      byCohort.set(c, aggregate(await fetchCohort(c, chain)));
+      const rows = aggregate(await fetchCohort(c, chain));
+      remember(rows);          // grow the directory before the snapshot is discarded
+      byCohort.set(c, rows);
     } catch (e) {
       // One cohort failing must not lose the other — a 429 on the second call is common.
       byCohort.set(c, cache?.byCohort.get(c) ?? []);
@@ -141,4 +168,91 @@ export async function leaderboard(chain = "sol"): Promise<Board> {
     if (cache) return cache;   // stale board beats a 502 for a ranking
     throw e;
   }
+}
+
+// ------------------------------------------------------- per-trader lookups
+
+/** Shared request builder: X-APIKEY header + per-request timestamp/client_id in the query. */
+async function get(path: string, params: Record<string, string | number>): Promise<any> {
+  if (!haveGmgn()) throw new Error("GMGN_API_KEY is not set");
+  const qs = new URLSearchParams({
+    ...Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)])),
+    timestamp: String(Math.floor(Date.now() / 1000)),
+    client_id: crypto.randomUUID(),
+  });
+  const r = await fetch(`${HOST}${path}?${qs}`, {
+    headers: { "X-APIKEY": GMGN_KEY, Accept: "application/json" },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const j = (await r.json().catch(() => null)) as any;
+  if (j?.error === "RATE_LIMIT_EXCEEDED") throw new Error("gmgn rate limit (1 req/s, per IP)");
+  if (!r.ok) throw new Error(`gmgn HTTP ${r.status}`);
+  if (j?.code !== 0) throw new Error(String(j?.message ?? "gmgn error").slice(0, 160));
+  return j?.data;
+}
+
+/**
+ * Wallet performance. This is the one endpoint across all four platforms that returns
+ * realized PnL already computed — the accounting we would otherwise have to build.
+ */
+export async function walletStats(address: string, chain: string, period = "7d") {
+  const d = await get("/v1/user/wallet_stats", { chain, wallet_address: address, period });
+  return {
+    address: d?.wallet_address ?? address,
+    period,
+    nativeBalance: Number(d?.native_balance) || 0,
+    realizedProfit: Number(d?.realized_profit) || 0,
+    realizedProfitPct: Number(d?.realized_profit_pnl) || 0,
+    buys: Number(d?.buy) || 0,
+    sells: Number(d?.sell) || 0,
+    boughtCost: Number(d?.bought_cost) || 0,
+    soldIncome: Number(d?.sold_income) || 0,
+    totalCost: Number(d?.total_cost) || 0,
+    lastActive: Number(d?.last_timestamp) || null,
+  };
+}
+
+/** Recent buys/sells for a wallet, newest first. */
+export async function walletActivity(address: string, chain: string, limit: number) {
+  const d = await get("/v1/user/wallet_activity", { chain, wallet_address: address, limit });
+  return (d?.activities ?? []).slice(0, limit).map((a: any) => ({
+    time: Number(a?.timestamp) || 0,
+    timeIso: a?.timestamp ? new Date(Number(a.timestamp) * 1000).toISOString() : null,
+    side: a?.event_type ?? null,
+    token: a?.token?.symbol ?? null,
+    mint: a?.token?.address ?? a?.quote_address ?? null,
+    amount: Number(a?.token_amount) || 0,
+    amountUsd: Number(a?.cost_usd) || 0,
+    priceUsd: Number(a?.price_usd) || 0,
+    launchpad: a?.launchpad ?? a?.launchpad_platform ?? null,
+    signature: a?.tx_hash ?? null,
+  }));
+}
+
+/**
+ * Accept a name as well as an address.
+ *
+ * gmgn has no handle system — the wallet address is the identity — but the curated
+ * cohorts carry `label` and `twitter` for the wallets they track, so those are usable as
+ * lookup keys. Matches either, case-insensitively, across both cohorts. Returns null for
+ * a name nobody on the board answers to, which the route turns into a 404 rather than
+ * passing a non-address through to gmgn and getting "invalid wallet address".
+ *
+ * Only wallets currently on a cohort board can be found this way — it is a convenience
+ * over the cached board, not a directory.
+ */
+export async function resolveHandle(handle: string, chain = "sol"): Promise<string | null> {
+  const h = handle.trim();
+  // Solana addresses are base58 and 32-44 chars; anything else is treated as a name.
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(h)) return h;
+  const needle = h.toLowerCase().replace(/^@/, "");
+  // Refresh first so a brand-new name can be picked up, then search everything ever seen.
+  await leaderboard(chain).catch(() => null);
+  return known.get(needle)?.address ?? null;
+}
+
+/** Identity for one wallet, taken from whichever cohort already knows it. */
+export async function profile(address: string, chain = "sol"): Promise<Row | null> {
+  await leaderboard(chain).catch(() => null);
+  return known.get(address.toLowerCase()) ?? null;
 }

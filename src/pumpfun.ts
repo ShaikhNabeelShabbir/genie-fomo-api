@@ -45,6 +45,8 @@ export type Row = { address: string; volumeUsd: number; trades: number };
  * claimed that account. `registered` separates a chosen identity from a placeholder.
  */
 export type Profile = {
+  /** The real wallet. /users/{x} accepts a username OR an address and returns this. */
+  address: string | null;
   label: string | null;
   registered: boolean;
   followers: number | null;
@@ -137,7 +139,9 @@ export async function leaderboard(): Promise<Board> {
  * ?limit=2 costs two lookups, not two hundred.
  */
 const profiles = new Map<string, Profile>();
-const NO_PROFILE: Profile = { label: null, registered: false, followers: null, twitter: null };
+const NO_PROFILE: Profile = {
+  address: null, label: null, registered: false, followers: null, twitter: null,
+};
 
 async function fetchProfile(address: string): Promise<Profile> {
   try {
@@ -148,6 +152,9 @@ async function fetchProfile(address: string): Promise<Profile> {
     if (!r.ok) return NO_PROFILE;   // 404 simply means no profile exists
     const u = (await r.json()) as any;
     return {
+      // Crucial: the caller may have passed a username, so never assume the input was
+      // an address. Echoing a username back as `address` produced silently empty trades.
+      address: u?.address || u?.canonical_svm_wallet || null,
       label: u?.username ?? null,
       registered: Boolean(u?.is_pump_user),
       followers: typeof u?.followers === "number" ? u.followers : null,
@@ -156,6 +163,13 @@ async function fetchProfile(address: string): Promise<Profile> {
   } catch {
     return NO_PROFILE;   // the profile API is unofficial — never fail a board over it
   }
+}
+
+/** username OR address -> the real wallet address, via the profile endpoint. */
+export async function resolveHandle(handle: string): Promise<string | null> {
+  const p = (await resolveProfiles([handle])).get(handle);
+  // Fall back to the input when it already looks like a Solana address but has no profile.
+  return p?.address ?? (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(handle) ? handle : null);
 }
 
 /** Resolve profiles for one page, in bounded parallel, reusing anything already known. */
@@ -171,3 +185,56 @@ export async function resolveProfiles(addresses: string[]): Promise<Map<string, 
 }
 
 export const PROTOCOL_NAMES = PROTOCOLS;
+
+// ------------------------------------------------------- per-trader lookups
+
+/**
+ * A wallet's pump.fun trades, newest first.
+ *
+ * Bitquery again rather than pump.fun: their frontend API has no per-wallet trade route.
+ * Both legs carry AmountInUSD, so each row is priced without an oracle — this is the raw
+ * material for realized-PnL accounting, not just a transaction list.
+ *
+ * Bounded by the same ~12h `realtime` window as the board; older trades need archive.
+ */
+export async function trades(address: string, limit: number) {
+  const list = PROTOCOLS.map((p) => `"${p}"`).join(",");
+  const data = await gql(`{
+    Solana {
+      DEXTrades(
+        limit: {count: ${Math.min(Math.max(limit, 1), 100)}}
+        orderBy: {descending: Block_Time}
+        where: {Transaction: {Signer: {is: "${address}"}},
+                Trade: {Dex: {ProtocolName: {in: [${list}]}}}}
+      ) {
+        Block { Time }
+        Transaction { Signature }
+        Trade {
+          Dex { ProtocolName }
+          Buy  { Amount AmountInUSD Currency { Symbol MintAddress } }
+          Sell { Amount AmountInUSD Currency { Symbol MintAddress } }
+        }
+      }
+    }
+  }`);
+
+  return (data?.Solana?.DEXTrades ?? []).map((t: any) => {
+    const buy = t?.Trade?.Buy ?? {};
+    const sell = t?.Trade?.Sell ?? {};
+    const sellSym = sell?.Currency?.Symbol ?? "";
+    // A swap out of SOL/a stable is a buy of the other leg; the reverse is a sell.
+    const isBuy = sellSym === "SOL" || /^(USDC|USDT)$/.test(sellSym);
+    return {
+      time: t?.Block?.Time ?? null,
+      signature: t?.Transaction?.Signature ?? null,
+      protocol: t?.Trade?.Dex?.ProtocolName ?? null,
+      side: isBuy ? "buy" : "sell",
+      token: (isBuy ? buy : sell)?.Currency?.Symbol ?? null,
+      mint: (isBuy ? buy : sell)?.Currency?.MintAddress ?? null,
+      amount: Number((isBuy ? buy : sell)?.Amount) || 0,
+      amountUsd: Number(buy?.AmountInUSD) || Number(sell?.AmountInUSD) || 0,
+      // The other side of the swap: what was spent on a buy, what was received on a sell.
+      counterToken: (isBuy ? sell : buy)?.Currency?.Symbol ?? null,
+    };
+  });
+}
