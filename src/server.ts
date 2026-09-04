@@ -1300,16 +1300,29 @@ app.post("/v1/snapshots", auth, (_req, res) => {
 
 app.use((_req, res) => res.status(404).json({ detail: "not found" }));
 
+// The directory is loaded BEFORE the port opens. Serving requests against an empty
+// directory would return a confident 404 for every trader, which is worse than not being
+// up yet.
+try {
+  const src = await directory.init();
+  console.log(`directory loaded from ${src}: ${directory.meta().traders} traders`);
+} catch (e) {
+  console.error(`FATAL: could not load the directory — ${e instanceof Error ? e.message : String(e)}`);
+  process.exit(1);
+}
+
 const server = app.listen(PORT, () => {
   console.log(`genie-fomo API (typescript) on port ${PORT}`);
-  console.log(`  directory: ${directory.meta().traders} traders`);
-  // Archive on boot so K2 starts accruing without anyone remembering to call it. Keyed on
-  // the directory's own timestamp, so repeated restarts do not stack identical snapshots.
-  try {
-    const a = snapshots.archive();
-    console.log(`  snapshots: ${a.total} archived${a.written ? ` (wrote ${a.file})` : ""}`);
-  } catch (e) {
-    console.log(`  snapshots: archive failed — ${e instanceof Error ? e.message : String(e)}`);
+  // The file-based snapshot archive only exists to give K2 a history. In database mode
+  // that history is `holdings.captured_at`, so archiving would duplicate it on a disk that
+  // does not survive a redeploy.
+  if (directory.meta().source === "file") {
+    try {
+      const a = snapshots.archive();
+      console.log(`  snapshots: ${a.total} archived${a.written ? ` (wrote ${a.file})` : ""}`);
+    } catch (e) {
+      console.log(`  snapshots: archive failed — ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   console.log(`  auth: ${API_KEY ? "X-API-Key required" : "none (open access)"}`);
   console.log(`  cors: ${CORS_ORIGINS.length ? CORS_ORIGINS.join(", ") : "any origin"}`);

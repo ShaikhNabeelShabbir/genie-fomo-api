@@ -179,12 +179,12 @@ coverage stops improving, not once.
 
 ---
 
-## Phase 3 — Read path ⬜
+## Phase 3 — Read path 🔄
 
 | | Step | Why | Verify | Status |
 | --- | --- | --- | --- | --- |
-| 3.1 | `directory.ts` reads Postgres | one change moves 9 file-only routes at once — `metrics.ts` is pure functions over a trader array | routes return 200 | ⬜ |
-| 3.2 | **CHECKPOINT — diff DB vs file** | the only guard against a schema bug silently changing every number | all §Baseline figures reproduce exactly | ⬜ |
+| 3.1 | `directory.ts` reads Postgres | one change moves 9 file-only routes at once — `metrics.ts` is pure functions over a trader array | ✅ `directory loaded from db: 100 traders` | ✅ |
+| 3.2 | **CHECKPOINT — diff DB vs file** | the only guard against a schema bug silently changing every number | ✅ 7 of 7 checks identical | ✅ |
 | 3.3 | Move heavy aggregates to SQL | `/v1/tokens` inverts 2,038 holdings in memory per request; in Postgres it is an indexed GROUP BY | same output, faster | ⬜ |
 | 3.4 | `/pnl` + `/scorecard` from `trades` | removes fomoapi from the request path | no network call during a request | ⬜ |
 | 3.5 | K5–K8 from `trades` | **45s → ~10ms, and 25 sampled holders → all 896 tokens** | `/activity` under 100ms | ⬜ |
@@ -193,6 +193,24 @@ coverage stops improving, not once.
 **Step 3.2 is the one step that must not be skipped.** Everything after it assumes the DB
 is a faithful copy. If a number moves here, it is a schema bug, and finding it later means
 unpicking three phases.
+
+**Result — 7 of 7 identical.** `DIRECTORY_SOURCE=file|db` forces the source, so both were
+run side by side on ports 8788 and 8787 and compared:
+
+```
+/v1/chains                      (100, 2038, 5)
+/v1/chains solana value         10544636.01
+/v1/tokens                      ranked 896, excluded (7 tokens, 93 positions)
+/v1/traders/unipcs/portfolio    118 positions, 0.9851 concentration, $3,630,587.09
+/v1/traders/unipcs/trust        implausible, 5.98, 3.91
+/v1/traders?limit=3             unipcs, DumbCrayonEater, Salem1299534
+```
+
+The `DIRECTORY_SOURCE` override is kept deliberately: without a way to run both sources at
+once, a schema bug becomes the new truth instead of a visible difference.
+
+**One known gap:** `window` is now null. The build window ("30d") was a field in the JSON
+and has no column. Cosmetic, but `/v1/traders` reports it.
 
 ---
 
