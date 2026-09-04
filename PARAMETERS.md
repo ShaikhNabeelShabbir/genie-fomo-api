@@ -8,7 +8,6 @@
 | ⚠️ | built, but the source data is too sparse to trust — the route returns `null` and says why |
 | 🎯 | next up |
 | ⬜ | not started |
-| 🔒 | blocked — the data to compute it does not exist |
 
 **Priority rule: build what has no external dependency first.** Anything computable from
 `data/wallet.full.data.json` alone ships with no key, no rate limit and no staleness beyond
@@ -25,19 +24,19 @@ the file's own.
 | ✅ | **K4** who else holds it | same route (`holderHandles`) | file only |
 | ✅ | **K9** which chain | same route (`chain`) | file only |
 | ✅ | **K1/K3/K4** for one token | `GET /v1/tokens/:address` | file only |
-| ✅ | **Trust flags** plausibility of reported numbers | `GET /v1/traders/:handle/trust` | file only |
+| ✅ | **Trust flags** plausibility of reported numbers | `GET /v1/traders/:handle/trust` | postgres |
 | ✅ | **C1** leaders per chain · **C2** value per chain · **C4** our coverage · **C5** verifiability | `GET /v1/chains` | file only |
-| ✅ | **T1** banked vs on paper | `GET /v1/traders/:handle/pnl` | fomoapi `/trades` |
+| ✅ | **T1** banked vs on paper | `GET /v1/traders/:handle/pnl` | postgres · `trades` |
 | ✅ | **T5–T9, T15, T16, T18, T19, T20** the scorecard | `GET /v1/traders/:handle/scorecard` | **same fetch as T1 — no extra call** |
 | ✅ | **T2** money in/out · **T3** return % · **T17** entry/exit | same route | fomoapi carries these on **46.5% / 43.5%** of trades — see the correction below |
 | ✅ | **T10** typical bet size | same route (`typicalBetUsd.method`) | falls back to `volume ÷ trades` |
-| ✅ | **K5–K8** crowd entry, per-token win rate, ever-sold, flow | `GET /v1/tokens/:address/activity` | 1 fomoapi call per sampled holder, capped at 25 |
-| ✅ | **K2** momentum | `GET /v1/tokens/momentum` + `/v1/snapshots` | two snapshots — see §4 |
-| 🔒 | **C3** chain profitability | — | the file holds one `pnl` per trader, not one per chain |
-| 🔒 | **K10** is the price real | — | needs Bitquery pool prices |
+| ✅ | **K5–K8** crowd entry, per-token win rate, ever-sold, flow | `GET /v1/tokens/:address/activity` | postgres · `trades` — no fan-out, no cap |
+| ✅ | **K2** momentum | `GET /v1/tokens/momentum` | two generations of `holdings.captured_at` |
+| ✅ | **C3** chain profitability | `GET /v1/chains` (`entries[].realized`) | postgres · `trades.network_id` |
+| ✅ | **T4** time-framed profit | `GET /v1/traders/:handle/scorecard` (`windows`) | postgres · `trades.closed_at` |
 
-**Twenty-eight parameters across eleven routes. Fifteen need no external call at all, and
-the fourteen-parameter scorecard rides on a fetch T1 already pays for.**
+**Thirty-five parameters across fifteen routes, every one served from Postgres with zero
+external calls per request.**
 
 ### What the routes found
 
@@ -89,7 +88,7 @@ would imply otherwise.
 | ✅ T1 | **Banked vs on paper** | "Cashed out **$6,171** · **$2.1M still on paper**" | `realized / (realized + unrealized)` | Reported |
 | ✅ T2 | Money in / money out | "Put in **$86,400** · took out **$102,100**" | `amount × avgEntry` / `amount × avgExit` | Reported |
 | ✅ T3 | Return % | "Turned **$1,000 into $1,420**" | `realized ÷ cost basis` | Reported |
-| 🔒 T4 | Time-framed profit | "This week: **+12.6%**" | needs a per-window feed we do not have | 🔒 |
+| ✅ T4 | Time-framed profit | "This week: **+$215**" | `sum(realized_pnl_usd)` by `closed_at` window | Reported |
 | ✅ T5 | Per-token P&L | "**+$2,100 on PONS**, −$340 on BONK" | `realizedPnlUsd` by `token.symbol` | Reported |
 | ✅ T6 | **Win rate** | "Made money on **3 of every 4** coins" | `count(pnl>0) ÷ closed` | Reported |
 | ✅ T7 | Best / worst trade | "Best **+$198** · worst **−$118,667**" | max/min `realizedPnlUsd` | Reported |
@@ -170,7 +169,6 @@ Subject is the **coin**, not the person. K1/K3/K4/K9 cost **zero API calls**, by
 | ✅ K7 | **Has anyone ever sold it?** | "⚠️ **No proven exit** — every holder still holding" | any `status: closed` | Reported |
 | ✅ K8 | Accumulating or distributing | "Leaders are **buying**" | open vs closed balance | Reported |
 | ✅ K9 | Which chain | "Lives on **BSC**" | `networkId` from the file | Reported |
-| 🔒 K10 | **Is the price real?** | "⚠️ **Price not independently verified**" | mark vs pool price | Needs Bitquery |
 
 **K7 returns `null`, never `false`, when no sampled holder has a trade record.** "Nobody
 has ever sold this" and "we have no evidence either way" are different claims, and only one
@@ -189,9 +187,9 @@ crowd entry / exit      $0.04898 -> $0.0344
 Every one of those denominators is in the response. A "0% win rate" on 2 holders out of 21
 is not a verdict on the token, and `sampled` says so on the same line.
 
-The 25-holder cap is a **budget, not a page size**. Each sampled holder is one call against
-a 10,000/month free tier; an uncapped board-wide version refreshing every 10 minutes would
-spend 14,400 calls a day.
+**The 25-holder cap is gone.** It existed because the Express route made one live fomoapi
+call per holder against a 10,000/month tier. Reading `trades` from Postgres removed both the
+cost and the cap: every trader with a record for the token is included, in about a second.
 
 ---
 
@@ -220,7 +218,7 @@ a single priced position.
 | --- | --- | --- | --- |
 | ✅ C1 | Leaders active here | "**99 of 100** leaders trade Solana" | Reported |
 | ✅ C2 | Value on this chain | "**$18.5M** of leader money sits on Solana" | Reported |
-| 🔒 C3 | Chain profitability | "Leaders made most of their money on **Robinhood**" | the file has one `pnl` per trader, not per chain |
+| ✅ C3 | Chain profitability | "Leaders made most of their money on **Robinhood**" | Reported — `sum(realized_pnl_usd)` by `trades.network_id` |
 | ✅ C4 | **Coverage warning** | "⚠️ **BSC history needs Bitquery**" | ✅ Verified (our own credentials) |
 | ✅ C5 | `balanceOf` verifiability | "Position **✓ checkable on-chain**" | ✅ Verified — free on all 5 chains |
 
@@ -235,11 +233,11 @@ when transaction history is not.
 Every other parameter is a function of the current file. **K2 is not**: "what changed" is
 not a property of one snapshot, and no cleverness recovers it from a single file.
 
-`GET /v1/snapshots` reports the archive; `POST /v1/snapshots` writes one; the server also
-archives on boot, keyed on the directory's own `generated_at` so restarts do not stack
-duplicates and manufacture a momentum of zero. With fewer than two snapshots the momentum
-route returns `available: false` and explains itself, rather than an empty board — "nothing
-moved" and "we have no baseline" must never render identically.
+**The file-based snapshot archive is gone**, and so are `/v1/snapshots` and `snapshots.ts`.
+`captured_at` is part of the primary key on `holdings`, so history is the table and momentum
+is a self-join over its two most recent generations. With fewer than two the route returns
+`available: false` and explains itself, rather than an empty board — "nothing moved" and "we
+have no baseline" must never render identically.
 
 **Deployment caveat:** the archive lives on the instance filesystem. On an ephemeral host
 (Render's free tier included) it resets on redeploy, so for momentum to accumulate the
@@ -263,7 +261,7 @@ traders on this board report a profit larger than their entire lifetime volume.
 
 ## 6. Live routes — Supabase Edge Functions
 
-**33 of 36 parameters are served by 14 routes. Zero external API calls per request.**
+**All 35 parameters are served by 15 routes. Zero external API calls per request.**
 
 ```bash
 export B=https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api
@@ -288,14 +286,6 @@ Etherscan are used only by the scheduled loaders, so a thousand visitors cost wh
 | `GET /v1/tokens/:address/activity` | K5–K8 | "**Has anyone who holds this ever actually sold it?**" |
 | `GET /v1/tokens/momentum` | K2 | "What did they move into or out of since last time?" |
 | `GET /v1/chains` | C1, C2, C4, C5 | "Which blockchains do they trade, and what can we even see there?" |
-
-### Still blocked (3)
-
-| | Why |
-| --- | --- |
-| **T4** time-framed profit | fomoapi carries no per-window figures; the schema has nothing to split |
-| **K10** is the price real | needs Bitquery pool prices to compare against the mark |
-| **C3** chain profitability | the source gives one `pnl` per trader, not one per chain — splitting it means inventing an attribution |
 
 ### Not migrated, deliberately
 
@@ -334,8 +324,6 @@ curl -s "$B/v1/tokens/momentum?direction=in&limit=5" | jq    # gainers only
 curl -s "$B/v1/tokens/momentum?direction=out&limit=5" | jq   # losers only
 
 # K2's substrate — how many snapshots exist, and whether a diff is possible yet
-curl -s "$B/v1/snapshots" | jq
-curl -s -X POST "$B/v1/snapshots" | jq                       # archive the current build
 ```
 
 With one snapshot, momentum returns `available: false` and says so. That is correct, not a
@@ -389,10 +377,9 @@ curl -s "$B/v1/tokens/$T/activity?chain=solana&holders=10" | jq '.perHolder'
 curl -s "$B/v1/tokens/$T/activity?chain=solana&holders=3" | jq '.sampled, .plain'
 ```
 
-`holders` is a **budget**, capped at 25. Ten holders takes ~45s cold and ~16s warm — only
-*usable* documents are cached (10 min, shared with `/pnl` and `/scorecard`), so holders fomo
-served a degraded envelope for are re-fetched every call rather than being remembered as
-empty. Expect this route to be slow; it is the only one that fans out.
+No cap and no `holders` parameter any more — the route reads `trades` from Postgres and
+returns every trader with a record for the token in about a second. The old version made one
+live fomoapi call per holder and took ~45s for a sample of 25.
 
 ### 6D. Previously built — regression set
 

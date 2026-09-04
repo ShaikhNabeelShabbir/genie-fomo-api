@@ -17,7 +17,35 @@ is used throughout below.
 **The handle is a parameter, not the first segment**: it is `$B/traders/unipcs/wallets`,
 never `$B/unipcs/wallets`.
 
-**33 of 36 parameters are live.** The 3 that are not are in §7, with the reason.
+**All 35 parameters are live.**
+
+Every money figure carries an **`asOf`**. Every "not known" is **`null`, never `0`** — a
+zero would read as "worth nothing", which is a different and much worse statement than
+"we could not value it".
+
+---
+
+## 0a. Errors — telling apart "stop", "back off" and "retry"
+
+Every error body carries a stable machine-readable `code` beside the human `detail`, because
+status alone cannot separate "no such trader" from "no such route".
+
+| Status | `error.code` | What to do |
+| --- | --- | --- |
+| 400 | `bad_request` | Fix the parameter. `error.detail` names it. |
+| 401 | `unauthorized` | **Stop.** The key is missing or wrong; retrying will not help. |
+| 404 | `not_found` | Wrong handle, token, or URL shape. The body lists valid routes. |
+| 429 | `rate_limited` | **Back off.** `Retry-After` header and `error.retryAfterSeconds`. |
+| 503 | `unavailable` | **Retry**, and keep showing your last good copy. |
+| 500 | `internal_error` | A real bug. Report it. |
+
+A 404 for an unknown route returns the 15 valid routes plus a hint, so a URL-shape mistake
+is self-correcting rather than a guessing game.
+
+```json
+{ "error": { "code": "rate_limited", "detail": "too many requests — retry after the stated delay",
+             "retryAfterSeconds": 57 } }
+```
 
 ---
 
@@ -26,9 +54,16 @@ never `$B/unipcs/wallets`.
 | Route | In plain words | Live value |
 | --- | --- | --- |
 | `GET $B/health` | "What's in the database, and when was it loaded?" | 100 traders · 2,038 holdings · 6,398 trades · 42,033 transfers |
-| `GET $B/traders` | "Who are the top 100?" | ranked board, `?limit=` and `?q=` |
+| `GET $B/traders` | "Who are the top 100?" | each entry carries a stable `id` and its own `updatedAt` |
 | `GET $B/traders/unipcs` | "Everything about one trader, and **what else I can ask**" | summary + `links` to all seven sub-routes |
 | `GET $B/traders/unipcs/transactions?limit=5` | "What have their wallets actually done on-chain?" | `stored: 476` transfers for `unipcs` |
+
+**`id` is stable, `handle` is not.** Every trader carries a UUID `id` that is ours and never
+reissued; `handle` comes from fomo and is theirs to rename. Key your rows on `id`.
+
+**`updatedAt` is per trader.** The board envelope's `capturedAt` covers the whole list, so it
+cannot tell a trader refreshed a minute ago from one refreshed yesterday — each entry now
+carries its own.
 
 **Start at `$B/traders/<handle>`.** It returns a `links` object naming every sub-route for
 that trader, so the next URL never has to be guessed. It also separates `reported`
@@ -44,6 +79,7 @@ Reported-vs-Verified split that runs through the rest of this document.
 | **T1** | "How much have they **actually cashed out**, versus what's only on paper?" | `GET $B/traders/unipcs/pnl` | `bankedUsd`, `onPaperUsd`, `realizedShare` | banked **−$209,204** · on paper **$13,848,582** |
 | **T2** | "How much money went in, and how much came back out?" | `GET $B/traders/unipcs/scorecard` | `moneyIn`, `moneyOut` | $2,559,114 in — but **coverage 21/191 (11%)** |
 | **T3** | "Turned $1,000 into what?" | same | `returnPct` | **null** — only 2 of 25 closed trades have both prices |
+| **T4** | "How did they do this week / this month?" | same | `windows.{24h,7d,30d,all}` | 24h **+$215** (7 closed) · 7d **−$209,204** (25) |
 | **T5** | "Which coins made or lost them money?" | same | `byToken[]` | SPCXB **+$184.15** over 3 closed trades |
 | **T6** | "How often are they right?" | same | `winRate`, `wins`, `losses` | **56%** — 14 wins of 25 |
 | **T7** | "Best and worst single trade" | same | `bestTradeUsd`, `worstTradeUsd` | best **+$198** · worst **−$118,667** |
@@ -85,13 +121,34 @@ that 98.5% of the money is in one of them.
 | # | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- | --- |
 | **T16** | "How long do they usually hold?" | `GET $B/traders/unipcs/scorecard` | `holdingTime` | **1.12 days** (26.8h), coverage 25/25 |
-| **T17** | "What price did they get in and out at?" | same | `byToken[].avgEntryPrice/avgExitPrice` | present per token where fomo carries it |
+| **T17** | "What did they pay to get in — **as a market cap**?" | same | `byToken[].avgEntryMarketCapUsd` + `totalSupply` | LEGS **$2,867,200 MC** from supply 1,000,000,000 |
 | **T18** | "Are they still active?" | same | `lastTradeAt` | **2026-09-04T07:41Z** |
 | **T19** | "How long have they been trading?" | same | `trackRecordDays` | **105.2 days** |
 | **T20** | "How busy are they?" | same | `tradesPerDay` | **1.81 trades/day** |
 
 Unlike the price fields, **timestamps are populated on 100% of trades** — which is why all
 of §3 is solid while §1 carries coverage caveats.
+
+### Average entry is a market cap, and the supply travels with it
+
+Entry reads on screen as "$717K MC", not as a per-token price, so `byToken[]` carries both:
+
+```json
+{ "symbol": "LEGS", "avgEntryPrice": 0.0028672,
+  "avgEntryMarketCapUsd": 2867200,
+  "totalSupply": 1000000000, "supplySource": "rpc", "supplyReadAt": "…" }
+```
+
+**The supply is published because supply moves.** One coin was measured drifting 12.45% in
+a day, so sending only a price would make a consumer's conversion and ours disagree with no
+way to tell which was right. Sending the multiplier we used makes the two reconcilable.
+
+`entryBasis` states what the average is over — `scope`, `sellsReduceIt: false`, and how the
+cap is derived — because two reasonable definitions give different numbers and the figure
+has to be labelled correctly on screen.
+
+Coverage: **1,394 tokens have a supply (94% of trades with an entry price)**. 102 tokens
+resolve a chain but no supply, and 16 have no chain at all. Both return `null`, never `0`.
 
 ---
 
@@ -145,6 +202,7 @@ entirely.** That is exit information a holder count alone cannot show.
 | --- | --- | --- | --- | --- |
 | **C1** | "How many leaders trade this chain?" | `GET $B/chains` | `entries[].traders` | Solana **57 of 100** |
 | **C2** | "How much of their money sits there?" | same | `entries[].totalValueUsd` | Solana **$10,544,636** |
+| **C3** | "Which chain did they make their money on?" | same | `entries[].realized` | robinhood **+$1,850,549** · solana **−$1,503,966** |
 | **C4** | "**What can we even see on this chain?**" | same | `entries[].historyCoverage` | solana → helius · robinhood → blockscout (keyless) |
 | **C5** | "Can a position size be checked on-chain?" | same | `entries[].balanceVerifiable` | **true on all five chains** |
 
@@ -159,13 +217,39 @@ this API is, in practice, a Solana figure.
 
 ---
 
-## 7. Not available (3)
+## 7. Two parameters that used to be listed as impossible
 
-| # | In plain words | Why not |
-| --- | --- | --- |
-| **T4** | "How did they do this week / this month?" | fomoapi carries no per-window figures, and the schema has nothing to split |
-| **K10** | "Is the quoted price real?" | needs Bitquery pool prices to compare against the mark |
-| **C3** | "Which chain did they make their money on?" | the source gives one `pnl` per trader, not one per chain — splitting it means inventing an attribution |
+**T4 and C3 were both once listed as impossible, and are now live.** Both were blocked only while the
+leaderboard file was the sole source: it gives one lifetime `pnl` per trader with nothing to
+slice by time or chain. Storing per-trade history removed both obstacles — every closed
+trade carries its own `closed_at` and `network_id`, so neither figure invents an
+attribution, it sums records that already know when and where they happened.
+
+C3 needed one extra step. 39% of trades had no chain (tokens traded but no longer held match
+nothing in `tokens`), and that bucket held **−$2.46M of realized P&L** — far too large to
+publish a breakdown around. Resolving those by address shape and `eth_getCode` cut it to
+**26 closed trades and −$137K**, which is now published as `unattributedRealized` rather
+than folded into a chain row.
+
+---
+
+## 7b. Chain profitability, and what it does not say
+
+```bash
+curl -s "$B/chains" | jq -r '.entries[] | "\(.chain)\t\(.realized.closedTrades) closed\t$\(.realized.pnlUsd)"'
+```
+
+```
+robinhood   1396 closed   $1,850,549
+solana       413 closed  -$1,503,966
+bsc          365 closed   $1,834,528
+base          62 closed     $699,745
+ethereum      40 closed    -$221,218
+unattributed  26 closed    -$137,427   ← published, never absorbed
+```
+
+This is **realized** profit from fomo's own trade records — the same Reported tier as
+everything else on this board. It is not independently verified.
 
 ---
 

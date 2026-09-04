@@ -1,9 +1,26 @@
 import { sql, n, round } from "./db.ts";
 
+/**
+ * When the underlying data was measured.
+ *
+ * Every money figure this API returns carries one. A dollar amount with no age goes stale
+ * silently and a consumer cannot tell a fresh total from yesterday's — which is the whole
+ * point of the field, so it is computed once here rather than per route.
+ */
+export const asOfHoldings = async (): Promise<string | null> => {
+  const [r] = await sql`select max(captured_at) as at from holdings`;
+  return r?.at ? new Date(String(r.at)).toISOString() : null;
+};
+export const asOfTrades = async (): Promise<string | null> => {
+  const [r] = await sql`select max(captured_at) as at from trades`;
+  return r?.at ? new Date(String(r.at)).toISOString() : null;
+};
+
 /** '' is not a value. The columns store empty strings where fomo gave nothing. */
 const nonEmpty = (v: string | null | undefined): string | null =>
   v && v.trim() ? v.trim() : null;
-import { get, HttpError } from "./router.ts";
+import { get } from "./router.ts";
+import { notFound, badRequest } from "./errors.ts";
 
 /**
  * PARAMETERS.md routes, served from Postgres.
@@ -22,7 +39,7 @@ import { get, HttpError } from "./router.ts";
 const chainWhere = async (chain: string | null) => {
   if (!chain) return null;
   const [row] = await sql`select network_id from chains where name = ${chain.toLowerCase()}`;
-  if (!row) throw new HttpError(400, `unknown chain '${chain}'`);
+  if (!row) throw badRequest(`unknown chain '${chain}'`);
   return Number(row.network_id);
 };
 
@@ -46,12 +63,38 @@ get("/v1/chains", async () => {
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
   const [{ total }] = await sql`select count(*)::int as total from holdings_current`;
 
+  /**
+   * C3 — realized profit per chain.
+   *
+   * Previously marked unavailable because the source gives one `pnl` per trader and
+   * splitting it would mean inventing an attribution. That is still true of the LEADERBOARD
+   * figure — but per-trade records carry their own chain, so this attributes nothing: it
+   * sums realized P&L over trades that already know where they happened.
+   *
+   * `unattributed` is published rather than folded in. 26 closed trades still have no chain,
+   * and a breakdown that silently absorbed them would misstate every row.
+   */
+  const profit = await sql`
+    select t.network_id,
+           count(*) filter (where t.status = 'closed')::int as closed,
+           coalesce(sum(t.realized_pnl_usd) filter (where t.status = 'closed'), 0) as realized
+    from trades t group by t.network_id`;
+  const byNet = new Map(profit.filter((r) => r.network_id !== null)
+    .map((r) => [Number(r.network_id), r]));
+  const orphan = profit.find((r) => r.network_id === null);
+
   const top = rows[0];
   return {
     board: "chains",
+    asOf: await asOfHoldings(),
     traders: Number(traderCount),
     totalPositions: Number(total),
     count: rows.length,
+    // Never folded into a chain row: attributing it would misstate whichever row absorbed it.
+    unattributedRealized: orphan
+      ? { closedTrades: Number(orphan.closed), pnlUsd: round(n(orphan.realized)),
+          note: "closed trades whose chain could not be established" }
+      : null,
     plain: top
       ? `${top.traders} of ${traderCount} leaders trade ${top.name}, which carries ` +
         `${top.positions} of ${total} positions on the board.`
@@ -75,6 +118,15 @@ get("/v1/chains", async () => {
           ? `${r.traders} of ${traderCount} leaders trade ${name}, but only ${priced} of ` +
             `${positions} positions there have a usable price — the value figure is partial.`
           : `${r.traders} of ${traderCount} leaders trade ${name}, across ${positions} positions.`,
+        // C3
+        realized: (() => {
+          const p = byNet.get(Number(r.network_id));
+          return {
+            closedTrades: p ? Number(p.closed) : 0,
+            pnlUsd: p ? round(n(p.realized)) : null,
+            basis: "sum of realized_pnl_usd over closed trades recorded on this chain",
+          };
+        })(),
         historyCoverage: {
           available: !!r.history_provider,
           via: r.history_provider ?? null,
@@ -92,10 +144,60 @@ get("/v1/chains", async () => {
 
 // ------------------------------------------------------------- T11/T13/T14
 
-get("/v1/traders/:handle/portfolio", async ({ handle }) => {
+get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
     select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+
+  const asOf = await asOfHoldings();
+
+  /**
+   * Per-chain breakdown of what the total actually covers.
+   *
+   * "Which chains are in this number" is not a nicety here: only Solana carries prices in
+   * the current snapshot, so a cross-chain-looking AUM is in practice a Solana figure.
+   * Saying so per chain is the difference between a total and a total that misleads.
+   */
+  const byChain = await sql`
+    select c.name as chain, h.network_id,
+           count(*)::int                              as positions,
+           count(h.value) filter (where h.value > 0)::int as priced,
+           sum(h.value)   filter (where h.value > 0)  as value
+    from holdings_current h join chains c using (network_id)
+    where h.handle = ${t.handle}
+    group by c.name, h.network_id
+    order by positions desc`;
+
+  /**
+   * Is a particular coin inside this total, or outside it?
+   *
+   * The consuming screen shows AUM beside one coin's row, where "their whole portfolio" and
+   * "their whole portfolio excluding this coin" are different statements. Rather than make
+   * them subtract — and get it wrong when the position is unpriced — the route answers it.
+   */
+  const tokenQ = (url.searchParams.get("token") ?? "").trim().toLowerCase() || null;
+  let includesToken: Record<string, unknown> | null = null;
+  if (tokenQ) {
+    const rows = await sql`
+      select tk.address, h.network_id, c.name as chain, h.value
+      from holdings_current h
+      join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
+      join chains c on c.network_id = h.network_id
+      where h.handle = ${t.handle} and h.token_key = ${tokenQ}`;
+    const priced = rows.filter((r) => (n(r.value) ?? 0) > 0);
+    includesToken = {
+      tokenAddress: rows[0]?.address ?? tokenQ,
+      held: rows.length > 0,
+      // Held but unpriced means it is in the portfolio and NOT in the total — the case
+      // most likely to be read wrongly if we only returned a boolean.
+      inTotal: priced.length > 0,
+      valueUsd: priced.length ? round(priced.reduce((a, r) => a + (n(r.value) ?? 0), 0)) : null,
+      chains: [...new Set(rows.map((r) => r.chain))],
+      note: rows.length === 0 ? "this trader does not hold that token"
+        : priced.length === 0 ? "held, but unpriced — it is NOT part of totalValueUsd"
+        : "held and priced — it IS part of totalValueUsd",
+    };
+  }
 
   const [r] = await sql`
     select count(*)::int                                as positions,
@@ -113,9 +215,19 @@ get("/v1/traders/:handle/portfolio", async ({ handle }) => {
   const top = n(r.top_value);
   const cash = n(r.cash) ?? 0;
 
+  const chainCoverage = byChain.map((r) => ({
+    chain: r.chain,
+    networkId: Number(r.network_id),
+    positions: Number(r.positions),
+    priced: Number(r.priced),
+    valueUsd: Number(r.priced) ? round(n(r.value)) : null,
+  }));
+
   const base = {
     handle: t.display_handle,
     name: t.name ?? null,
+    // The measurement time of every money figure below.
+    asOf,
     positions,
     concentration: null as number | null,
     topPosition: null as unknown,
@@ -126,6 +238,8 @@ get("/v1/traders/:handle/portfolio", async ({ handle }) => {
       unpricedPositions: positions - priced,
       pricedShare: positions ? Number((priced / positions).toFixed(4)) : null,
     },
+    byChain: chainCoverage,
+    ...(includesToken ? { includesToken } : {}),
     partial: positions > 0 && priced / positions < 0.5,
     plain: positions === 0
       ? "No positions on record."
@@ -180,7 +294,7 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
     select t.handle, t.display_handle, t.name, s.pnl_usd, s.volume_usd, s.trade_count
     from traders t left join trader_stats_current s using (handle)
     where t.handle = ${handle.toLowerCase()}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const [h] = await sql`
     select count(*)::int as positions,
@@ -247,8 +361,8 @@ get("/v1/traders", async (_p, url) => {
   // Ranked by the leaderboard's own `rank`, and search scores exact > prefix > substring so
   // it matches the Node implementation rather than relying on Postgres text ranking.
   const rows = await sql`
-    select t.handle, t.display_handle, t.name, t.avatar,
-           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count,
+    select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at,
+           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
            case
              when ${q} = '' then 0
              when lower(t.display_handle) = ${q} or lower(coalesce(t.name,'')) = ${q} then 0
@@ -276,7 +390,13 @@ get("/v1/traders", async (_p, url) => {
     ...(page.length < rows.length ? { total: rows.length } : {}),
     entries: page.map((r) => ({
       rank: r.rank ?? null,
-      id: null,
+      // Ours, generated once, never reissued. `handle` comes from fomo and is theirs to
+      // change; anything keying rows on it loses the trader the day they rename.
+      id: r.id,
+      // Per-trader freshness. The envelope's `capturedAt` covers the whole board, so it
+      // cannot distinguish a trader refreshed a minute ago from one refreshed yesterday.
+      updatedAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
+      lastSeenAt: r.last_seen_at ? new Date(String(r.last_seen_at)).toISOString() : null,
       handle: r.display_handle,
       label: r.name ?? null,
       // Empty string is not a URL. The column stores '' where fomo gave nothing, and the
@@ -303,14 +423,15 @@ get("/v1/traders", async (_p, url) => {
 get("/v1/traders/:handle", async ({ handle }) => {
   const h = handle.toLowerCase();
   const [t] = await sql`
-    select t.handle, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified,
+    select t.handle, t.id, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified,
+           t.last_seen_at, s.captured_at,
            s.rank, s.pnl_usd, s.volume_usd, s.trade_count, s.followers,
            w.evm_address, w.sol_address
     from traders t
     left join trader_stats_current s using (handle)
     left join wallets w using (handle)
     where t.handle = ${h}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const [c] = await sql`
     select (select count(*) from holdings_current where handle = ${h})  as positions,
@@ -320,10 +441,13 @@ get("/v1/traders/:handle", async ({ handle }) => {
                .filter((a): a is string => !!a).map((a) => a.toLowerCase())})) as transfers`;
 
   return {
+    // Stable across a fomo rename; `handle` is not guaranteed to be.
+    id: t.id,
     handle: t.display_handle,
     name: t.name ?? null,
     rank: t.rank ?? null,
     verified: !!t.verified,
+    updatedAt: t.captured_at ? new Date(String(t.captured_at)).toISOString() : null,
     bio: nonEmpty(t.bio as string | null),
     profilePicture: nonEmpty(t.avatar as string | null),
     twitter: nonEmpty(t.twitter as string | null),
@@ -354,7 +478,7 @@ get("/v1/traders/:handle", async ({ handle }) => {
 get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const [t] = await sql`
     select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const rows = await sql`
     select tk.address, h.network_id, c.name as chain, h.human_amount, h.price, h.value,
@@ -396,6 +520,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   return {
     handle: t.display_handle,
     name: t.name ?? null,
+    asOf: await asOfHoldings(),
     count: page.length,
     positions: filtered.length,
     totalValueUsd: total > 0 ? round(total) : null,
@@ -464,6 +589,7 @@ get("/v1/tokens", async (_p, url) => {
   return {
     board: "tokens",
     chain: chainQ ?? "all",
+    asOf: await asOfHoldings(),
     traders: Number(traderCount),
     count: page.length,
     ranked: rows.length,
@@ -510,7 +636,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
              t.display_handle`;
 
   if (!rows.length) {
-    throw new HttpError(404, `no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
+    throw notFound(`no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
   }
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
 
@@ -524,6 +650,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
 
   return {
     tokenAddress: address,
+    asOf: await asOfHoldings(),
     chains: byNet.size,
     entries: [...byNet.values()].map((group) => {
       const holders = new Set(group.map((g) => g.display_handle)).size;
@@ -576,15 +703,18 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     select t.handle, t.display_handle, t.name, s.volume_usd, s.trade_count
     from traders t left join trader_stats_current s using (handle)
     where t.handle = ${handle.toLowerCase()}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const rows = await sql`
-    select trade_id, network_id, token_address, token_key, token_symbol, status, amount,
-           avg_entry_price, avg_exit_price, realized_pnl_usd, unrealized_pnl_usd,
-           opened_at, closed_at, captured_at
-    from trades where handle = ${t.handle}`;
+    select tr.trade_id, tr.network_id, tr.token_address, tr.token_key, tr.token_symbol,
+           tr.status, tr.amount, tr.avg_entry_price, tr.avg_exit_price,
+           tr.realized_pnl_usd, tr.unrealized_pnl_usd, tr.opened_at, tr.closed_at, tr.captured_at,
+           tk.total_supply, tk.supply_source, tk.supply_read_at
+    from trades tr
+    left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
+    where tr.handle = ${t.handle}`;
 
-  if (!rows.length) throw new HttpError(404, `no stored trades for '${t.handle}'`);
+  if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
 
   const closed = rows.filter((r) => r.status === "closed");
   const realized = closed.map((r) => n(r.realized_pnl_usd)).filter((x): x is number => x !== null);
@@ -652,6 +782,7 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     symbol: string | null; address: string | null; trades: number; closed: number;
     realizedPnlUsd: number; unrealizedPnlUsd: number;
     avgEntryPrice: number | null; avgExitPrice: number | null;
+    totalSupply: number | null; supplySource: string | null; supplyReadAt: string | null;
   }>();
   for (const r of rows) {
     const key = String(r.token_key ?? r.token_symbol ?? "unknown");
@@ -659,6 +790,8 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
       symbol: (r.token_symbol as string) ?? null, address: (r.token_address as string) ?? null,
       trades: 0, closed: 0, realizedPnlUsd: 0, unrealizedPnlUsd: 0,
       avgEntryPrice: null, avgExitPrice: null,
+      totalSupply: n(r.total_supply), supplySource: (r.supply_source as string) ?? null,
+      supplyReadAt: r.supply_read_at ? new Date(String(r.supply_read_at)).toISOString() : null,
     };
     rec.trades++;
     if (r.status === "closed") { rec.closed++; rec.realizedPnlUsd += n(r.realized_pnl_usd) ?? 0; }
@@ -670,7 +803,30 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     byTokenMap.set(key, rec);
   }
   const byToken = [...byTokenMap.values()]
-    .map((r) => ({ ...r, realizedPnlUsd: round(r.realizedPnlUsd)!, unrealizedPnlUsd: round(r.unrealizedPnlUsd)! }))
+    .map((r) => ({
+      ...r,
+      realizedPnlUsd: round(r.realizedPnlUsd)!,
+      unrealizedPnlUsd: round(r.unrealizedPnlUsd)!,
+      /**
+       * Entry expressed as a MARKET CAP, which is how it is read on screen.
+       *
+       * null — never 0 — when either the price or the supply is unknown. A trader whose
+       * entry we cannot establish must not appear to have got in for nothing.
+       *
+       * `supply` and `supplyReadAt` travel with it deliberately: supply on these tokens
+       * moves (one was measured drifting 12.45% in a day), so publishing only the cap would
+       * make our number and a consumer's recomputation disagree with no way to tell which
+       * was right. Sending the multiplier we used makes them reconcilable.
+       */
+      avgEntryMarketCapUsd:
+        r.avgEntryPrice !== null && r.totalSupply !== null && r.totalSupply > 0
+          ? Number((r.avgEntryPrice * r.totalSupply).toPrecision(10))
+          : null,
+      avgExitMarketCapUsd:
+        r.avgExitPrice !== null && r.totalSupply !== null && r.totalSupply > 0
+          ? Number((r.avgExitPrice * r.totalSupply).toPrecision(10))
+          : null,
+    }))
     .sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd ||
                     b.unrealizedPnlUsd - a.unrealizedPnlUsd ||
                     String(a.address).localeCompare(String(b.address)));
@@ -703,12 +859,45 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     }
   }
 
+  /**
+   * T4 — profit by window.
+   *
+   * Previously marked unavailable because the leaderboard gives one lifetime `pnl` per
+   * trader with nothing to slice it by. Storing per-trade history changed that: every
+   * closed trade carries `closed_at`, so a window is a WHERE clause.
+   *
+   * This is REALIZED profit only — money actually taken off the table in that period.
+   * Including unrealised movement would need historical prices we do not store, and given
+   * T1 exists precisely to separate banked from on-paper, realized-only is the more
+   * truthful reading anyway. `basis` says so in the response rather than leaving it implied.
+   */
+  const [w] = await sql`
+    select coalesce(sum(realized_pnl_usd) filter (where closed_at > now() - interval '24 hours'), 0) as d1,
+           count(*) filter (where closed_at > now() - interval '24 hours')::int  as n1,
+           coalesce(sum(realized_pnl_usd) filter (where closed_at > now() - interval '7 days'), 0)   as d7,
+           count(*) filter (where closed_at > now() - interval '7 days')::int    as n7,
+           coalesce(sum(realized_pnl_usd) filter (where closed_at > now() - interval '30 days'), 0)  as d30,
+           count(*) filter (where closed_at > now() - interval '30 days')::int   as n30,
+           coalesce(sum(realized_pnl_usd), 0) as all_time,
+           count(*)::int as n_all
+    from trades where handle = ${t.handle} and status = 'closed' and closed_at is not null`;
+
+  const windows = {
+    basis: "realized profit only — closed trades, summed by closed_at. Unrealised movement " +
+           "is not included; see /pnl for banked versus on paper.",
+    "24h": { realizedUsd: round(n(w.d1)), closedTrades: Number(w.n1) },
+    "7d":  { realizedUsd: round(n(w.d7)), closedTrades: Number(w.n7) },
+    "30d": { realizedUsd: round(n(w.d30)), closedTrades: Number(w.n30) },
+    all:   { realizedUsd: round(n(w.all_time)), closedTrades: Number(w.n_all) },
+  };
+
   const askedTokens = Number(url.searchParams.get("tokens"));
   const tokenLimit = Number.isFinite(askedTokens) && askedTokens >= 1 ? Math.floor(askedTokens) : null;
 
   return {
     handle: t.display_handle, name: t.name ?? null,
     source: "postgres · trades (loaded from fomoapi)",
+    asOf: await asOfTrades(),
     sample: { returned: rows.length, storedAt: rows[0]?.captured_at ?? null },
     winRate, wins, losses, breakeven,
     bestTradeUsd: round(best), worstTradeUsd: round(worst),
@@ -728,6 +917,19 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     firstTradeAt: firstAt === null ? null : new Date(firstAt).toISOString(),
     trackRecordDays: spanDays === null ? null : Number(spanDays.toFixed(1)),
     tradesPerDay: spanDays !== null && spanDays >= 1 ? Number((rows.length / spanDays).toFixed(2)) : null,
+    /**
+     * What the per-token averages mean, stated rather than left to be guessed. Two
+     * reasonable definitions give different numbers, and the consumer has to label the
+     * figure on screen.
+     */
+    entryBasis: {
+      scope: "all buys on record for this trader and token",
+      sellsReduceIt: false,
+      note: "fomoapi supplies one avgEntryPrice per trade; we surface the first non-zero " +
+            "value per token and do not re-average across trades. A sell does not change it.",
+      marketCap: "avgEntryPrice x tokens.total_supply, both returned so the figure can be rechecked",
+    },
+    windows,
     tokensTotal: byToken.length,
     byToken: tokenLimit === null ? byToken : byToken.slice(0, tokenLimit),
     plain, caveats,
@@ -746,11 +948,11 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     from holdings_current h join traders t on t.handle = h.handle
     where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}`;
   if (!holders.length) {
-    throw new HttpError(404, `no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
+    throw notFound(`no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
   }
   const nets = new Set(holders.map((h) => Number(h.network_id)));
   if (nets.size > 1) {
-    throw new HttpError(400, `'${address}' exists on ${nets.size} chains — pass ?chain= to pick one`);
+    throw badRequest(`'${address}' exists on ${nets.size} chains — pass ?chain= to pick one`);
   }
 
   // No fan-out, no per-holder API call, no 25-holder cap: every trader who has ever traded
@@ -811,6 +1013,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     networkId: [...nets][0],
     chain: (await sql`select name from chains where network_id = ${[...nets][0]}`)[0]?.name ?? null,
     holdersInDirectory: holderCount,
+    asOf: await asOfTrades(),
     totalValueUsd: priced.length ? round(priced.reduce((s, h) => s + (n(h.value) ?? 0), 0)) : null,
     source: "postgres · trades",
     /**
@@ -866,7 +1069,7 @@ get("/v1/tokens/momentum", async (_p, url) => {
   // request 400s or 200s depending on how much history exists.
   const dir = (url.searchParams.get("direction") ?? "").trim().toLowerCase();
   if (dir && dir !== "in" && dir !== "out") {
-    throw new HttpError(400, `unknown direction '${dir}' — use 'in' or 'out'`);
+    throw badRequest(`unknown direction '${dir}' — use 'in' or 'out'`);
   }
 
   // K2 is the one parameter that is not a function of the current snapshot. It falls out
@@ -960,7 +1163,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     select t.handle, t.display_handle, t.name, w.evm_address, w.sol_address
     from traders t left join wallets w using (handle)
     where t.handle = ${handle.toLowerCase()}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
   const net = await chainWhere(chainQ);
@@ -999,18 +1202,41 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     name: t.name ?? null,
     wallets: { evm: t.evm_address ?? null, solana: t.sol_address ?? null },
     source: "postgres · transactions",
+    asOf: stored.newest ? new Date(String(stored.newest)).toISOString() : null,
+    /**
+     * What this feed is, said plainly, because it is easy to mistake for something else.
+     *
+     * These are TRANSFERS, not trades. An incoming transfer is not a purchase — it is
+     * just as likely someone moving coins between their own wallets, and most rows come
+     * back `side: "in"` for exactly that reason. There is no USD value or price on a row
+     * because the providers do not give one and we will not invent it.
+     *
+     * For buy/sell with P&L and entry/exit prices, use /traders/:handle/scorecard, which
+     * reads fomo's trade records rather than raw chain movement.
+     */
+    kind: "transfers",
+    caveats: {
+      notTrades: "rows are on-chain transfers, not buys and sells; an inbound transfer is " +
+                 "commonly a self-transfer between the trader's own wallets",
+      noUsdValue: "providers do not return a USD value or price per transfer, so none is published",
+      limitIsTotal: "limit caps the whole result set, not per chain",
+      forTrades: "/traders/" + t.display_handle + "/scorecard",
+    },
     stored: {
       total: Number(stored.total),
       newest: stored.newest ?? null,
       oldest: stored.oldest ?? null,
     },
     count: rows.length,
+    limit,
     transfers: rows.map((r) => ({
       chain: r.chain,
       networkId: Number(r.network_id),
       tx_hash: r.tx_hash,
       time: r.block_time ?? null,
       side: r.direction ?? null,
+      // Null where no trade record has taught us the symbol yet; the contract is always
+      // present, so a consumer always has something to key on.
       token: r.token_symbol ?? null,
       contract: r.token_key ?? null,
       amount: n(r.amount),
@@ -1058,7 +1284,7 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
            w.evm_confidence, w.sol_confidence
     from traders t left join wallets w using (handle)
     where t.handle = ${handle.toLowerCase()}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   // Shape-checked before publishing. fomo's own evm/sol fields are empty for all 100
   // traders; these come from fomoapi's resolution and are REPORTED, not verified — see
@@ -1088,7 +1314,7 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
 get("/v1/traders/:handle/pnl", async ({ handle }) => {
   const [t] = await sql`
     select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
-  if (!t) throw new HttpError(404, `no trader '${handle}' in the directory`);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const [r] = await sql`
     select count(*) filter (where status = 'closed')::int  as closed,

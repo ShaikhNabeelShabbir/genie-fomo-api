@@ -11,12 +11,6 @@ export function get(pattern: string, handler: Handler): void {
   routes.push({ method: "GET", parts: pattern.split("/").filter(Boolean), handler });
 }
 
-export class HttpError extends Error {
-  constructor(readonly status: number, message: string, readonly extra?: Record<string, unknown>) {
-    super(message);
-  }
-}
-
 /**
  * Match a path, preferring literal segments over parameters.
  *
