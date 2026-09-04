@@ -1,4 +1,5 @@
 import type { Holding, Trader } from "./directory.js";
+import { EVM_CHAINS, SOLANA_NETWORK_ID } from "./settings.js";
 
 /**
  * Derived trader metrics computed from the directory snapshot alone.
@@ -148,7 +149,6 @@ export function portfolio(trader: Trader): Portfolio {
 
 // ---------------------------------------------------------------- K1 / K4
 
-import { EVM_CHAINS, SOLANA_NETWORK_ID } from "./settings.js";
 
 export const chainName = (networkId: number): string =>
   networkId === SOLANA_NETWORK_ID ? "solana" : (EVM_CHAINS[networkId]?.name ?? String(networkId));
@@ -257,4 +257,209 @@ export function tokenBoard(
     excluded: { tokens: quoteTokens.size, positions: quoteRows },
     traderCount,
   };
+}
+
+// ------------------------------------------------------------------- T12
+
+export type Position = {
+  tokenAddress: string;
+  networkId: number;
+  chain: string;
+  amount: number;
+  priceUsd: number | null;
+  valueUsd: number | null;
+  /** Share of the trader's *priced* portfolio, so it sums to 1 across priced rows. */
+  share: number | null;
+  isQuoteAsset: boolean;
+};
+
+/**
+ * T12 — what a trader actually holds, biggest first.
+ *
+ * `/portfolio` says how concentrated someone is but not in what; this answers that.
+ * Unpriced rows are RETURNED rather than dropped — they are part of the portfolio even
+ * when we cannot value them, and hiding them would misrepresent the position count.
+ * They sort last and carry `valueUsd: null`, never 0.
+ */
+export function positions(trader: Trader): { rows: Position[]; totalValueUsd: number | null } {
+  const holdings = (trader.holdings ?? []).filter((h) => h.tokenAddress && h.networkId !== undefined);
+  const val = (h: Holding) =>
+    typeof h.value === "number" && Number.isFinite(h.value) && h.value > 0 ? h.value : null;
+  const total = holdings.reduce((s, h) => s + (val(h) ?? 0), 0);
+
+  const rows: Position[] = holdings
+    .map((h) => {
+      const v = val(h);
+      return {
+        tokenAddress: h.tokenAddress!,
+        networkId: h.networkId!,
+        chain: chainName(h.networkId!),
+        amount: typeof h.humanAmount === "number" ? h.humanAmount : 0,
+        priceUsd: typeof h.price === "number" && Number.isFinite(h.price) ? h.price : null,
+        valueUsd: v === null ? null : Number(v.toFixed(2)),
+        share: v !== null && total > 0 ? Number((v / total).toFixed(4)) : null,
+        isQuoteAsset: isQuoteAsset(h.tokenAddress!),
+      };
+    })
+    // Priced rows first, descending; unpriced trail rather than masquerading as zero.
+    .sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1));
+
+  return { rows, totalValueUsd: total > 0 ? Number(total.toFixed(2)) : null };
+}
+
+// ------------------------------------------------- token detail (K1/K3/K4/C5)
+
+export type TokenDetail = TokenRow & {
+  holders_detail: { handle: string; amount: number; valueUsd: number | null }[];
+};
+
+/**
+ * One token: who holds it, how much, and on which chain.
+ *
+ * A token address can exist on more than one chain (2 of our 908 do), so `networkId`
+ * disambiguates. Without it we return every match rather than silently picking one.
+ */
+export function tokenDetail(
+  traders: Trader[],
+  tokenAddress: string,
+  networkId?: number | null,
+): TokenDetail[] {
+  const needle = tokenAddress.toLowerCase();
+  const byKey = new Map<string, { networkId: number; addr: string;
+    holders: { handle: string; amount: number; valueUsd: number | null }[] }>();
+
+  for (const t of traders) {
+    if (!t.handle) continue;
+    for (const h of t.holdings ?? []) {
+      if (!h.tokenAddress || h.networkId === undefined) continue;
+      if (h.tokenAddress.toLowerCase() !== needle) continue;
+      if (networkId != null && h.networkId !== networkId) continue;
+      const key = String(h.networkId);
+      const rec = byKey.get(key) ?? { networkId: h.networkId, addr: h.tokenAddress, holders: [] };
+      const v = typeof h.value === "number" && Number.isFinite(h.value) && h.value > 0 ? h.value : null;
+      rec.holders.push({
+        handle: t.handle,
+        amount: typeof h.humanAmount === "number" ? h.humanAmount : 0,
+        valueUsd: v === null ? null : Number(v.toFixed(2)),
+      });
+      byKey.set(key, rec);
+    }
+  }
+
+  const traderCount = traders.filter((t) => t.handle).length;
+  return [...byKey.values()].map((r) => {
+    const priced = r.holders.filter((h) => h.valueUsd !== null);
+    const total = priced.reduce((s, h) => s + (h.valueUsd ?? 0), 0);
+    const holders = new Set(r.holders.map((h) => h.handle)).size;
+    return {
+      tokenAddress: r.addr,
+      networkId: r.networkId,
+      chain: chainName(r.networkId),
+      holders,
+      holderShare: Number((traderCount ? holders / traderCount : 0).toFixed(4)),
+      totalValueUsd: priced.length ? Number(total.toFixed(2)) : null,
+      holderHandles: [...r.holders].sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1)).map((h) => h.handle),
+      holders_detail: [...r.holders].sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1)),
+      plain:
+        holders === 1
+          ? `Only 1 of ${traderCount} leaders holds this.`
+          : `${holders} of ${traderCount} leaders hold this.`,
+    };
+  });
+}
+
+// ------------------------------------------------------------- trust flags
+
+export type Flag = { code: string; severity: "warn" | "info"; plain: string };
+
+export type Trust = {
+  flags: Flag[];
+  /** Ratio of claimed profit to lifetime volume. Above 1 the claim exceeds all trading. */
+  pnlToVolume: number | null;
+  /** Ratio of claimed profit to everything they currently hold. */
+  pnlToHoldings: number | null;
+  trades: number | null;
+  verdict: "implausible" | "unverified" | "insufficient" | "ok";
+  plain: string;
+};
+
+/**
+ * Trust flags — pure file arithmetic, no API call.
+ *
+ * This exists because the leaderboard's own numbers frequently do not survive their own
+ * arithmetic. Measured on the current snapshot of 100 traders:
+ *
+ *   45 claim a `pnl` LARGER than their entire lifetime `volume`
+ *   64 claim a `pnl` more than 10x the value of everything they hold
+ *
+ * Nearly half the board reports profit that cannot be reconciled with its own trading.
+ * Without this, a reader sees a ranked list of profits with nothing indicating that most
+ * of them are unsupportable.
+ *
+ * These are plausibility checks, NOT fraud findings. A high ratio means the number cannot
+ * be corroborated from the data we hold — it does not prove intent.
+ */
+export function trust(trader: Trader): Trust {
+  const pnl = typeof trader.pnl === "number" ? trader.pnl : null;
+  const volume = typeof trader.volume === "number" ? trader.volume : null;
+  const trades = typeof trader.trades === "number" ? trader.trades : null;
+  const holdingsValue = (trader.holdings ?? []).reduce(
+    (s, h) => s + (typeof h.value === "number" && Number.isFinite(h.value) && h.value > 0 ? h.value : 0),
+    0,
+  );
+
+  const flags: Flag[] = [];
+  const pnlToVolume = pnl !== null && volume !== null && volume > 0 ? Number((pnl / volume).toFixed(2)) : null;
+  const pnlToHoldings = pnl !== null && holdingsValue > 0 ? Number((pnl / holdingsValue).toFixed(2)) : null;
+
+  if (pnlToVolume !== null && pnlToVolume > 1) {
+    flags.push({
+      code: "pnl_exceeds_volume",
+      severity: "warn",
+      plain:
+        `Reported profit ($${Math.round(pnl!).toLocaleString("en-US")}) is larger than everything ` +
+        `they have ever traded ($${Math.round(volume!).toLocaleString("en-US")}). That cannot come from trading alone.`,
+    });
+  }
+  if (pnlToHoldings !== null && pnlToHoldings > 10) {
+    flags.push({
+      code: "pnl_exceeds_holdings",
+      severity: "warn",
+      plain:
+        `Reported profit is ${Math.round(pnlToHoldings)}x the value of everything they currently hold — ` +
+        `the money is not visible in the portfolio.`,
+    });
+  }
+  if (trades !== null && trades < 10) {
+    flags.push({
+      code: "too_few_trades",
+      severity: "warn",
+      plain: `Only ${trades} trade${trades === 1 ? "" : "s"} on record — far too few to tell skill from luck.`,
+    });
+  }
+  const p = portfolio(trader);
+  if (p.partial) {
+    flags.push({
+      code: "partial_pricing",
+      severity: "info",
+      plain: `Only ${p.coverage.pricedPositions} of ${p.positions} positions have a usable price, so portfolio figures are incomplete.`,
+    });
+  }
+
+  const verdict: Trust["verdict"] =
+    flags.some((f) => f.code === "pnl_exceeds_volume") ? "implausible"
+      : flags.some((f) => f.code === "pnl_exceeds_holdings") ? "unverified"
+      : flags.some((f) => f.code === "too_few_trades") ? "insufficient"
+      : "ok";
+
+  const plain =
+    verdict === "implausible"
+      ? "The reported profit does not reconcile with this trader's own trading volume. Treat it as unproven."
+      : verdict === "unverified"
+      ? "The reported profit is far larger than the portfolio we can see, so we cannot corroborate it."
+      : verdict === "insufficient"
+      ? "There is not enough trading history here to judge skill."
+      : "Nothing in the numbers contradicts itself.";
+
+  return { flags, pnlToVolume, pnlToHoldings, trades, verdict, plain };
 }

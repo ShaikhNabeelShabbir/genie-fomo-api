@@ -10,7 +10,7 @@ import { fetchTransactions } from "./transactions.js";
 import * as hyperliquid from "./hyperliquid.js";
 import * as pumpfun from "./pumpfun.js";
 import * as gmgn from "./gmgn.js";
-import { portfolio, tokenBoard, chainName } from "./metrics.js";
+import { portfolio, tokenBoard, chainName, positions, tokenDetail, trust } from "./metrics.js";
 import { banked, haveFomoapi } from "./fomoapi.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
 import { asQuote } from "./prices.js";
@@ -976,6 +976,90 @@ app.get("/v1/traders/:handle/pnl", auth, async (req, res) => {
         : `fomoapi unavailable: ${msg}`,
     });
   }
+});
+
+
+/** PARAMETERS.md T12 — what a trader actually holds, biggest position first.
+ *
+ *  Unpriced positions are returned, not dropped: they are real holdings we simply cannot
+ *  value, and hiding them would misstate the position count. They sort last with
+ *  `valueUsd: null` — never 0, which would imply we checked and found nothing.
+ *
+ *    ?limit=10           page size (absent = all)
+ *    ?includeQuote=false drop stablecoins/wrapped natives from the list
+ */
+app.get("/v1/traders/:handle/positions", auth, (req, res) => {
+  const t = directory.get(req.params.handle);
+  if (!t) {
+    res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
+    return;
+  }
+  const { rows, totalValueUsd } = positions(t);
+  const filtered = String(req.query.includeQuote ?? "") === "false"
+    ? rows.filter((r) => !r.isQuoteAsset)
+    : rows;
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+  const page = limit === null ? filtered : filtered.slice(0, limit);
+  const priced = rows.filter((r) => r.valueUsd !== null).length;
+
+  res.json({
+    handle: t.handle,
+    name: t.name ?? null,
+    count: page.length,
+    positions: filtered.length,
+    totalValueUsd,
+    coverage: { pricedPositions: priced, unpricedPositions: rows.length - priced },
+    entries: page,
+  });
+});
+
+/** PARAMETERS.md K1/K3/K4/C5 for a single token — the drill-down from /v1/tokens.
+ *
+ *  A token address can exist on more than one chain, so without `?chain=` every match is
+ *  returned rather than one being picked silently.
+ */
+app.get("/v1/tokens/:address", auth, (req, res) => {
+  const chainQ = String(req.query.chain ?? "").trim().toLowerCase();
+  let networkId: number | null = null;
+  if (chainQ) {
+    const hit = [SOLANA_NETWORK_ID, ...Object.keys(EVM_CHAINS).map(Number)]
+      .find((id) => chainName(id) === chainQ);
+    if (hit === undefined) {
+      res.status(400).json({ detail: `unknown chain '${chainQ}'` });
+      return;
+    }
+    networkId = hit;
+  }
+  const matches = tokenDetail(directory.all(), req.params.address, networkId);
+  if (!matches.length) {
+    res.status(404).json({ detail: `no leader holds '${req.params.address}'${chainQ ? ` on ${chainQ}` : ""}` });
+    return;
+  }
+  res.json({
+    tokenAddress: req.params.address,
+    capturedAt: directory.meta().generated_at ?? null,
+    chains: matches.length,
+    entries: matches,
+  });
+});
+
+/** PARAMETERS.md trust flags — plausibility of a trader's own reported numbers.
+ *
+ *  Pure file arithmetic. Exists because the leaderboard's figures frequently fail their own
+ *  arithmetic: measured on this snapshot, 45 of 100 traders claim a profit larger than
+ *  their entire lifetime volume, and 64 of 100 claim more than 10x everything they hold.
+ *
+ *  These are plausibility checks, not fraud findings — a flag means the number cannot be
+ *  corroborated from the data we hold, not that anyone acted in bad faith.
+ */
+app.get("/v1/traders/:handle/trust", auth, (req, res) => {
+  const t = directory.get(req.params.handle);
+  if (!t) {
+    res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
+    return;
+  }
+  res.json({ handle: t.handle, name: t.name ?? null, reportedPnlUsd: t.pnl ?? null, volumeUsd: t.volume ?? null, ...trust(t) });
 });
 
 app.use((_req, res) => res.status(404).json({ detail: "not found" }));

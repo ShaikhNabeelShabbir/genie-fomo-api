@@ -16,12 +16,39 @@ the file's own.
 | Status | Parameter | Route | Depends on |
 | --- | --- | --- | --- |
 | ✅ | **T11** position count | `GET /v1/traders/:handle/portfolio` | file only |
-| ✅ | **T13** concentration | same route | file only |
+| ✅ | **T13** concentration | same route (`concentration`, `partial`) | file only |
 | ✅ | **T14** cash vs coins | same route (`cashShare`) | file only |
+| ✅ | **T12** quantity & value per position | `GET /v1/traders/:handle/positions` | file only |
 | ✅ | **K1** crowding / trending tokens | `GET /v1/tokens` | file only |
+| ✅ | **K3** money parked in a token | same route (`totalValueUsd`) | file only |
 | ✅ | **K4** who else holds it | same route (`holderHandles`) | file only |
-| ✅ | **T1** banked vs on paper | `GET /v1/traders/:handle/pnl` | fomoapi `/trades` — key OK, **endpoint degraded** |
+| ✅ | **K9** which chain | same route (`chain`) | file only |
+| ✅ | **K1/K3/K4** for one token | `GET /v1/tokens/:address` | file only |
+| ✅ | **Trust flags** plausibility of reported numbers | `GET /v1/traders/:handle/trust` | file only |
+| ✅ | **T1** banked vs on paper | `GET /v1/traders/:handle/pnl` | fomoapi `/trades` — live, occasionally flaky per trader |
 | ⬜ | everything else | — | see per-parameter tables |
+
+**Ten parameters across six routes. Nine need no external call at all.**
+
+### What the trust route found
+
+Running it across the board is not a formality — it disqualifies most of the leaderboard:
+
+```
+23 of 40 sampled traders flag as "implausible"
+Natan_benish reports profit 244x their entire lifetime volume
+```
+
+And T1 on the rank-1 trader shows why banked and on-paper must never be merged:
+
+```
+unipcs   leaderboard file says  : $7,366,512 profit
+         actually banked        :  -$209,403   (down on all 25 closed trades)
+         still on paper         : $14,434,492  (158 unsold positions)
+```
+
+Three different numbers from three sources for the same trader. The one the board ranks by
+is not the one they have realised.
 
 ---
 
@@ -48,7 +75,7 @@ the file's own.
 | # | Parameter | Layman phrasing | Computed from | Tier |
 | --- | --- | --- | --- | --- |
 | ✅ T11 | Number of tokens | "Holds **95 different coins**" | `holdings.length` | Reported |
-| T12 | Quantity & value | "**10,957,270 PONS**, worth **$2.2M**" | `humanAmount`, `value` | **Verifiable** via `balanceOf` |
+| ✅ T12 | Quantity & value | "**10,957,270 PONS**, worth **$2.2M**" | `humanAmount`, `value` | **Verifiable** via `balanceOf` |
 | ✅ T13 | **Concentration** | "**97% of their money is in one coin**" | `max(value) ÷ sum(value)` | Reported |
 | ✅ T14 | Cash vs coins | "**40% sitting in dollars**" | stablecoin share of value | Reported |
 | T15 | Open vs closed | "**39 open, 688 closed**" | `activeCount`, `closedCount` | Reported |
@@ -75,13 +102,13 @@ cost**, by inverting `holdings[]` into a `tokenAddress → traders` index.
 | --- | --- | --- | --- | --- |
 | ✅ K1 | **Crowding** | "**25 of the top 100** traders own this" | count holders of `tokenAddress` | Reported |
 | K2 | Momentum | "**+8 new holders today**" | diff two snapshots | Reported |
-| K3 | Money parked in it | "Leaders hold **$4.2M** of this" | sum `value` | Verifiable via `balanceOf` |
+| ✅ K3 | Money parked in it | "Leaders hold **$4.2M** of this" | sum `value` | Verifiable via `balanceOf` |
 | ✅ K4 | Who else holds it | "Also held by unipcs, theveeman" | reverse index | Reported |
 | K5 | Crowd's average entry | "Leaders bought around **$0.004**, now **$0.011**" | mean `avgEntryPrice` | Reported |
 | K6 | **Per-token win rate** | "**7 of 9** holders made money on this" | `realizedPnlUsd` by token | Reported |
 | K7 | **Has anyone ever sold it?** | "⚠️ **No proven exit** — every holder still holding" | any `status: closed` | Reported |
 | K8 | Accumulating or distributing | "Leaders are **buying**" | buy/sell balance | Reported |
-| K9 | Which chain | "Lives on **BSC**" | `networkId` | ✅ **Verified** via `eth_getCode` |
+| ✅ K9 | Which chain | "Lives on **BSC**" | `networkId` | ✅ **Verified** via `eth_getCode` |
 | K10 | **Is the price real?** | "⚠️ **Price not independently verified**" | mark vs pool price | Verifiable via Bitquery |
 
 
