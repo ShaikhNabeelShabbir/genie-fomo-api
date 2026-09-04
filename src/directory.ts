@@ -177,6 +177,22 @@ function maybeRefresh(): void {
     });
 }
 
+/**
+ * Force a reload now, ignoring the TTL.
+ *
+ * `maybeRefresh()` deliberately serves the stale snapshot to the request that triggers it,
+ * because `all()` and `get()` are synchronous. That is correct for traffic and wrong for
+ * "I just changed a row and want to see it", which is what this is for.
+ */
+export async function forceRefresh(): Promise<void> {
+  if (source() !== "db") {
+    mtime = 0;
+    reloadIfChanged();
+    return;
+  }
+  await refreshFromDb();
+}
+
 /** Load once at boot so the first request is not served an empty directory. */
 export async function init(): Promise<Source> {
   const src = source();
@@ -228,6 +244,13 @@ export function meta() {
     traders: traders.length,
     window: windowLabel,
     generated_at: generatedAt,
-    loaded_at: Math.floor(Date.now() / 1000),
+    // When the data was actually loaded — NOT `Date.now()`, which is what this used to
+    // report and which made it impossible to tell a fresh snapshot from a stale one. A
+    // "loaded_at" that always equals now is worse than no field at all.
+    loaded_at: src === "db"
+      ? (dbLoadedAt ? Math.floor(dbLoadedAt / 1000) : null)
+      : (mtime ? Math.floor(mtime / 1000) : null),
+    age_seconds: src === "db" && dbLoadedAt ? Math.floor((Date.now() - dbLoadedAt) / 1000) : null,
+    ttl_seconds: src === "db" ? DB_TTL_MS / 1000 : null,
   };
 }

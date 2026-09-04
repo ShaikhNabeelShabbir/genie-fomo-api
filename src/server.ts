@@ -1351,6 +1351,31 @@ app.post("/v1/snapshots", auth, (_req, res) => {
 });
 
 
+/**
+ * Reload the directory from Postgres immediately.
+ *
+ * The cache is a 5-minute TTL refreshed in the background, so a row edited in the database
+ * can take longer than that to surface — and the request that triggers the refresh still
+ * gets the old snapshot. This is the escape hatch for verifying a change without waiting
+ * or restarting the service.
+ */
+app.post("/v1/admin/refresh", auth, async (_req, res) => {
+  try {
+    const before = directory.meta();
+    await directory.forceRefresh();
+    const after = directory.meta();
+    res.json({
+      refreshed: true,
+      source: after.source,
+      traders: after.traders,
+      captured_at: after.generated_at,
+      previous_age_seconds: before.age_seconds,
+    });
+  } catch (e) {
+    res.status(502).json({ detail: `refresh failed: ${e instanceof Error ? e.message : String(e)}` });
+  }
+});
+
 app.use((_req, res) => res.status(404).json({ detail: "not found" }));
 
 // The directory is loaded BEFORE the port opens. Serving requests against an empty
