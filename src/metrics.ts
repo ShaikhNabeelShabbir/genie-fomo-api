@@ -463,3 +463,110 @@ export function trust(trader: Trader): Trust {
 
   return { flags, pnlToVolume, pnlToHoldings, trades, verdict, plain };
 }
+
+// ------------------------------------------------------------- C1 / C2 / C5
+
+export type ChainRow = {
+  networkId: number;
+  chain: string;
+  /** C1 — distinct leaders holding anything here. */
+  traders: number;
+  /** Share of the board, so "63" reads against a denominator. */
+  traderShare: number;
+  positions: number;
+  /** Distinct non-quote tokens seen on this chain. */
+  tokens: number;
+  /** C2 — summed value of the positions we could price. Null when none could be. */
+  totalValueUsd: number | null;
+  /**
+   * What that total is built on. A chain where 8 of 226 rows carry a price produces a
+   * number that looks authoritative and is not, so the denominator travels with it.
+   */
+  coverage: { pricedPositions: number; unpricedPositions: number; pricedShare: number | null };
+  plain: string;
+};
+
+/**
+ * C1 + C2 — where the leaderboard actually trades, and how much sits on each chain.
+ *
+ * Pure inversion of the snapshot by `networkId`; no API call. This section exists because
+ * *what we can see differs by chain*, which constrains every other parameter: history is
+ * free on Solana and Robinhood, and absent on BSC and Base without a paid provider.
+ *
+ * Quote assets are counted separately rather than dropped outright. On a chain board they
+ * are genuinely informative — a chain whose entire value is USDC is a parking lot, not a
+ * market — but they must not be mistaken for positions, so `tokens` excludes them while
+ * `totalValueUsd` reports both.
+ */
+export function chainBoard(traders: Trader[]): {
+  rows: ChainRow[];
+  traderCount: number;
+  totalPositions: number;
+} {
+  const by = new Map<
+    number,
+    {
+      handles: Set<string>;
+      tokens: Set<string>;
+      positions: number;
+      value: number;
+      priced: number;
+      quoteValue: number;
+    }
+  >();
+
+  let totalPositions = 0;
+  for (const t of traders) {
+    if (!t.handle) continue;
+    for (const h of t.holdings ?? []) {
+      if (!h.tokenAddress || h.networkId === undefined) continue;
+      totalPositions++;
+      const rec =
+        by.get(h.networkId) ??
+        { handles: new Set<string>(), tokens: new Set<string>(), positions: 0, value: 0, priced: 0, quoteValue: 0 };
+      rec.handles.add(t.handle);
+      rec.positions++;
+      const quote = isQuoteAsset(h.tokenAddress);
+      if (!quote) rec.tokens.add(h.tokenAddress.toLowerCase());
+      const v = typeof h.value === "number" && Number.isFinite(h.value) && h.value > 0 ? h.value : null;
+      if (v !== null) {
+        rec.priced++;
+        rec.value += v;
+        if (quote) rec.quoteValue += v;
+      }
+      by.set(h.networkId, rec);
+    }
+  }
+
+  const traderCount = traders.filter((t) => t.handle).length;
+  const rows: ChainRow[] = [...by.entries()]
+    .map(([networkId, r]) => {
+      const share = traderCount ? r.handles.size / traderCount : 0;
+      const pricedShare = r.positions ? r.priced / r.positions : null;
+      const name = chainName(networkId);
+      // Lead with the caveat when the money figure rests on a minority of the rows.
+      const plain =
+        pricedShare !== null && pricedShare < 0.5
+          ? `${r.handles.size} of ${traderCount} leaders trade ${name}, but only ${r.priced} of ` +
+            `${r.positions} positions there have a usable price — the value figure is partial.`
+          : `${r.handles.size} of ${traderCount} leaders trade ${name}, across ${r.positions} positions.`;
+      return {
+        networkId,
+        chain: name,
+        traders: r.handles.size,
+        traderShare: Number(share.toFixed(4)),
+        positions: r.positions,
+        tokens: r.tokens.size,
+        totalValueUsd: r.priced ? Number(r.value.toFixed(2)) : null,
+        coverage: {
+          pricedPositions: r.priced,
+          unpricedPositions: r.positions - r.priced,
+          pricedShare: pricedShare === null ? null : Number(pricedShare.toFixed(4)),
+        },
+        plain,
+      };
+    })
+    .sort((a, b) => b.positions - a.positions);
+
+  return { rows, traderCount, totalPositions };
+}

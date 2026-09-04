@@ -10,8 +10,9 @@ import { fetchTransactions } from "./transactions.js";
 import * as hyperliquid from "./hyperliquid.js";
 import * as pumpfun from "./pumpfun.js";
 import * as gmgn from "./gmgn.js";
-import { portfolio, tokenBoard, chainName, positions, tokenDetail, trust } from "./metrics.js";
-import { banked, haveFomoapi } from "./fomoapi.js";
+import { portfolio, tokenBoard, chainName, positions, tokenDetail, trust, chainBoard } from "./metrics.js";
+import { banked, scorecard, tokenActivity, haveFomoapi } from "./fomoapi.js";
+import * as snapshots from "./snapshots.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
 import { asQuote } from "./prices.js";
 import type { Transfer } from "./transactions.js";
@@ -1014,6 +1015,51 @@ app.get("/v1/traders/:handle/positions", auth, (req, res) => {
   });
 });
 
+/**
+ * PARAMETERS.md K2 — what the leaders moved into and out of since the last snapshot.
+ *
+ * Registered BEFORE /v1/tokens/:address deliberately: Express matches in order, and a
+ * literal path declared after a parameterised sibling of the same shape is unreachable.
+ *
+ * This is the one parameter that cannot be computed from the current file, because "what
+ * changed" is not a property of a single snapshot. When only one snapshot exists the route
+ * returns `available: false` rather than an empty board — "nothing moved" and "we have no
+ * baseline" are different answers and must not render identically.
+ *
+ *   ?limit=20      page size (absent = every token that moved)
+ *   ?direction=in  only gainers (`in`) or only losers (`out`)
+ */
+app.get("/v1/tokens/momentum", auth, (req, res) => {
+  const m = snapshots.momentum();
+  const dir = String(req.query.direction ?? "").trim().toLowerCase();
+  let rows = m.rows;
+  if (dir === "in") rows = rows.filter((r) => r.change > 0);
+  else if (dir === "out") rows = rows.filter((r) => r.change < 0);
+  else if (dir) {
+    res.status(400).json({ detail: `unknown direction '${dir}' — use 'in' or 'out'` });
+    return;
+  }
+
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+  const page = limit === null ? rows : rows.slice(0, limit);
+
+  res.status(m.available ? 200 : 200).json({
+    board: "momentum",
+    available: m.available,
+    snapshots: m.snapshots,
+    from: m.from,
+    to: m.to,
+    spanHours: m.spanHours,
+    direction: dir || "all",
+    moved: rows.length,
+    count: page.length,
+    entries: page,
+    plain: m.plain,
+  });
+});
+
+
 /** PARAMETERS.md K1/K3/K4/C5 for a single token — the drill-down from /v1/tokens.
  *
  *  A token address can exist on more than one chain, so without `?chain=` every match is
@@ -1062,11 +1108,209 @@ app.get("/v1/traders/:handle/trust", auth, (req, res) => {
   res.json({ handle: t.handle, name: t.name ?? null, reportedPnlUsd: t.pnl ?? null, volumeUsd: t.volume ?? null, ...trust(t) });
 });
 
+/**
+ * PARAMETERS.md C1 + C2 + C4 + C5 — where the leaderboard actually trades.
+ *
+ * Pure file arithmetic for C1/C2; C4 and C5 describe OUR state rather than the traders',
+ * which is the point of the section. What we can see differs by chain, and that constrains
+ * every other parameter in this API: position sizes are verifiable everywhere via a free
+ * `balanceOf`, but transaction history is not — on BSC and Base it needs a paid provider,
+ * so a trader who looks quiet there may simply be invisible to us.
+ *
+ * C3 (chain profitability) is deliberately absent: the snapshot carries one `pnl` per
+ * trader, not one per chain, so splitting it would mean inventing an attribution.
+ */
+app.get("/v1/chains", auth, (req, res) => {
+  const { rows, traderCount, totalPositions } = chainBoard(directory.all());
+
+  // C4 — coverage is a fact about our own credentials, so it is reported, not guessed.
+  const history = (networkId: number): { available: boolean; via: string | null; note: string | null } => {
+    if (networkId === SOLANA_NETWORK_ID) {
+      if (haveHelius()) return { available: true, via: "helius", note: null };
+      if (haveBitquery()) return { available: true, via: "bitquery", note: null };
+      return { available: false, via: null, note: "needs HELIUS_API_KEY or BITQUERY_TOKEN" };
+    }
+    const chain = EVM_CHAINS[networkId];
+    if (chain?.blockscout) return { available: true, via: "blockscout", note: "keyless" };
+    if (networkId === 1 && haveEtherscan()) return { available: true, via: "etherscan", note: null };
+    if (haveBitquery()) return { available: true, via: "bitquery", note: null };
+    return { available: false, via: null, note: "no free history provider for this chain" };
+  };
+
+  res.json({
+    board: "chains",
+    capturedAt: directory.meta().generated_at ?? null,
+    traders: traderCount,
+    totalPositions,
+    count: rows.length,
+    entries: rows.map((r) => ({
+      ...r,
+      // C4
+      historyCoverage: history(r.networkId),
+      // C5 — true on every chain we index, and worth stating: it means a position SIZE is
+      // always checkable even where the trade history behind it is not.
+      balanceVerifiable: true,
+    })),
+    plain:
+      rows.length
+        ? `${rows[0].traders} of ${traderCount} leaders trade ${rows[0].chain}, which carries ` +
+          `${rows[0].positions} of ${totalPositions} positions on the board.`
+        : "No positions in the directory.",
+  });
+});
+
+
+/**
+ * PARAMETERS.md T2, T3, T5-T10, T15-T20 — the full scorecard.
+ *
+ * Costs NO additional API call: it reads the same `/trades` document `/pnl` already
+ * fetches and caches for 10 minutes. That is why fourteen parameters could ship at once.
+ *
+ * Read the `coverage` objects before the numbers. fomo carries entry and exit prices on a
+ * minority of trades — measured on `unipcs`, 21 of 184 have an entry price and 2 of 25
+ * closed trades have both — so every price-derived figure here (money in/out, return %,
+ * typical bet size) states what it was computed over, and returns null rather than a
+ * confident number drawn from a handful of rows.
+ *
+ *   ?tokens=10   trim the per-token breakdown (absent = every token)
+ */
+app.get("/v1/traders/:handle/scorecard", auth, async (req, res) => {
+  const t = directory.get(req.params.handle);
+  if (!t) {
+    res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
+    return;
+  }
+  if (!haveFomoapi()) {
+    res.status(503).json({ detail: "FOMOAPI_KEY is not set — the scorecard needs fomoapi /trades" });
+    return;
+  }
+  try {
+    const s = await scorecard(t.handle, { volume: t.volume ?? null, trades: t.trades ?? null });
+    if (!s) {
+      res.status(404).json({ detail: `fomoapi has no trades for '${t.handle}'` });
+      return;
+    }
+    const asked = Number(req.query.tokens);
+    const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
+    res.json({
+      handle: t.handle,
+      name: t.name ?? null,
+      source: "fomoapi /v2/users/{handle}/trades",
+      ...s,
+      tokensReturned: limit === null ? s.byToken.length : Math.min(limit, s.byToken.length),
+      tokensTotal: s.byToken.length,
+      byToken: limit === null ? s.byToken : s.byToken.slice(0, limit),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    res.status(502).json({
+      detail: /timed out|abort/i.test(msg)
+        ? "fomoapi /trades did not respond in time — it serves trades live and is currently slow"
+        : `fomoapi unavailable: ${msg}`,
+    });
+  }
+});
+
+
+/**
+ * PARAMETERS.md K5, K6, K7, K8 — what the holders of a token have actually DONE with it.
+ *
+ * `/v1/tokens/:address` answers who holds it. This answers whether anyone ever got OUT,
+ * which is the sharper question: a token every leader holds and nobody has ever sold is
+ * the shape of a honeypot, and a holder count cannot tell that apart from a good call.
+ *
+ * Costs one fomoapi call per sampled holder, capped (default 25) and cached 10 minutes
+ * alongside /pnl and /scorecard. The cap is a budget, not a page size — the free tier is
+ * 10,000 calls a month, and an uncapped board-wide version would spend that in a day.
+ *
+ *   ?chain=solana   disambiguate a token address that exists on more than one chain
+ *   ?holders=10     lower the sample (and the cost); 25 max
+ */
+app.get("/v1/tokens/:address/activity", auth, async (req, res) => {
+  if (!haveFomoapi()) {
+    res.status(503).json({ detail: "FOMOAPI_KEY is not set — K5-K8 need fomoapi /trades" });
+    return;
+  }
+  const chainQ = String(req.query.chain ?? "").trim().toLowerCase();
+  let networkId: number | null = null;
+  if (chainQ) {
+    const hit = [SOLANA_NETWORK_ID, ...Object.keys(EVM_CHAINS).map(Number)]
+      .find((id) => chainName(id) === chainQ);
+    if (hit === undefined) {
+      res.status(400).json({ detail: `unknown chain '${chainQ}'` });
+      return;
+    }
+    networkId = hit;
+  }
+
+  const matches = tokenDetail(directory.all(), req.params.address, networkId);
+  if (!matches.length) {
+    res.status(404).json({ detail: `no leader holds '${req.params.address}'${chainQ ? ` on ${chainQ}` : ""}` });
+    return;
+  }
+  if (matches.length > 1) {
+    res.status(400).json({
+      detail: `'${req.params.address}' exists on ${matches.length} chains — pass ?chain= to pick one`,
+      chains: matches.map((m) => m.chain),
+    });
+    return;
+  }
+
+  const asked = Number(req.query.holders);
+  const cap = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 25) : 25;
+  try {
+    const act = await tokenActivity(matches[0].holderHandles, matches[0].tokenAddress, cap);
+    res.json({
+      chain: matches[0].chain,
+      networkId: matches[0].networkId,
+      holdersInDirectory: matches[0].holders,
+      totalValueUsd: matches[0].totalValueUsd,
+      source: "fomoapi /v2/users/{handle}/trades",
+      ...act,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    res.status(502).json({ detail: `fomoapi unavailable: ${msg}` });
+  }
+});
+
+
+/**
+ * Snapshot archive state — the substrate K2 runs on.
+ *
+ * POST writes the current directory build to the archive if it is not already there,
+ * keyed on the file's own `generated_at` so restarting the server does not manufacture
+ * duplicate snapshots and a momentum of zero.
+ */
+app.get("/v1/snapshots", auth, (_req, res) => {
+  const m = snapshots.momentum();
+  res.json({
+    snapshots: m.snapshots,
+    comparable: m.available,
+    from: m.from,
+    to: m.to,
+    note: "archive lives on the instance filesystem; on an ephemeral host it resets on redeploy",
+  });
+});
+
+app.post("/v1/snapshots", auth, (_req, res) => {
+  res.json(snapshots.archive());
+});
+
+
 app.use((_req, res) => res.status(404).json({ detail: "not found" }));
 
 const server = app.listen(PORT, () => {
   console.log(`genie-fomo API (typescript) on port ${PORT}`);
   console.log(`  directory: ${directory.meta().traders} traders`);
+  // Archive on boot so K2 starts accruing without anyone remembering to call it. Keyed on
+  // the directory's own timestamp, so repeated restarts do not stack identical snapshots.
+  try {
+    const a = snapshots.archive();
+    console.log(`  snapshots: ${a.total} archived${a.written ? ` (wrote ${a.file})` : ""}`);
+  } catch (e) {
+    console.log(`  snapshots: archive failed — ${e instanceof Error ? e.message : String(e)}`);
+  }
   console.log(`  auth: ${API_KEY ? "X-API-Key required" : "none (open access)"}`);
   console.log(`  cors: ${CORS_ORIGINS.length ? CORS_ORIGINS.join(", ") : "any origin"}`);
 });
