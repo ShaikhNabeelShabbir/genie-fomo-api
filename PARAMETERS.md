@@ -261,7 +261,53 @@ traders on this board report a profit larger than their entire lifetime volume.
 
 ---
 
-## 6. Test calls
+## 6. Live routes — Supabase Edge Functions
+
+**33 of 36 parameters are served by 14 routes. Zero external API calls per request.**
+
+```bash
+export B=https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api
+```
+
+No key required. Every route answers from Postgres — fomoapi, Helius, Bitquery and
+Etherscan are used only by the scheduled loaders, so a thousand visitors cost what one does.
+
+| Route | Params | In plain words |
+| --- | --- | --- |
+| `GET /v1/health` | — | "What's in the database, and when was it loaded?" |
+| `GET /v1/traders` | the board | "Who are the top 100 traders?" |
+| `GET /v1/traders/:handle/pnl` | T1, T15 | "**How much have they actually cashed out**, versus what's still on paper?" |
+| `GET /v1/traders/:handle/scorecard` | T2, T3, T5–T10, T16–T20 | "How often do they win, how big, how long do they hold, how long have they been at it?" |
+| `GET /v1/traders/:handle/portfolio` | T11, T13, T14 | "How many coins, **how much is in just one**, how much is sitting in dollars?" |
+| `GET /v1/traders/:handle/positions` | T12 | "What exactly do they hold, and what is it worth?" |
+| `GET /v1/traders/:handle/trust` | trust flags | "**Do their own numbers add up?**" |
+| `GET /v1/traders/:handle/wallets` | — | "Which wallets do they trade from?" |
+| `GET /v1/traders/:handle/transactions` | — | "What have those wallets actually done on-chain?" |
+| `GET /v1/tokens` | K1, K3, K4, K9 | "**What are the leaders crowding into?**" |
+| `GET /v1/tokens/:address` | K1, K3, K4 | "Who holds this one coin, and how much?" |
+| `GET /v1/tokens/:address/activity` | K5–K8 | "**Has anyone who holds this ever actually sold it?**" |
+| `GET /v1/tokens/momentum` | K2 | "What did they move into or out of since last time?" |
+| `GET /v1/chains` | C1, C2, C4, C5 | "Which blockchains do they trade, and what can we even see there?" |
+
+### Still blocked (3)
+
+| | Why |
+| --- | --- |
+| **T4** time-framed profit | fomoapi carries no per-window figures; the schema has nothing to split |
+| **K10** is the price real | needs Bitquery pool prices to compare against the mark |
+| **C3** chain profitability | the source gives one `pnl` per trader, not one per chain — splitting it means inventing an attribution |
+
+### Not migrated, deliberately
+
+`/v1/traders/:handle/trades` and `/performance` stay on the Node service. They run the
+chain-derived P&L replay in `pnl.ts`, which carries three confirmed bugs (`top_position_share`
+unbounded, `worst_trade_usd` can report a gain as a loss, `realized_share` ignores sign).
+They overlap heavily with `/scorecard`, which serves fourteen parameters from the same data
+and is correct. The hyperliquid, pump.fun and gmgn boards are on hold.
+
+---
+
+## 7. Test calls
 
 Local, with the key in the environment:
 

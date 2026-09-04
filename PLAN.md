@@ -115,14 +115,14 @@ quote_assets   (network_id, token_address) PK      USDC/USDT/wSOL/WETH/WBNB
 
 ---
 
-## Phase 2 — Ingest (build time — where every key now lives) 🔄
+## Phase 2 — Ingest (build time — where every key now lives) ✅
 
 | | Step | Why | Verify | Status |
 | --- | --- | --- | --- | --- |
 | 2.1 | `load_to_db.py` upserts traders / tokens / holdings | replaces the JSON write; append-only by `captured_at` | ✅ every §Baseline figure reproduced exactly | ✅ |
 | 2.2 | Wallets from `src_evm` / `src_sol` | 97 of 100 traders already carry a resolved address — no fingerprinting needed | ✅ 97 rows, one per trader: 95 evm + 88 sol | ✅ |
 | 2.3 | Trades from fomoapi | unlocks T1–T20 **and** turns K5–K8 from a 25-holder fan-out into SQL | ✅ 100/100 traders, 6,398 trades (2,302 closed) | ✅ |
-| 2.4 | Transactions via Helius / Bitquery / Etherscan | removes the chain stack from the request path entirely | txs for 97 wallets | ⬜ |
+| 2.4 | Transactions via Helius / Bitquery / Etherscan | removes the chain stack from the request path entirely | ✅ 42,033 transfers · 23,851 txs · 183 wallets · 224s · 0 failures | ✅ |
 
 **On 2.2 — this may retire the most expensive machinery in the project.** `resolvers.ts`
 fingerprints real wallets by matching position sizes against on-chain holder lists, because
@@ -185,10 +185,11 @@ coverage stops improving, not once.
 | --- | --- | --- | --- | --- |
 | 3.1 | `directory.ts` reads Postgres | one change moves 9 file-only routes at once — `metrics.ts` is pure functions over a trader array | ✅ `directory loaded from db: 100 traders` | ✅ |
 | 3.2 | **CHECKPOINT — diff DB vs file** | the only guard against a schema bug silently changing every number | ✅ 7 of 7 checks identical | ✅ |
-| 3.3 | Move heavy aggregates to SQL | `/v1/tokens` inverts 2,038 holdings in memory per request; in Postgres it is an indexed GROUP BY | same output, faster | ⬜ |
-| 3.4 | `/pnl` + `/scorecard` from `trades` | removes fomoapi from the request path | no network call during a request | ⬜ |
-| 3.5 | K5–K8 from `trades` | **45s → ~10ms, and 25 sampled holders → all 896 tokens** | `/activity` under 100ms | ⬜ |
-| 3.6 | K2 from a `captured_at` self-join | deletes `snapshots.ts` and its ephemeral-disk problem | momentum works after 2 cron runs | ⬜ |
+| 3.3 | Move heavy aggregates to SQL | `/v1/tokens` inverts 2,038 holdings in memory per request; in Postgres it is an indexed GROUP BY | ✅ done in the edge function | ✅ |
+| 3.4 | `/scorecard` from `trades` | removes fomoapi from the request path | ✅ 0.76s, identical figures, zero API calls | ✅ |
+| 3.5 | K5–K8 from `trades` | **45s → ~1s, and 25 sampled holders → every trader with a record** | ✅ `/activity` ~1.1s, no fan-out | ✅ |
+| 3.6 | K2 from a `captured_at` self-join | deletes `snapshots.ts` and its ephemeral-disk problem | ✅ verified against a synthetic second generation | ✅ |
+| 3.8 | `/transactions` reads the table | it queried 5 providers live on every request, ~6s, uncached | ✅ ~0.9s from Postgres, `stored` reports depth | ✅ |
 | 3.7 | `/wallets` serves stored addresses | it read the directory then discarded it, re-resolving live on every request | ✅ 21ms, reflects the DB; `?verify=true` keeps the resolver | ✅ |
 
 **On 3.7 — found by editing a row in the dashboard and watching the API ignore it.**
@@ -243,12 +244,45 @@ and has no column. Cosmetic, but `/v1/traders` reports it.
 
 ---
 
-## Phase 5 — Serving ⬜
+## Phase 5 — Serving 🔄
 
 | | Step | Why | Verify | Status |
 | --- | --- | --- | --- | --- |
-| 5.1 | Edge Functions port | serve from the DB's edge, drop the Render instance | parity with Express | ⬜ |
+| 5.1 | Edge Functions written | serve from the DB's edge, drop the Render instance | ✅ 11 routes, **20/20 parity** against Express | ✅ |
+| 5.1b | Deploy to Supabase | — | not yet run | ⬜ |
 | 5.2 | RLS policies | published data should be readable without exposing writes | anon can read, not write | ⬜ |
+
+### Edge Function routes (`supabase/functions/api/`)
+
+| Route | Parameters | Ported or new |
+| --- | --- | --- |
+| `GET /v1/chains` | C1, C2, C4, C5 | port · parity |
+| `GET /v1/traders` | the board | port · parity |
+| `GET /v1/traders/:handle/portfolio` | T11, T13, T14 | port · parity |
+| `GET /v1/traders/:handle/positions` | T12 | port · parity |
+| `GET /v1/traders/:handle/trust` | trust flags | port · parity |
+| `GET /v1/tokens` | K1, K3, K4, K9 | port · parity |
+| `GET /v1/tokens/:address` | token detail | port · parity |
+| `GET /v1/traders/:handle/scorecard` | T2, T3, T5–T10, T15–T20 | **new** — reads `trades` |
+| `GET /v1/tokens/:address/activity` | K5–K8 | **new** — no fan-out, no cap |
+| `GET /v1/tokens/momentum` | K2 | **new** — `captured_at` self-join |
+| `GET /v1/traders/:handle/transactions` | — | **new** — reads `transactions` |
+
+**Four bugs the parity diff caught**, none of which a smoke test would have found:
+
+1. `label` fell back to the handle where Node returns `null`; `avatarUrl` returned `''`
+   instead of `null`.
+2. `total` was emitted unconditionally where Node omits it unless the page is truncated.
+3. `totalTokens` reported the count *after* `minHolders` filtered it, making the filter
+   invisible.
+4. **Neither implementation had a deterministic sort tiebreak.** Hundreds of tokens tie on
+   holder count with no price, so the board could come back in a different order on
+   successive requests. Fixed on BOTH sides — holders desc, value desc, address, network.
+
+Two more found by exercising the routes rather than diffing them: the router matched
+`/v1/tokens/momentum` against `/v1/tokens/:address` (fixed by scoring literal segments over
+parameters, so declaration order stops mattering), and `?direction=` was validated *after*
+the availability check, so a typo returned 200 whenever history was too short to answer.
 
 **Two routes cannot move to Edge Functions:**
 - `/v1/hyperliquid/traders` — 36MB feed, ~121MB heap to parse. Exceeds the memory budget.

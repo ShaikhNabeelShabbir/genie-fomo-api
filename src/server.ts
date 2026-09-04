@@ -12,7 +12,6 @@ import * as pumpfun from "./pumpfun.js";
 import * as gmgn from "./gmgn.js";
 import { portfolio, tokenBoard, chainName, positions, tokenDetail, trust, chainBoard } from "./metrics.js";
 import { banked, scorecard, tokenActivity, haveFomoapi } from "./fomoapi.js";
-import * as snapshots from "./snapshots.js";
 import { buildTrades, replay, summarise } from "./pnl.js";
 import { asQuote } from "./prices.js";
 import type { Transfer } from "./transactions.js";
@@ -1068,49 +1067,6 @@ app.get("/v1/traders/:handle/positions", auth, (req, res) => {
   });
 });
 
-/**
- * PARAMETERS.md K2 — what the leaders moved into and out of since the last snapshot.
- *
- * Registered BEFORE /v1/tokens/:address deliberately: Express matches in order, and a
- * literal path declared after a parameterised sibling of the same shape is unreachable.
- *
- * This is the one parameter that cannot be computed from the current file, because "what
- * changed" is not a property of a single snapshot. When only one snapshot exists the route
- * returns `available: false` rather than an empty board — "nothing moved" and "we have no
- * baseline" are different answers and must not render identically.
- *
- *   ?limit=20      page size (absent = every token that moved)
- *   ?direction=in  only gainers (`in`) or only losers (`out`)
- */
-app.get("/v1/tokens/momentum", auth, (req, res) => {
-  const m = snapshots.momentum();
-  const dir = String(req.query.direction ?? "").trim().toLowerCase();
-  let rows = m.rows;
-  if (dir === "in") rows = rows.filter((r) => r.change > 0);
-  else if (dir === "out") rows = rows.filter((r) => r.change < 0);
-  else if (dir) {
-    res.status(400).json({ detail: `unknown direction '${dir}' — use 'in' or 'out'` });
-    return;
-  }
-
-  const asked = Number(req.query.limit);
-  const limit = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : null;
-  const page = limit === null ? rows : rows.slice(0, limit);
-
-  res.status(m.available ? 200 : 200).json({
-    board: "momentum",
-    available: m.available,
-    snapshots: m.snapshots,
-    from: m.from,
-    to: m.to,
-    spanHours: m.spanHours,
-    direction: dir || "all",
-    moved: rows.length,
-    count: page.length,
-    entries: page,
-    plain: m.plain,
-  });
-});
 
 
 /** PARAMETERS.md K1/K3/K4/C5 for a single token — the drill-down from /v1/tokens.
@@ -1328,53 +1284,9 @@ app.get("/v1/tokens/:address/activity", auth, async (req, res) => {
 });
 
 
-/**
- * Snapshot archive state — the substrate K2 runs on.
- *
- * POST writes the current directory build to the archive if it is not already there,
- * keyed on the file's own `generated_at` so restarting the server does not manufacture
- * duplicate snapshots and a momentum of zero.
- */
-app.get("/v1/snapshots", auth, (_req, res) => {
-  const m = snapshots.momentum();
-  res.json({
-    snapshots: m.snapshots,
-    comparable: m.available,
-    from: m.from,
-    to: m.to,
-    note: "archive lives on the instance filesystem; on an ephemeral host it resets on redeploy",
-  });
-});
-
-app.post("/v1/snapshots", auth, (_req, res) => {
-  res.json(snapshots.archive());
-});
 
 
-/**
- * Reload the directory from Postgres immediately.
- *
- * The cache is a 5-minute TTL refreshed in the background, so a row edited in the database
- * can take longer than that to surface — and the request that triggers the refresh still
- * gets the old snapshot. This is the escape hatch for verifying a change without waiting
- * or restarting the service.
- */
-app.post("/v1/admin/refresh", auth, async (_req, res) => {
-  try {
-    const before = directory.meta();
-    await directory.forceRefresh();
-    const after = directory.meta();
-    res.json({
-      refreshed: true,
-      source: after.source,
-      traders: after.traders,
-      captured_at: after.generated_at,
-      previous_age_seconds: before.age_seconds,
-    });
-  } catch (e) {
-    res.status(502).json({ detail: `refresh failed: ${e instanceof Error ? e.message : String(e)}` });
-  }
-});
+
 
 app.use((_req, res) => res.status(404).json({ detail: "not found" }));
 
@@ -1391,17 +1303,6 @@ try {
 
 const server = app.listen(PORT, () => {
   console.log(`genie-fomo API (typescript) on port ${PORT}`);
-  // The file-based snapshot archive only exists to give K2 a history. In database mode
-  // that history is `holdings.captured_at`, so archiving would duplicate it on a disk that
-  // does not survive a redeploy.
-  if (directory.meta().source === "file") {
-    try {
-      const a = snapshots.archive();
-      console.log(`  snapshots: ${a.total} archived${a.written ? ` (wrote ${a.file})` : ""}`);
-    } catch (e) {
-      console.log(`  snapshots: archive failed — ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
   console.log(`  auth: ${API_KEY ? "X-API-Key required" : "none (open access)"}`);
   console.log(`  cors: ${CORS_ORIGINS.length ? CORS_ORIGINS.join(", ") : "any origin"}`);
 });

@@ -194,7 +194,7 @@ export function tokenBoard(
   const byToken = new Map<
     string,
     { tokenAddress: string; networkId: number; holders: Set<string>; value: number; priced: boolean;
-      byHandle: { handle: string; value: number }[] }
+      byHandle: { handle: string; value: number; rank: number | undefined }[] }
   >();
   // Count BOTH: how many distinct quote tokens were dropped, and how many holding rows
   // they accounted for. Reporting one number for "excluded" conflates 5 assets with the
@@ -220,7 +220,7 @@ export function tokenBoard(
       rec.holders.add(t.handle);
       const v = typeof h.value === "number" && Number.isFinite(h.value) && h.value > 0 ? h.value : 0;
       if (v > 0) { rec.value += v; rec.priced = true; }
-      rec.byHandle.push({ handle: t.handle, value: v });
+      rec.byHandle.push({ handle: t.handle, value: v, rank: t.rank });
       byToken.set(key, rec);
     }
   }
@@ -233,7 +233,7 @@ export function tokenBoard(
       const share = traderCount ? holders / traderCount : 0;
       // Biggest position first: who has the most conviction, not who happens to be first.
       const handles = [...new Map(r.byHandle.map((x) => [x.handle, x])).values()]
-        .sort((a, b) => b.value - a.value)
+        .sort((a, b) => b.value - a.value || (a.rank ?? 9999) - (b.rank ?? 9999))
         .map((x) => x.handle);
       return {
         tokenAddress: r.tokenAddress,
@@ -249,7 +249,17 @@ export function tokenBoard(
             : `${holders} of ${traderCount} leaders hold this.`,
       };
     })
-    .sort((a, b) => b.holders - a.holders || (b.totalValueUsd ?? 0) - (a.totalValueUsd ?? 0));
+    // The third term is load-bearing. Hundreds of tokens tie on holder count with no
+    // price at all, and without a deterministic tiebreak their order depends on the order
+    // traders happened to come out of the directory — so the same request could return a
+    // different board twice. Address is arbitrary but stable, which is the point.
+    .sort((a, b) =>
+      b.holders - a.holders ||
+      (b.totalValueUsd ?? 0) - (a.totalValueUsd ?? 0) ||
+      a.tokenAddress.toLowerCase().localeCompare(b.tokenAddress.toLowerCase()) ||
+      // Address alone is not unique: the same address exists on two chains in the current
+      // snapshot, so the network is the final term.
+      a.networkId - b.networkId);
 
   return {
     rows,
@@ -302,7 +312,11 @@ export function positions(trader: Trader): { rows: Position[]; totalValueUsd: nu
       };
     })
     // Priced rows first, descending; unpriced trail rather than masquerading as zero.
-    .sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1));
+    // Address breaks the tie among unpriced rows, which would otherwise come back in
+    // whatever order the storage layer happened to produce.
+    .sort((a, b) =>
+      (b.valueUsd ?? -1) - (a.valueUsd ?? -1) ||
+      a.tokenAddress.toLowerCase().localeCompare(b.tokenAddress.toLowerCase()));
 
   return { rows, totalValueUsd: total > 0 ? Number(total.toFixed(2)) : null };
 }
@@ -351,6 +365,8 @@ export function tokenDetail(
     const priced = r.holders.filter((h) => h.valueUsd !== null);
     const total = priced.reduce((s, h) => s + (h.valueUsd ?? 0), 0);
     const holders = new Set(r.holders.map((h) => h.handle)).size;
+    const sortedHolders = [...r.holders].sort(
+      (a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1) || a.handle.localeCompare(b.handle));
     return {
       tokenAddress: r.addr,
       networkId: r.networkId,
@@ -358,8 +374,8 @@ export function tokenDetail(
       holders,
       holderShare: Number((traderCount ? holders / traderCount : 0).toFixed(4)),
       totalValueUsd: priced.length ? Number(total.toFixed(2)) : null,
-      holderHandles: [...r.holders].sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1)).map((h) => h.handle),
-      holders_detail: [...r.holders].sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1)),
+      holderHandles: sortedHolders.map((h) => h.handle),
+      holders_detail: sortedHolders,
       plain:
         holders === 1
           ? `Only 1 of ${traderCount} leaders holds this.`
