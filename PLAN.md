@@ -189,6 +189,26 @@ coverage stops improving, not once.
 | 3.4 | `/pnl` + `/scorecard` from `trades` | removes fomoapi from the request path | no network call during a request | ⬜ |
 | 3.5 | K5–K8 from `trades` | **45s → ~10ms, and 25 sampled holders → all 896 tokens** | `/activity` under 100ms | ⬜ |
 | 3.6 | K2 from a `captured_at` self-join | deletes `snapshots.ts` and its ephemeral-disk problem | momentum works after 2 cron runs | ⬜ |
+| 3.7 | `/wallets` serves stored addresses | it read the directory then discarded it, re-resolving live on every request | ✅ 21ms, reflects the DB; `?verify=true` keeps the resolver | ✅ |
+
+**On 3.7 — found by editing a row in the dashboard and watching the API ignore it.**
+Appending `Nabeel` to `wallets.evm_address` proved the directory *was* reading Postgres
+(`src_evm` came back edited) and that `/wallets` then threw that answer away:
+
+```
+verifyCandidate("0x…119eNabeel")  ->  balanceOf fails, address = null
+evmOk === false                   ->  resolveAll() searches holder lists
+                                  ->  re-derives the real 0x…119e
+```
+
+Two problems, not one. The route spent Bitquery and Helius quota per visitor to re-derive a
+value already in the database — and a single malformed row turned a 431ms request into a
+measured **4m12s** one, which is a denial-of-service shape rather than a slow path.
+
+Now: stored addresses by default, labelled `tier: "reported"`; `?verify=true` opts into the
+resolver and returns `tier: "verified"` with confidence grades. Addresses are shape-checked
+before anything expensive touches them, so bad data is withheld with a warning in
+microseconds instead of triggering a chain-wide search.
 
 **Step 3.2 is the one step that must not be skipped.** Everything after it assumes the DB
 is a faithful copy. If a number moves here, it is a schema bug, and finding it later means

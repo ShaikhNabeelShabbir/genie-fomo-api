@@ -201,12 +201,61 @@ async function resolvePreferVerified(
 }
 
 const nonEmpty = (v: string | undefined) => (v && v.trim() ? v.trim() : null);
+/**
+ * Address shape check, before anything expensive touches it.
+ *
+ * Without this, a malformed address in the directory fails `verifyCandidate`, falls through
+ * to a full `resolveAll()` holder-list search, and turns a 431ms request into a measured
+ * 4m12s one. A string that cannot be an address on any chain we index is not a resolution
+ * problem — it is bad data, and it should be rejected in microseconds.
+ */
+const looksLikeAddress = (a: string | undefined | null): boolean => {
+  if (!a) return false;
+  const v = a.trim();
+  return /^0x[0-9a-fA-F]{40}$/.test(v) || /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
+};
+
 app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
   const t = directory.get(req.params.handle);
   if (!t) {
     res.status(404).json({ detail: `no trader '${req.params.handle}' in the directory` });
     return;
   }
+
+  /**
+   * Stored addresses by default; live resolution only on `?verify=true`.
+   *
+   * The route used to resolve on every request, which meant it read the directory and then
+   * discarded it — an edited address in the database came back as the chain's answer, not
+   * ours. That is defensible as *verification* and indefensible as a default: it spent
+   * Bitquery and Helius quota per visitor for a value we already hold, and a single bad
+   * row cost four minutes.
+   *
+   * So the default is now what the database says, labelled honestly as REPORTED. The
+   * resolver is still here and still correct — it is opt-in, and `source` says which path
+   * produced the answer so the two can never be confused.
+   */
+  const wantVerify = String(req.query.verify ?? "") === "true";
+  if (!wantVerify) {
+    const bad = [t.src_evm, t.src_sol].filter((a) => a && !looksLikeAddress(a));
+    res.json({
+      handle: t.handle,
+      name: t.name ?? null,
+      bio: nonEmpty(t.bio),
+      banner: null,
+      profilePicture: nonEmpty(t.avatar),
+      twitter: nonEmpty(t.twitter),
+      solanaAddress: looksLikeAddress(t.src_sol) ? t.src_sol! : null,
+      evmAddress: looksLikeAddress(t.src_evm) ? t.src_evm! : null,
+      source: t.src ?? null,
+      // Reported, not Verified — see PARAMETERS.md section 5. Pass ?verify=true to check
+      // these against the chain.
+      tier: "reported",
+      ...(bad.length ? { warning: `${bad.length} stored address(es) are malformed and were withheld` } : {}),
+    });
+    return;
+  }
+
   const r = await resolvePreferVerified(t);
   const cand = r.candidate;
 
@@ -244,6 +293,10 @@ app.get("/v1/traders/:handle/wallets", auth, async (req, res) => {
     twitter: nonEmpty(t.twitter),
     solanaAddress: publishable(r.solana, t.src_sol),
     evmAddress: publishable(r.evm, t.src_evm),
+    source: t.src ?? null,
+    tier: "verified",
+    confidence: { evm: r.evm.confidence ?? null, solana: r.solana.confidence ?? null },
+    elapsed_ms: r.elapsed_ms,
   });
 });
 
