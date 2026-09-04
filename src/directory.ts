@@ -95,7 +95,7 @@ function reloadIfChanged(): void {
  */
 export async function refreshFromDb(): Promise<void> {
   const pool = db();
-  const [people, positions] = await Promise.all([
+  const [people, positions, build] = await Promise.all([
     pool.query(`
       select t.handle, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified, t.source,
              s.rank, s.pnl_usd, s.volume_usd, s.trade_count, s.followers,
@@ -112,6 +112,7 @@ export async function refreshFromDb(): Promise<void> {
       from holdings_current h
       join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     `),
+    pool.query(`select window_label from builds order by captured_at desc limit 1`),
   ]);
 
   const byTrader = new Map<string, Holding[]>();
@@ -155,7 +156,7 @@ export async function refreshFromDb(): Promise<void> {
   traders = rows;
   byHandle = new Map(rows.filter((t) => t.handle).map((t) => [t.handle.toLowerCase(), t]));
   generatedAt = people.rows[0]?.captured ? Number(people.rows[0].captured) : undefined;
-  windowLabel = undefined; // the build window is not carried in the schema
+  windowLabel = build.rows[0]?.window_label ?? undefined;
   dbLoadedAt = Date.now();
 }
 

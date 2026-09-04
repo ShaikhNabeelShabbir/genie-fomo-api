@@ -171,6 +171,17 @@ def main() -> None:
 
     with psycopg.connect(db_url()) as conn:
         with conn.cursor() as cur:
+            # The build row first: it records what the row tables cannot, notably the
+            # leaderboard `window` the trader_stats figures describe.
+            cur.execute("""
+                insert into builds (captured_at, window_label, source, trader_count, holding_count)
+                values (%s,%s,%s,%s,%s)
+                on conflict (captured_at) do update set
+                  window_label = excluded.window_label, source = excluded.source,
+                  trader_count = excluded.trader_count, holding_count = excluded.holding_count
+            """, (captured, doc.get("window"), (doc["traders"][0].get("src") or "fomoapi.io"),
+                  len(traders), len(holdings)))
+
             # Order matters: every FK target before its dependants.
             cur.executemany("""
                 insert into traders (handle, display_handle, name, avatar, bio, twitter, verified, source)
