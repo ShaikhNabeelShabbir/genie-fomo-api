@@ -29,7 +29,7 @@ the file's own.
 | ✅ | **C1** leaders per chain · **C2** value per chain · **C4** our coverage · **C5** verifiability | `GET /v1/chains` | file only |
 | ✅ | **T1** banked vs on paper | `GET /v1/traders/:handle/pnl` | fomoapi `/trades` |
 | ✅ | **T5–T9, T15, T16, T18, T19, T20** the scorecard | `GET /v1/traders/:handle/scorecard` | **same fetch as T1 — no extra call** |
-| ⚠️ | **T2** money in/out · **T3** return % · **T17** entry/exit | same route | fomoapi carries these on ~11–19% of trades |
+| ✅ | **T2** money in/out · **T3** return % · **T17** entry/exit | same route | fomoapi carries these on **46.5% / 43.5%** of trades — see the correction below |
 | ✅ | **T10** typical bet size | same route (`typicalBetUsd.method`) | falls back to `volume ÷ trades` |
 | ✅ | **K5–K8** crowd entry, per-token win rate, ever-sold, flow | `GET /v1/tokens/:address/activity` | 1 fomoapi call per sampled holder, capped at 25 |
 | ✅ | **K2** momentum | `GET /v1/tokens/momentum` + `/v1/snapshots` | two snapshots — see §4 |
@@ -87,8 +87,8 @@ would imply otherwise.
 | # | Parameter | Layman phrasing | Computed from | Tier |
 | --- | --- | --- | --- | --- |
 | ✅ T1 | **Banked vs on paper** | "Cashed out **$6,171** · **$2.1M still on paper**" | `realized / (realized + unrealized)` | Reported |
-| ⚠️ T2 | Money in / money out | "Put in **$86,400** · took out **$102,100**" | `amount × avgEntry` / `amount × avgExit` | Reported |
-| ⚠️ T3 | Return % | "Turned **$1,000 into $1,420**" | `realized ÷ cost basis` | Reported |
+| ✅ T2 | Money in / money out | "Put in **$86,400** · took out **$102,100**" | `amount × avgEntry` / `amount × avgExit` | Reported |
+| ✅ T3 | Return % | "Turned **$1,000 into $1,420**" | `realized ÷ cost basis` | Reported |
 | 🔒 T4 | Time-framed profit | "This week: **+12.6%**" | needs a per-window feed we do not have | 🔒 |
 | ✅ T5 | Per-token P&L | "**+$2,100 on PONS**, −$340 on BONK" | `realizedPnlUsd` by `token.symbol` | Reported |
 | ✅ T6 | **Win rate** | "Made money on **3 of every 4** coins" | `count(pnl>0) ÷ closed` | Reported |
@@ -97,10 +97,21 @@ would imply otherwise.
 | ✅ T9 | **Fluke or pattern** | "One lucky hit" vs "consistent" | `mean ÷ median` trade | Reported |
 | ✅ T10 | Typical bet size | "Usually risks **$918 a trade**" | median entry size, else `volume ÷ trades` | Reported |
 
-**T2, T3 and T17 are marked ⚠️ on measurement, not on principle.** On `unipcs`: 21 of 184
-trades carry an entry price, 35 carry an exit price, and **2 of 25 closed trades carry
-both**. A return % computed from two trades is not a return %, so the route returns `null`
-with the denominator attached rather than a confident-looking number.
+**Correction — T2, T3 and T17 were downgraded on a sample of one, and that sample was the
+outlier.** The 11%/8% figures below came from `unipcs` alone. Measured across all 6,398
+trades now in the database:
+
+| | `unipcs` | the other 99 traders |
+| --- | --- | --- |
+| trades | 191 | 6,207 |
+| entry price present | **11.0%** | **47.6%** |
+| closed trades with both prices | **8.0%** | **63.5%** |
+
+Per-trader, 51 have usable entry coverage (≥50%), 35 partial, 12 thin, and 2 none. So T3 is
+genuinely computable for most of the board, and the routes were already doing the right
+thing: every price-derived figure ships with its own coverage denominator and returns `null`
+when it is too thin, so `unipcs` correctly gets nulls while the other 99 get numbers. It was
+the documentation that was wrong, not the code.
 
 Two sign rules are load-bearing, because breaking either produces a plausible lie:
 
@@ -130,7 +141,7 @@ carries that as a boolean rather than a footnote.
 | # | Parameter | Layman phrasing | Computed from | Tier |
 | --- | --- | --- | --- | --- |
 | ✅ T16 | **Holding time** | "Usually holds about **1.1 days**" | median `closedAt − createdAt` | Reported |
-| ⚠️ T17 | Entry / exit | "Bought at **$0.013**, sold at **$0.036**" | `avgEntryPrice`/`avgExitPrice` | Reported · *verifiable via Bitquery* |
+| ✅ T17 | Entry / exit | "Bought at **$0.013**, sold at **$0.036**" | `avgEntryPrice`/`avgExitPrice` | Reported · *verifiable via Bitquery* |
 | ✅ T18 | Still active | "Last trade **4 hours ago**" | most recent timestamp | Reported |
 | ✅ T19 | **Track record length** | "Trading for **105 days**" | span of `createdAt` | Reported |
 | ✅ T20 | Trading pace | "About **1.75 trades a day**" | `trades ÷ days` | Reported |

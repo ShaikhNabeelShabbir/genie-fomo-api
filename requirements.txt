@@ -1,2 +1,3 @@
 # build_directory.py — its only external dependency
 requests>=2.32
+psycopg[binary]>=3.1
