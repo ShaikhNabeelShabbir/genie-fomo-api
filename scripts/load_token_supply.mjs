@@ -22,7 +22,16 @@ const LIMIT = arg("limit", null);
 const FANOUT = Number(arg("fanout", 5));
 const HELIUS = (process.env.HELIUS_SOLANA_KEY ?? process.env.HELIUS_KEY ?? "").trim();
 
-const url = (process.env.SUPABASE_DB_URL ?? process.env.DATABASE_URL ?? "").trim();
+/**
+ * Prefer the TRANSACTION pooler (6543) over the session pooler (5432).
+ *
+ * Session mode holds one Postgres connection per client for the life of the connection and
+ * caps at 15. This script opening 4 alongside horizontally-scaled Edge Functions exhausted
+ * that pool mid-run — the workflow died with EMAXCONNSESSION and the live API 500'd with it.
+ * Transaction mode multiplexes, and every query here is a single statement per checkout,
+ * which is exactly the shape it suits.
+ */
+const url = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 if (!url) { console.error("SUPABASE_DB_URL is not set"); process.exit(1); }
 const pool = new Pool({ connectionString: url, max: 4, ssl: { rejectUnauthorized: false } });
 

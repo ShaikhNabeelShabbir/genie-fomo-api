@@ -23,7 +23,14 @@ const url = Deno.env.get("DB_URL") ?? Deno.env.get("SUPABASE_DB_URL") ??
 if (!url) throw new Error("SUPABASE_DB_URL is not set");
 
 export const sql = postgres(url, {
-  max: 3,
+  /**
+   * Deliberately small. Edge Functions scale HORIZONTALLY — every warm instance holds its
+   * own pool, so `max` multiplies by instance count. Pointed at the session pooler (5432)
+   * with max: 3, five instances exhausted the 15-client limit and every route began
+   * returning 500 `EMAXCONNSESSION`. DB_URL is now the transaction pooler (6543), which
+   * multiplexes, and this stays low so the same mistake cannot repeat as cheaply.
+   */
+  max: 2,
   idle_timeout: 20,
   connect_timeout: 15,
   prepare: false,

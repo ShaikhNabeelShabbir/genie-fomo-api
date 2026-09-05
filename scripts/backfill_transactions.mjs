@@ -31,7 +31,16 @@ const FANOUT = Number(arg("fanout", 4));
 const NETWORK_OF = { solana: SOLANA_NETWORK_ID };
 for (const [id, cfg] of Object.entries(EVM_CHAINS)) NETWORK_OF[cfg.name] = Number(id);
 
-const url = (process.env.SUPABASE_DB_URL ?? process.env.DATABASE_URL ?? "").trim();
+/**
+ * Prefer the TRANSACTION pooler (6543) over the session pooler (5432).
+ *
+ * Session mode holds one Postgres connection per client for the life of the connection and
+ * caps at 15. This script opening 4 alongside horizontally-scaled Edge Functions exhausted
+ * that pool mid-run — the workflow died with EMAXCONNSESSION and the live API 500'd with it.
+ * Transaction mode multiplexes, and every query here is a single statement per checkout,
+ * which is exactly the shape it suits.
+ */
+const url = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 if (!url) { console.error("SUPABASE_DB_URL is not set"); process.exit(1); }
 const pool = new Pool({ connectionString: url, max: 4, ssl: { rejectUnauthorized: false } });
 
@@ -93,7 +102,12 @@ async function main() {
         t.contract ? String(t.contract).toLowerCase() : null,
         t.token ?? null,
         num(t.amount),
-        t.source ?? c_source(t.chain),
+        // `source` means WHO TOLD US — the provider. It previously stored `t.source`,
+        // which for Solana is Helius's PROTOCOL attribution (JUPITER, PUMP_AMM), so the
+        // column ended up conflating provenance with protocol and neither was queryable.
+        c_source(t.chain),
+        t.type ?? null,      // SWAP / TRANSFER / ... — a swap is a trade, a transfer often is not
+        t.source ?? null,    // the protocol, where the provider attributes one
       ]);
     }
     // Postgres refuses an ON CONFLICT statement that touches the same row twice, so two
@@ -117,17 +131,20 @@ async function main() {
         // identical to the migration's definition — computing it in two places is how the
         // two quietly drift apart.
         const values = rows.map((_, i) => {
-          const b = i * 10;
-          return `($${b+1},$${b+2},$${b+3},md5(coalesce($${b+7},'')||'|'||coalesce($${b+5},'')||'|'||coalesce($${b+6},'')||'|'||coalesce($${b+9}::text,'')),$${b+4}::timestamptz,$${b+5},$${b+6},$${b+7},$${b+8},$${b+9}::numeric,$${b+10})`;
+          const b = i * 12;
+          return `($${b+1},$${b+2},$${b+3},md5(coalesce($${b+7},'')||'|'||coalesce($${b+5},'')||'|'||coalesce($${b+6},'')||'|'||coalesce($${b+9}::text,'')),$${b+4}::timestamptz,$${b+5},$${b+6},$${b+7},$${b+8},$${b+9}::numeric,$${b+10},$${b+11},$${b+12})`;
         }).join(",");
         await client.query(
           `insert into transactions
              (network_id, tx_hash, address_key, transfer_key, block_time, direction,
-              counterparty, token_key, token_symbol, amount, source)
+              counterparty, token_key, token_symbol, amount, source, tx_type, tx_source)
            values ${values}
            on conflict (network_id, tx_hash, address_key, transfer_key) do update set
              block_time = excluded.block_time, token_symbol = excluded.token_symbol,
-             amount = excluded.amount, source = excluded.source, ingested_at = now()`,
+             amount = excluded.amount, source = excluded.source,
+             tx_type = coalesce(excluded.tx_type, transactions.tx_type),
+             tx_source = coalesce(excluded.tx_source, transactions.tx_source),
+             ingested_at = now()`,
           rows.flat(),
         );
         written += rows.length;

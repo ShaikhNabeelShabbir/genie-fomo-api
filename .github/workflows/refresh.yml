@@ -30,7 +30,13 @@ jobs:
     timeout-minutes: 90          # measured ~40 min; headroom for a slow fomo night
     env:
       FOMOAPI_KEY:       ${{ secrets.FOMOAPI_KEY }}
+      # 5432, session mode — used by the Python loaders, which are short-lived and
+      # single-client so a held connection is fine.
       SUPABASE_DB_URL:   ${{ secrets.SUPABASE_DB_URL }}
+      # 6543, transaction mode — used by the .mjs loaders, which open several connections
+      # at once. On session mode that exhausted the 15-client pool mid-run and took the
+      # live API down with it.
+      DATABASE_URL:      ${{ secrets.DATABASE_URL }}
       HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
       BITQUERY_KEY:      ${{ secrets.BITQUERY_KEY }}
       ETHERSCAN_KEY:     ${{ secrets.ETHERSCAN_KEY }}
@@ -89,7 +95,7 @@ jobs:
 
       # ---------------------------------------------------------------- 6. transfers
       - name: Refresh on-chain transfers
-        run: node scripts/backfill_transactions.mjs --pages 5
+        run: node scripts/backfill_transactions.mjs --pages 5 --fanout 3
 
       # ---------------------------------------------------------------- summary
       # `always()` so a failed run still reports how far it got. Each script commits its own
