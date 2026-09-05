@@ -1181,12 +1181,30 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     };
   }
 
+  /**
+   * ?kind=swap returns only rows a provider classified as a swap.
+   *
+   * The review's sharpest point was that an inbound transfer is not a purchase — it is just
+   * as likely a self-transfer between the trader's own wallets. `tx_type` now carries the
+   * provider's own classification, so "show me actual trades" is finally answerable rather
+   * than being left to the caller to guess at.
+   *
+   * Rows ingested before that column existed have tx_type NULL and are EXCLUDED from a
+   * ?kind filter — absent, not assumed. Unfiltered requests still return everything.
+   */
+  const kind = (url.searchParams.get("kind") ?? "").trim().toLowerCase() || null;
+  if (kind && !["swap", "transfer"].includes(kind)) {
+    throw badRequest(`unknown kind '${kind}' — use 'swap' or 'transfer'`);
+  }
+
   const rows = await sql`
     select tx.network_id, c.name as chain, tx.tx_hash, tx.block_time, tx.direction,
-           tx.counterparty, tx.token_key, tx.token_symbol, tx.amount, tx.source
+           tx.counterparty, tx.token_key, tx.token_symbol, tx.amount, tx.source,
+           tx.tx_type, tx.tx_source
     from transactions tx join chains c using (network_id)
     where tx.address_key = any(${keys})
       ${net === null ? sql`` : sql`and tx.network_id = ${net}`}
+      ${kind === null ? sql`` : sql`and upper(tx.tx_type) = ${kind.toUpperCase()}`}
     order by tx.block_time desc nulls last, tx.tx_hash
     limit ${limit}`;
 
@@ -1214,10 +1232,11 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
      * For buy/sell with P&L and entry/exit prices, use /traders/:handle/scorecard, which
      * reads fomo's trade records rather than raw chain movement.
      */
-    kind: "transfers",
+    feed: "transfers",
     caveats: {
-      notTrades: "rows are on-chain transfers, not buys and sells; an inbound transfer is " +
-                 "commonly a self-transfer between the trader's own wallets",
+      notTrades: "an inbound transfer is commonly a self-transfer between the trader's own " +
+                 "wallets, not a purchase. Use ?kind=swap for rows a provider classified as " +
+                 "an actual trade, and read `kind` on each row.",
       noUsdValue: "providers do not return a USD value or price per transfer, so none is published",
       limitIsTotal: "limit caps the whole result set, not per chain",
       forTrades: "/traders/" + t.display_handle + "/scorecard",
@@ -1229,6 +1248,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     },
     count: rows.length,
     limit,
+    kindFilter: kind ?? "all",
     transfers: rows.map((r) => ({
       chain: r.chain,
       networkId: Number(r.network_id),
@@ -1242,6 +1262,10 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
       amount: n(r.amount),
       counterparty: r.counterparty ?? null,
       source: r.source,
+      // The provider's classification. A SWAP is a trade; a TRANSFER very often is not.
+      // NULL on rows ingested before this was captured — absent, not "unknown".
+      kind: r.tx_type ?? null,
+      protocol: r.tx_source ?? null,
     })),
     plain: Number(stored.total) === 0
       ? "Nothing stored for this trader's wallets yet — the backfill has not covered them."

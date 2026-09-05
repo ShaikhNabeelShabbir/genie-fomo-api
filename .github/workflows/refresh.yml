@@ -110,6 +110,15 @@ jobs:
       - name: Refresh on-chain transfers
         run: node scripts/backfill_transactions.mjs --pages 5 --fanout 3
 
+      # ---------------------------------------------------------------- 7. webhook
+      # A trader entering the top 100 is invisible to the live feed until their wallet is
+      # registered with Helius — every other route would show them while transactions stayed
+      # empty. Re-syncing here keeps the watch list in step with the directory automatically.
+      - name: Sync the Helius watch list
+        env:
+          HELIUS_WEBHOOK_SECRET: ${{ secrets.HELIUS_WEBHOOK_SECRET }}
+        run: node scripts/register_webhook.mjs
+
       # ---------------------------------------------------------------- summary
       # `always()` so a failed run still reports how far it got. Each script commits its own
       # work independently, so a late failure leaves the earlier steps landed — the job goes

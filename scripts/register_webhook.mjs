@@ -38,8 +38,11 @@ const api = async (path, init = {}) => {
 
 const existing = await api("");
 if (process.argv.includes("--list")) {
+  // The listing endpoint omits accountAddresses; only the single-webhook GET returns it.
   for (const w of existing) {
-    console.log(`${w.webhookID}  ${w.accountAddresses.length} addresses  -> ${w.webhookURL}`);
+    const one = await api(`/${w.webhookID}`);
+    console.log(`${w.webhookID}  ${(one.accountAddresses ?? []).length} addresses  -> ${w.webhookURL}`);
+    console.log(`  auth header: ${one.authHeader ? "set" : "NOT SET"}  ·  active: ${one.active}`);
   }
   process.exit(0);
 }
