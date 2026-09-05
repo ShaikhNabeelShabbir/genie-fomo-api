@@ -194,7 +194,7 @@ def main() -> None:
         run_once(args)
 
 
-def run_once(args):
+def run_once(args, fatal_on_empty: bool = True):
     key = env("FOMOAPI_KEY")
     if not key:
         sys.exit("FOMOAPI_KEY is not set")
@@ -279,7 +279,16 @@ def run_once(args):
         print("\ndry run — nothing written")
         return len(rows), ok
     if not trades:
-        sys.exit("no trades fetched — refusing to write nothing over something")
+        # A single-shot run that fetched nothing is a failure worth shouting about — it
+        # usually means the key is wrong or fomo is down, and writing nothing over something
+        # would be worse. Inside --converge it is the OPPOSITE: the last pass targeting the
+        # handful of traders fomo will not serve resolving none of them IS the terminal
+        # condition, and exiting here killed the process before the loop could finish
+        # normally. The caller decides which situation it is in.
+        if fatal_on_empty:
+            sys.exit("no trades fetched — refusing to write nothing over something")
+        print("  no trades fetched this pass")
+        return len(rows), 0
     if degraded:
         print(f"  note: {degraded} traders degraded; re-run to pick them up "
               f"(the loader skips traders it already has)")
@@ -326,18 +335,31 @@ def converge(args) -> None:
 
     Stops on: nothing left to fetch, a pass that resolved zero traders, or --max-passes.
     """
+    resolved_total = 0
+    targeted_first = None
     for p in range(1, args.max_passes + 1):
         print(f"\n=== pass {p}/{args.max_passes} ===")
-        result = run_once(args)
+        result = run_once(args, fatal_on_empty=False)
         if result is None:
-            print("nothing left to fetch — converged")
+            print(f"nothing left to fetch — converged after {p - 1} pass(es), "
+                  f"{resolved_total} trader(s) refreshed")
             return
         targeted, ok = result
+        if targeted_first is None:
+            targeted_first = targeted
+        resolved_total += ok
         if ok == 0:
-            print(f"pass {p} resolved none of {targeted} — stopping rather than looping on a "
-                  f"provider that is not answering")
-            return
-    print(f"reached --max-passes ({args.max_passes}); re-run to continue")
+            # fomo will not serve these right now. Stopping is correct; whether it is a
+            # FAILURE depends on whether anything was refreshed at all this run.
+            if resolved_total:
+                print(f"pass {p} resolved none of {targeted} — stopping. "
+                      f"{resolved_total} trader(s) refreshed this run; the rest stay stale "
+                      f"and will be retried on the next scheduled run.")
+                return
+            sys.exit(f"no trader could be refreshed across {p} pass(es) of "
+                     f"{targeted_first} target(s) — fomoapi is not answering")
+    print(f"reached --max-passes ({args.max_passes}) with {resolved_total} refreshed; "
+          f"re-run to continue")
 
 
 if __name__ == "__main__":
