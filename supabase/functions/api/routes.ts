@@ -11,8 +11,28 @@ export const asOfHoldings = async (): Promise<string | null> => {
   const [r] = await sql`select max(captured_at) as at from holdings`;
   return r?.at ? new Date(String(r.at)).toISOString() : null;
 };
-export const asOfTrades = async (): Promise<string | null> => {
-  const [r] = await sql`select max(captured_at) as at from trades`;
+/**
+ * When THIS trader's trade records were measured — not the board's.
+ *
+ * The unscoped version reported `max(captured_at)` across all 114 traders, so a trader last
+ * refreshed two days ago still showed today's timestamp on their own page. That is exactly
+ * the failure the consuming team reported against /v1/traders ("we cannot tell a trader
+ * refreshed a minute ago from one refreshed a day ago"), which was fixed there with a
+ * per-trader `updatedAt` and then quietly reintroduced here.
+ *
+ * Passing no handle keeps the board-wide value, which is the right answer only for
+ * board-wide questions.
+ */
+export const asOfTrades = async (handle?: string): Promise<string | null> => {
+  const [r] = handle
+    ? await sql`select max(captured_at) as at from trades where handle = ${handle}`
+    : await sql`select max(captured_at) as at from trades`;
+  return r?.at ? new Date(String(r.at)).toISOString() : null;
+};
+
+/** Freshness of the trade records behind one token, for the K5-K8 route. */
+export const asOfToken = async (tokenKey: string): Promise<string | null> => {
+  const [r] = await sql`select max(captured_at) as at from trades where token_key = ${tokenKey}`;
   return r?.at ? new Date(String(r.at)).toISOString() : null;
 };
 
@@ -900,7 +920,7 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   return {
     handle: t.display_handle, name: t.name ?? null,
     source: "postgres · trades (loaded from fomoapi)",
-    asOf: await asOfTrades(),
+    asOf: await asOfTrades(t.handle as string),
     sample: { returned: rows.length, storedAt: rows[0]?.captured_at ?? null },
     winRate, wins, losses, breakeven,
     bestTradeUsd: round(best), worstTradeUsd: round(worst),
@@ -1016,7 +1036,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     networkId: [...nets][0],
     chain: (await sql`select name from chains where network_id = ${[...nets][0]}`)[0]?.name ?? null,
     holdersInDirectory: holderCount,
-    asOf: await asOfTrades(),
+    asOf: await asOfToken(key),
     totalValueUsd: priced.length ? round(priced.reduce((s, h) => s + (n(h.value) ?? 0), 0)) : null,
     source: "postgres · trades",
     /**
@@ -1388,6 +1408,9 @@ get("/v1/traders/:handle/pnl", async ({ handle }) => {
     onPaperUsd: any ? round(unrealized) : null,
     openPositions: open,
     realizedShare: share,
+    // Same value under both names. `asOf` is the convention every other money route uses;
+    // `capturedAt` predates it and is kept so existing consumers do not break.
+    asOf: r.captured ? new Date(String(r.captured)).toISOString() : null,
     capturedAt: r.captured ?? null,
     plain,
   };
