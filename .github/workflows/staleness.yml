@@ -1,0 +1,72 @@
+name: staleness check
+
+# The alarm for a silently dead pipeline — which is the failure that actually bites, because
+# the API keeps returning 200 with correct-looking numbers the whole time. Nothing errors;
+# the data just quietly ages.
+#
+# Replaces directory-staleness.yml, which polled the Render service and checked a JSON file's
+# generated_at. Both of those are now the wrong target.
+#
+# Needs no secret: /health is deliberately unauthenticated.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'          # 09:00 UTC — a few hours after the refresh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api
+  MAX_AGE_HOURS: '36'            # a daily refresh plus one fully missed run
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the database is fresh
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            curl -sf --max-time 60 "$BASE_URL/health" -o /tmp/health.json && break
+            echo "attempt $attempt failed, retrying…"; sleep 10
+          done
+          [ -s /tmp/health.json ] || { echo "::error::/health returned nothing after 3 attempts"; exit 1; }
+          cat /tmp/health.json
+
+          python3 - <<'PY'
+          import json, os, sys, datetime as dt
+          d = json.load(open("/tmp/health.json"))
+          rows = d.get("rows", {})
+          at = (d.get("build") or {}).get("capturedAt")
+          fail = []
+
+          if not at:
+              fail.append("no build.capturedAt — the directory has never been loaded")
+          else:
+              age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(at.replace("Z","+00:00")))
+              hours = age.total_seconds() / 3600
+              print(f"build is {hours:.1f}h old")
+              if hours > float(os.environ["MAX_AGE_HOURS"]):
+                  fail.append(f"directory is {hours:.1f}h old, over the {os.environ['MAX_AGE_HOURS']}h threshold")
+
+          # An empty table returns 200 and every route answers — with nothing in it. Checking
+          # freshness alone would not notice.
+          for table, floor in (("traders", 50), ("holdings", 500), ("trades", 1000), ("transactions", 5000)):
+              n = rows.get(table, 0)
+              if n < floor:
+                  fail.append(f"{table} has {n} rows, under the {floor} floor")
+
+          # K2 momentum cannot answer with one generation. Not fatal, but it is the thing
+          # most likely to be silently broken for weeks.
+          if rows.get("generations", 0) < 2:
+              print(f"::warning::only {rows.get('generations',0)} generation(s) — K2 momentum "
+                    f"stays unavailable until the refresh has run twice")
+
+          if fail:
+              for f in fail: print(f"::error::{f}")
+              sys.exit(1)
+          print("all checks passed")
+          PY

@@ -1,0 +1,122 @@
+name: nightly refresh
+
+# Rebuilds the directory from fomoapi and loads every table in Postgres.
+#
+# This REPLACES refresh-directory.yml, which built the JSON and git-pushed it so Render
+# would redeploy. That was right when the file was the source of truth. It is now wrong
+# twice over: Postgres serves the API, and the workflow's own diff step reads
+# `git show HEAD:data/wallet.full.data.json` — a file deleted in 2b0e56b, so it errors
+# before doing anything useful.
+#
+# Nothing here commits to git. The JSON is a transient intermediate now.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'          # 06:00 UTC daily
+  workflow_dispatch:              # so a run can be forced without waiting for the clock
+
+permissions:
+  contents: read
+
+concurrency:
+  # Two overlapping runs would write two generations minutes apart and make K2 momentum
+  # compare a snapshot against itself.
+  group: nightly-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90          # measured ~40 min; headroom for a slow fomo night
+    env:
+      FOMOAPI_KEY:       ${{ secrets.FOMOAPI_KEY }}
+      SUPABASE_DB_URL:   ${{ secrets.SUPABASE_DB_URL }}
+      HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
+      BITQUERY_KEY:      ${{ secrets.BITQUERY_KEY }}
+      ETHERSCAN_KEY:     ${{ secrets.ETHERSCAN_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Kept in step with .python-version so CI runs the same interpreter as local.
+          python-version-file: '.python-version'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: pip install --disable-pip-version-check requests 'psycopg[binary]>=3.1'
+      - run: npm ci
+
+      # The .mjs loaders import from dist/, so TypeScript has to compile before they run.
+      - run: npm run build
+
+      # ---------------------------------------------------------------- 1. directory
+      # Exits non-zero on an empty build, a rejected key, or a directory that would shrink
+      # by more than 20% — so a bad fomo night fails here rather than overwriting good data.
+      - name: Build directory from fomoapi
+        run: python3 build_directory_fomoapi.py --top 100
+
+      # ---------------------------------------------------------------- 2. load
+      # Appends a new generation: captured_at is part of the primary key on holdings and
+      # trader_stats, so nothing is overwritten. This is also what makes K2 momentum
+      # possible — it diffs the two most recent generations.
+      - name: Load directory into Postgres
+        run: python3 load_to_db.py
+
+      # ---------------------------------------------------------------- 3. trades
+      # --converge because fomo sheds load over a time window: one pass reached 41 of 100
+      # traders and it took six to reach 100. A single pass would sit at ~40% coverage and
+      # report success, which is the failure mode most likely to go unnoticed.
+      #
+      # --stale-hours 20 is the refresh selector and is self-converging: a trader that
+      # fetches successfully has ingested_at moved to now and drops out of the next pass.
+      - name: Refresh trades
+        run: python3 load_trades.py --converge --all --stale-hours 20
+
+      # ---------------------------------------------------------------- 4. chains
+      # Tokens traded but no longer held match nothing in `tokens`, so their trades carry no
+      # network_id. Left unresolved that bucket held -$2.46M of realized P&L, which is far
+      # too large to publish a per-chain breakdown around.
+      - name: Resolve chains for newly traded tokens
+        run: node scripts/resolve_trade_chains.mjs
+
+      # ---------------------------------------------------------------- 5. supply
+      # Needed to express average entry as a market cap rather than a per-token price.
+      - name: Resolve supply for new tokens
+        run: node scripts/load_token_supply.mjs
+
+      # ---------------------------------------------------------------- 6. transfers
+      - name: Refresh on-chain transfers
+        run: node scripts/backfill_transactions.mjs --pages 5
+
+      # ---------------------------------------------------------------- summary
+      # `always()` so a failed run still reports how far it got. Each script commits its own
+      # work independently, so a late failure leaves the earlier steps landed — the job goes
+      # red without discarding what succeeded.
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os, psycopg
+          with psycopg.connect(os.environ["SUPABASE_DB_URL"]) as c, c.cursor() as cur:
+              cur.execute("""
+                select (select count(*) from traders),
+                       (select count(distinct captured_at) from holdings),
+                       (select count(*) from holdings_current),
+                       (select count(*) from trades),
+                       (select count(*) from transactions),
+                       (select max(captured_at) from builds)""")
+              t, gens, hold, tr, tx, at = cur.fetchone()
+          print(f"| | |\n| --- | --- |")
+          print(f"| traders | {t} |")
+          print(f"| generations | {gens} |")
+          print(f"| holdings (current) | {hold} |")
+          print(f"| trades | {tr} |")
+          print(f"| transactions | {tx} |")
+          print(f"| build captured_at | {at} |")
+          if gens < 2:
+              print("\n> K2 momentum needs two generations and has "
+                    f"{gens}. It stays `available: false` until the next run.")
+          PY

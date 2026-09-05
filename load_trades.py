@@ -135,7 +135,41 @@ def fetch(handle: str, key: str, limit: int) -> dict:
     return {"handle": handle, "error": "unreachable"}
 
 
-def main() -> None:
+def select_targets(cur, args) -> list[tuple]:
+    """
+    Which traders to fetch this run.
+
+    `--all --stale-hours N` is the refresh selector, and it is SELF-CONVERGING: a trader
+    that fetches successfully has their `ingested_at` moved to now and drops out of the
+    next pass, while a trader fomo degraded keeps their old timestamp and stays selected.
+    That is what makes `--converge` terminate without needing to track state.
+
+    The default (neither flag) is the backfill selector — traders with no trades at all.
+    Correct when filling an empty table, useless for a refresh where all 100 already have
+    some, which is the trap: the loop would stall on pass one and report success.
+    """
+    if args.all and args.stale_hours is not None:
+        cur.execute("""
+            select t.handle, t.display_handle from traders t
+            where coalesce((select max(x.ingested_at) from trades x where x.handle = t.handle),
+                           -- `make_interval(hours => ...)` needs an integer and psycopg
+                           -- sends a float, so multiply an interval instead. This also
+                           -- keeps fractional hours working.
+                           'epoch'::timestamptz) < now() - (%s * interval '1 hour')
+            order by t.handle
+        """, (args.stale_hours,))
+    elif args.all:
+        cur.execute("select handle, display_handle from traders order by handle")
+    else:
+        cur.execute("""
+            select t.handle, t.display_handle from traders t
+            where not exists (select 1 from trades x where x.handle = t.handle)
+            order by t.handle
+        """)
+    return cur.fetchall()
+
+
+def _build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, help="only this many traders (smoke test)")
     ap.add_argument("--all", action="store_true",
@@ -144,9 +178,23 @@ def main() -> None:
                     help="with --all, only refetch traders whose newest trade row is older than this")
     ap.add_argument("--trade-limit", type=int, default=500, help="trades per trader")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--converge", action="store_true",
+                    help="keep making passes until a pass fetches nothing new. fomo sheds "
+                         "load over a time window, so one pass never covers the board.")
+    ap.add_argument("--max-passes", type=int, default=8)
     ap.add_argument("--fanout", type=int, help="override concurrency")
-    args = ap.parse_args()
+    return ap
 
+
+def main() -> None:
+    args = _build_parser().parse_args()
+    if args.converge:
+        converge(args)
+    else:
+        run_once(args)
+
+
+def run_once(args):
     key = env("FOMOAPI_KEY")
     if not key:
         sys.exit("FOMOAPI_KEY is not set")
@@ -160,22 +208,7 @@ def main() -> None:
         # 6-of-6 success rate on a small sample. Rather than fighting that, the loader
         # only fetches traders it has nothing for, so repeated runs converge on full
         # coverage without re-spending the budget on traders already done.
-        if args.all and args.stale_hours is not None:
-            cur.execute("""
-                select t.handle, t.display_handle from traders t
-                where coalesce((select max(x.ingested_at) from trades x where x.handle = t.handle),
-                               'epoch'::timestamptz) < now() - make_interval(hours => %s)
-                order by t.handle
-            """, (args.stale_hours,))
-        elif args.all:
-            cur.execute("select handle, display_handle from traders order by handle")
-        else:
-            cur.execute("""
-                select t.handle, t.display_handle from traders t
-                where not exists (select 1 from trades x where x.handle = t.handle)
-                order by t.handle
-            """)
-        rows = cur.fetchall()
+        rows = select_targets(cur, args)
         # token_key -> network_id, so a trade can be attributed to a chain. The trades
         # endpoint carries a token address but NO networkId, so this is the only way.
         cur.execute("select token_key, network_id from tokens")
@@ -184,8 +217,8 @@ def main() -> None:
     if args.limit:
         rows = rows[: args.limit]
     if not rows:
-        print("every trader already has trades — nothing to fetch (use --all to refresh)")
-        return
+        print("nothing selected — every target is already fresh (use --all to force)")
+        return None
     scope = "all" if args.all else "missing only"
     print(f"fetching trades for {len(rows)} traders ({scope}, fanout {args.fanout or FANOUT}) …")
 
@@ -244,7 +277,7 @@ def main() -> None:
     print(f"  tokens matched to a chain: {len(symbols)} · unmatched: {len(unmatched_tokens)}")
     if args.dry_run:
         print("\ndry run — nothing written")
-        return
+        return len(rows), ok
     if not trades:
         sys.exit("no trades fetched — refusing to write nothing over something")
     if degraded:
@@ -279,6 +312,32 @@ def main() -> None:
         conn.commit()
 
     print(f"\nwrote {len(trades)} trades — {total} rows in the table")
+    return len(rows), ok
+
+
+def converge(args) -> None:
+    """
+    Make passes until one fetches nothing new.
+
+    Measured: a single pass at fanout 2 reached 41 of 100 traders and it took six passes to
+    reach 100, because fomo sheds load over a time window rather than per connection.
+    Lowering concurrency does not help — the limit is not per-connection — so the answer is
+    to re-ask for what is still missing rather than to fight it.
+
+    Stops on: nothing left to fetch, a pass that resolved zero traders, or --max-passes.
+    """
+    for p in range(1, args.max_passes + 1):
+        print(f"\n=== pass {p}/{args.max_passes} ===")
+        result = run_once(args)
+        if result is None:
+            print("nothing left to fetch — converged")
+            return
+        targeted, ok = result
+        if ok == 0:
+            print(f"pass {p} resolved none of {targeted} — stopping rather than looping on a "
+                  f"provider that is not answering")
+            return
+    print(f"reached --max-passes ({args.max_passes}); re-run to continue")
 
 
 if __name__ == "__main__":
