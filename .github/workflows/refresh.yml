@@ -52,6 +52,19 @@ jobs:
         with:
           node-version: '22'
 
+      # A connection string pasted into the GitHub secrets UI commonly picks up a trailing
+      # newline. Postgres then reports `database "postgres\n" does not exist`, which reads
+      # like a wrong database name rather than a whitespace problem and is easy to chase in
+      # the wrong direction. Strip once here so no step has to remember to.
+      - name: Normalise connection strings
+        run: |
+          for v in SUPABASE_DB_URL DATABASE_URL; do
+            clean="${!v}"
+            clean="${clean//$'\n'/}"; clean="${clean//$'\r'/}"; clean="${clean//$'\t'/}"
+            printf '%s=%s\n' "$v" "$clean" >> "$GITHUB_ENV"
+          done
+          echo "normalised SUPABASE_DB_URL and DATABASE_URL"
+
       - run: pip install --disable-pip-version-check requests 'psycopg[binary]>=3.1'
       - run: npm ci
 
@@ -106,7 +119,7 @@ jobs:
         run: |
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import os, psycopg
-          with psycopg.connect(os.environ["SUPABASE_DB_URL"]) as c, c.cursor() as cur:
+          with psycopg.connect(os.environ["SUPABASE_DB_URL"].strip()) as c, c.cursor() as cur:
               cur.execute("""
                 select (select count(*) from traders),
                        (select count(distinct captured_at) from holdings),
