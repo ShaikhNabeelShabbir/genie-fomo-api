@@ -338,6 +338,9 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
 
   return {
     handle: t.display_handle, name: t.name ?? null,
+    // Every money figure carries its measurement time; these are derived from the holdings
+    // snapshot, so they age with it.
+    asOf: await asOfHoldings(),
     reportedPnlUsd: pnl, volumeUsd: volume,
     flags, pnlToVolume, pnlToHoldings, trades, verdict,
     plain: verdict === "implausible"
