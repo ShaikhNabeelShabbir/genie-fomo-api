@@ -17,6 +17,9 @@
  */
 import { fetchTransactions } from "../dist/transactions.js";
 import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../dist/settings.js";
+
+/** SOL as `quote_assets` records it. Native lamport movements carry no mint of their own. */
+const SOL_MINT = "11111111111111111111111111111111";
 import { Pool } from "pg";
 
 const arg = (name, fallback) => {
@@ -73,7 +76,11 @@ async function main() {
   await pool_(wallets, FANOUT, async (w) => {
     let out;
     try {
-      out = await fetchTransactions(w.evm_address, w.sol_address, null, 200, { pages: PAGES });
+      // includeNative pulls the native SOL side of a swap. It defaulted to false, so this
+      // script had never fetched it — and neither had the webhook, which is why 96.5% of
+      // Solana swap events held a single leg and a spend could not be attributed to a token.
+      out = await fetchTransactions(w.evm_address, w.sol_address, null, 200,
+        { pages: PAGES, includeNative: true });
     } catch (e) {
       failed++; done++;
       console.log(`  [${done}/${wallets.length}] ${w.handle} FAILED: ${String(e.message).slice(0, 60)}`);
@@ -99,7 +106,15 @@ async function main() {
         t.time_iso ?? (t.time ? new Date(t.time * 1000).toISOString() : null),
         t.side ?? null,
         counterparty ? String(counterparty).toLowerCase() : null,
-        t.contract ? String(t.contract).toLowerCase() : null,
+        // `src/transactions.ts` labels a native lamport movement with the literal "native".
+        // It is stored under SOL's `quote_assets` address instead, because a token_key that
+        // joins to nothing cannot be priced — the row would exist and be permanently
+        // valueless. The webhook writes the same key, so the two ingestion paths agree.
+        t.contract
+          ? (String(t.contract).toLowerCase() === "native"
+            ? SOL_MINT
+            : String(t.contract).toLowerCase())
+          : null,
         t.token ?? null,
         num(t.amount),
         // `source` means WHO TOLD US — the provider. It previously stored `t.source`,

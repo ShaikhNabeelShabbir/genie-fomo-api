@@ -67,6 +67,59 @@ function intParam(
   return opts.max !== undefined ? Math.min(v, opts.max) : v;
 }
 
+/**
+ * T1.5. A decimal bound, for range filters over money columns.
+ *
+ * Separate from `intParam` because P&L and volume are `numeric` and a caller filtering on
+ * `minPnl=1000.50` should not be told it must be a whole number. Same strictness otherwise:
+ * BUG-3 established that a parameter we cannot parse is a 400, never a silent default, since
+ * an ignored filter returns MORE rows than asked for and looks like data rather than an error.
+ */
+function numParam(url: URL, name: string): number | null {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw.trim() === "") return null;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) {
+    throw badRequest(`'${name}' must be a number — got '${raw}'`, { parameter: name });
+  }
+  return v;
+}
+
+/**
+ * Resolve `?orderBy=` against a whitelist.
+ *
+ * The value never reaches SQL. It selects a pre-written fragment, so an unknown key is a 400
+ * naming the valid set rather than anything that could reach the planner.
+ *
+ * Ordering direction applies ONLY to the chosen column. Every sort keeps its existing
+ * tiebreak, unreversed, because T1.4's cursors resume through a total order — a sort that
+ * ties would make pagination skip and repeat rows again, which is the bug that item existed
+ * to fix.
+ */
+function sortParam(
+  url: URL,
+  allowed: readonly string[],
+  fallback: string,
+  /** Per-key default direction. A key absent here defaults to descending. */
+  ascByDefault: readonly string[] = [],
+): { key: string; desc: boolean } {
+  const raw = (url.searchParams.get("orderBy") ?? "").trim();
+  const key = raw === "" ? fallback : raw;
+  if (!allowed.includes(key)) {
+    throw badRequest(`unknown orderBy '${raw}'`, { parameter: "orderBy", valid: allowed });
+  }
+  const dirRaw = (url.searchParams.get("direction") ?? "").trim().toLowerCase();
+  if (dirRaw !== "" && dirRaw !== "asc" && dirRaw !== "desc") {
+    throw badRequest(`direction must be 'asc' or 'desc' — got '${dirRaw}'`,
+      { parameter: "direction" });
+  }
+  // Most metrics descend by default because "most" is the interesting end. Rank is the
+  // exception and has to be declared, not inferred: rank 1 is the BEST trader, so defaulting
+  // it to descending would put the worst of the board first.
+  if (dirRaw === "") return { key, desc: !ascByDefault.includes(key) };
+  return { key, desc: dirRaw === "desc" };
+}
+
 /** '' is not a value. The columns store empty strings where fomo gave nothing. */
 const nonEmpty = (v: string | null | undefined): string | null =>
   v && v.trim() ? v.trim() : null;
@@ -490,6 +543,62 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
  * in one pass. A bulk route that loops would have moved the N+1 server-side and made things
  * worse.
  */
+/**
+ * T1.4. Cursor pagination.
+ *
+ * `?offset=` addresses rows by POSITION, which is only correct if the list does not move
+ * between calls. Ours moves: the board refreshes nightly and the Helius webhook appends
+ * transactions continuously. A row inserted before your offset shifts everything down, so
+ * page 2 repeats a row page 1 already gave you; a row removed shifts up and page 2 skips one.
+ * Neither is visible to the caller — the sync just ends up wrong.
+ *
+ * A cursor names WHERE YOU WERE instead of HOW FAR IN. `offset` is kept working, because
+ * removing a published parameter to fix a bug nobody reported would break consumers who are
+ * fine today; new syncs should use the cursor.
+ *
+ * The payload is not secret and not signed — it is the sort key, base64url so it survives a
+ * query string and so nobody is tempted to hand-assemble one. Tampering yields a 400, never
+ * a wrong page.
+ */
+const encodeCursor = (parts: (string | number | null)[]): string =>
+  btoa(JSON.stringify(parts)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+const decodeCursor = (raw: string): (string | number | null)[] => {
+  try {
+    const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const out = JSON.parse(atob(b64 + "=".repeat((4 - b64.length % 4) % 4)));
+    if (!Array.isArray(out)) throw new Error("not an array");
+    return out;
+  } catch {
+    throw badRequest("cursor is malformed — use the nextCursor from a previous response, unmodified",
+      { parameter: "cursor" });
+  }
+};
+
+/**
+ * Resume a JS-paged list after the row a cursor names.
+ *
+ * The board routes fetch the whole ordered list and slice it, so the cursor identifies the
+ * anchor ROW rather than encoding a comparable key: resuming at "the row after this one" is
+ * exact, and it cannot disagree with the SQL ordering the way a re-implemented comparator
+ * could.
+ *
+ * If the anchor is gone — the nightly refresh dropped that trader or token — we say so
+ * instead of guessing. Silently restarting from the top would hand back rows the caller
+ * already has and look like duplicates in their data.
+ */
+const resumeAfter = <T>(rows: T[], cursor: string | null, id: (r: T) => string): number => {
+  if (!cursor) return 0;
+  const want = JSON.stringify(decodeCursor(cursor));
+  const i = rows.findIndex((r) => JSON.stringify([id(r)]) === want);
+  if (i < 0) {
+    throw badRequest(
+      "cursor no longer matches any row — the list changed since it was issued; restart without a cursor",
+      { parameter: "cursor" });
+  }
+  return i + 1;
+};
+
 const INCLUDES = ["pnl", "scorecard", "wallets", "trust"] as const;
 type Include = typeof INCLUDES[number];
 
@@ -528,6 +637,34 @@ get("/v1/traders", async (_p, url) => {
 
   // Ranked by the leaderboard's own `rank`, and search scores exact > prefix > substring so
   // it matches the Node implementation rather than relying on Postgres text ranking.
+  /**
+   * T1.5. Sorting and range filters.
+   *
+   * Every option here is a column we already hold. GMGN exposes ~19 range filters on its
+   * trending board over metrics we do not have at all (`bundler_rate`, `insider_rate`,
+   * `top70_sniper_hold_rate`); this is deliberately the subset we can answer honestly rather
+   * than a claim of parity.
+   */
+  const TRADER_SORTS = ["rank", "pnl", "volume", "trades", "followers", "updated"] as const;
+  const sort = sortParam(url, TRADER_SORTS, "rank", ["rank"]);
+  const minPnl = numParam(url, "minPnl"), maxPnl = numParam(url, "maxPnl");
+  const minVolume = numParam(url, "minVolume"), maxVolume = numParam(url, "maxVolume");
+  const minTrades = numParam(url, "minTrades");
+  const minFollowers = numParam(url, "minFollowers");
+
+  const dir = sort.desc ? sql`desc` : sql`asc`;
+  const sortCol = sort.key === "rank"
+    ? sql`s.rank`
+    : sort.key === "pnl"
+    ? sql`s.pnl_usd`
+    : sort.key === "volume"
+    ? sql`s.volume_usd`
+    : sort.key === "trades"
+    ? sql`s.trade_count`
+    : sort.key === "followers"
+    ? sql`s.followers`
+    : sql`s.captured_at`;
+
   const rows = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at,
            s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
@@ -539,13 +676,48 @@ get("/v1/traders", async (_p, url) => {
            end as score
     from traders t
     left join trader_stats_current s using (handle)
-    where ${q} = '' or lower(t.display_handle) like ${"%" + q + "%"}
-                    or lower(coalesce(t.name,'')) like ${"%" + q + "%"}
-    order by score, s.rank nulls last`;
+    where (${q} = '' or lower(t.display_handle) like ${"%" + q + "%"}
+                     or lower(coalesce(t.name,'')) like ${"%" + q + "%"})
+      ${minPnl === null ? sql`` : sql`and s.pnl_usd >= ${minPnl}`}
+      ${maxPnl === null ? sql`` : sql`and s.pnl_usd <= ${maxPnl}`}
+      ${minVolume === null ? sql`` : sql`and s.volume_usd >= ${minVolume}`}
+      ${maxVolume === null ? sql`` : sql`and s.volume_usd <= ${maxVolume}`}
+      ${minTrades === null ? sql`` : sql`and s.trade_count >= ${minTrades}`}
+      ${minFollowers === null ? sql`` : sql`and s.followers >= ${minFollowers}`}
+    -- Search relevance outranks the chosen metric: when a caller passes a query they want
+    -- matches first, and a best-match trader buried under the highest-volume one is not a
+    -- search result. With no query every row scores 0 and this term drops out.
+    --
+    -- Handle is the tiebreak, and it is not cosmetic: 37 of 137 traders have no stats row,
+    -- so rank is NULL for all of them and they tied as one undifferentiated block. The
+    -- order within that block was whatever the planner produced, which meant an offset
+    -- could already skip or repeat rows across two calls. A cursor over a non-total order
+    -- would do the same thing silently, so it stays on the end of EVERY sort, unreversed.
+    order by score, ${sortCol} ${dir} nulls last, t.handle`;
 
   const [{ window_label, captured }] = await sql`
     select window_label, extract(epoch from captured_at)::bigint as captured
     from builds order by captured_at desc limit 1`;
+
+  /**
+   * A range filter over a nullable column drops rows where the value is UNKNOWN, not just
+   * rows that fail the test — 44 of 144 traders have no stats row, so even `minPnl` at
+   * negative infinity returns 100. That is correct SQL and completely invisible to a caller,
+   * who reasonably reads a short list as "few traders qualify" rather than "a third of the
+   * board could not be tested".
+   *
+   * So when a filter is active we say how many rows it could not evaluate. Costs one cheap
+   * count, and only when it is relevant.
+   */
+  const anyFilter = [minPnl, maxPnl, minVolume, maxVolume, minTrades, minFollowers]
+    .some((v) => v !== null);
+  const unratedCount = anyFilter
+    ? Number(
+      (await sql`
+        select count(*)::int as n from traders t
+        left join trader_stats_current s using (handle) where s.handle is null`)[0].n,
+    )
+    : 0;
 
   /**
    * Applied before paging, so `offset` walks the filtered set rather than the full board.
@@ -560,7 +732,20 @@ get("/v1/traders", async (_p, url) => {
     r.captured_at === null || r.captured_at === undefined ||
     Date.parse(String(r.captured_at)) > sinceMs!);
 
-  const page = limit === null ? visible.slice(offset) : visible.slice(offset, offset + limit);
+  /**
+   * A cursor wins over an offset when both are sent: the caller who supplies a cursor is
+   * mid-sync, and quietly honouring a stale default offset instead would corrupt exactly the
+   * flow the cursor exists to protect.
+   */
+  const cursor = url.searchParams.get("cursor");
+  const start = cursor
+    ? resumeAfter(visible, cursor, (r) => String(r.handle))
+    : offset;
+  const page = limit === null ? visible.slice(start) : visible.slice(start, start + limit);
+  const last = page[page.length - 1];
+  const nextCursor = last && start + page.length < visible.length
+    ? encodeCursor([String(last.handle)])
+    : null;
 
   /**
    * One query per include, for the whole page, all in flight together.
@@ -660,6 +845,30 @@ get("/v1/traders", async (_p, url) => {
     // Present only when something was cut. A `total` equal to `count` says nothing and the
     // Node route omits it, so emitting it unconditionally is a difference, not a courtesy.
     ...(page.length < visible.length ? { total: visible.length } : {}),
+    /**
+     * `null` means this is the last page. Feed it back as `?cursor=` to continue; do not
+     * mix it with `?offset=`, and do not build one by hand.
+     */
+    nextCursor,
+    ...(anyFilter
+      ? {
+        filters: {
+          applied: Object.fromEntries(
+            Object.entries({ minPnl, maxPnl, minVolume, maxVolume, minTrades, minFollowers })
+              .filter(([, v]) => v !== null),
+          ),
+          excludedForMissingValue: unratedCount,
+          note: unratedCount > 0
+            ? `${unratedCount} trader(s) have no stats row, so no range filter can evaluate ` +
+              `them and they are absent from this result — that is not the same as failing ` +
+              `the filter`
+            : "every trader has a stats row, so nothing was excluded for a missing value",
+        },
+      }
+      : {}),
+    ...(url.searchParams.has("orderBy") || url.searchParams.has("direction")
+      ? { orderBy: sort.key, direction: sort.desc ? "desc" : "asc" }
+      : {}),
     entries: page.map((r, i) => ({
       rank: r.rank ?? null,
       // Ours, generated once, never reissued. `handle` comes from fomo and is theirs to
@@ -706,6 +915,10 @@ get("/v1/traders/:handle", async ({ handle }) => {
     where t.handle = ${h}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
+  const addrs = [t.evm_address, t.sol_address]
+    .filter((a): a is string => !!a).map((a) => a.toLowerCase());
+  const [act] = addrs.length ? await walletActivity(addrs) : [undefined];
+
   const [c] = await sql`
     select (select count(*) from holdings_current where handle = ${h})  as positions,
            (select count(*) from trades   where handle = ${h})          as trades,
@@ -731,6 +944,30 @@ get("/v1/traders/:handle", async ({ handle }) => {
       trades: t.trade_count ?? null, followers: t.followers ?? null,
     },
     wallets: { evm: t.evm_address ?? null, solana: t.sol_address ?? null },
+    /**
+     * T1.2. What these wallets have actually done on chain, as opposed to what fomo reports.
+     *
+     * This sits beside `reported` deliberately: `reported.numTrades` is fomo's count and
+     * `onChain.transactions` is ours, from transfers we ingested ourselves. They will not
+     * match — different definitions, different windows — and seeing both is the point.
+     */
+    onChain: act
+      ? {
+        transactions: Number(act.transactions),
+        transfers: Number(act.transfers),
+        inbound: Number(act.inbound),
+        outbound: Number(act.outbound),
+        swaps: Number(act.swaps),
+        tokensTouched: Number(act.tokens_touched),
+        activeDays: Number(act.active_days),
+        firstSeenAt: act.first_at ? new Date(String(act.first_at)).toISOString() : null,
+        lastActiveAt: act.last_at ? new Date(String(act.last_at)).toISOString() : null,
+        tier: "verified",
+        source: "postgres · transactions (helius webhook)",
+        note: "counted from transfers we ingested, not from fomo's figures — and only from " +
+              "the date on-chain ingestion began, so these are floors for older wallets",
+      }
+      : null,
     stored: {
       positions: Number(c.positions), trades: Number(c.trades), transfers: Number(c.transfers),
     },
@@ -748,13 +985,61 @@ get("/v1/traders/:handle", async ({ handle }) => {
 
 // ---------------------------------------------------------- T12 positions
 
+/**
+ * T1.1. When a wallet first received a token, last sent it, and last did anything.
+ *
+ * Straight off `transactions`, which the Helius webhook keeps current — no external call and
+ * no new table. `transactions_address_idx` covers it: a bitmap index scan over one trader's
+ * ~30k rows measures 63ms server-side.
+ *
+ * Addresses are passed already resolved. Both of a trader's wallets go in one `any()` rather
+ * than a query each, so a trader costs one round-trip regardless of how many chains they use.
+ */
+const positionTiming = (addrs: string[]) => sql`
+  select network_id, token_key,
+         min(block_time) filter (where direction = 'in')  as start_at,
+         max(block_time) filter (where direction = 'out') as end_at,
+         max(block_time)                                  as last_at
+  from transactions
+  where address_key = any(${addrs})
+  group by network_id, token_key`;
+
+/**
+ * T1.2. On-chain activity counters for a set of wallets.
+ *
+ * GMGN publishes `buys_{window}` / `sells_{window}` / `swaps_{window}` per token; this is the
+ * per-WALLET equivalent, which is what our routes are organised around. Same source and same
+ * index as T1.1, so it costs one round-trip and no new table.
+ *
+ * `activeDays` counts distinct UTC days with any movement — not the span between first and
+ * last. A wallet that traded twice a year apart has 2 active days, not 365, and the two
+ * readings support very different conclusions about whether someone is actually trading.
+ */
+const walletActivity = (addrs: string[]) => sql`
+  select count(*)::int                                             as transfers,
+         count(*) filter (where direction = 'in')::int             as inbound,
+         count(*) filter (where direction = 'out')::int            as outbound,
+         count(*) filter (where tx_type = 'SWAP')::int             as swaps,
+         count(distinct tx_hash)::int                              as transactions,
+         count(distinct date_trunc('day', block_time))::int        as active_days,
+         count(distinct token_key)::int                            as tokens_touched,
+         min(block_time)                                           as first_at,
+         max(block_time)                                           as last_at
+  from transactions
+  where address_key = any(${addrs})`;
+
 get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const [t] = await sql`
-    select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
+    select t.handle, t.display_handle, t.name, w.evm_address, w.sol_address
+    from traders t left join wallets w using (handle)
+    where t.handle = ${handle.toLowerCase()}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
+  const addrs = [t.evm_address, t.sol_address]
+    .filter((a): a is string => !!a).map((a) => a.toLowerCase());
+
   const rows = await sql`
-    select tk.address, h.network_id, c.name as chain, h.human_amount, h.price, h.value,
+    select tk.address, h.network_id, h.token_key, c.name as chain, h.human_amount, h.price, h.value,
            (q.token_key is not null) as is_quote
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
@@ -767,8 +1052,28 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     order by (case when h.value > 0 then h.value else null end) desc nulls last,
              lower(tk.address)`;
 
+  const timing = addrs.length ? await positionTiming(addrs) : [];
+
+  /**
+   * The floor under every timestamp on this page, derived in memory from `timing`.
+   *
+   * This was `select min(block_time) from transactions`. `block_time` leads no index, so that
+   * planned as a Parallel Seq Scan over 384k rows — 7.9s measured — on every request, to
+   * produce one constant. The earliest row we hold for THIS trader answers the same question
+   * for this response and costs nothing, since the rows are already here.
+   */
+  const observedFrom = timing
+    .map((r) => (r.start_at ? Date.parse(String(r.start_at)) : null))
+    .filter((x): x is number => x !== null && Number.isFinite(x));
+  const historyFrom = observedFrom.length
+    ? new Date(Math.min(...observedFrom)).toISOString() : null;
+  const timeBy = new Map<string, Record<string, unknown>>();
+  for (const r of timing) timeBy.set(`${r.network_id}:${r.token_key}`, r);
+  const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
+
   const total = rows.reduce((s, r) => s + ((n(r.value) ?? 0) > 0 ? n(r.value)! : 0), 0);
   const all = rows.map((r) => {
+    const tm = timeBy.get(`${r.network_id}:${r.token_key}`);
     const v = (n(r.value) ?? 0) > 0 ? n(r.value) : null;
     return {
       tokenAddress: r.address,
@@ -780,6 +1085,15 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       valueUsd: v === null ? null : round(v),
       share: v !== null && total > 0 ? Number((v / total).toFixed(4)) : null,
       isQuoteAsset: !!r.is_quote,
+      /**
+       * T1.1. First time we saw this token arrive, last time we saw any leave, and the last
+       * movement of either kind. `null` means no on-chain record — which for a position
+       * opened before ingestion began is the honest answer, not a claim that nothing
+       * happened. Compare against `chainHistory.observedFrom` in the envelope.
+       */
+      startHoldingAt: iso(tm?.start_at),
+      endHoldingAt: iso(tm?.end_at),
+      lastActiveAt: iso(tm?.last_at),
     };
   });
 
@@ -797,6 +1111,23 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     positions: filtered.length,
     totalValueUsd: total > 0 ? round(total) : null,
     coverage: { pricedPositions: priced, unpricedPositions: all.length - priced },
+    /**
+     * T1.1. The boundary every `startHoldingAt` on this page has to be read against.
+     *
+     * We began ingesting transactions on this date; trades on record predate it. A position
+     * whose `startHoldingAt` equals this timestamp was very likely opened EARLIER and simply
+     * first observed here — which is a different statement from "opened here", and only the
+     * caller can tell which matters to them.
+     */
+    chainHistory: {
+      observedFrom: historyFrom,
+      note: "on-chain timing is a FLOOR, not a first event. Ingestion began part-way through " +
+            "this trader's history, so a position opened earlier shows the first movement we " +
+            "saw, not the first that happened. `observedFrom` is the earliest we hold for " +
+            "this trader; positions without timing predate it or never moved on chain.",
+      positionsWithTiming: all.filter((r) => r.startHoldingAt !== null).length,
+      positionsWithoutTiming: all.filter((r) => r.startHoldingAt === null).length,
+    },
     entries: page,
   };
 });
@@ -807,6 +1138,25 @@ get("/v1/tokens", async (_p, url) => {
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
   const net = await chainWhere(chainQ);
   const minHolders = intParam(url, "minHolders", { min: 1, fallback: 1 }) ?? 1;
+
+  /**
+   * T1.5. Board sorting and value filters.
+   *
+   * `value` uses the same coalesce-to-0 the ordering already used, so an unpriced token sorts
+   * and filters as 0 here rather than dropping out. That is a filtering convenience and NOT a
+   * claim it is worth nothing — `totalValueUsd` in the response stays `null` for those rows,
+   * which is the figure a consumer actually reads.
+   */
+  const TOKEN_SORTS = ["holders", "value", "priced"] as const;
+  const tokenSort = sortParam(url, TOKEN_SORTS, "holders");
+  const tokenDir = tokenSort.desc ? sql`desc` : sql`asc`;
+  const tokenSortCol = tokenSort.key === "holders"
+    ? sql`count(distinct h.handle)`
+    : tokenSort.key === "priced"
+    ? sql`count(h.value) filter (where h.value > 0)`
+    : sql`coalesce(sum(h.value) filter (where h.value > 0), 0)`;
+  const minValue = numParam(url, "minValue"), maxValue = numParam(url, "maxValue");
+
 
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
 
@@ -829,9 +1179,12 @@ get("/v1/tokens", async (_p, url) => {
     where q.token_key is null ${net === null ? sql`` : sql`and h.network_id = ${net}`}
     group by h.network_id, c.name, tk.address
     having count(distinct h.handle) >= ${minHolders}
+      ${minValue === null ? sql`` : sql`and coalesce(sum(h.value) filter (where h.value > 0), 0) >= ${minValue}`}
+      ${maxValue === null ? sql`` : sql`and coalesce(sum(h.value) filter (where h.value > 0), 0) <= ${maxValue}`}
     -- Address is the tiebreak, and it matters: hundreds of tokens tie on holder count with
-    -- no price, so without it the board order is whatever the planner produced.
-    order by holders desc, coalesce(sum(h.value) filter (where h.value > 0), 0) desc,
+    -- no price, so without it the board order is whatever the planner produced. It stays on
+    -- the end of every sort, unreversed, because T1.4's cursors resume through a total order.
+    order by ${tokenSortCol} ${tokenDir} nulls last,
              lower(tk.address), h.network_id`;
 
   const [{ total_tokens }] = await sql`
@@ -854,7 +1207,17 @@ get("/v1/tokens", async (_p, url) => {
   }
 
   const limit = intParam(url, "limit", { min: 1, fallback: null });
-  const page = limit === null ? rows : rows.slice(0, limit);
+  const cursor = url.searchParams.get("cursor");
+  // A token is identified by chain + address: the same address exists on several chains and
+  // the board carries one row per pair, so the address alone would be an ambiguous anchor.
+  const start = cursor
+    ? resumeAfter(rows, cursor, (r) => `${r.network_id}:${String(r.address).toLowerCase()}`)
+    : 0;
+  const page = limit === null ? rows.slice(start) : rows.slice(start, start + limit);
+  const lastRow = page[page.length - 1];
+  const nextCursor = lastRow && start + page.length < rows.length
+    ? encodeCursor([`${lastRow.network_id}:${String(lastRow.address).toLowerCase()}`])
+    : null;
 
   return {
     board: "tokens",
@@ -868,8 +1231,22 @@ get("/v1/tokens", async (_p, url) => {
     totalTokens: Number(total_tokens),
     minHolders,
     excludedQuoteAssets: { tokens: Number(ex.tokens), positions: Number(ex.positions) },
+    nextCursor,
+    ...(minValue !== null || maxValue !== null
+      ? {
+        filters: Object.fromEntries(
+          Object.entries({ minValue, maxValue }).filter(([, v]) => v !== null),
+        ),
+      }
+      : {}),
+    ...(url.searchParams.has("orderBy") || url.searchParams.has("direction")
+      ? { orderBy: tokenSort.key, direction: tokenSort.desc ? "desc" : "asc" }
+      : {}),
     entries: page.map((r, i) => ({
-      rank: i + 1,
+      // Rank is the position on the WHOLE board, not within this page. It was `i + 1`, which
+      // was correct only while the board could not be paged past the first slice — page two
+      // would have restarted the ranking at 1 and quietly reported the 51st token as first.
+      rank: start + i + 1,
       tokenAddress: r.address,
       networkId: Number(r.network_id),
       chain: r.chain,
@@ -933,6 +1310,44 @@ get("/v1/tokens/:address", async ({ address }, url) => {
         holders,
         holderShare: Number((holders / Number(traderCount)).toFixed(4)),
         totalValueUsd: priced.length ? round(total) : null,
+        /**
+         * T1.3. Concentration among the leaders WE TRACK — deliberately not named
+         * `top_10_holder_rate`.
+         *
+         * GMGN's field of that name is supply across every holder on chain. This one is the
+         * share of value among the handful of tracked traders holding this token. For our
+         * top-ranked token those two read 0.1974 and 0.4234 — same shape, same plausible
+         * magnitude, completely different denominators. Giving ours GMGN's name would make
+         * the two silently interchangeable, and the day both appear in one response the
+         * mistake becomes permanent.
+         *
+         * Value is summed PER HANDLE first: a trader holding the same token in two wallets
+         * is one leader, and counting their rows separately would understate concentration.
+         */
+        leaderConcentration: (() => {
+          if (!priced.length || total <= 0) return null;
+          const perHandle = new Map<string, number>();
+          for (const g of priced) {
+            const h = String(g.display_handle);
+            perHandle.set(h, (perHandle.get(h) ?? 0) + (n(g.value) ?? 0));
+          }
+          const vals = [...perHandle.values()].sort((a, b) => b - a);
+          const share = (k: number) =>
+            Number((vals.slice(0, k).reduce((a, b) => a + b, 0) / total).toFixed(4));
+          return {
+            top1: share(1),
+            // null, not a smaller-k answer: "the top 3 of 2 holders" is the whole set, and
+            // reporting 1.0 there would read as extreme concentration rather than too few
+            // holders to say.
+            top3: vals.length >= 3 ? share(3) : null,
+            top10: vals.length >= 10 ? share(10) : null,
+            leaders: vals.length,
+            basis: "share of USD value among the tracked leaders holding this token, summed " +
+                   "per leader. NOT chain-wide supply concentration — see GMGN's " +
+                   "top_10_holder_rate for that, which has a different denominator.",
+            coverage: cov(priced.length, group.length),
+          };
+        })(),
         holderHandles: group.map((g) => g.display_handle),
         holders_detail: group.map((g) => ({
           handle: g.display_handle,
@@ -1715,23 +2130,93 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     throw badRequest(`unknown kind '${kind}' — use 'swap' or 'transfer'`);
   }
 
+  /**
+   * True keyset pagination, not an offset.
+   *
+   * This feed is append-only and the webhook writes to it continuously, so rows arrive at the
+   * FRONT of a `block_time desc` ordering. Under `?offset=` every insertion between two calls
+   * pushes the whole list down and page two repeats rows page one already returned. A keyset
+   * asks for "everything ordered after this exact row", which newly-arrived rows cannot
+   * disturb — they sort ahead of the cursor and are simply not in the caller's backward walk.
+   *
+   * `block_time` is NULL on 0 of 386,544 rows, so the ordering needs no NULL branch; the
+   * remaining four columns are the primary key and all ascend, which lets the tail be one
+   * row-value comparison rather than a nested OR chain.
+   */
+  const after = url.searchParams.get("cursor")
+    ? decodeCursor(url.searchParams.get("cursor")!) : null;
+  if (after && after.length !== 5) {
+    throw badRequest("cursor does not belong to this route", { parameter: "cursor" });
+  }
+
   const rows = await sql`
     select tx.network_id, c.name as chain, tx.tx_hash, tx.block_time, tx.direction,
            tx.counterparty, tx.token_key, tx.token_symbol, tx.amount, tx.source,
-           tx.tx_type, tx.tx_source
+           tx.tx_type, tx.tx_source, tx.address_key, tx.transfer_key, tx.value_usd
     from transactions tx join chains c using (network_id)
     where tx.address_key = any(${keys})
       ${net === null ? sql`` : sql`and tx.network_id = ${net}`}
       ${kind === null ? sql`` : sql`and upper(tx.tx_type) = ${kind.toUpperCase()}`}
-    order by tx.block_time desc nulls last, tx.tx_hash
+      ${
+    after === null ? sql`` : sql`and (
+        tx.block_time < ${String(after[0])}::timestamptz
+        or (tx.block_time = ${String(after[0])}::timestamptz
+            and (tx.tx_hash, tx.network_id, tx.address_key, tx.transfer_key)
+              > (${String(after[1])}, ${Number(after[2])}::bigint, ${String(after[3])}, ${String(after[4])}))
+      )`
+  }
+    -- The full primary key is the tiebreak. 23,916 (block_time, tx_hash) pairs carry more
+    -- than one row and one carries 49, because a single transaction moves several tokens
+    -- and each transfer is its own row. Ordering on the pair alone left up to 49 rows in
+    -- arbitrary order, which keyset pagination cannot resume through.
+    order by tx.block_time desc nulls last, tx.tx_hash, tx.network_id, tx.address_key, tx.transfer_key
     limit ${limit}`;
 
   // What the store actually holds for this trader, so "no rows" can be told apart from
   // "we never fetched this chain". A count of zero with a populated store is a real
   // finding; a count of zero with an empty store is a gap in ingestion.
-  const [stored] = await sql`
+  const storedQ = sql`
     select count(*)::int as total, max(block_time) as newest, min(block_time) as oldest
     from transactions where address_key = any(${keys})`;
+
+  /**
+   * T2.1. The cost-basis figures GMGN publishes as `history_bought_cost` /
+   * `history_sold_income`, derived from the quote leg of each swap.
+   *
+   * We overwhelmingly stored the quote side rather than the memecoin side, which is what
+   * makes this answerable: we know a wallet spent 1.5 SOL even though we never recorded what
+   * came back. So this is how much money MOVED, not what price they paid per token — the
+   * second question needs both legs and we hold those for a small minority of swaps.
+   *
+   * Coverage travels with it because a third of a wallet's swap legs can be unpriceable, and
+   * a spend total drawn from two thirds of the record must not read as the whole of it.
+   */
+  const moneyQ = sql`
+    select coalesce(sum(value_usd) filter (where direction = 'out'), 0) as spent,
+           coalesce(sum(value_usd) filter (where direction = 'in'),  0) as received,
+           count(*) filter (where tx_type = 'SWAP')::int             as swap_legs,
+           count(value_usd) filter (where tx_type = 'SWAP')::int     as swap_legs_priced
+    from transactions
+    where address_key = any(${keys})
+      ${net === null ? sql`` : sql`and network_id = ${net}`}`;
+
+  /**
+   * The money block is a WHOLE-WALLET total, identical on every page — so it is computed when
+   * you start reading a wallet and not again while you page through it.
+   *
+   * It is the expensive part of this route: 386ms as an index-only scan over 30,907 rows for
+   * a large wallet, which took the route from 2.5s to 3.6s against a 2.7s control. Recomputing
+   * it on all 12 pages of a walk would spend that twelve times over to return the same number
+   * twelve times. Present by default, absent once you are following a cursor, and `?money=true`
+   * forces it either way.
+   */
+  const wantMoney = url.searchParams.get("money") === "true" ||
+    (after === null && url.searchParams.get("money") !== "false");
+  const [[stored], moneyRows] = await Promise.all([
+    storedQ,
+    wantMoney ? moneyQ : Promise.resolve([]),
+  ]);
+  const money = moneyRows[0];
 
   return {
     handle: t.display_handle,
@@ -1767,6 +2252,41 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     count: rows.length,
     limit,
     kindFilter: kind ?? "all",
+    /**
+     * Whole-wallet totals, NOT a total of the page — a page of 50 transfers says nothing
+     * about a wallet with 30,000, and a figure that changes when you paginate is a trap.
+     */
+    ...(money
+      ? {
+        money: {
+          spentUsd: round(n(money.spent)),
+          receivedUsd: round(n(money.received)),
+          netUsd: round((n(money.received) ?? 0) - (n(money.spent) ?? 0)),
+          basis: "quote-asset legs only — the stablecoin or SOL side of each swap, valued " +
+                 "at its daily close. This is how much money moved, not the price paid per token.",
+          coverage: cov(Number(money.swap_legs_priced), Number(money.swap_legs)),
+          note: "unpriced legs are the memecoin side of a swap, whose value we did not " +
+                "store; they are excluded rather than counted as zero",
+        },
+      }
+      : {
+        moneyOmitted: "whole-wallet totals are the same on every page, so they are not " +
+          "recomputed while paging. Add ?money=true to include them.",
+      }),
+    /**
+     * `null` on the last page. A full page is only a HINT that more exist — if the feed holds
+     * exactly `limit` remaining rows the next call returns empty, which is correct and cheap.
+     * Claiming to know otherwise would mean a second count query on every request.
+     */
+    nextCursor: rows.length === limit && rows.length > 0
+      ? encodeCursor([
+        new Date(String(rows[rows.length - 1].block_time)).toISOString(),
+        String(rows[rows.length - 1].tx_hash),
+        Number(rows[rows.length - 1].network_id),
+        String(rows[rows.length - 1].address_key),
+        String(rows[rows.length - 1].transfer_key),
+      ])
+      : null,
     transfers: rows.map((r) => ({
       chain: r.chain,
       networkId: Number(r.network_id),
@@ -1778,6 +2298,16 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
       token: r.token_symbol ?? null,
       contract: r.token_key ?? null,
       amount: n(r.amount),
+      /**
+       * T2.1. USD size of this leg — a MAGNITUDE, like `amount`, with the direction in
+       * `side`. `amount` is positive on every row in both directions (measured: 0 of 117,524
+       * swap legs are negative), so signing this column would have made the two disagree.
+       *
+       * `null` is the honest answer for a leg whose token is not a quote asset: ~8,700 of
+       * 117,500 swap legs are the memecoin side, and we did not store what it was worth. It
+       * is never 0 — a swap we could not value is not a swap worth nothing.
+       */
+      costUsd: n(r.value_usd) === null ? null : round(n(r.value_usd)),
       counterparty: r.counterparty ?? null,
       source: r.source,
       // The provider's classification. A SWAP is a trade; a TRANSFER very often is not.

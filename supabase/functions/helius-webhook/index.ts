@@ -20,6 +20,11 @@ import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
  *                 Anything unparseable is counted, skipped, and acknowledged.
  */
 const SOLANA = 1399811149;
+/**
+ * SOL as it appears in `quote_assets` — the system program address. Native lamport movements
+ * carry no mint of their own, so they are recorded under this key to be priceable.
+ */
+const SOL_MINT = "11111111111111111111111111111111";
 const url = Deno.env.get("DB_URL") ?? Deno.env.get("SUPABASE_DB_URL") ?? "";
 const AUTH = (Deno.env.get("HELIUS_WEBHOOK_SECRET") ?? "").trim();
 
@@ -85,6 +90,38 @@ Deno.serve(async (req) => {
         if (!watched.has(mine)) continue;
         rows.push([
           SOLANA, sig, mine, at, dir, other || null, mint, amount,
+          "helius-webhook", ev?.type ?? null, ev?.source ?? null,
+        ]);
+      }
+    }
+
+    /**
+     * The native SOL side of a swap.
+     *
+     * This loop did not exist, and its absence was the reason chain-derived P&L could not be
+     * built: on Solana the money side of a swap is very often native SOL, which Helius reports
+     * in `nativeTransfers` rather than `tokenTransfers`. Storing only the latter kept the token
+     * and dropped the dollars — 95,740 of 99,187 Solana swap events (96.5%) held a single leg,
+     * so only 3.45% could have a spend attributed to a token. `src/transactions.ts:364` has
+     * always handled both; this receiver did not, and the two quietly disagreed.
+     *
+     * `token_key` is SOL's `quote_assets` address, NOT the string "native" the Express path
+     * uses. It has to join to `quote_assets` or T2.1 cannot price the leg, which would leave
+     * the row present and valueless — no better than not having it.
+     */
+    for (const t of (ev?.nativeTransfers ?? []) as any[]) {
+      const from = String(t?.fromUserAccount ?? "").toLowerCase();
+      const to = String(t?.toUserAccount ?? "").toLowerCase();
+      const lamports = num(t?.amount);
+      // Zero-value entries are bookkeeping, not movement. No other threshold is applied:
+      // picking one would silently drop small but real trades, and the Express path
+      // deliberately filters on zero alone.
+      if (lamports === null || lamports === 0) { skipped++; continue; }
+
+      for (const [mine, other, dir] of [[from, to, "out"], [to, from, "in"]] as const) {
+        if (!watched.has(mine)) continue;
+        rows.push([
+          SOLANA, sig, mine, at, dir, other || null, SOL_MINT, lamports / 1e9,
           "helius-webhook", ev?.type ?? null, ev?.source ?? null,
         ]);
       }

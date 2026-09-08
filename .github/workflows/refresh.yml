@@ -110,6 +110,18 @@ jobs:
       - name: Refresh on-chain transfers
         run: node scripts/backfill_transactions.mjs --pages 5 --fanout 3
 
+      # ---------------------------------------------------------------- 6b. prices
+      # Must follow the transfer step, not precede it: it prices whatever was just ingested,
+      # and the webhook keeps adding rows all day, so running it earlier would leave the
+      # newest transfers unvalued until tomorrow.
+      #
+      # Cheap by design. Only ONE quote asset floats (wSOL) — USDC and USDT carry
+      # quote_assets.pegged_usd instead — so this is a single Binance call plus a batched
+      # UPDATE. Batched because the single-statement version hit the 2-minute
+      # statement_timeout and rolled back everything it had written.
+      - name: Price quote-asset transfers
+        run: node scripts/load_quote_prices.mjs
+
       # ---------------------------------------------------------------- 7. webhook
       # A trader entering the top 100 is invisible to the live feed until their wallet is
       # registered with Helius — every other route would show them while transactions stayed
