@@ -35,7 +35,7 @@ about **whether the answer exists in our data at all**:
 | Tier | Meaning | External calls at request time |
 | --- | --- | --- |
 | **T1** | Computable from rows we already hold | none | — ✅ 5 of 5 done |
-| **T2** | Computable after a one-off backfill, then free forever | none | — 1 done, 1 blocked |
+| **T2** | Computable after a one-off backfill, then free forever | none | — ✅ 2 of 2 done |
 | **T3** | Inherently external — describes the whole chain or a contract, not our traders | cached proxy | — 4 of 5 done |
 | **T4** | Does not fit what this product is | n/a |
 
@@ -432,7 +432,7 @@ both legs of a swap and we hold those for 3.4% of events — the limit recorded 
 
 ---
 
-### T2.2 ⛔ Realised/unrealised P&L from chain — BLOCKED, do not build yet
+### T2.2 ✅ Realised P&L from chain — SHIPPED (was blocked; the blocker was the wrong API)
 
 **Why it matters:** every P&L figure we publish today is fomo's, which is exactly what
 `/trust` exists to test. Deriving our own from chain would turn `tier: "reported"` into
@@ -547,6 +547,62 @@ are captured and priced, and the finding is recorded so nobody re-runs this expe
 when both sides involve the watched wallet — likely how Helius reports transfers through
 intermediate token accounts. That is a research task, not a build task, and it should produce
 a measurement before any code.
+
+### ✅ T2.2 shipped — 2026-09-08 · the blocker was the API, not the data
+
+Everything above this line was correct about the *evidence* and wrong about the *cause*. Two
+diagnoses were wrong before the right one:
+
+1. **"native SOL legs are missing"** — fixed it, no improvement (0.4%). The legs were rent and
+   fees; these wallets trade through wSOL.
+2. **"these are not the traders' own transactions"** — based on `feePayer`, which proves
+   nothing: these traders route through bots and relayers that pay the fees. The real address
+   is feePayer on 0 of 25 of its own transactions.
+
+**The actual cause: we were reading the wrong API.** Helius *Enhanced Transactions* returns a
+parsed `swap` event that was **empty on 88 of 100** sampled and named a different wallet on the
+other 12. Helius **RPC `getTransaction`** returns `pre/postTokenBalances` with an `owner` on
+every entry — the wallet's NET position change, immune to how a router shuffled funds
+internally. Same key, same provider, no new dependency, no paid endpoint.
+
+**The result is not a marginal improvement:**
+
+```
+                          transfer matching (old)     RPC pre/post balances (new)
+same direction as fomo         66%                          100%   (106/106)
+within 25% of fomo             15%                            94%   (100/106)
+```
+
+That is the difference between noise and a measurement. `tier: "verified"` is now earned.
+
+**What shipped:** `wallet_swaps` (`20260908170000_wallet_swaps.sql`),
+`scripts/resolve_wallet_swaps.mjs`, and a `chainDerived` block on `/traders/:handle/pnl`.
+
+```
+102,811 swap events scanned    2,917 were the wallet's own two-sided swap (2.8%)
+120 wallets · 475 tokens · $12.2M gross flow
+146 positions fully round-tripped -> realised -$145,593 · 35 winners · best +$8,785 · worst -$25,608
+```
+
+**Coverage is 2.8% BY CONSTRUCTION, and that is the finding, not a shortfall.**
+`transactions.tx_type` is the TRANSACTION's type, not the wallet's action in it — in 57 of 60
+sampled rows tagged SWAP the wallet was not even among the transaction's accounts. Somebody
+else swapped and sent tokens to the wallet's token account. Only the two-sided remainder is a
+trade, and only those are counted. The response says so rather than implying the rest were
+losses.
+
+**Two figures, deliberately separate.** `realizedUsd` covers only positions opened AND fully
+closed on chain (token quantity nets to ~0) — the only subset where "realised profit" is
+literally true. `netCashUsd` is dollars out minus dollars in across every resolved swap and is
+negative for anyone still holding, which is why it is named for cash flow rather than profit.
+
+**A bug worth recording.** The first run resolved **0 of 400**. `quote_assets.token_key` is
+`lower(address)` throughout this schema, but a Solana mint from RPC is case-sensitive base58,
+so the quote-asset lookup matched nothing. A random sample had already shown 5%, which is the
+only reason the zero was recognised as a bug rather than a finding.
+
+**Cost:** ~35 minutes of RPC at fanout 16 (measured 49 req/s, and 2,959 transient failures that
+a resumable re-run picks up). Idempotent — it only fetches events not already resolved.
 
 ---
 

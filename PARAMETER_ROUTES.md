@@ -1,6 +1,6 @@
 # genie-fomo API — complete reference
 
-**Generated: 2026-09-08T16:10Z**
+**Generated: 2026-09-08T18:35Z**
 
 Everything the API answers, in one document: the **35 PARAMETERS.md parameters**, the **10
 GMGN-parity features** built on top of them, and the corrections from the bug report. One row
@@ -9,7 +9,7 @@ per thing you can ask — what it means in plain words, the exact call, and the 
 | | |
 | --- | --- |
 | Parameters (T·K·C series) | **35**, all live |
-| GMGN-parity features (G series) | **10 of 12** — G1–G10 |
+| GMGN-parity features (G series) | **11 of 12** — G1–G11 |
 | Reported bugs and issues | **10 of 10 fixed** — see Appendix A |
 | Routes | **15**, plus bulk `?include=` |
 
@@ -67,6 +67,7 @@ more careful than they need to:
 | **6** | [Chain](#6-chain) | C-series |
 | **7** | [Two parameters that used to be listed as impossible](#7-two-parameters-that-used-to-be-listed-as-impossible) |  |
 | **7b** | [Chain profitability, and what it does not say](#7b-chain-profitability-and-what-it-does-not-say) |  |
+| **4b** | [Chain-verified P&L](#4b-chain-verified-pl-g11) | **G11** |
 | **8** | [Read the coverage before the number](#8-read-the-coverage-before-the-number) | how to not misread any of it |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
@@ -674,6 +675,85 @@ A `basis` object names each denominator, so a verdict can be weighed rather than
 `pnl_exceeds_holdings` is withheld below 0.5 coverage and replaced by
 `holdings_coverage_too_low` — a ratio against one eighth of a portfolio cannot support a
 claim about the whole.
+
+---
+
+## 4b. Chain-verified P&L (G11)
+
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "Forget what the leaderboard claims — what did the blockchain actually pay them?" | `GET $B/traders/:handle/pnl` | `chainDerived` | **1** closed position(s), realised **$6** |
+
+**In layman's terms.** Every other profit figure on this API is fomo's — we pass it on and, in
+the trust route, test it against itself. This one is **ours**: we read both sides of each swap
+straight off Solana, so a buy and its matching sell reconcile on quantity. It is the only
+number here that does not depend on anyone's reporting.
+
+### How to test
+
+```bash
+curl -s "$B/traders/pointfarmcap/pnl" | jq '{fomo: {banked: .bankedUsd, onPaper: .onPaperUsd}, chain: .chainDerived}'
+```
+
+```json
+{
+  "realizedUsd": 6,
+  "closedPositions": 1,
+  "winners": 1,
+  "netCashUsd": -70720.05,
+  "swapsResolved": 410,
+  "tokensTraded": 51,
+  "firstSwapAt": "2026-09-06T05:08:55.000Z",
+  "lastSwapAt": "2026-09-08T10:45:59.000Z",
+  "tier": "verified",
+  "source": "postgres \u00b7 wallet_swaps (helius rpc pre/post balances)",
+  "basis": "both sides of each swap resolved from the wallet's net balance change, so a buy and its matching sell reconcile on quantity. Solana only.",
+  "coverage": {
+    "of": 410,
+    "total": 9821,
+    "share": 0.0417
+  },
+  "note": "coverage is low BY CONSTRUCTION: most rows tagged SWAP are inbound transfers inside someone else's transaction, not trades the wallet made. Only two-sided swaps are counted, and this figure is independent of the fomo numbers above."
+}
+```
+
+### What to know before you use it
+
+**⚠ Coverage is ~3%, and that is the finding — not a shortfall.** `tx_type` in our transaction
+feed is the TRANSACTION's type, not the wallet's action in it. In **57 of 60** sampled rows
+tagged `SWAP`, the wallet was not even among the transaction's accounts — somebody else swapped
+and sent tokens to the wallet's token account. Only the two-sided remainder is a trade the
+wallet made, and only those are counted. A low `coverage.share` means *"few of these rows were
+trades"*, never *"the rest lost money"*.
+
+**`realizedUsd` and `netCashUsd` are different questions.** `realizedUsd` counts only positions
+opened **and fully closed** on chain — where the token quantity nets to zero, so dollars in and
+out are a complete round trip. That is the only subset where "realised profit" is literally
+true. `netCashUsd` is dollars out minus dollars in across every resolved swap, and is negative
+for anyone still holding — which is correct, and why it is named for cash flow rather than
+profit.
+
+**`realizedUsd` is `null`, not `0`, when nothing has round-tripped.** "No closed position" is
+not "made nothing".
+
+**It agrees with fomo, which is the point.** Across the 106 positions where both sources have a
+figure:
+
+```
+same direction as fomo    106 / 106   (100%)
+within 25% of fomo        100 / 106    (94%)
+```
+
+An earlier attempt that matched raw transfers instead of net balances scored 66% and 15% —
+close enough to look plausible, far enough to be worthless. The agreement is what makes
+`tier: "verified"` defensible.
+
+**Solana only.** The resolution reads Solana pre/post balances; EVM chains carry no
+`chainDerived` block.
+
+**Versus GMGN.** They have no equivalent, and structurally cannot: they publish one P&L and
+have no independent second source to check it against. This exists precisely because we do.
 
 ---
 

@@ -1,6 +1,6 @@
 # GMGN-parity features → Route
 
-**Generated: 2026-09-08T15:20Z** · 10 of 12 planned features live
+**Generated: 2026-09-08T18:30Z** · 11 of 12 planned features live
 
 Companion to [PARAMETER_ROUTES.md](PARAMETER_ROUTES.md), same shape: one row per feature —
 what it means in plain words, the exact call that returns it, the field to read. This file
@@ -40,6 +40,7 @@ Postgres (G6's prices are fetched nightly and stored, never at request time) —
 | **G8** | Chain-wide concentration | `top_10_holder_rate`, `dev_team_hold_rate`, `holder_count` | `/tokens/:address` | ✅ live |
 | **G9** | Wallet tags | `wallet_tags_stat` — `smart_wallets`, `renowned_wallets`, … | `/tokens`, `/tokens/:address` | ✅ live |
 | **G10** | Creator / dev signals | `creator_token_status`, `cto_flag`, `creator_ath_info` | `/tokens/:address` | ✅ live |
+| **G11** | Chain-verified P&L | *none — GMGN has no second source to check against* | `/traders/:handle/pnl` | ✅ live |
 
 ---
 
@@ -669,9 +670,87 @@ project over. Different from a dev who never left, and worth reading next to `st
 
 ---
 
+## G11 · Chain-verified P&L
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "Forget what the leaderboard claims — what did the blockchain actually pay them?" | `GET $B/traders/:handle/pnl` | `chainDerived` | **1** closed position(s), realised **$6** |
+
+**In layman's terms.** Every other profit figure on this API is fomo's — we pass it on and, in
+the trust route, test it against itself. This one is **ours**: we read both sides of each swap
+straight off Solana, so a buy and its matching sell reconcile on quantity. It is the only
+number here that does not depend on anyone's reporting.
+
+### How to test
+
+```bash
+curl -s "$B/traders/pointfarmcap/pnl" | jq '{fomo: {banked: .bankedUsd, onPaper: .onPaperUsd}, chain: .chainDerived}'
+```
+
+```json
+{
+  "realizedUsd": 6,
+  "closedPositions": 1,
+  "winners": 1,
+  "netCashUsd": -70720.05,
+  "swapsResolved": 410,
+  "tokensTraded": 51,
+  "firstSwapAt": "2026-09-06T05:08:55.000Z",
+  "lastSwapAt": "2026-09-08T10:45:59.000Z",
+  "tier": "verified",
+  "source": "postgres \u00b7 wallet_swaps (helius rpc pre/post balances)",
+  "basis": "both sides of each swap resolved from the wallet's net balance change, so a buy and its matching sell reconcile on quantity. Solana only.",
+  "coverage": {
+    "of": 410,
+    "total": 9821,
+    "share": 0.0417
+  },
+  "note": "coverage is low BY CONSTRUCTION: most rows tagged SWAP are inbound transfers inside someone else's transaction, not trades the wallet made. Only two-sided swaps are counted, and this figure is independent of the fomo numbers above."
+}
+```
+
+### What to know before you use it
+
+**⚠ Coverage is ~3%, and that is the finding — not a shortfall.** `tx_type` in our transaction
+feed is the TRANSACTION's type, not the wallet's action in it. In **57 of 60** sampled rows
+tagged `SWAP`, the wallet was not even among the transaction's accounts — somebody else swapped
+and sent tokens to the wallet's token account. Only the two-sided remainder is a trade the
+wallet made, and only those are counted. A low `coverage.share` means *"few of these rows were
+trades"*, never *"the rest lost money"*.
+
+**`realizedUsd` and `netCashUsd` are different questions.** `realizedUsd` counts only positions
+opened **and fully closed** on chain — where the token quantity nets to zero, so dollars in and
+out are a complete round trip. That is the only subset where "realised profit" is literally
+true. `netCashUsd` is dollars out minus dollars in across every resolved swap, and is negative
+for anyone still holding — which is correct, and why it is named for cash flow rather than
+profit.
+
+**`realizedUsd` is `null`, not `0`, when nothing has round-tripped.** "No closed position" is
+not "made nothing".
+
+**It agrees with fomo, which is the point.** Across the 106 positions where both sources have a
+figure:
+
+```
+same direction as fomo    106 / 106   (100%)
+within 25% of fomo        100 / 106    (94%)
+```
+
+An earlier attempt that matched raw transfers instead of net balances scored 66% and 15% —
+close enough to look plausible, far enough to be worthless. The agreement is what makes
+`tier: "verified"` defensible.
+
+**Solana only.** The resolution reads Solana pre/post balances; EVM chains carry no
+`chainDerived` block.
+
+**Versus GMGN.** They have no equivalent, and structurally cannot: they publish one P&L and
+have no independent second source to check it against. This exists precisely because we do.
+
+---
+
 ## What is not here yet
 
-Two of the twelve planned parity features are unbuilt — and **every one of them requires a
+One of the twelve planned parity features is unbuilt — and **every one of them requires a
 migration or an external call**, since the pure-code tier is complete, including everything requiring an
 external call — token security (`is_honeypot`, `buy_tax`), fundamentals (`price`, `liquidity`,
 `market_cap`), true chain-wide holder counts, wallet tags and creator signals. See
