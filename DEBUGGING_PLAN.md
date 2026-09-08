@@ -26,13 +26,12 @@ on through DOC-10. Nothing has been merged, split or renumbered.
 | **ISSUE-5** | Per-chain realized profit unlabelled | medium | 30m | ✅ done |
 | **ISSUE-6** | Momentum asserts a buy it cannot see | medium | 30m | ✅ done |
 | **ISSUE-7** | No rate-limit headers; `401` documented but impossible | low | 1h | ✅ done |
-| **ISSUE-8** | ~2s per call, no bulk route | low | 1d | ⬜ |
+| **ISSUE-8** | ~2s per call, no bulk route | low | 1d | ✅ done |
 | **ISSUE-9** | `detail` duplicated in error bodies | cosmetic | 15m | ✅ done |
 | **DOC-10** | Doc numbers stale, no `generatedAt` | doc | 30m | ✅ done |
 
 **Total: about 2.5 days**, of which ISSUE-8 is a day on its own.
-**9 of 10 done** (BUG-1, BUG-2, BUG-3, ISSUE-4, ISSUE-5, ISSUE-6, ISSUE-7, ISSUE-9, DOC-10) — all verified live, all 15 routes still 200.
-Remaining: **ISSUE-8** (bulk `?include=` route, ~1d).
+**10 of 10 done.** Every item in the report is fixed and verified live; all 15 routes plus the new bulk route return 200.
 
 ---
 
@@ -501,6 +500,113 @@ Edge Function cold start plus a pooled connection, not query time — the same q
 **Fix:** `GET /traders?include=pnl,scorecard,portfolio` returning the sub-resources inline, so a
 full sync is a handful of calls. A day's work, and the only item here that is a feature rather
 than a correction.
+
+### ✅ Done — 2026-09-08
+
+**Latency was the symptom; the call COUNT was the cause.** I measured where the 2s goes
+before building anything. An `OPTIONS` request returns before any database call, so it
+isolates the fixed cost:
+
+```
+DNS + TCP + TLS                              0.02s
+OPTIONS  (isolate boot + modules, no DB)     0.18-0.50s
+GET      (the same, plus database)           2.0s
+```
+
+Region is `ap-south-1`, so network is negligible — **~0.4s is overhead and ~1.6s is database
+round-trips**, and latency tracked the round-trip count almost exactly (2 trips 1.86s, 5 trips
+2.98s, 7 trips 3.13s: ~350ms each). No amount of shaving that divides 960 calls into something
+comfortable, which is why the bulk route was the right option and not A/B/C.
+
+**The design rests on one measured fact:** these aggregates group set-wide almost for free.
+
+```
+one trader   152 ms
+ALL 137      614 ms      <- 4x the work, not 137x
+```
+
+Had that not held, a bulk route would only have moved the N+1 server-side and made things
+worse.
+
+**Built as a refactor, not a second implementation.** Each sub-resource was split into a
+set-based query plus a pure body function that the single-trader route and the bulk route both
+call:
+
+| | query | body |
+| --- | --- | --- |
+| pnl | `pnlAgg(handles)` | `pnlBody()` |
+| scorecard | `scorecardRows(handles)` | `scorecardBody()` |
+| wallets | `walletRows(handles)` | `walletsBody()` |
+| trust | `trustHoldings(handles)` | `trustBody()` |
+
+A bulk route that re-derived its own summaries would drift from the single-trader route the
+first time either was edited. Sharing the code path makes them identical by construction.
+
+**Two per-trader queries were deleted outright.** `scorecardBody` had a windows query and an
+`asOfTrades()` call inside it, both computable from rows already fetched. That takes the
+single-trader scorecard from **4 database trips to 2** (trader row, then trades).
+
+**Per-call latency is essentially unchanged, and that is the honest result.** Re-running the
+report's own repro still gives ~2.4s:
+
+```
+for i in $(seq 8); do curl ... "$B/traders/unipcs/pnl" & done; wait
+  200 2.36s  200 2.36s  200 2.39s  200 2.41s  200 2.42s  200 2.43s  200 2.45s  200 3.13s
+```
+
+Option D targets the call COUNT, not the per-call cost. The report offered both remedies —
+*"a bulk endpoint (e.g. GET /traders?include=pnl,scorecard) OR a lower per-call latency"* —
+and the bulk endpoint is the one that was built, using the report's own example. Anyone
+wanting the ~2s itself reduced needs the separate work: overlapping the rate-limit query and
+parallelising each route's independent queries, neither of which is in this change.
+
+Routes left untouched drifted the same 5-10% over the session (`/portfolio` 2.77s to 3.0s,
+`/chains` 2.34s to 2.6s), so nothing here made any single route slower — the differences are
+ambient, and were checked against those unchanged routes as controls.
+
+**Verified:**
+
+```
+PARITY - refactored single routes vs pre-refactor baselines
+  unipcs, ether_monk, sadcrissy, frankdegods, Rowdy      5/5 BYTE-IDENTICAL
+
+PARITY - bulk sub-resources vs the individual routes
+  10 traders x pnl/wallets/scorecard                    30/30 identical
+  8 traders x trust                                      8/8 identical
+
+THROUGHPUT - all 137 traders, pnl+scorecard+wallets+trust, ONE call
+  5.2s, 969KB                     was 548 calls, ~18 min sequentially
+
+  16/16 routes 200 (15 existing + bulk); ?include=bogus and
+  ?updatedSince=notadate both 400
+```
+
+**Three design decisions worth recording:**
+
+1. **`byToken` is omitted from the bulk scorecard** (`tokens: 0`). It is 98% of the payload —
+   185KB against 3KB without it — so 137 full scorecards would be a **24MB** response.
+   `tokensTotal` still reports the real count, so nothing is hidden.
+2. **Sub-resources are nested under `entries[].included`, not spread onto the entry.**
+   `entries[].pnl` is fomo's REPORTED figure and `included.pnl` is computed from stored
+   trades; spreading silently replaced one with the other under the same key — the exact
+   reported-versus-verified conflation this API keeps apart everywhere else. Caught in
+   testing, before it shipped.
+3. **`?updatedSince=` for incremental sync.** Making today's sync fast is not the same as
+   keeping it fast. An hourly job now pulls only what moved.
+
+**A bug found in my own incremental sync while testing it:** 37 of 137 traders have no
+`captured_at`, and my first filter excluded them — they would have been **permanently
+invisible** to every incremental consumer, with nothing to indicate anything was missing.
+Unknown freshness cannot prove absence of change, so they are now always returned and the
+response says so in `updatedSinceNote`.
+
+**Scope, stated plainly.** Four of the seven sub-resources are bulk-able: `pnl`, `scorecard`,
+`wallets`, `trust`. `portfolio` (6 queries), `positions` (8) and `transactions` (inherently
+per-trader and paginated) are not, so a consumer wanting those still calls per trader. The
+report's own example was `include=pnl,scorecard`, and that is covered with two more besides.
+
+**Side-effect:** at 1-5 requests per sync instead of 960, the 240/min rate limit added in
+ISSUE-7 stops being a constraint for legitimate consumers, so no carve-out is needed.
 
 ---
 

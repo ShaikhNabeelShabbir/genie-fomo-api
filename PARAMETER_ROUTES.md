@@ -99,6 +99,8 @@ browser clients can read them.
 | `GET $B/traders` | "Who are the top 137?" | each entry carries a stable `id` and its own `updatedAt` |
 | `GET $B/traders/unipcs` | "Everything about one trader, and **what else I can ask**" | summary + `links` to all seven sub-routes |
 | `GET $B/traders/unipcs/transactions?limit=5` | "What have their wallets actually done on-chain?" | `?kind=swap` filters to trades; each row carries `kind` and `protocol` |
+| `GET $B/traders?include=pnl,scorecard` | "Give me the whole board **and** its sub-resources in one call" | 137 traders x 4 sub-resources in **one 5.2s call**, replacing 548 |
+| `GET $B/traders?updatedSince=<ISO>` | "Only what changed since my last sync" | returns the changed set plus anything whose freshness is unknown |
 
 **`id` is stable, `handle` is not.** Every trader carries a UUID `id` that is ours and never
 reissued; `handle` comes from fomo and is theirs to rename. Key your rows on `id`.
@@ -106,6 +108,44 @@ reissued; `handle` comes from fomo and is theirs to rename. Key your rows on `id
 **`updatedAt` is per trader.** The board envelope's `capturedAt` covers the whole list, so it
 cannot tell a trader refreshed a minute ago from one refreshed yesterday — each entry now
 carries its own.
+
+### Bulk fetch — `?include=` (for syncing, not for browsing)
+
+Mirroring the directory used to mean 137 traders x 7 sub-routes, ~960 calls, ~30 minutes
+sequentially. `?include=` inlines sub-resources from **one set-based query each**:
+
+```bash
+curl -s "$B/traders?include=pnl,scorecard,wallets,trust"      # 137 traders, 5.2s, 969KB
+curl -s "$B/traders?include=pnl&limit=25&offset=50"           # paged
+curl -s "$B/traders?include=pnl&updatedSince=2026-09-07T00:00:00Z"
+```
+
+Valid values are `pnl`, `scorecard`, `wallets`, `trust`. Anything else is a **400** naming the
+valid set — a silently ignored parameter is how a consumer ends up believing they have data
+they never received. `portfolio`, `positions` and `transactions` are not bulk-able and are
+still fetched per trader.
+
+**Sub-resources arrive under `entries[].included`, not on the entry itself.** `entries[].pnl`
+is fomo's *reported* figure; `included.pnl` is what we compute from stored trades. They are
+different numbers answering different questions and must not share a key — the same
+reported-versus-verified split that runs through this whole document.
+
+```json
+{ "handle": "unipcs",
+  "pnl": 17852542,                      // fomo's reported figure
+  "included": {
+    "pnl": { "bankedUsd": -131120.08, "onPaperUsd": 17491475.98, ... }   // ours
+  } }
+```
+
+**`included.scorecard.byToken` is empty here.** That one field is 98% of a scorecard's bytes
+(185KB against 3KB), so 137 of them would be a 24MB response. `tokensTotal` still reports the
+real count; `/traders/:handle/scorecard` serves the tokens in full.
+
+**`?updatedSince=<ISO-8601>` is for incremental sync.** It returns traders refreshed since that
+moment — **plus every trader whose refresh time is unknown** (37 of 137 have no stats row).
+Unknown freshness cannot prove nothing changed, and omitting them would hide them from every
+incremental sync with nothing to signal the gap. The response says so in `updatedSinceNote`.
 
 **Start at `$B/traders/<handle>`.** It returns a `links` object naming every sub-route for
 that trader, so the next URL never has to be guessed. It also separates `reported`

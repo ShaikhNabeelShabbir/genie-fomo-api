@@ -351,22 +351,29 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
 
 // ------------------------------------------------------------------- trust
 
-get("/v1/traders/:handle/trust", async ({ handle }) => {
-  const [t] = await sql`
-    select t.handle, t.display_handle, t.name, s.pnl_usd, s.volume_usd, s.trade_count
-    from traders t left join trader_stats_current s using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
-  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+/** Holdings aggregate per trader, grouped so the bulk route needs one statement. */
+const trustHoldings = (handles: string[]) => sql`
+  select handle,
+         count(*)::int as positions,
+         count(value) filter (where value > 0)::int as priced,
+         coalesce(sum(value) filter (where value > 0), 0) as holdings_value
+  from holdings_current where handle = any(${handles}) group by handle`;
 
-  const [h] = await sql`
-    select count(*)::int as positions,
-           count(value) filter (where value > 0)::int as priced,
-           coalesce(sum(value) filter (where value > 0), 0) as holdings_value
-    from holdings_current where handle = ${t.handle}`;
-
+/**
+ * Shared by the single and bulk routes. As with `pnlBody`, `group by` yields no row for a
+ * trader with no holdings where the ungrouped query yielded one row of zeros, so a missing
+ * row is treated as zeros.
+ */
+/**
+ * `asOf` is passed in rather than fetched here. `asOfHoldings()` is a global max with no
+ * handle in it, so it returns the same value for every trader — calling it inside the body
+ * would have meant 137 identical queries for one answer.
+ */
+// deno-lint-ignore no-explicit-any
+function trustBody(t: any, h: any | undefined, asOf: string | null) {
   const pnl = n(t.pnl_usd), volume = n(t.volume_usd), trades = n(t.trade_count);
-  const holdingsValue = n(h.holdings_value) ?? 0;
-  const positions = Number(h.positions), priced = Number(h.priced);
+  const holdingsValue = (h ? n(h.holdings_value) : 0) ?? 0;
+  const positions = Number(h?.positions ?? 0), priced = Number(h?.priced ?? 0);
 
   const flags: { code: string; severity: string; plain: string }[] = [];
   const pnlToVolume = pnl !== null && volume !== null && volume > 0
@@ -433,7 +440,7 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
     handle: t.display_handle, name: t.name ?? null,
     // Every money figure carries its measurement time; these are derived from the holdings
     // snapshot, so they age with it.
-    asOf: await asOfHoldings(),
+    asOf,
     reportedPnlUsd: pnl, volumeUsd: volume,
     flags, pnlToVolume, pnlToHoldings, trades, verdict,
     // What each denominator was, so a consumer can weigh the verdict rather than take it.
@@ -454,14 +461,70 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
       ? "There is not enough trading history here to judge skill."
       : "Nothing in the numbers contradicts itself.",
   };
+}
+
+get("/v1/traders/:handle/trust", async ({ handle }) => {
+  const [t] = await sql`
+    select t.handle, t.display_handle, t.name, s.pnl_usd, s.volume_usd, s.trade_count
+    from traders t left join trader_stats_current s using (handle)
+    where t.handle = ${handle.toLowerCase()}`;
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+  const [h, asOf] = await Promise.all([
+    trustHoldings([t.handle as string]).then((r) => r[0]),
+    asOfHoldings(),
+  ]);
+  return trustBody(t, h, asOf);
 });
 
 // ----------------------------------------------------------- the board
+
+/**
+ * ISSUE-8. Sub-resources that `/v1/traders?include=` can inline.
+ *
+ * The reported problem: a consumer mirroring the directory needed 137 traders x 7 sub-routes,
+ * ~960 calls, ~30 minutes sequentially. Per-call latency was the symptom; the call COUNT was
+ * the cause, and no amount of shaving 2s down divides 960 into something comfortable.
+ *
+ * Each include is served by ONE set-based query for the whole page, never a loop — measured,
+ * 137 traders aggregate in 614ms against 152ms for a single trader, because Postgres does it
+ * in one pass. A bulk route that loops would have moved the N+1 server-side and made things
+ * worse.
+ */
+const INCLUDES = ["pnl", "scorecard", "wallets", "trust"] as const;
+type Include = typeof INCLUDES[number];
 
 get("/v1/traders", async (_p, url) => {
   const q = (url.searchParams.get("q") ?? "").trim().replace(/^@/, "").toLowerCase();
   const limit = intParam(url, "limit", { min: 1, fallback: null });
   const offset = intParam(url, "offset", { min: 0, fallback: 0 }) ?? 0;
+
+  // Unknown values are rejected rather than ignored, for the same reason BUG-3 made
+  // `?limit=abc` a 400: silently dropping a parameter the caller believed in is how you get
+  // a consumer who thinks they have data they do not.
+  const includeRaw = (url.searchParams.get("include") ?? "").trim();
+  const include: Include[] = [];
+  if (includeRaw) {
+    for (const part of includeRaw.split(",").map((x) => x.trim()).filter(Boolean)) {
+      if (!(INCLUDES as readonly string[]).includes(part)) {
+        throw badRequest(`unknown include '${part}'`, { valid: INCLUDES });
+      }
+      if (!include.includes(part as Include)) include.push(part as Include);
+    }
+  }
+
+  /**
+   * Incremental sync. Without it a consumer re-pulls the whole directory every hour forever;
+   * with it an hourly job moves only what actually changed, which is what keeps this fixed as
+   * the directory grows rather than just making today's sync fast.
+   */
+  const sinceRaw = url.searchParams.get("updatedSince");
+  let sinceMs: number | null = null;
+  if (sinceRaw) {
+    sinceMs = Date.parse(sinceRaw);
+    if (!Number.isFinite(sinceMs)) {
+      throw badRequest("updatedSince must be an ISO-8601 timestamp", { got: sinceRaw });
+    }
+  }
 
   // Ranked by the leaderboard's own `rank`, and search scores exact > prefix > substring so
   // it matches the Node implementation rather than relying on Postgres text ranking.
@@ -484,16 +547,120 @@ get("/v1/traders", async (_p, url) => {
     select window_label, extract(epoch from captured_at)::bigint as captured
     from builds order by captured_at desc limit 1`;
 
-  const page = limit === null ? rows.slice(offset) : rows.slice(offset, offset + limit);
+  /**
+   * Applied before paging, so `offset` walks the filtered set rather than the full board.
+   *
+   * A trader with NO `captured_at` is included, not excluded. 37 of 137 have no stats row, so
+   * filtering them out would make them permanently invisible to every incremental sync —
+   * a consumer would never learn they exist and would never be told anything was missing.
+   * Unknown freshness cannot prove absence of change, so the safe answer is to send them and
+   * let the consumer over-write identical data.
+   */
+  const visible = sinceMs === null ? rows : rows.filter((r) =>
+    r.captured_at === null || r.captured_at === undefined ||
+    Date.parse(String(r.captured_at)) > sinceMs!);
+
+  const page = limit === null ? visible.slice(offset) : visible.slice(offset, offset + limit);
+
+  /**
+   * One query per include, for the whole page, all in flight together.
+   *
+   * `any($handles)` is what makes this a bulk route rather than a loop wearing one's coat.
+   */
+  const handles = page.map((r) => r.handle as string);
+  const [pnlRows, scRows, wRows, trRows] = handles.length
+    ? await Promise.all([
+      include.includes("pnl") ? pnlAgg(handles) : Promise.resolve([]),
+      include.includes("scorecard") ? scorecardRows(handles) : Promise.resolve([]),
+      include.includes("wallets") ? walletRows(handles) : Promise.resolve([]),
+      include.includes("trust") ? trustHoldings(handles) : Promise.resolve([]),
+    ])
+    : [[], [], [], []];
+
+  // One global value shared by every trader's trust block, fetched once.
+  const holdingsAsOf = include.includes("trust") ? await asOfHoldings() : null;
+
+  // deno-lint-ignore no-explicit-any
+  const byHandle = <T extends { handle: unknown }>(list: T[]) => {
+    const m = new Map<string, T[]>();
+    for (const r of list) {
+      const k = String(r.handle);
+      const cur = m.get(k);
+      if (cur) cur.push(r); else m.set(k, [r]);
+    }
+    return m;
+  };
+  // deno-lint-ignore no-explicit-any
+  const pnlBy = byHandle(pnlRows as any[]);
+  // deno-lint-ignore no-explicit-any
+  const scBy = byHandle(scRows as any[]);
+  // deno-lint-ignore no-explicit-any
+  const wBy = byHandle(wRows as any[]);
+  // deno-lint-ignore no-explicit-any
+  const trBy = byHandle(trRows as any[]);
+
+  /**
+   * Sub-resources are nested under `included`, NOT spread onto the entry.
+   *
+   * `entry.pnl` already exists and is fomo's REPORTED figure; the `pnl` sub-resource is the
+   * one we compute from stored trades. Spreading would have silently replaced one with the
+   * other under the same key — the exact reported-versus-verified conflation this API keeps
+   * apart everywhere else. Nesting also means a future include can never collide with a
+   * board field.
+   */
+  // deno-lint-ignore no-explicit-any
+  const attach = async (r: any) => {
+    const h = String(r.handle);
+    const out: Record<string, unknown> = {};
+    if (include.includes("pnl")) out.pnl = pnlBody(r, pnlBy.get(h)?.[0]);
+    if (include.includes("wallets")) {
+      const w = wBy.get(h)?.[0];
+      out.wallets = w ? walletsBody(w) : null;
+    }
+    if (include.includes("trust")) out.trust = trustBody(r, trBy.get(h)?.[0], holdingsAsOf);
+    if (include.includes("scorecard")) {
+      const rows = scBy.get(h) ?? [];
+      /**
+       * `tokens: 0` on purpose. `byToken[]` is 98% of a scorecard's bytes — 185KB against
+       * 3KB without it — so 137 full scorecards would be a 24MB response. `tokensTotal`
+       * still reports the real count, so a consumer knows what is there and can fetch the
+       * single-trader route for the tokens of whoever they care about.
+       */
+      out.scorecard = rows.length ? await scorecardBody(r, rows, 0) : null;
+    }
+    return out;
+  };
+
+  const extras = include.length ? await Promise.all(page.map(attach)) : [];
+
   return {
     board: "traders",
     window: window_label ?? null,
     capturedAt: captured ? Number(captured) : null,
     count: page.length,
+    ...(include.length
+      ? {
+        include,
+        includeNote: "each sub-resource comes from one set-based query for the whole page " +
+          "and appears under `entries[].included`. It is nested rather than spread because " +
+          "`entries[].pnl` is fomo's reported figure while `included.pnl` is computed from " +
+          "stored trades, and the two must not share a key. `included.scorecard.byToken` is " +
+          "empty here (see its `tokensTotal`); /traders/:handle/scorecard serves it in full.",
+      }
+      : {}),
+    ...(sinceMs !== null
+      ? {
+        updatedSince: new Date(sinceMs).toISOString(),
+        matched: visible.length,
+        updatedSinceNote: "traders with no recorded refresh time are always returned — " +
+          "unknown freshness cannot prove nothing changed, and silently omitting them " +
+          "would hide them from every incremental sync",
+      }
+      : {}),
     // Present only when something was cut. A `total` equal to `count` says nothing and the
     // Node route omits it, so emitting it unconditionally is a difference, not a courtesy.
-    ...(page.length < rows.length ? { total: rows.length } : {}),
-    entries: page.map((r) => ({
+    ...(page.length < visible.length ? { total: visible.length } : {}),
+    entries: page.map((r, i) => ({
       rank: r.rank ?? null,
       // Ours, generated once, never reissued. `handle` comes from fomo and is theirs to
       // change; anything keying rows on it loses the trader the day they rename.
@@ -512,6 +679,7 @@ get("/v1/traders", async (_p, url) => {
       followers: r.followers ?? null,
       numTrades: r.trade_count ?? null,
       memberCount: null, marketCap: null, price: null, liquidity: null,
+      ...(include.length ? { included: extras[i] } : {}),
     })),
   };
 });
@@ -800,23 +968,31 @@ const money = (v: number) =>
 
 // ------------------------------------------------ T2, T3, T5-T10, T15-T20
 
-get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
-  const [t] = await sql`
-    select t.handle, t.display_handle, t.name, s.volume_usd, s.trade_count
-    from traders t left join trader_stats_current s using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
-  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+/**
+ * The trade rows a scorecard is computed from. One statement, so the bulk route can ask for
+ * every trader at once instead of once per trader — measured, 137 traders cost 614ms against
+ * 152ms for one, because Postgres groups them in a single pass.
+ */
+const scorecardRows = (handles: string[]) => sql`
+  select tr.handle,
+         tr.trade_id, tr.network_id, tr.token_address, tr.token_key, tr.token_symbol,
+         tr.status, tr.amount, tr.avg_entry_price, tr.avg_exit_price,
+         tr.realized_pnl_usd, tr.unrealized_pnl_usd, tr.opened_at, tr.closed_at, tr.captured_at,
+         tk.total_supply, tk.supply_source, tk.supply_read_at
+  from trades tr
+  left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
+  where tr.handle = any(${handles})`;
 
-  const rows = await sql`
-    select tr.trade_id, tr.network_id, tr.token_address, tr.token_key, tr.token_symbol,
-           tr.status, tr.amount, tr.avg_entry_price, tr.avg_exit_price,
-           tr.realized_pnl_usd, tr.unrealized_pnl_usd, tr.opened_at, tr.closed_at, tr.captured_at,
-           tk.total_supply, tk.supply_source, tk.supply_read_at
-    from trades tr
-    left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
-    where tr.handle = ${t.handle}`;
-
-  if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
+/**
+ * Everything the scorecard computes, over rows already fetched.
+ *
+ * Split out for ISSUE-8 so `/traders?include=scorecard` runs THIS function rather than a
+ * second implementation of it. A bulk route that re-derives its own summary drifts from the
+ * single-trader route the first time either is edited; sharing the code path makes the two
+ * identical by construction rather than by test.
+ */
+// deno-lint-ignore no-explicit-any
+async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
 
   const closed = rows.filter((r) => r.status === "closed");
   const realized = closed.map((r) => n(r.realized_pnl_usd)).filter((x): x is number => x !== null);
@@ -1116,32 +1292,50 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
    * T1 exists precisely to separate banked from on-paper, realized-only is the more
    * truthful reading anyway. `basis` says so in the response rather than leaving it implied.
    */
-  const [w] = await sql`
-    select coalesce(sum(realized_pnl_usd) filter (where closed_at > now() - interval '24 hours'), 0) as d1,
-           count(*) filter (where closed_at > now() - interval '24 hours')::int  as n1,
-           coalesce(sum(realized_pnl_usd) filter (where closed_at > now() - interval '7 days'), 0)   as d7,
-           count(*) filter (where closed_at > now() - interval '7 days')::int    as n7,
-           coalesce(sum(realized_pnl_usd) filter (where closed_at > now() - interval '30 days'), 0)  as d30,
-           count(*) filter (where closed_at > now() - interval '30 days')::int   as n30,
-           coalesce(sum(realized_pnl_usd), 0) as all_time,
-           count(*)::int as n_all
-    from trades where handle = ${t.handle} and status = 'closed' and closed_at is not null`;
+  /**
+   * Computed from `rows`, not from a second query.
+   *
+   * This used to be its own round-trip per trader. Every input it needs — status, closed_at,
+   * realized_pnl_usd — is already in `rows`, so the query was fetching data we were holding.
+   * Dropping it takes the single-trader route from 3 database trips to 1, and it is what
+   * lets `/traders?include=scorecard` serve 137 traders without 137 extra queries.
+   *
+   * The SQL used `now()` (database clock) and this uses the function's; both are UTC and the
+   * boundary is a moving 24h/7d/30d window, so a few milliseconds of skew cannot change a
+   * bucket that any consumer could observe.
+   */
+  const nowMs = Date.now();
+  const closedDated = rows.filter((r) =>
+    r.status === "closed" && r.closed_at !== null && r.closed_at !== undefined);
+  const windowAgg = (sinceMs: number | null) => {
+    const inWindow = sinceMs === null
+      ? closedDated
+      : closedDated.filter((r) => Date.parse(String(r.closed_at)) > sinceMs);
+    // `sum()` skips NULLs and `coalesce(..., 0)` makes an empty window zero — matched here,
+    // because a window with no closed trades earned nothing, which is a real 0 and not a
+    // missing value.
+    const total = inWindow.reduce((acc, r) => acc + (n(r.realized_pnl_usd) ?? 0), 0);
+    return { realizedUsd: round(total), closedTrades: inWindow.length };
+  };
 
   const windows = {
     basis: "realized profit only — closed trades, summed by closed_at. Unrealised movement " +
            "is not included; see /pnl for banked versus on paper.",
-    "24h": { realizedUsd: round(n(w.d1)), closedTrades: Number(w.n1) },
-    "7d":  { realizedUsd: round(n(w.d7)), closedTrades: Number(w.n7) },
-    "30d": { realizedUsd: round(n(w.d30)), closedTrades: Number(w.n30) },
-    all:   { realizedUsd: round(n(w.all_time)), closedTrades: Number(w.n_all) },
+    "24h": windowAgg(nowMs - 86_400_000),
+    "7d":  windowAgg(nowMs - 7 * 86_400_000),
+    "30d": windowAgg(nowMs - 30 * 86_400_000),
+    all:   windowAgg(null),
   };
-
-  const tokenLimit = intParam(url, "tokens", { min: 0, fallback: null });
 
   return {
     handle: t.display_handle, name: t.name ?? null,
     source: "postgres · trades (loaded from fomoapi)",
-    asOf: await asOfTrades(t.handle as string),
+    // max(captured_at) over the same rows — identical to the query this replaces, and free.
+    asOf: (() => {
+      const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
+        .filter((x): x is number => x !== null && Number.isFinite(x));
+      return times.length ? new Date(Math.max(...times)).toISOString() : null;
+    })(),
     sample: { returned: rows.length, storedAt: rows[0]?.captured_at ?? null },
     winRate, wins, losses, breakeven,
     bestTradeUsd: round(best), worstTradeUsd: round(worst),
@@ -1187,6 +1381,19 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     byToken: tokenLimit === null ? byToken : byToken.slice(0, tokenLimit),
     plain, caveats,
   };
+}
+
+get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
+  const [t] = await sql`
+    select t.handle, t.display_handle, t.name, s.volume_usd, s.trade_count
+    from traders t left join trader_stats_current s using (handle)
+    where t.handle = ${handle.toLowerCase()}`;
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+
+  const rows = await scorecardRows([t.handle as string]);
+  if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
+
+  return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }));
 });
 
 // ------------------------------------------------------------ K5-K8 (SQL)
@@ -1612,15 +1819,17 @@ get("/v1/health", async () => {
 
 // ----------------------------------------------------------------- wallets
 
-get("/v1/traders/:handle/wallets", async ({ handle }) => {
-  const [t] = await sql`
-    select t.handle, t.display_handle, t.name, t.bio, t.avatar, t.twitter,
-           w.evm_address, w.sol_address, w.evm_source, w.sol_source,
-           w.evm_confidence, w.sol_confidence
-    from traders t left join wallets w using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
-  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+/** Wallet rows for many traders at once, for the ISSUE-8 bulk route. */
+const walletRows = (handles: string[]) => sql`
+  select t.handle, t.display_handle, t.name, t.bio, t.avatar, t.twitter,
+         w.evm_address, w.sol_address, w.evm_source, w.sol_source,
+         w.evm_confidence, w.sol_confidence
+  from traders t left join wallets w using (handle)
+  where t.handle = any(${handles})`;
 
+/** Shared by the single route and the bulk route, so the two cannot diverge. */
+// deno-lint-ignore no-explicit-any
+function walletsBody(t: any) {
   // Shape-checked before publishing. fomo's own evm/sol fields are empty for all 100
   // traders; these come from fomoapi's resolution and are REPORTED, not verified — see
   // PARAMETERS.md section 5. Verification writes into the *_confidence columns.
@@ -1642,25 +1851,40 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
     confidence: { evm: t.evm_confidence ?? null, solana: t.sol_confidence ?? null },
     ...(bad ? { warning: `${bad} stored address(es) are malformed and were withheld` } : {}),
   };
+}
+
+get("/v1/traders/:handle/wallets", async ({ handle }) => {
+  const [t] = await walletRows([handle.toLowerCase()]);
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+  return walletsBody(t);
 });
 
 // ------------------------------------------------------ T1 banked vs on paper
 
-get("/v1/traders/:handle/pnl", async ({ handle }) => {
-  const [t] = await sql`
-    select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
-  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+/**
+ * The P&L aggregate, grouped so the bulk route gets every trader in one statement.
+ *
+ * Note `group by` returns NO row for a trader with no trades, where the single-trader query
+ * returned one row of zeros. `pnlBody` therefore treats a missing row and a zero row
+ * identically — see its signature.
+ */
+const pnlAgg = (handles: string[]) => sql`
+  select handle,
+         count(*) filter (where status = 'closed')::int  as closed,
+         count(*) filter (where status <> 'closed')::int as open,
+         coalesce(sum(realized_pnl_usd)   filter (where status = 'closed'), 0)  as realized,
+         coalesce(sum(unrealized_pnl_usd) filter (where status <> 'closed'), 0) as unrealized,
+         max(captured_at) as captured
+  from trades where handle = any(${handles}) group by handle`;
 
-  const [r] = await sql`
-    select count(*) filter (where status = 'closed')::int  as closed,
-           count(*) filter (where status <> 'closed')::int as open,
-           coalesce(sum(realized_pnl_usd)   filter (where status = 'closed'), 0)  as realized,
-           coalesce(sum(unrealized_pnl_usd) filter (where status <> 'closed'), 0) as unrealized,
-           max(captured_at) as captured
-    from trades where handle = ${t.handle}`;
-
-  const closed = Number(r.closed), open = Number(r.open);
-  const realized = n(r.realized) ?? 0, unrealized = n(r.unrealized) ?? 0;
+/**
+ * Split out for ISSUE-8, same reasoning as `scorecardBody`: the bulk route runs this exact
+ * function rather than a parallel implementation that would drift on the first edit.
+ */
+// deno-lint-ignore no-explicit-any
+function pnlBody(t: any, r: any | undefined) {
+  const closed = Number(r?.closed ?? 0), open = Number(r?.open ?? 0);
+  const realized = (r ? n(r.realized) : 0) ?? 0, unrealized = (r ? n(r.unrealized) : 0) ?? 0;
   const any = closed + open > 0;
 
   /**
@@ -1698,8 +1922,16 @@ get("/v1/traders/:handle/pnl", async ({ handle }) => {
     realizedShare: share,
     // Same value under both names. `asOf` is the convention every other money route uses;
     // `capturedAt` predates it and is kept so existing consumers do not break.
-    asOf: r.captured ? new Date(String(r.captured)).toISOString() : null,
-    capturedAt: r.captured ?? null,
+    asOf: r?.captured ? new Date(String(r.captured)).toISOString() : null,
+    capturedAt: r?.captured ?? null,
     plain,
   };
+}
+
+get("/v1/traders/:handle/pnl", async ({ handle }) => {
+  const [t] = await sql`
+    select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+  const [r] = await pnlAgg([t.handle as string]);
+  return pnlBody(t, r);
 });
