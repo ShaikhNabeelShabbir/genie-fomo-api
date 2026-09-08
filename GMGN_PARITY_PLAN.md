@@ -36,7 +36,7 @@ about **whether the answer exists in our data at all**:
 | --- | --- | --- |
 | **T1** | Computable from rows we already hold | none | — ✅ 5 of 5 done |
 | **T2** | Computable after a one-off backfill, then free forever | none | — 1 done, 1 blocked |
-| **T3** | Inherently external — describes the whole chain or a contract, not our traders | cached proxy |
+| **T3** | Inherently external — describes the whole chain or a contract, not our traders | cached proxy | — 4 of 5 done |
 | **T4** | Does not fit what this product is | n/a |
 
 **The T3 line is the important one.** `holder_count`, `is_honeypot`, `buy_tax` and
@@ -560,14 +560,124 @@ in our DB with `fetched_at`, serve from cache, label `tier: "third_party"` and
 | Item | GMGN endpoint | Why we cannot compute it | Effort |
 | --- | --- | --- | --- |
 | ⬜ Token security — `is_honeypot`, `buy_tax`, `sell_tax`, `owner_renounced`, `rug_ratio` | `GET /v1/token/security` | Contract-level facts. Not in any table we own. | ~4h |
-| ⬜ Token fundamentals — `price`, `liquidity`, `market_cap`, `circulating_supply` | `GET /v1/token/info` | We hold `total_supply` only; no price feed. | ~4h |
-| ⬜ True holder counts — `holder_count`, `top_10_holder_rate` | `GET /v1/token/info` | All chain holders; we see 137 traders. Pairs with T1.3 — ours and theirs side by side is genuinely better than either alone. | ~3h |
-| ⬜ Wallet tags — `smart_degen`, `renowned`, `sniper`, `bundler`, `dev` | `GET /v1/market/token_top_holders` | GMGN's own classification of wallets we do not track. | ~4h |
-| ⬜ Creator/dev signals — `creator_token_status`, `cto_flag`, `creator_ath_info` | `GET /v1/token/security` | Requires creator history across all their launches. | ~3h |
+| ✅ **Token fundamentals** — `price`, `liquidity`, `market_cap`, `circulating_supply` | `GET /v1/token/info` | We hold `total_supply` only; no price feed. | done 2026-09-08 |
+| ✅ **True holder counts** — `holder_count`, `top_10_holder_rate` | `GET /v1/token/info` | All chain holders; we see 137 traders. Pairs with T1.3 — ours and theirs side by side is genuinely better than either alone. | done 2026-09-08 |
+| ✅ **Wallet tags** — `smart_degen`, `renowned`, `sniper`, `bundler`, `dev` | `GET /v1/token/info` (`wallet_tags_stat`) | GMGN's own classification of wallets we do not track. | done 2026-09-08 |
+| ✅ **Creator/dev signals** — `creator_token_status`, `cto_flag`, `creator_ath_info` | `GET /v1/token/info` (`dev`) | Requires creator history across all their launches. | done 2026-09-08 |
 
 **Sequencing note:** do **T3 security first**. It is the one set of fields where absence is
 actively dangerous — we currently rank tokens by leader interest with no honeypot signal
 anywhere in the response.
+
+### ✅ T3d shipped — 2026-09-08
+
+**One endpoint turned out to cover four items.** `GET /v1/token/info` returns the fundamentals
+(T3d), the holder concentration (T3b), the creator signals (T3c) **and** the wallet tags (T3e)
+in a single response. This plan estimated them separately at 4h + 3h + 3h + 4h across four
+backfills; the whole response is now stored in `token_info.raw`, so T3b, T3c and T3e become a
+query against that table rather than three more 18-minute crawls.
+
+**The headline.** Board tokens that can be valued went from **37.1% to 100%**:
+
+```
+1,095 held tokens fetched · 1,095 with price, market cap, holder count and top-10 rate · 0 failed
+board tokens with a value   406 of 1,095 (37.1%)  ->  1,095 of 1,095 (100%)
+```
+
+**Kept strictly separate from what we compute.** `totalValueUsd` still reports only our stored
+value and is untouched. GMGN's numbers arrive in a `fundamentals` block carrying
+`tier: "third_party"`, `source` and `fetchedAt`, with a parallel `estimatedValueUsd` that
+states its own basis. Blending them would have spent the reported-vs-verified split that is
+the one thing this API has and GMGN does not.
+
+**Board sorting and filtering extended:** `orderBy=marketCap|liquidity|chainHolders`, plus
+`minMarketCap`, `maxMarketCap`, `minLiquidity`. Cursor paging verified under the new sorts —
+1,095 rows, 0 duplicates.
+
+**Three bugs found while building it:**
+
+1. **A crawl killed by one memecoin's name.** The run died at token 976 of 1,083 with
+   `unsupported Unicode escape sequence` — an escaped null byte, which Postgres `jsonb`
+   cannot store. Null bytes are now stripped and each token's insert is isolated, so one bad
+   name costs one token rather than the remaining 107.
+2. **A market cap of $1.8 x 10^51 sorting to rank 1.** GMGN returns `market_cap` on **0 of
+   1,095** tokens, so every one is ours — `price x circulating_supply`. One token mints 10^76
+   units, making the arithmetic correct and the result meaningless. Bounded at $10 trillion
+   (Apple is ~$4T, all of crypto ~$3T); above that it is an artifact of supply, so it is NULL
+   and the price and supply that produced it are still published.
+3. **`leaderConcentration` was needlessly price-dependent** — a flaw in T1.3, found here.
+   It was computed from `value`, so it returned `null` for 63% of the board. But every holder
+   of a token holds it at the same price, so price cancels out of
+   `sum(top N) / sum(all)` entirely. Computed from amounts it is the identical ratio and
+   answers for **every** token, with nothing borrowed in it. Sampled 12 board tokens: 12 now
+   return it.
+
+**The two concentration figures now sit side by side, and the difference is stark:**
+
+```
+ours  leaderConcentration.top10   0.592     over    44 tracked leaders
+GMGN  fundamentals.top10HolderRate 0.1974   over 2,644 chain holders
+```
+
+That is exactly why ours was never allowed to be called `top_10_holder_rate`.
+
+**Verified:** 21/21 routes 200, rate-limit headers 4/4, `/tokens` 3.21s and `/tokens/:address`
+2.16s. Nightly step added to `refresh.yml` with `continue-on-error` — a lost night of
+third-party enrichment degrades `fetchedAt`, which the response already states, and must not
+discard the directory and trade refreshes that did succeed.
+
+**⚠ Action required before the next scheduled run:** `GMGN_API_KEY` is referenced by the new
+workflow step but is **not** yet a repository secret. The step is `continue-on-error`, so the
+job will not fail — it will simply skip, and `fundamentals` will go stale without saying why
+beyond `fetchedAt`.
+
+### ✅ T3b, T3c and T3e shipped — 2026-09-08
+
+**No new backfill and no new external call.** T3d stored the whole `/v1/token/info` response
+in `token_info.raw` precisely so these three would be a read of that table. All three are at
+**100% coverage across all 1,095 tokens** — the data was already there.
+
+Two of them also arrive on the board with sorts: `orderBy=smartWallets|renownedWallets`.
+
+**T3b — chain concentration.** `chainConcentration` carries `holderCount`, `top10HolderRate`,
+`devTeamHoldRate`, `creatorHoldRate`, `freshWalletRate`, `sniperHoldRate`, `botDegenRate`. It
+sits beside `leaderConcentration` and the pair is the point:
+
+```
+ours  leaderConcentration.top10      0.592    over    44 tracked leaders
+GMGN  chainConcentration.top10HolderRate 0.9142  over 258,728 chain holders
+```
+
+**T3e — wallet tags, and the trap in them.** `walletTags` gives smart, renowned, sniper,
+bundler, whale, fresh, ratTrader, top and creator counts. **Every one is capped at 1000 and
+the cap is invisible in the raw number.** Measured over 1,095 tokens: the distribution runs
+0, 1, 2, 3 … then piles up at exactly 1000 — 450 tokens on `fresh`, 271 on `bundler`, 29 on
+`whale` — with **not one token above it on any tag**. A smooth distribution ending in a hard
+spike at a round number with nothing beyond is a truncation, not a count. So the response
+names which tags are capped and says a 1000 means *at least* 1000:
+
+```json
+"cappedTags": ["bundler", "whale", "fresh"],
+"note": "GMGN caps these counts at 1000. bundler, whale, fresh read exactly 1000,
+         which means AT LEAST 1000 and not that many exactly."
+```
+
+**T3c — creator signals.** `creator` carries the address, `status`, a decoded `stillHolding`,
+`communityTakeover` (from `cto_flag`), `tokensLaunched` and `bestPreviousToken`.
+
+**Two bugs of my own, both the same failure mode this codebase exists to avoid:**
+
+1. **Gating the whole creator block on a blank address.** `creator_address` is empty on
+   **104 of 1,095 tokens (9.5%)**, and my first version returned `creator: null` for all of
+   them — discarding a known `creator_close` and a community-takeover flag because one field
+   was missing. An unknown address is one null field, not a reason to withhold what we know.
+2. **A creator's best token published as worth $0.** GMGN returns `ath_token_info` PRESENT
+   BUT EMPTY for creators with no prior launch: blank symbol, blank address, `ath_mc` of 0.
+   Passed through, that read as "their best token peaked at nothing" rather than "there is no
+   previous token". Now `null`, and the peak cap follows the same rule.
+
+**Verified:** 23/23 routes 200, cursor exact under both new sorts (1,095 rows, 0 duplicates),
+`/tokens/:address` at 2.27s.
 
 ---
 

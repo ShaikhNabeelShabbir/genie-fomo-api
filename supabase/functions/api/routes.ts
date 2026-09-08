@@ -1147,15 +1147,33 @@ get("/v1/tokens", async (_p, url) => {
    * claim it is worth nothing — `totalValueUsd` in the response stays `null` for those rows,
    * which is the figure a consumer actually reads.
    */
-  const TOKEN_SORTS = ["holders", "value", "priced"] as const;
+  // T3d adds three: a board that carries market cap and liquidity but cannot sort on them is
+  // only half a board. `chainHolders` is GMGN's count across every holder, distinct from
+  // `holders`, which counts the leaders WE track.
+  const TOKEN_SORTS = [
+    "holders", "value", "priced", "marketCap", "liquidity", "chainHolders",
+    "smartWallets", "renownedWallets",
+  ] as const;
   const tokenSort = sortParam(url, TOKEN_SORTS, "holders");
   const tokenDir = tokenSort.desc ? sql`desc` : sql`asc`;
   const tokenSortCol = tokenSort.key === "holders"
     ? sql`count(distinct h.handle)`
     : tokenSort.key === "priced"
     ? sql`count(h.value) filter (where h.value > 0)`
+    : tokenSort.key === "marketCap"
+    ? sql`max(ti.market_cap_usd)`
+    : tokenSort.key === "liquidity"
+    ? sql`max(ti.liquidity_usd)`
+    : tokenSort.key === "chainHolders"
+    ? sql`max(ti.holder_count)`
+    : tokenSort.key === "smartWallets"
+    ? sql`max((ti.raw->'wallet_tags_stat'->>'smart_wallets')::int)`
+    : tokenSort.key === "renownedWallets"
+    ? sql`max((ti.raw->'wallet_tags_stat'->>'renowned_wallets')::int)`
     : sql`coalesce(sum(h.value) filter (where h.value > 0), 0)`;
   const minValue = numParam(url, "minValue"), maxValue = numParam(url, "maxValue");
+  const minMarketCap = numParam(url, "minMarketCap"), maxMarketCap = numParam(url, "maxMarketCap");
+  const minLiquidity = numParam(url, "minLiquidity");
 
 
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
@@ -1164,6 +1182,15 @@ get("/v1/tokens", async (_p, url) => {
   // leaving them in makes the top of the board the currency rather than a trade.
   const rows = await sql`
     select h.network_id, c.name as chain, tk.address,
+           max(ti.price_usd)      as price_usd,
+           max(ti.market_cap_usd) as market_cap_usd,
+           max(ti.liquidity_usd)  as liquidity_usd,
+           max(ti.holder_count)   as holder_count,
+           max(ti.fetched_at)     as info_fetched_at,
+           -- T3e on the board. Only the two tags worth scanning a list by; the rest are on
+           -- the token detail route with the cap disclosure attached.
+           max((ti.raw->'wallet_tags_stat'->>'smart_wallets')::int)    as smart_wallets,
+           max((ti.raw->'wallet_tags_stat'->>'renowned_wallets')::int) as renowned_wallets,
            count(distinct h.handle)::int              as holders,
            sum(h.value) filter (where h.value > 0)    as total_value,
            count(h.value) filter (where h.value > 0)::int as priced,
@@ -1176,11 +1203,15 @@ get("/v1/tokens", async (_p, url) => {
     join chains c on c.network_id = h.network_id
     join trader_stats_current st on st.handle = h.handle
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
+    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     where q.token_key is null ${net === null ? sql`` : sql`and h.network_id = ${net}`}
     group by h.network_id, c.name, tk.address
     having count(distinct h.handle) >= ${minHolders}
       ${minValue === null ? sql`` : sql`and coalesce(sum(h.value) filter (where h.value > 0), 0) >= ${minValue}`}
       ${maxValue === null ? sql`` : sql`and coalesce(sum(h.value) filter (where h.value > 0), 0) <= ${maxValue}`}
+      ${minMarketCap === null ? sql`` : sql`and max(ti.market_cap_usd) >= ${minMarketCap}`}
+      ${maxMarketCap === null ? sql`` : sql`and max(ti.market_cap_usd) <= ${maxMarketCap}`}
+      ${minLiquidity === null ? sql`` : sql`and max(ti.liquidity_usd) >= ${minLiquidity}`}
     -- Address is the tiebreak, and it matters: hundreds of tokens tie on holder count with
     -- no price, so without it the board order is whatever the planner produced. It stays on
     -- the end of every sort, unreversed, because T1.4's cursors resume through a total order.
@@ -1232,11 +1263,20 @@ get("/v1/tokens", async (_p, url) => {
     minHolders,
     excludedQuoteAssets: { tokens: Number(ex.tokens), positions: Number(ex.positions) },
     nextCursor,
-    ...(minValue !== null || maxValue !== null
+    ...([minValue, maxValue, minMarketCap, maxMarketCap, minLiquidity].some((v) => v !== null)
       ? {
         filters: Object.fromEntries(
-          Object.entries({ minValue, maxValue }).filter(([, v]) => v !== null),
+          Object.entries({ minValue, maxValue, minMarketCap, maxMarketCap, minLiquidity })
+            .filter(([, v]) => v !== null),
         ),
+        // A market-cap or liquidity filter can only judge a token we have fetched. One that
+        // has not been is absent from the result, which is not the same as failing the test.
+        ...(minMarketCap !== null || maxMarketCap !== null || minLiquidity !== null
+          ? {
+            filtersNote: "market cap and liquidity come from GMGN; a token not yet fetched " +
+              "cannot be evaluated and is excluded rather than counted as zero",
+          }
+          : {}),
       }
       : {}),
     ...(url.searchParams.has("orderBy") || url.searchParams.has("direction")
@@ -1251,6 +1291,23 @@ get("/v1/tokens", async (_p, url) => {
       networkId: Number(r.network_id),
       chain: r.chain,
       holders: Number(r.holders),
+      /**
+       * T3d. GMGN's chain-wide figures, flat on the board row because that is where a
+       * consumer scans them. `tier` says whose numbers these are; the token detail route
+       * carries the full block plus supply and concentration.
+       */
+      priceUsd: n(r.price_usd),
+      marketCapUsd: round(n(r.market_cap_usd)),
+      liquidityUsd: round(n(r.liquidity_usd)),
+      chainHolderCount: r.holder_count === null ? null : Number(r.holder_count),
+      /**
+       * GMGN's own classification of the holders. Capped at 1000 like every wallet tag — a
+       * value of exactly 1000 means "at least 1000". The detail route carries the full set
+       * and names which tags are capped.
+       */
+      smartWallets: r.smart_wallets === null ? null : Number(r.smart_wallets),
+      renownedWallets: r.renowned_wallets === null ? null : Number(r.renowned_wallets),
+      fundamentalsTier: r.info_fetched_at ? "third_party" : null,
       holderShare: Number((Number(r.holders) / Number(traderCount)).toFixed(4)),
       totalValueUsd: Number(r.priced) ? round(n(r.total_value)) : null,
       holderHandles: [...new Set(r.handles as string[])].map((h) => disp.get(h) ?? h),
@@ -1272,12 +1329,31 @@ get("/v1/tokens/:address", async ({ address }, url) => {
   const key = address.toLowerCase();
 
   const rows = await sql`
-    select h.network_id, c.name as chain, tk.address, t.display_handle, h.human_amount, h.value
+    select h.network_id, c.name as chain, tk.address, t.display_handle, h.human_amount, h.value,
+           ti.price_usd, ti.liquidity_usd, ti.market_cap_usd, ti.total_supply,
+           ti.circulating_supply, ti.holder_count, ti.top_10_holder_rate,
+           ti.symbol as gmgn_symbol, ti.source as info_source, ti.fetched_at as info_fetched_at,
+           -- T3b/T3c/T3e. Specific paths rather than the whole ti.raw document: this query
+           -- returns one row per holder, so selecting all of it would ship the same ~10KB
+           -- JSON once per holder — 70+ copies of an identical value on a widely-held token.
+           ti.raw->'stat'->>'dev_team_hold_rate'          as dev_team_hold_rate,
+           ti.raw->'stat'->>'creator_hold_rate'           as creator_hold_rate,
+           ti.raw->'stat'->>'fresh_wallet_rate'           as fresh_wallet_rate,
+           ti.raw->'stat'->>'top70_sniper_hold_rate'      as sniper_hold_rate,
+           ti.raw->'stat'->>'bot_degen_rate'              as bot_degen_rate,
+           ti.raw->'wallet_tags_stat'                     as wallet_tags,
+           ti.raw->'dev'->>'creator_address'              as creator_address,
+           ti.raw->'dev'->>'creator_token_status'         as creator_status,
+           ti.raw->'dev'->>'cto_flag'                     as cto_flag,
+           ti.raw->'dev'->>'creator_open_count'           as creator_open_count,
+           ti.raw->'dev'->'ath_token_info'                as creator_ath
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
     join traders t on t.handle = h.handle
     join trader_stats_current st on st.handle = h.handle
+    left join token_info ti
+      on ti.network_id = h.network_id and ti.token_key = h.token_key
     where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}
     order by (case when h.value > 0 then h.value else null end) desc nulls last,
              t.display_handle`;
@@ -1311,6 +1387,178 @@ get("/v1/tokens/:address", async ({ address }, url) => {
         holderShare: Number((holders / Number(traderCount)).toFixed(4)),
         totalValueUsd: priced.length ? round(total) : null,
         /**
+         * T3d. Chain-wide facts about the token, from GMGN — NOT computed by us.
+         *
+         * They describe every holder and every pool; we observe 137 traders and could not
+         * derive any of this from our own rows. It therefore arrives wearing `tier` and
+         * `source`, like every other borrowed figure in this API, so it stays
+         * distinguishable from the numbers we stand behind. That separation is the one thing
+         * we have that GMGN does not, and quietly blending the two would spend it.
+         *
+         * `null` when the token has not been fetched yet — the loader covers held tokens and
+         * a newly-held one waits for the next nightly pass.
+         */
+        fundamentals: group[0].info_fetched_at
+          ? {
+            priceUsd: n(group[0].price_usd),
+            liquidityUsd: round(n(group[0].liquidity_usd)),
+            marketCapUsd: round(n(group[0].market_cap_usd)),
+            totalSupply: n(group[0].total_supply),
+            circulatingSupply: n(group[0].circulating_supply),
+            holderCount: group[0].holder_count === null ? null : Number(group[0].holder_count),
+            /**
+             * GMGN's concentration across ALL chain holders. Deliberately named differently
+             * from `leaderConcentration` above, which is the share among the leaders we
+             * track. Same shape, same plausible range, different denominators — for our
+             * top-ranked token they read 0.1974 and 0.4234.
+             */
+            top10HolderRate: n(group[0].top_10_holder_rate),
+            tier: "third_party",
+            source: group[0].info_source ?? "gmgn",
+            fetchedAt: new Date(String(group[0].info_fetched_at)).toISOString(),
+          }
+          : null,
+        /**
+         * What the leaders' holdings would be worth at GMGN's price.
+         *
+         * Separate from `totalValueUsd`, never a replacement for it: that figure is what we
+         * stored, this one is arithmetic on someone else's price. 64.7% of holdings carry no
+         * price of our own, so without this the honest answer for two thirds of the board is
+         * `null` — but a borrowed answer must not be able to pass as our own.
+         */
+        estimatedValueUsd: n(group[0].price_usd) !== null
+          ? round(group.reduce((acc, g) => acc + (n(g.human_amount) ?? 0), 0) * n(group[0].price_usd)!)
+          : null,
+        estimatedValueBasis: n(group[0].price_usd) !== null
+          ? "sum(holdings.amount) x GMGN price — third-party, not our stored value"
+          : null,
+        /**
+         * T3b. Concentration across EVERY holder on chain, from GMGN.
+         *
+         * The counterpart to `leaderConcentration` above, and the reason that one was never
+         * allowed to be called `top_10_holder_rate`: ours is the share among the leaders we
+         * track, this is the share of supply across the whole holder base. On a typical
+         * token they read 0.592 and 0.197. Both are useful; neither substitutes for the
+         * other, and the pair is more informative than either alone.
+         */
+        chainConcentration: group[0].info_fetched_at
+          ? {
+            holderCount: group[0].holder_count === null ? null : Number(group[0].holder_count),
+            top10HolderRate: n(group[0].top_10_holder_rate),
+            devTeamHoldRate: n(group[0].dev_team_hold_rate),
+            creatorHoldRate: n(group[0].creator_hold_rate),
+            freshWalletRate: n(group[0].fresh_wallet_rate),
+            sniperHoldRate: n(group[0].sniper_hold_rate),
+            botDegenRate: n(group[0].bot_degen_rate),
+            basis: "share of supply across all chain holders — NOT the tracked-leader share " +
+                   "in leaderConcentration, which has a different denominator",
+            tier: "third_party",
+            source: group[0].info_source ?? "gmgn",
+          }
+          : null,
+        /**
+         * T3e. How GMGN classifies the token's holders.
+         *
+         * Every count is CAPPED AT 1000 and the cap is invisible in the raw figure. Measured
+         * over 1,095 tokens: the distribution runs 0, 1, 2, 3 … then piles up at exactly 1000
+         * — 450 tokens on `fresh`, 271 on `bundler`, 29 on `whale` — with not one token above
+         * it on any tag. A smooth distribution ending in a hard spike at a round number with
+         * nothing beyond is a truncation, not a count, so a tag reading 1000 means "at least
+         * 1000" and the response says which tags are in that state rather than leaving a
+         * reader to infer a precise-looking number that is not one.
+         */
+        walletTags: (() => {
+          const w = group[0].wallet_tags as Record<string, unknown> | null;
+          if (!w) return null;
+          const CAP = 1000;
+          const val = (k: string) => {
+            const x = n(w[k]);
+            return x === null ? null : Math.trunc(x);
+          };
+          const tags = {
+            smart: val("smart_wallets"),
+            renowned: val("renowned_wallets"),
+            sniper: val("sniper_wallets"),
+            bundler: val("bundler_wallets"),
+            whale: val("whale_wallets"),
+            fresh: val("fresh_wallets"),
+            ratTrader: val("rat_trader_wallets"),
+            top: val("top_wallets"),
+            creator: val("creator_wallets"),
+          };
+          const capped = Object.entries(tags)
+            .filter(([, v]) => v !== null && v >= CAP).map(([k]) => k);
+          return {
+            ...tags,
+            capped: capped.length > 0,
+            cappedTags: capped,
+            note: capped.length
+              ? `GMGN caps these counts at ${CAP}. ${capped.join(", ")} read exactly ${CAP}, ` +
+                `which means AT LEAST ${CAP} and not that many exactly.`
+              : `GMGN caps these counts at ${CAP}; none of this token's tags reached it.`,
+            tier: "third_party",
+            source: group[0].info_source ?? "gmgn",
+          };
+        })(),
+        /**
+         * T3c. Who launched it and what they did next.
+         *
+         * `creatorStatus` is blank on 185 of 1,095 tokens and is reported as `null` there —
+         * "we were not told" is a different claim from "the creator still holds", and only
+         * one of them is evidence.
+         */
+        creator: group[0].info_fetched_at &&
+            (nonEmpty(group[0].creator_address as string | null) ||
+             nonEmpty(group[0].creator_status as string | null) ||
+             nonEmpty(group[0].cto_flag as string | null))
+          ? {
+            /**
+             * Blank on 104 of 1,095 tokens (9.5%). Gating the whole block on it — as the
+             * first version did — threw away a known `creator_close` and community-takeover
+             * flag for every one of them. An unknown address is one missing field, not a
+             * reason to withhold what we do know.
+             */
+            address: nonEmpty(group[0].creator_address as string | null),
+            // creator_hold / creator_close. Empty string means unknown, never "sold".
+            status: nonEmpty(group[0].creator_status as string | null),
+            stillHolding: group[0].creator_status === "creator_hold"
+              ? true
+              : group[0].creator_status === "creator_close"
+              ? false
+              : null,
+            // 0/1 as a string. Community takeover — the original dev walked away and holders
+            // took it over, which is a very different thing from a dev who never left.
+            communityTakeover: group[0].cto_flag === null || group[0].cto_flag === ""
+              ? null
+              : String(group[0].cto_flag) === "1",
+            tokensLaunched: n(group[0].creator_open_count),
+            /**
+             * The creator's best previous launch — null when there is not one.
+             *
+             * GMGN returns the object PRESENT BUT EMPTY for creators with no prior token:
+             * blank symbol, blank address, ath_mc of 0. Passing that through published
+             * `peakMarketCapUsd: 0`, which reads as "their best token peaked at nothing"
+             * rather than "they have no previous token". Emitted only when there is a real
+             * one, and the cap follows the same rule — never 0 for unknown.
+             */
+            bestPreviousToken: (() => {
+              const a = group[0].creator_ath as Record<string, unknown> | null;
+              if (!a) return null;
+              const symbol = nonEmpty(a.symbol as string | null);
+              const address = nonEmpty(a.ath_token as string | null);
+              const peak = n(a.ath_mc);
+              if (!symbol && !address) return null;
+              return {
+                symbol,
+                address,
+                peakMarketCapUsd: peak !== null && peak > 0 ? round(peak) : null,
+              };
+            })(),
+            tier: "third_party",
+            source: group[0].info_source ?? "gmgn",
+          }
+          : null,
+        /**
          * T1.3. Concentration among the leaders WE TRACK — deliberately not named
          * `top_10_holder_rate`.
          *
@@ -1325,15 +1573,31 @@ get("/v1/tokens/:address", async ({ address }, url) => {
          * is one leader, and counting their rows separately would understate concentration.
          */
         leaderConcentration: (() => {
-          if (!priced.length || total <= 0) return null;
+          /**
+           * Computed from AMOUNTS, not values — and that is not a shortcut, it is exact.
+           *
+           * Every holder here holds the same token at the same price, so in
+           * `sum(top N amount x price) / sum(all amount x price)` the price cancels out
+           * entirely. The ratio is identical either way.
+           *
+           * It used to be computed from `value`, which needed a price and therefore returned
+           * `null` for 63% of the board — 689 of 1,095 tokens — for no arithmetic reason at
+           * all. Amounts are on every holding, so this now answers for every token, and it
+           * stays a figure about OUR leaders with nothing borrowed in it.
+           */
+          const amounts = group.map((g) => n(g.human_amount) ?? 0).filter((a) => a > 0);
+          const totalAmount = amounts.reduce((a, b) => a + b, 0);
+          if (!amounts.length || totalAmount <= 0) return null;
           const perHandle = new Map<string, number>();
-          for (const g of priced) {
+          for (const g of group) {
+            const amt = n(g.human_amount) ?? 0;
+            if (amt <= 0) continue;
             const h = String(g.display_handle);
-            perHandle.set(h, (perHandle.get(h) ?? 0) + (n(g.value) ?? 0));
+            perHandle.set(h, (perHandle.get(h) ?? 0) + amt);
           }
           const vals = [...perHandle.values()].sort((a, b) => b - a);
           const share = (k: number) =>
-            Number((vals.slice(0, k).reduce((a, b) => a + b, 0) / total).toFixed(4));
+            Number((vals.slice(0, k).reduce((a, b) => a + b, 0) / totalAmount).toFixed(4));
           return {
             top1: share(1),
             // null, not a smaller-k answer: "the top 3 of 2 holders" is the whole set, and
@@ -1342,10 +1606,11 @@ get("/v1/tokens/:address", async ({ address }, url) => {
             top3: vals.length >= 3 ? share(3) : null,
             top10: vals.length >= 10 ? share(10) : null,
             leaders: vals.length,
-            basis: "share of USD value among the tracked leaders holding this token, summed " +
-                   "per leader. NOT chain-wide supply concentration — see GMGN's " +
-                   "top_10_holder_rate for that, which has a different denominator.",
-            coverage: cov(priced.length, group.length),
+            basis: "share of the token AMOUNT held by the tracked leaders, summed per leader. " +
+                   "Price-independent: every holder holds the same token, so a price would " +
+                   "cancel out of the ratio. NOT chain-wide supply concentration — compare " +
+                   "fundamentals.top10HolderRate, which has a different denominator.",
+            coverage: cov(amounts.length, group.length),
           };
         })(),
         holderHandles: group.map((g) => g.display_handle),

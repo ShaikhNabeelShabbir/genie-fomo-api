@@ -122,6 +122,23 @@ jobs:
       - name: Price quote-asset transfers
         run: node scripts/load_quote_prices.mjs
 
+      # ---------------------------------------------------------------- 6c. token info
+      # After supply resolution, so a token discovered tonight is fetched in the same run.
+      #
+      # GMGN allows 1 request/second per IP and we fetch only tokens a leader actually holds
+      # (~1,100 of 3,100 known), so a full pass is ~20 minutes. `--stale-hours 20` means a
+      # token refreshed in the previous run is skipped, and the ordering is never-fetched
+      # first — a run cut short still leaves the set more complete than it found it.
+      #
+      # continue-on-error: these are third-party enrichments. Losing a night of them degrades
+      # `fundamentals` to a stale `fetchedAt`, which the response already states; failing the
+      # whole job over it would discard the directory and trade refreshes that did succeed.
+      - name: Refresh token fundamentals
+        continue-on-error: true
+        env:
+          GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
+        run: node scripts/load_token_info.mjs --stale-hours 20
+
       # ---------------------------------------------------------------- 7. webhook
       # A trader entering the top 100 is invisible to the live feed until their wallet is
       # registered with Helius — every other route would show them while transactions stayed

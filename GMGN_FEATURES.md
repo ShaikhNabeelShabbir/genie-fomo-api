@@ -1,6 +1,6 @@
 # GMGN-parity features → Route
 
-**Generated: 2026-09-08T13:10Z** · 6 of 12 planned features live
+**Generated: 2026-09-08T15:20Z** · 10 of 12 planned features live
 
 Companion to [PARAMETER_ROUTES.md](PARAMETER_ROUTES.md), same shape: one row per feature —
 what it means in plain words, the exact call that returns it, the field to read. This file
@@ -36,6 +36,10 @@ Postgres (G6's prices are fetched nightly and stored, never at request time) —
 | **G4** | Cursor pagination | `cursor` + `next` | `/traders`, `/tokens`, `/traders/:handle/transactions` | ✅ live |
 | **G5** | Sorting + range filters | `--order-by`, `--direction`, `--min-*` / `--max-*` | `/traders`, `/tokens` | ✅ live |
 | **G6** | USD value per transfer | `cost_usd`, `history_bought_cost`, `history_sold_income` | `/traders/:handle/transactions` | ✅ live |
+| **G7** | Token fundamentals | `price`, `liquidity`, `market_cap`, `holder_count`, `top_10_holder_rate` | `/tokens`, `/tokens/:address` | ✅ live |
+| **G8** | Chain-wide concentration | `top_10_holder_rate`, `dev_team_hold_rate`, `holder_count` | `/tokens/:address` | ✅ live |
+| **G9** | Wallet tags | `wallet_tags_stat` — `smart_wallets`, `renowned_wallets`, … | `/tokens`, `/tokens/:address` | ✅ live |
+| **G10** | Creator / dev signals | `creator_token_status`, `cto_flag`, `creator_ath_info` | `/tokens/:address` | ✅ live |
 
 ---
 
@@ -82,7 +86,7 @@ never appeared as transfers we captured. Reporting a date there would be an inve
 
 **`endHoldingAt` is frequently `null`, and that is a data limitation not a bug.** It needs an
 outbound transfer, and our ingestion is skewed **86% inbound / 14% outbound** overall — for
-`unipcs` specifically it is 32,660 in against 619 out, so only 16 of 107 positions have an
+`unipcs` specifically it is 33,244 in against 619 out, so only 16 of 107 positions have an
 exit date. Treat a missing `endHoldingAt` as "no exit observed", never as "still holding".
 
 **Versus GMGN.** They publish `start_holding_at` / `end_holding_at` per position and
@@ -95,7 +99,7 @@ have ingested, and says so in the response. Theirs is more complete; ours is che
 
 | In plain words | Call | Read | Live value (`unipcs`) |
 | --- | --- | --- | --- |
-| "What has this wallet actually *done*, as opposed to what the leaderboard says?" | `GET $B/traders/unipcs` | `onChain.*` | **32,775 transactions**, 13,864 swaps, 719 tokens, 58 active days |
+| "What has this wallet actually *done*, as opposed to what the leaderboard says?" | `GET $B/traders/unipcs` | `onChain.*` | **33,359 transactions**, 14,138 swaps, 726 tokens, 58 active days |
 
 **In layman's terms.** Every other trading figure on this API comes from fomo — it is their
 number and we pass it on. This block is ours: we watched the wallet on-chain and counted what
@@ -113,12 +117,12 @@ curl -s "$B/traders/unipcs" | jq '{fomo: .reported, ours: .onChain}'
 
 ```json
 {
-  "transactions": 32775,  "transfers": 33279,
-  "inbound": 32660,       "outbound": 619,
-  "swaps": 13864,         "tokensTouched": 719,
+  "transactions": 33359,  "transfers": 33863,
+  "inbound": 33244,       "outbound": 619,
+  "swaps": 14138,         "tokensTouched": 726,
   "activeDays": 58,
-  "firstSeenAt": "2026-07-27T22:07:35.000Z",
-  "lastActiveAt": "2026-09-08T10:20:25.000Z",
+  "firstSeenAt": "2026-07-03T02:51:23.000Z",
+  "lastActiveAt": "2026-09-08T13:50:02.000Z",
   "tier": "verified",
   "source": "postgres · transactions (helius webhook)"
 }
@@ -135,11 +139,15 @@ separate calendar days. A wallet that traded twice a year apart has 2 active day
 the two readings support very different conclusions about whether someone is actually trading,
 and this is deliberately the stricter one.
 
-**`transfers` exceeds `transactions` because one transaction can move several tokens.** 33,279
-transfers across 32,775 transactions. Neither is wrong; they count different things.
+**`transfers` exceeds `transactions` because one transaction can move several tokens.** 33,863
+transfers across 33,359 transactions. Neither is wrong; they count different things.
 
 **These are floors too.** Same ingestion boundary as G1 — `firstSeenAt` is when we started
 watching this wallet, not when it was created.
+
+**These numbers move faster than any other figure in this file.** The Helius webhook ingests
+continuously, so the counts climb by the minute — they rose by ~600 transactions during the
+hour this page was last regenerated. Match the shape, not the digits.
 
 **Versus GMGN.** Their `buys_{window}` / `sells_{window}` / `swaps_{window}` are per token
 over fixed windows. Ours is per wallet over all history we hold. Theirs slices finer; ours
@@ -149,65 +157,70 @@ exists to be compared against a reported figure, which theirs has no counterpart
 
 ## G3 · Leader concentration
 
-| In plain words | Call | Read | Live value (USDC on Solana) |
+| In plain words | Call | Read | Live value |
 | --- | --- | --- | --- |
-| "Is this coin spread across the leaders we track, or is one whale holding most of it?" | `GET $B/tokens/:address` | `entries[].leaderConcentration` | top 1 holds **16.1%**, top 10 hold **82.1%** of 60 leaders' value |
+| "Is this coin spread across the leaders we track, or is one of them holding most of it?" | `GET $B/tokens/:address` | `entries[].leaderConcentration` | top 1 holds **9.2%**, top 10 hold **59.2%** of what 44 leaders hold |
 
-**In layman's terms.** When 60 tracked traders hold the same coin, that sounds like broad
-agreement. This checks whether it really is: if one of them holds most of the value, "72
-leaders hold this" is a much weaker signal than it appears. It measures crowding among the
-people we watch — not the coin's whole holder base.
+**In layman's terms.** When 44 tracked traders hold the same coin, that sounds like broad
+agreement. This checks whether it really is: if one of them holds most of it, "44 leaders hold
+this" is a far weaker signal than it looks. It measures crowding among the people we watch —
+not the coin's whole holder base, which is **G8**.
 
 ### How to test
 
 ```bash
-curl -s "$B/tokens/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" \
-  | jq '.entries[0] | {holders, holderShare, totalValueUsd, leaderConcentration}'
+curl -s "$B/tokens/0xfd0bb211d479710dfa01d3d98751767f51edb2d9" \
+  | jq '.entries[0] | {holders, holderShare, leaderConcentration}'
+
+# the pair that matters — ours beside GMGN's
+curl -s "$B/tokens/0xfd0bb211d479710dfa01d3d98751767f51edb2d9" \
+  | jq '.entries[0] | {ours: .leaderConcentration.top10, gmgn: .chainConcentration.top10HolderRate}'
 ```
 
 ```json
 {
-  "holders": 60,
-  "holderShare": 0.4167,
-  "totalValueUsd": 4225539.66,
+  "holders": 44,
+  "holderShare": 0.3056,
   "leaderConcentration": {
-    "top1": 0.1609, "top3": 0.4079, "top10": 0.8206,
-    "leaders": 60,
-    "coverage": { "of": 60, "total": 60, "share": 1 }
+    "top1": 0.092, "top3": 0.2644, "top10": 0.592,
+    "leaders": 44,
+    "coverage": { "of": 44, "total": 44, "share": 1 }
   }
 }
 ```
 
 ### ⚠ This is NOT GMGN's `top_10_holder_rate`
 
-**The most important thing on this page.** The two fields look alike, land in the same
-numeric range, and mean completely different things:
+**The most important thing on this page.** The two look alike, land in the same numeric range,
+and answer completely different questions. On this very token:
 
-| | Field | Denominator | Our #1 token reads |
+| | Field | Denominator | Reads |
 | --- | --- | --- | --- |
-| **GMGN** | `top_10_holder_rate` | supply held by the top 10 wallets, **out of every holder on chain** | `0.1974` |
-| **Ours** | `leaderConcentration.top10` | value held by the top 10, **out of the leaders we track** | `0.4234` |
+| **Ours** | `leaderConcentration.top10` | the **44 leaders we track** | **0.592** |
+| **GMGN** | `chainConcentration.top10HolderRate` (**G8**) | all **2,644 holders on chain** | **0.1974** |
 
-Both are plausible numbers. Neither substitutes for the other. A coin can be evenly spread
-across our leaders and still be 90% owned by one wallet we do not track — GMGN would see that
-and we would not. This is why our field is named `leaderConcentration` and carries a `basis`
-string naming theirs, and why it must never be renamed to match.
+A coin can be evenly spread across our leaders and still be 90% owned by one wallet we do not
+track — GMGN would see that and we would not. Both are now returned on the same response so
+they can be read together; they must never share a name.
 
 ### What else to know
 
-**Value is summed per leader before ranking.** A trader holding the same token in two wallets
-is one leader. Counting their rows separately would understate concentration.
+**It is computed from AMOUNTS, and that is exact rather than approximate.** Every holder of a
+token holds it at the same price, so in `sum(top N x price) / sum(all x price)` the price
+cancels out entirely — the ratio is identical either way. This used to be computed from `value`
+and therefore returned `null` for 63% of the board for no arithmetic reason. It now answers for
+**every** token, with nothing borrowed in it.
+
+**Amounts are summed per leader before ranking.** A trader holding the same token in two
+wallets is one leader; counting their rows separately would understate concentration.
 
 **`top3` and `top10` are `null` when there are fewer holders than that.** "The top 10 of 4
 holders" is the whole set, and reporting `1.0` would read as extreme concentration rather than
-"too few holders to say". `top1` is always present when anything is priced.
+"too few holders to say".
 
-**`null` for the whole block means nothing is priced.** Concentration is a share of USD value,
-so a token where no holding carries a price gets `null` — never `0`.
-
-**Read it with `holderShare`.** `holderShare: 0.4167` means 41.7% of tracked traders hold
-this; `leaderConcentration.top10: 0.8206` means 10 of them hold 82.1% of the value. Wide
-ownership, concentrated value — the two together say more than either alone.
+**Read it with `holderShare`.** `holderShare: 0.3056` means 30.6% of tracked traders hold
+this; `leaderConcentration.top10: 0.592` means 10 of them hold 59.2% of the position. Wide
+ownership, concentrated holding — the two together say more than either alone.
 
 ---
 
@@ -424,9 +437,241 @@ of swap legs — and states its coverage. Theirs is broader; ours says what it d
 
 ---
 
+## G7 · Token fundamentals
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "What is this coin actually worth, and how many people hold it?" | `GET $B/tokens/:address` | `entries[].fundamentals` | price **$0.7611131**, mcap **$6,088,904,800**, **258,728** holders |
+
+**In layman's terms.** Until now we could tell you *which* leaders hold a coin but often not
+what it was worth — 63% of the board came back with no value at all, because we only knew a
+price when fomo happened to give us one. This adds the coin's own numbers: price, liquidity,
+market cap, total supply, and how many people hold it across the whole chain. **Every token on
+the board can now be valued**, up from 37%.
+
+### How to test
+
+```bash
+# the full block on one token
+curl -s "$B/tokens/0x000ae314e2a2172a039b26378814c252734f556a" | jq '.entries[0].fundamentals'
+
+# on the board, flat
+curl -s "$B/tokens?limit=5&orderBy=marketCap" | jq '.entries[] | {rank, holders, priceUsd, marketCapUsd, chainHolderCount}'
+
+# new sorts and filters
+curl -s "$B/tokens?orderBy=liquidity&limit=5"      | jq '.entries[].liquidityUsd'
+curl -s "$B/tokens?orderBy=chainHolders&limit=5"   | jq '.entries[].chainHolderCount'
+curl -s "$B/tokens?minMarketCap=1000000&limit=500" | jq '{count, filters, filtersNote}'
+```
+
+```json
+{
+  "priceUsd": 0.7611131,
+  "liquidityUsd": 1409568.71,
+  "marketCapUsd": 6088904800,
+  "totalSupply": 8000000000,
+  "circulatingSupply": 8000000000,
+  "holderCount": 258728,
+  "top10HolderRate": 0.9142,
+  "tier": "third_party",
+  "source": "gmgn",
+  "fetchedAt": "2026-09-08T12:48:56.000Z"
+}
+```
+
+### What to know before you use it
+
+**These are GMGN's numbers, not ours, and they say so.** `tier: "third_party"` and `source`
+are on every block. Everything else in this API is either computed by us or clearly marked as
+fomo's; this is a third category and it is labelled rather than blended in.
+
+**`totalValueUsd` is untouched.** It still reports only what we stored, so it is still `null`
+for most tokens. The GMGN-derived figure is a separate field, `estimatedValueUsd`, carrying
+its own `estimatedValueBasis` — because a borrowed answer must not be able to pass as our own.
+
+**⚠ `fundamentals.top10HolderRate` is NOT `leaderConcentration`.** They measure different
+populations and the gap is large:
+
+```
+ours  leaderConcentration.top10    0.592     over    44 tracked leaders
+GMGN  fundamentals.top10HolderRate 0.1974    over 2,644 chain holders
+```
+
+Ours asks "is this crowded among the traders we follow"; theirs asks "is the supply
+concentrated on chain". Both are useful; neither substitutes for the other.
+
+**Market cap is computed, not reported.** GMGN returned `market_cap` on **0 of 1,095** tokens,
+so it is always `price x circulating_supply`. Values above $10 trillion are published as
+`null`: one token mints 10^76 units, which makes the arithmetic correct and the answer
+meaningless. The price and supply behind it are always returned so you can judge for yourself.
+
+**Refreshed nightly, not per request.** A token first held today shows `fundamentals: null`
+until the next run. `fetchedAt` tells you how old the figures are — there is **no external
+call at request time**.
+
+**Versus GMGN.** Same endpoint, same numbers. The difference is that ours arrive beside our
+own figures with the provenance attached, so you can see where each came from.
+
+---
+
+## G8 · Chain-wide concentration
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "Is this coin's supply held by a few big wallets?" | `GET $B/tokens/:address` | `entries[].chainConcentration` | top 10 hold **0.9142** of supply across **258,728** holders |
+
+**In layman's terms.** A coin can look widely held and still be controlled by a handful of
+wallets. This is the share of the total supply sitting in the biggest ten, plus how much the
+dev team and the creator kept, and what proportion of holders are brand-new wallets — the
+things that decide whether a price can be moved by one person.
+
+### How to test
+
+```bash
+curl -s "$B/tokens/0x000ae314e2a2172a039b26378814c252734f556a" | jq '.entries[0].chainConcentration'
+
+# read it against OUR figure — different denominators
+curl -s "$B/tokens/0x000ae314e2a2172a039b26378814c252734f556a" \
+  | jq '.entries[0] | {ours: .leaderConcentration.top10, gmgn: .chainConcentration.top10HolderRate}'
+```
+
+```json
+{
+  "holderCount": 258728,
+  "top10HolderRate": 0.9142,
+  "devTeamHoldRate": 0,
+  "creatorHoldRate": 0,
+  "freshWalletRate": 0.0001,
+  "sniperHoldRate": 0,
+  "botDegenRate": 0.0005,
+  "tier": "third_party",
+  "source": "gmgn"
+}
+```
+
+### What to know
+
+**These are GMGN's numbers, not ours.** Every field carries `tier: "third_party"` and
+`source`. We observe 44–2,644 wallets depending on the token; a figure about *every*
+holder on chain is not something our data can produce, so it is borrowed and labelled rather
+than derived and claimed.
+
+**⚠ This is not `leaderConcentration` (G3).** Ours is the share among the leaders we track;
+this is the share across every holder on chain. On a token where both are present:
+
+```
+ours  leaderConcentration.top10          0.592    over      44 tracked leaders
+GMGN  chainConcentration.top10HolderRate 0.1974   over   2,644 chain holders
+```
+
+Different questions, different denominators — that is why they have different names and why
+neither may be renamed to the other.
+
+**All rates are 0–1**, not percentages. `0.1974` means 19.74%.
+
+**`null` for the whole block means the token has not been fetched yet.** Quote assets
+(USDC, USDT, SOL) are deliberately never fetched, so they carry no `chainConcentration` — the
+question is meaningless for a stablecoin.
+
+**Versus GMGN.** Same numbers, same endpoint. The difference is that ours arrive next to our
+own tracked-leader figure with the provenance attached, so the two can be read together
+instead of one standing in for the other.
+
+---
+
+## G9 · Wallet tags
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "Who is holding this — smart money, snipers, or fresh wallets?" | `GET $B/tokens/:address` | `entries[].walletTags` | smart **965**, renowned **406**, sniper **26** |
+
+**In layman's terms.** GMGN classifies wallets by how they behave: proven profitable traders
+("smart"), known influencers ("renowned"), launch snipers, bot bundlers, whales, brand-new
+wallets. This tells you which kinds are holding a coin. A coin held mostly by fresh wallets and
+bundlers reads very differently from one held by smart money.
+
+### How to test
+
+```bash
+curl -s "$B/tokens/0x000ae314e2a2172a039b26378814c252734f556a" | jq '.entries[0].walletTags'
+
+# on the board, and sortable
+curl -s "$B/tokens?orderBy=smartWallets&limit=5"    | jq '.entries[] | {rank, holders, smartWallets, renownedWallets}'
+curl -s "$B/tokens?orderBy=renownedWallets&limit=5" | jq '.entries[].renownedWallets'
+```
+
+### ⚠ The counts are capped at 1000
+
+**A tag reading exactly `1000` means "at least 1000", not "exactly 1000".** Across all 1,095
+tokens the distribution runs 0, 1, 2, 3 … then piles up at exactly 1000 — 450 tokens on
+`fresh`, 271 on `bundler`, 29 on `whale` — with **not one token above it on any tag**. That is
+a truncation, not a count. The response says which tags hit the ceiling:
+
+```json
+"cappedTags": ["bundler", "whale", "fresh"],
+"capped": true,
+"note": "GMGN caps these counts at 1000. …"
+```
+
+Treat a capped tag as a floor. Never sum capped tags into a total.
+
+---
+
+## G10 · Creator / dev signals
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "Who launched this, are they still holding, and what did they launch before?" | `GET $B/tokens/:address` | `entries[].creator` | status **creator_hold**, previous best **T0WER** |
+
+**In layman's terms.** The person who created a coin usually holds some of it. Whether they
+still do — or quietly sold — is one of the strongest signals there is. This also says whether
+the community took the project over after the dev left, and what the creator's best previous
+coin ever reached.
+
+### How to test
+
+```bash
+curl -s "$B/tokens/0x0f8b43fcdf0d9d01f3dcd6230fe7a6fca889958a" | jq '.entries[0].creator'
+```
+
+```json
+{
+  "address": "0x1c9ebbc3231645d283e88e50988d0202c15ecadc",
+  "status": "creator_hold",
+  "stillHolding": true,
+  "communityTakeover": true,
+  "tokensLaunched": 0,
+  "bestPreviousToken": {
+    "symbol": "T0WER",
+    "address": "0x0f8b43fcdf0d9d01f3dcd6230fe7a6fca889958a",
+    "peakMarketCapUsd": 1035942.5
+  },
+  "tier": "third_party",
+  "source": "gmgn"
+}
+```
+
+### What to know
+
+**`stillHolding` is `true` / `false` / `null`** — and the `null` matters. `creator_token_status`
+is blank on 185 of 1,095 tokens, and "we were not told" is a different claim from "the creator
+sold". Only one of them is evidence.
+
+**`address` can be `null` while the rest is present.** It is blank on 104 of 1,095 tokens
+(9.5%). An unknown address is one missing field, not a reason to withhold a known status.
+
+**`bestPreviousToken` is `null` when the creator has no prior launch.** GMGN returns the object
+present but empty in that case — blank symbol, `ath_mc` of 0 — which if passed through would
+read as "their best token peaked at $0" rather than "there isn't one".
+
+**`communityTakeover`** is GMGN's `cto_flag`: the original dev walked away and holders took the
+project over. Different from a dev who never left, and worth reading next to `stillHolding`.
+
+---
+
 ## What is not here yet
 
-Six of the twelve planned parity features are unbuilt — and **every one of them requires a
+Two of the twelve planned parity features are unbuilt — and **every one of them requires a
 migration or an external call**, since the pure-code tier is complete, including everything requiring an
 external call — token security (`is_honeypot`, `buy_tax`), fundamentals (`price`, `liquidity`,
 `market_cap`), true chain-wide holder counts, wallet tags and creator signals. See
