@@ -1,7 +1,14 @@
 # Parameter → Route
 
+**Generated: 2026-09-08T06:41Z** · build `capturedAt 2026-09-07T11:38:55Z` · 8 generations
+
 One row per parameter: what it means in plain words, the exact call that returns it, and
-the field to read. Every value shown below was pulled from the live service, not invented.
+the field to read.
+
+**Every figure below is a dated example, not current state.** They were pulled from the live
+service at the timestamp above and the pipeline refreshes nightly, so they will have moved by
+the time you read this. Treat them as "what this field looks like", never as today's value —
+re-run the command for that.
 
 ```bash
 export B=https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api
@@ -33,7 +40,7 @@ status alone cannot separate "no such trader" from "no such route".
 | Status | `error.code` | What to do |
 | --- | --- | --- |
 | 400 | `bad_request` | Fix the parameter. `error.detail` names it. |
-| 401 | `unauthorized` | **Stop.** The key is missing or wrong; retrying will not help. |
+| 401 | `unauthorized` | **Stop.** Only reachable when the deployment sets `GENIE_API_KEY`. The public deployment does not, so this status cannot occur there — see below. |
 | 404 | `not_found` | Wrong handle, token, or URL shape. The body lists valid routes. |
 | 429 | `rate_limited` | **Back off.** `Retry-After` header and `error.retryAfterSeconds`. |
 | 503 | `unavailable` | **Retry**, and keep showing your last good copy. |
@@ -47,16 +54,51 @@ is self-correcting rather than a guessing game.
              "retryAfterSeconds": 57 } }
 ```
 
+**On 401.** The service is keyless as deployed: `GENIE_API_KEY` is unset and the gate is
+`if (KEY && ...)`, so every caller is anonymous and no request can 401. The row is kept
+because a private deployment can set that variable and turn the check on. If you are calling
+the public URL and see a 401, something in front of the API produced it, not the API.
+
+### Rate limit headers
+
+Every response — success and error alike, including the 429 itself — carries the current
+budget, so you can pace without first provoking a rejection.
+
+| Header | Meaning |
+| --- | --- | 
+| `RateLimit-Limit` | Requests allowed per 60s window (default 240; `RATE_LIMIT_PER_MINUTE`). |
+| `RateLimit-Remaining` | Left in the current window, counting the response you are reading. |
+| `RateLimit-Reset` | Seconds until the window resets. |
+| `RateLimit-Scope` | `global` normally; `unlimited` if the limiter is failing open. |
+
+The limit is **global**, not per instance: the counter is a single Postgres row bumped in one
+atomic statement, so every instance sees the same number. Verified — 250 requests fired 12 at
+a time on one key returned exactly 240 x 200 and 10 x 429, with `Remaining` decrementing
+monotonically.
+
+The counter is keyed on `x-api-key` when you send one, otherwise on the **leftmost** entry of
+`x-forwarded-for` (the original client; the rest of the chain is intermediate hops). It is
+checked before auth, so a flood of bad keys cannot be used to hammer the database.
+
+**`RateLimit-Scope: unlimited` means the limiter is not counting.** It fails open: if the
+database is unreachable the request is served rather than rejected, because a limiter that
+turns a database blip into a site-wide outage costs more than the traffic it guards against.
+In that state `Remaining` reads a full budget that is not being enforced — check `Scope`
+before trusting a suspiciously fresh number.
+
+`Retry-After` and the `RateLimit-*` headers are listed in `Access-Control-Expose-Headers`, so
+browser clients can read them.
+
 ---
 
 ## 0. Routes that are not a single parameter
 
 | Route | In plain words | Live value |
 | --- | --- | --- |
-| `GET $B/health` | "What's in the database, and when was it loaded?" | 100 traders · 2,038 holdings · 6,398 trades · 42,033 transfers |
-| `GET $B/traders` | "Who are the top 100?" | each entry carries a stable `id` and its own `updatedAt` |
+| `GET $B/health` | "What's in the database, and when was it loaded?" | 137 traders · 3,356 holdings · 12,137 trades · 374,927 transfers |
+| `GET $B/traders` | "Who are the top 137?" | each entry carries a stable `id` and its own `updatedAt` |
 | `GET $B/traders/unipcs` | "Everything about one trader, and **what else I can ask**" | summary + `links` to all seven sub-routes |
-| `GET $B/traders/unipcs/transactions?limit=5` | "What have their wallets actually done on-chain?" | `stored: 476` transfers for `unipcs` |
+| `GET $B/traders/unipcs/transactions?limit=5` | "What have their wallets actually done on-chain?" | `?kind=swap` filters to trades; each row carries `kind` and `protocol` |
 
 **`id` is stable, `handle` is not.** Every trader carries a UUID `id` that is ours and never
 reissued; `handle` comes from fomo and is theirs to rename. Key your rows on `id`.
@@ -76,28 +118,28 @@ Reported-vs-Verified split that runs through the rest of this document.
 
 | # | In plain words | Call | Read | Live value (`unipcs`) |
 | --- | --- | --- | --- | --- |
-| **T1** | "How much have they **actually cashed out**, versus what's only on paper?" | `GET $B/traders/unipcs/pnl` | `bankedUsd`, `onPaperUsd`, `realizedShare` | banked **−$209,204** · on paper **$13,848,582** |
-| **T2** | "How much money went in, and how much came back out?" | `GET $B/traders/unipcs/scorecard` | `moneyIn`, `moneyOut` | $2,559,114 in — but **coverage 21/191 (11%)** |
-| **T3** | "Turned $1,000 into what?" | same | `returnPct` | **null** — only 2 of 25 closed trades have both prices |
-| **T4** | "How did they do this week / this month?" | same | `windows.{24h,7d,30d,all}` | 24h **+$215** (7 closed) · 7d **−$209,204** (25) |
-| **T5** | "Which coins made or lost them money?" | same | `byToken[]` | SPCXB **+$184.15** over 3 closed trades |
-| **T6** | "How often are they right?" | same | `winRate`, `wins`, `losses` | **56%** — 14 wins of 25 |
-| **T7** | "Best and worst single trade" | same | `bestTradeUsd`, `worstTradeUsd` | best **+$198** · worst **−$118,667** |
-| **T8** | "Is the profit **one lucky hit**?" | same | `topTradeShare` | **45%** of gains came from one trade |
-| **T9** | "Fluke or consistent pattern?" | same | `meanToMedian`, `medianTradeUsd` | median trade **$0.15**; ratio suppressed (see below) |
-| **T10** | "How much do they usually risk per trade?" | same | `typicalBetUsd` | **$910** — via `volume_per_trade`, not entry prices |
+| **T1** | "How much have they **actually cashed out**, versus what's only on paper?" | `GET $B/traders/unipcs/pnl` | `bankedUsd`, `onPaperUsd`, `realizedShare` | banked **−$131,120** · on paper **$17,491,476** |
+| **T2** | "How much money went in, and how much came back out?" | `GET $B/traders/unipcs/scorecard` | `moneyIn`, `moneyOut` | $3,027,073 in — but **coverage 24/363 (6.6%)** |
+| **T3** | "Turned $1,000 into what?" | same | `returnPct` | **−70.72%** on 3 of 43 closed trades (7% coverage) |
+| **T4** | "How did they do this week / this month?" | same | `windows.{24h,7d,30d,all}` | 24h **$0** (0 closed) · 7d **−$131,120** (43 closed) |
+| **T5** | "Which coins made or lost them money?" | same | `byToken[]` | 牛来 **+$168,977** over 1 closed trade |
+| **T6** | "How often are they right?" | same | `winRate`, `wins`, `losses` | **44%** — 19 wins, 24 losses |
+| **T7** | "Best and worst single trade" | same | `bestTradeUsd`, `worstTradeUsd` | best **+$168,977** · worst **−$118,667** |
+| **T8** | "Is the profit **one lucky hit**?" | same | `topTradeShare` | **99.5%** of gains came from one trade |
+| **T9** | "Fluke or consistent pattern?" | same | `meanToMedian`, `medianTradeUsd` | median trade **−$1.04**; ratio suppressed (see below) |
+| **T10** | "How much do they usually risk per trade?" | same | `typicalBetUsd` | **$1,012** — via `volume_per_trade`, not entry prices |
 
-**Read T6 and T1 together.** A 56% win rate sits alongside a net of **−$209,204**, because
+**Read T6 and T1 together.** A 44% win rate sits alongside a net of **−$131,120**, because
 one loss was −$118,667. The route never states the rate without the net beside it:
 
 ```bash
 curl -s "$B/traders/unipcs/scorecard" | jq -r '.plain'
-# Closed 25 trades and made money on 14 of them (56%), for a net of -$209,204.
+# Closed 43 trades and made money on 19 of them (44%), for a net of -$131,120.
 ```
 
-**T9 returns null here on purpose.** A mean of −$8,368 over a median of $0.15 is
-"−56,822×" — arithmetically true, informationally worthless. The ratio is emitted only when
-mean and median are both positive; both dollar figures are always returned.
+**T9 returns null here on purpose.** The median trade is −$1.04, so the ratio would divide
+across a sign change and describe nothing. It is emitted only when mean and median are both
+positive; both dollar figures are always returned regardless.
 
 ---
 
@@ -105,14 +147,14 @@ mean and median are both positive; both dollar figures are always returned.
 
 | # | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- | --- |
-| **T11** | "How many different coins do they hold?" | `GET $B/traders/unipcs/portfolio` | `positions` | **118** |
-| **T12** | "What exactly do they hold, and what is it worth?" | `GET $B/traders/unipcs/positions?limit=5` | `entries[]` | 15,905,133 BONK @ $0.2249 = **$3,576,491** |
-| **T13** | "**How much is in just one coin?**" | `GET $B/traders/unipcs/portfolio` | `concentration` | **98.5%** in a single position |
-| **T14** | "How much is parked in dollars?" | same | `cashShare` | **0.04%** — almost nothing is safe |
-| **T15** | "How many open, how many closed?" | `GET $B/traders/unipcs/pnl` | `openPositions`, `closedTrades` | **166 open, 25 closed** |
+| **T11** | "How many different coins do they hold?" | `GET $B/traders/unipcs/portfolio` | `positions` | **97** |
+| **T12** | "What exactly do they hold, and what is it worth?" | `GET $B/traders/unipcs/positions?limit=5` | `entries[]` | 15,874,700 BONK @ $0.2430 = **$3,858,279** |
+| **T13** | "**How much is in just one coin?**" | `GET $B/traders/unipcs/portfolio` | `concentration` | **98.7%** in a single position |
+| **T14** | "How much is parked in dollars?" | same | `cashShare` | **0%** — nothing is in stablecoins |
+| **T15** | "How many open, how many closed?" | `GET $B/traders/unipcs/pnl` | `openPositions`, `closedTrades` | **320 open, 43 closed** |
 
-T11 and T13 ship together by rule. "Holds 118 coins" reads as diversified until you see
-that 98.5% of the money is in one of them.
+T11 and T13 ship together by rule. "Holds 97 coins" reads as diversified until you see that
+98.7% of the money is in one of them.
 
 ---
 
@@ -120,11 +162,11 @@ that 98.5% of the money is in one of them.
 
 | # | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- | --- |
-| **T16** | "How long do they usually hold?" | `GET $B/traders/unipcs/scorecard` | `holdingTime` | **1.12 days** (26.8h), coverage 25/25 |
-| **T17** | "What did they pay to get in — **as a market cap**?" | same | `byToken[].avgEntryMarketCapUsd` + `totalSupply` | LEGS **$2,867,200 MC** from supply 1,000,000,000 |
-| **T18** | "Are they still active?" | same | `lastTradeAt` | **2026-09-04T07:41Z** |
-| **T19** | "How long have they been trading?" | same | `trackRecordDays` | **105.2 days** |
-| **T20** | "How busy are they?" | same | `tradesPerDay` | **1.81 trades/day** |
+| **T16** | "How long do they usually hold?" | `GET $B/traders/unipcs/scorecard` | `holdingTime` | **1.06 days** (25.4h), coverage 43/43 |
+| **T17** | "What did they pay to get in — **as a market cap**?" | same | `byToken[].avgEntryMarketCapUsd` + `totalSupply` | `frankdegods` · Stonks **$2,398,439 MC** from supply 1,000,000,000, `entryMethod: weighted` over 2 positions |
+| **T18** | "Are they still active?" | same | `lastTradeAt` | **2026-09-07T11:22Z** |
+| **T19** | "How long have they been trading?" | same | `trackRecordDays` | **108.4 days** |
+| **T20** | "How busy are they?" | same | `tradesPerDay` | **3.35 trades/day** |
 
 Unlike the price fields, **timestamps are populated on 100% of trades** — which is why all
 of §3 is solid while §1 carries coverage caveats.
@@ -134,36 +176,100 @@ of §3 is solid while §1 carries coverage caveats.
 Entry reads on screen as "$717K MC", not as a per-token price, so `byToken[]` carries both:
 
 ```json
-{ "symbol": "LEGS", "avgEntryPrice": 0.0028672,
-  "avgEntryMarketCapUsd": 2867200,
+{ "symbol": "Stonks", "avgEntryPrice": 0.00239843884807,
+  "avgEntryMarketCapUsd": 2398438.848,
+  "entryMethod": "weighted", "entryPositions": 2, "entryPositionsWeighted": 2,
+  "firstEntryPrice": 0.00160551,
   "totalSupply": 1000000000, "supplySource": "rpc", "supplyReadAt": "…" }
 ```
+
+This example is itself one of the 319 corrected positions: `frankdegods` holds two positions
+in Stonks, so the field used to return the first of them and now returns both, weighted.
+
+### `avgEntryPrice` is a real average, and `entryMethod` says which kind
+
+A fomo "trade" is a **position**, not a fill — one row can open in April and close in August
+carrying a single `avgEntryPrice` that fomo has already averaged across the fills inside it.
+So on the 96.9% of trader-token pairs with exactly one position, the value already *is* an
+average. Where a trader holds **several** positions in one token, they are now combined into
+a quantity-weighted average rather than the first one being returned.
+
+`entryMethod` names the computation, because otherwise three different things arrive under
+one field:
+
+| `entryMethod` | Meaning | Rows |
+| --- | --- | --- |
+| `single_position` | One position; fomo averaged inside it | 3,699 |
+| `weighted` | Averaged across positions, every leg weighted | 305 |
+| `weighted_partial` | Some legs had no recoverable quantity and are excluded | 14 |
+| `first_only` | No leg had a weight; earliest value returned | 0 |
+| `null` | No entry price on record | 3,216 |
+
+**The weight is status-dependent, and that matters.** On an *open* position `amount` is the
+position, so it is the weight. On a *closed* position `amount` is what **remains** — nothing,
+it was sold — so quantity is recovered from `pnl / (exit − entry)` instead. Weighting a
+closed leg by `amount` is the same mistake that made BUG-1 wrong by ~10^17.
+
+`firstEntryPrice` carries the pre-fix value so a consumer can reconcile against what this
+field used to return. On `sadcrissy`'s CTO position (7 positions) the two differ by 9.8x:
+`avgEntryPrice 0.00296464623767` against `firstEntryPrice 0.000302014`. All 319 affected
+positions were recomputed in SQL and compared field-for-field against the live API: 319
+matched, 0 mismatched. Single-position rows are bit-identical to what they returned before.
+
+**Sells do not reduce it.** `sellsReduceIt: false`: this answers what they paid to get in
+across their whole record, including positions they have since exited — not what their
+remaining position cost.
 
 **The supply is published because supply moves.** One coin was measured drifting 12.45% in
 a day, so sending only a price would make a consumer's conversion and ours disagree with no
 way to tell which was right. Sending the multiplier we used makes the two reconcilable.
 
-`entryBasis` states what the average is over — `scope`, `sellsReduceIt: false`, and how the
-cap is derived — because two reasonable definitions give different numbers and the figure
+`entryBasis` states what the average is over — `scope`, `sellsReduceIt`, `weighting`, and how
+the cap is derived — because two reasonable definitions give different numbers and the figure
 has to be labelled correctly on screen.
 
-Coverage: **1,394 tokens have a supply (94% of trades with an entry price)**. 102 tokens
-resolve a chain but no supply, and 16 have no chain at all. Both return `null`, never `0`.
+A token whose supply we could not resolve returns `null` for the market cap, never `0` — and
+`unipcs`'s largest holdings are in that state, which is why the example above uses a different
+trader.
 
 ---
 
 ## 4. Trust
 
-| # | In plain words | Call | Read | Live value (`Natan_benish`) |
+| # | In plain words | Call | Read | Live value (`ogle`) |
 | --- | --- | --- | --- | --- |
-| **TRUST** | "**Do their own numbers even add up?**" | `GET $B/traders/Natan_benish/trust` | `verdict`, `flags[]`, `pnlToVolume` | **implausible** — profit is **374×** their lifetime volume |
+| **TRUST** | "**Do their own numbers even add up?**" | `GET $B/traders/ogle/trust` | `verdict`, `flags[]`, `pnlToVolume`, `basis` | **self_contradictory** — fomo reports **13.37×** more profit than volume |
 
 ```bash
-curl -s "$B/traders/Natan_benish/trust" | jq -r '.verdict, .plain'
+curl -s "$B/traders/ogle/trust" | jq -r '.verdict, .plain'
+# self_contradictory
+# fomo's own profit and volume figures for this trader do not reconcile with each other.
 ```
 
-This is a plausibility check, not a fraud finding: it means the number cannot be
-corroborated from the data we hold.
+**The verdict describes the numbers, not the trader.** `self_contradictory` means two figures
+fomo published cannot both be right — profit of $5,320,901 on $398,122 of lifetime volume.
+Both sides are fomo's own, so our coverage has no bearing on it.
+
+Four verdicts, and the difference between them matters:
+
+| verdict | means |
+| --- | --- |
+| `self_contradictory` | fomo's own profit and volume disagree |
+| `unverified` | profit far exceeds a portfolio we CAN see |
+| `unverifiable` | too little of the portfolio is priced to say anything |
+| `ok` | nothing contradicts |
+
+A `basis` object names each denominator, so a verdict can be weighed rather than taken:
+
+```json
+"pnlToVolume":   { "denominator": "fomo reported volume", "bothReported": true }
+"pnlToHoldings": { "denominator": "our sum of priced positions",
+                   "pricedPositions": 6, "totalPositions": 48, "pricedShare": 0.125 }
+```
+
+`pnl_exceeds_holdings` is withheld below 0.5 coverage and replaced by
+`holdings_coverage_too_low` — a ratio against one eighth of a portfolio cannot support a
+claim about the whole.
 
 ---
 
@@ -171,14 +277,15 @@ corroborated from the data we hold.
 
 | # | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- | --- |
-| **K1** | "**What are the leaders crowding into?**" | `GET $B/tokens?limit=5` | `entries[].holders` | top token held by **33 of 100** |
-| **K2** | "What did they move into or out of since last time?" | `GET $B/tokens/momentum` | `entries[].change` | needs 2 loader runs; says so when it has 1 |
+| **K1** | "**What are the leaders crowding into?**" | `GET $B/tokens?limit=5` | `entries[].holders` | top token held by **58 of 137** |
+| **K2** | "What did they move into or out of since last time?" | `GET $B/tokens/momentum` | `entries[].change` | **1,171 tokens moved** across a 25.3h span |
 | **K3** | "How much leader money is in it?" | `GET $B/tokens?limit=5` | `entries[].totalValueUsd` | null when no holder has a price |
 | **K4** | "Who else holds it?" | same | `entries[].holderHandles` | DumbCrayonEater, frogmanhaha, ogle… |
-| **K5** | "What did the crowd pay to get in?" | `GET $B/tokens/Ai66LHZ…q5ppump/activity?chain=solana` | `crowdAvgEntryPrice` | **$0.0338**, coverage 12/30 |
-| **K6** | "Of those who sold, how many won?" | same | `winRate`, `winners`, `losers` | **45%** — 5 of 11 |
-| **K7** | "**Has anyone who holds this ever actually sold it?**" | same | `everSold`, `holdersWhoSold` | **true** — 11 have sold |
-| **K8** | "Are they buying or getting out?" | same | `flow.verdict` | **mixed** (22 opened, 15 closed) |
+| **K5** | "What did the crowd pay to get in?" | `GET $B/tokens/Ai66LHZ…q5ppump/activity?chain=solana` | `crowdAvgEntryPrice` | **null** — no holder of this token has a recorded entry price |
+| **K5a** | "…and is that a typical leader, or the biggest one?" | same | `crowdAvgEntryPrice.method` | **one trader, one vote** — an unweighted mean over each holder's own weighted entry |
+| **K6** | "Of those who sold, how many won?" | same | `winRate`, `winners`, `losers` | **100%** — 17 winners, 0 losers |
+| **K7** | "**Has anyone who holds this ever actually sold it?**" | same | `everSold`, `holdersWhoSold` | **true** — 17 have sold |
+| **K8** | "Are they buying or getting out?" | same | `flow.verdict` | **accumulating** (114 opened, 17 closed) |
 | **K9** | "Which chain does it live on?" | `GET $B/tokens?limit=5` | `entries[].chain` | ethereum / solana / bsc / base / robinhood |
 
 **K7 is the sharpest signal here.** A token every leader holds and nobody has ever exited is
@@ -188,10 +295,10 @@ record — "nobody has ever sold" and "we have no evidence" are different claims
 `coverage` on that route separates two populations that are easy to conflate:
 
 ```json
-{ "holdersNow": 12, "withTradeRecord": 30, "holdersNowWithNoRecord": 0 }
+{ "holdersNow": 58, "withTradeRecord": 121, "holdersNowWithNoRecord": 0 }
 ```
 
-30 traders have a record for a token 12 people currently hold — **18 traded it and got out
+121 traders have a record for a token 58 people currently hold — **63 traded it and got out
 entirely.** That is exit information a holder count alone cannot show.
 
 ---
@@ -200,9 +307,9 @@ entirely.** That is exit information a holder count alone cannot show.
 
 | # | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- | --- |
-| **C1** | "How many leaders trade this chain?" | `GET $B/chains` | `entries[].traders` | Solana **57 of 100** |
-| **C2** | "How much of their money sits there?" | same | `entries[].totalValueUsd` | Solana **$10,544,636** |
-| **C3** | "Which chain did they make their money on?" | same | `entries[].realized` | robinhood **+$1,850,549** · solana **−$1,503,966** |
+| **C1** | "How many leaders trade this chain?" | `GET $B/chains` | `entries[].traders` | Solana **92 of 137** |
+| **C2** | "How much of their money sits there?" | same | `entries[].totalValueUsd` | Solana **$35,989,769** |
+| **C3** | "Which chain did they make their money on?" | same | `entries[].realized` | robinhood **+$1,679,429** · solana **−$1,103,437** |
 | **C4** | "**What can we even see on this chain?**" | same | `entries[].historyCoverage` | solana → helius · robinhood → blockscout (keyless) |
 | **C5** | "Can a position size be checked on-chain?" | same | `entries[].balanceVerifiable` | **true on all five chains** |
 
@@ -240,13 +347,17 @@ curl -s "$B/chains" | jq -r '.entries[] | "\(.chain)\t\(.realized.closedTrades) 
 ```
 
 ```
-robinhood   1396 closed   $1,850,549
-solana       413 closed  -$1,503,966
-bsc          365 closed   $1,834,528
-base          62 closed     $699,745
-ethereum      40 closed    -$221,218
-unattributed  26 closed    -$137,427   ← published, never absorbed
+robinhood   2925 closed   $1,679,429    pricedShare 0
+bsc         1057 closed   $6,211,462    pricedShare 0
+solana      1113 closed  -$1,103,437    pricedShare 0.78
+base         112 closed     $697,136    pricedShare 0
+ethereum      77 closed    -$266,586    pricedShare 0
+unattributed  48 closed    -$151,084   ← published, never absorbed
 ```
+
+Each `realized` block now carries `tier: "reported"` and `source: "fomoapi trade records"`,
+so a chain showing `pricedShare: 0` beside a dollar profit is no longer a puzzle — the profit
+comes from trade records and the pricing from the holdings snapshot.
 
 This is **realized** profit from fomo's own trade records — the same Reported tier as
 everything else on this board. It is not independently verified.
@@ -259,12 +370,11 @@ Several parameters ship a `coverage` object. It is not decoration — it is the 
 between a fact and a confident-looking guess:
 
 ```json
-"returnPct": { "value": null, "coverage": { "of": 2, "total": 25, "share": 0.08 } }
+"returnPct": { "value": -70.72, "coverage": { "of": 3, "total": 43, "share": 0.0698 } }
 ```
 
-A return % computed from 2 of 25 closed trades is not a return %, so the route returns
-`null` and shows you the denominator. `unipcs` is the worst case on the board — across the
-other 99 traders entry-price coverage is **47%**, and most get real numbers.
+A return computed from 3 of 43 closed trades is thin, and the coverage object says so rather
+than the value being withheld — the reader decides. `unipcs` is the worst case on the board.
 
-The same rule governs `holdings.value`: **1,688 of 2,038 positions have no price at all**,
-and a missing price is excluded from every aggregate rather than counted as zero.
+The same rule governs `holdings.value`: most positions have no price at all, and a missing
+price is excluded from every aggregate rather than counted as zero.

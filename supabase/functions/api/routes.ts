@@ -375,15 +375,40 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
     ? Number((pnl / holdingsValue).toFixed(2)) : null;
 
   const usd = (x: number) => `$${Math.round(x).toLocaleString("en-US")}`;
+  const pricedShare = positions > 0 ? priced / positions : null;
+
+  /**
+   * The two "exceeds" flags look alike and are not.
+   *
+   * pnl_exceeds_volume divides fomo's REPORTED profit by fomo's REPORTED volume. Both sides
+   * are their own figures, stored verbatim, so a ratio above 1 is a contradiction inside
+   * their data and nothing to do with our coverage. It stays.
+   *
+   * pnl_exceeds_holdings divides that same reported profit by OUR sum of priced positions —
+   * and for `ogle` that is 6 of 48 positions. "2,364x everything they hold" was 2,364x an
+   * eighth of what they hold. A denominator we know is partial cannot support a claim about
+   * the whole, so the flag is withheld below the same 0.5 floor the rest of the API uses,
+   * and a note explains why instead.
+   *
+   * The wording changed too. "That cannot come from trading alone" is a conclusion; the
+   * response now states the arithmetic and leaves the conclusion to the reader.
+   */
   if (pnlToVolume !== null && pnlToVolume > 1) {
     flags.push({ code: "pnl_exceeds_volume", severity: "warn",
-      plain: `Reported profit (${usd(pnl!)}) is larger than everything they have ever traded ` +
-             `(${usd(volume!)}). That cannot come from trading alone.` });
+      plain: `fomo reports ${usd(pnl!)} of profit on ${usd(volume!)} of lifetime volume — ` +
+             `a ratio of ${pnlToVolume}x. Both figures are fomo's own, so they disagree with ` +
+             `each other regardless of what we hold.` });
   }
-  if (pnlToHoldings !== null && pnlToHoldings > 10) {
+  if (pnlToHoldings !== null && pnlToHoldings > 10 && (pricedShare ?? 0) >= 0.5) {
     flags.push({ code: "pnl_exceeds_holdings", severity: "warn",
       plain: `Reported profit is ${Math.round(pnlToHoldings)}x the value of everything they ` +
-             `currently hold — the money is not visible in the portfolio.` });
+             `currently hold (${priced} of ${positions} positions priced) — the money is not ` +
+             `visible in the portfolio.` });
+  } else if (pnlToHoldings !== null && pnlToHoldings > 10) {
+    flags.push({ code: "holdings_coverage_too_low", severity: "info",
+      plain: `Reported profit is ${Math.round(pnlToHoldings)}x our valuation of their holdings, ` +
+             `but only ${priced} of ${positions} positions have a price — too little of the ` +
+             `portfolio is visible to draw a conclusion from that ratio.` });
   }
   if (trades !== null && trades < 10) {
     flags.push({ code: "too_few_trades", severity: "warn",
@@ -394,8 +419,14 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
       plain: `Only ${priced} of ${positions} positions have a usable price, so portfolio figures are incomplete.` });
   }
 
-  const verdict = flags.some((f) => f.code === "pnl_exceeds_volume") ? "implausible"
+  /**
+   * `self_contradictory` replaces `implausible`. The old word passed judgement on the
+   * TRADER; the new one describes the NUMBERS, which is all the data supports — two figures
+   * fomo published that cannot both be right.
+   */
+  const verdict = flags.some((f) => f.code === "pnl_exceeds_volume") ? "self_contradictory"
     : flags.some((f) => f.code === "pnl_exceeds_holdings") ? "unverified"
+    : flags.some((f) => f.code === "holdings_coverage_too_low") ? "unverifiable"
     : flags.some((f) => f.code === "too_few_trades") ? "insufficient" : "ok";
 
   return {
@@ -405,10 +436,20 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
     asOf: await asOfHoldings(),
     reportedPnlUsd: pnl, volumeUsd: volume,
     flags, pnlToVolume, pnlToHoldings, trades, verdict,
-    plain: verdict === "implausible"
-      ? "The reported profit does not reconcile with this trader's own trading volume. Treat it as unproven."
+    // What each denominator was, so a consumer can weigh the verdict rather than take it.
+    basis: {
+      pnlToVolume: { numerator: "fomo reported pnl", denominator: "fomo reported volume",
+                     bothReported: true },
+      pnlToHoldings: { numerator: "fomo reported pnl", denominator: "our sum of priced positions",
+                       pricedPositions: priced, totalPositions: positions,
+                       pricedShare: pricedShare === null ? null : Number(pricedShare.toFixed(4)) },
+    },
+    plain: verdict === "self_contradictory"
+      ? "fomo's own profit and volume figures for this trader do not reconcile with each other."
       : verdict === "unverified"
       ? "The reported profit is far larger than the portfolio we can see, so we cannot corroborate it."
+      : verdict === "unverifiable"
+      ? "Too little of this trader's portfolio has a price for us to say anything about the reported profit."
       : verdict === "insufficient"
       ? "There is not enough trading history here to judge skill."
       : "Nothing in the numbers contradicts itself.",
@@ -874,10 +915,44 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   const lastAt = allTimes.length ? Math.max(...allTimes) : null;
   const spanDays = firstAt !== null && lastAt !== null ? (lastAt - firstAt) / 86_400_000 : null;
 
+  /**
+   * ISSUE-4. `avgEntryPrice` used to be the FIRST entry price seen for a token, never
+   * re-averaged across a trader's several positions in it — while the field name, the T17
+   * doc row and K5's `crowdAvgEntryPrice` all said "average".
+   *
+   * A fomo "trade" is a POSITION, not a fill (one row opened 2026-04-24 and closed
+   * 2026-08-31 carrying a single `avgEntryPrice`), so fomo has already averaged within it.
+   * That is why the field is not simply renamed `firstEntryPrice`: on 9,886 of 10,205
+   * trader-token pairs there is exactly one position and the value already IS an average.
+   * Renaming would mislabel 96.9% of rows to fix 3.1%. The defect is only the failure to
+   * combine ACROSS positions — where it bites, it bites hard: median 38.5% off the weighted
+   * figure, 71% of them off by more than 10%.
+   */
+  const legQty = (r: Record<string, unknown>): number | null => {
+    // The TS twin of the `trade_qty()` SQL function used by K5, deliberately kept in step:
+    // the scorecard aggregates in JS and K5 in SQL, and two different answers to "what did
+    // they pay to get in" is exactly the incoherence this fixes.
+    if (r.status !== "closed") {
+      const a = n(r.amount);
+      return a !== null && a > 0 ? a : null;
+    }
+    // On a closed position `amount` is what REMAINS — nothing, it was sold. Weighting by it
+    // would repeat BUG-1. Recover the traded quantity from BUG-1's own identity instead:
+    // realized pnl = qty x (exit - entry).
+    const pnl = n(r.realized_pnl_usd), e = n(r.avg_entry_price), x = n(r.avg_exit_price);
+    if (pnl === null || e === null || x === null || x === e) return null;
+    const q = pnl / (x - e);
+    return Number.isFinite(q) && q > 0 ? q : null;
+  };
+
+  type Leg = { sum: number; weight: number; legs: number; weighted: number;
+               first: number | null; firstKey: string };
+  const emptyLeg = (): Leg => ({ sum: 0, weight: 0, legs: 0, weighted: 0, first: null, firstKey: "" });
+
   const byTokenMap = new Map<string, {
     symbol: string | null; address: string | null; trades: number; closed: number;
     realizedPnlUsd: number; unrealizedPnlUsd: number;
-    avgEntryPrice: number | null; avgExitPrice: number | null;
+    entry: Leg; exit: Leg;
     totalSupply: number | null; supplySource: string | null; supplyReadAt: string | null;
   }>();
   for (const r of rows) {
@@ -885,24 +960,84 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     const rec = byTokenMap.get(key) ?? {
       symbol: (r.token_symbol as string) ?? null, address: (r.token_address as string) ?? null,
       trades: 0, closed: 0, realizedPnlUsd: 0, unrealizedPnlUsd: 0,
-      avgEntryPrice: null, avgExitPrice: null,
+      entry: emptyLeg(), exit: emptyLeg(),
       totalSupply: n(r.total_supply), supplySource: (r.supply_source as string) ?? null,
       supplyReadAt: r.supply_read_at ? new Date(String(r.supply_read_at)).toISOString() : null,
     };
     rec.trades++;
     if (r.status === "closed") { rec.closed++; rec.realizedPnlUsd += n(r.realized_pnl_usd) ?? 0; }
     else rec.unrealizedPnlUsd += n(r.unrealized_pnl_usd) ?? 0;
+
+    const qty = legQty(r);
+    // Ordered by open time, tie-broken on trade_id, so `first` does not depend on the order
+    // rows happen to arrive in — the previous code took whatever the query yielded first.
+    //
+    // Compared as a zero-padded epoch, NOT as a stringified Date: postgres.js hands back a
+    // Date whose toString is "Wed Apr 10 2026 …", and comparing those lexicographically
+    // sorts by weekday name — "Fri Aug" lands before "Wed Apr". Caught by firstEntryPrice
+    // returning the wrong leg on a 7-position token.
+    const openedMs = ms(r.opened_at);
+    const sortKey = `${String(openedMs ?? 9e15).padStart(16, "0")}|${String(r.trade_id)}`;
     // The loader already stores fomo's `0` as NULL, because a $0 entry price implies
     // someone got in for nothing.
-    if (rec.avgEntryPrice === null) rec.avgEntryPrice = n(r.avg_entry_price);
-    if (rec.avgExitPrice === null) rec.avgExitPrice = n(r.avg_exit_price);
+    for (const [px, acc] of [[n(r.avg_entry_price), rec.entry], [n(r.avg_exit_price), rec.exit]] as const) {
+      if (px === null || px <= 0) continue;
+      acc.legs++;
+      if (acc.first === null || sortKey < acc.firstKey) { acc.first = px; acc.firstKey = sortKey; }
+      if (qty !== null) { acc.sum += px * qty; acc.weight += qty; acc.weighted++; }
+    }
     byTokenMap.set(key, rec);
   }
+
+  /**
+   * Resolve a leg accumulator to one price plus the method that produced it.
+   *
+   * The method travels with the number because three different computations hide behind one
+   * field, and a consumer cannot otherwise tell a genuine weighted average from a single
+   * position's value from a fallback. `weighted_partial` is the honest name for an average
+   * over the legs that had a weight when some did not — 14 of 319 positions.
+   */
+  const resolve = (a: Leg) => {
+    const method = a.legs === 0 ? null
+      : a.legs === 1 ? "single_position"
+      : a.weighted === a.legs ? "weighted"
+      : a.weighted > 0 ? "weighted_partial"
+      : "first_only";
+    const value = a.legs === 0 ? null
+      : method === "single_position" || method === "first_only" ? a.first
+      : a.weight > 0 ? a.sum / a.weight : a.first;
+    return { value, method, legs: a.legs, legsWeighted: a.weighted, first: a.first };
+  };
   const byToken = [...byTokenMap.values()]
-    .map((r) => ({
+    .map(({ entry, exit, ...r }) => {
+      const e = resolve(entry), x = resolve(exit);
+      // 12 significant figures, not a decimal rounding: these prices run to 0.0000101253 and
+      // `round(v, 2)` would flatten a real entry to zero. At 12 figures every value that was
+      // a single position comes back bit-identical to what it returned before, so the only
+      // rows that move are the ones ISSUE-4 is about.
+      const px = (v: number | null) => (v === null ? null : Number(v.toPrecision(12)));
+      return {
       ...r,
       realizedPnlUsd: round(r.realizedPnlUsd)!,
       unrealizedPnlUsd: round(r.unrealizedPnlUsd)!,
+      avgEntryPrice: px(e.value),
+      avgExitPrice: px(x.value),
+      /**
+       * Which of three computations produced the price above, and over how many positions.
+       *
+       * Without this a consumer cannot tell a genuine weighted average from a lone
+       * position's value from a fallback, and all three used to arrive under one name.
+       *   single_position  - one position in this token; fomo already averaged inside it
+       *   weighted         - averaged across positions, every leg weighted
+       *   weighted_partial - some legs had no recoverable quantity and are excluded
+       *   first_only       - no leg had a weight; the earliest value is returned
+       */
+      entryMethod: e.method,
+      entryPositions: e.legs,
+      entryPositionsWeighted: e.legsWeighted,
+      exitMethod: x.method,
+      /** The pre-ISSUE-4 value, kept so anyone reading the old field can reconcile. */
+      firstEntryPrice: px(e.first),
       /**
        * Entry expressed as a MARKET CAP, which is how it is read on screen.
        *
@@ -915,14 +1050,15 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
        * was right. Sending the multiplier we used makes them reconcilable.
        */
       avgEntryMarketCapUsd:
-        r.avgEntryPrice !== null && r.totalSupply !== null && r.totalSupply > 0
-          ? Number((r.avgEntryPrice * r.totalSupply).toPrecision(10))
+        e.value !== null && r.totalSupply !== null && r.totalSupply > 0
+          ? Number((e.value * r.totalSupply).toPrecision(10))
           : null,
       avgExitMarketCapUsd:
-        r.avgExitPrice !== null && r.totalSupply !== null && r.totalSupply > 0
-          ? Number((r.avgExitPrice * r.totalSupply).toPrecision(10))
+        x.value !== null && r.totalSupply !== null && r.totalSupply > 0
+          ? Number((x.value * r.totalSupply).toPrecision(10))
           : null,
-    }))
+      };
+    })
     .sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd ||
                     b.unrealizedPnlUsd - a.unrealizedPnlUsd ||
                     String(a.address).localeCompare(String(b.address)));
@@ -1031,11 +1167,20 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
      * figure on screen.
      */
     entryBasis: {
-      scope: "all buys on record for this trader and token",
+      scope: "every position on record for this trader and token, sold ones included",
       sellsReduceIt: false,
-      note: "fomoapi supplies one avgEntryPrice per trade; we surface the first non-zero " +
-            "value per token and do not re-average across trades. A sell does not change it.",
+      note: "fomoapi supplies one avgEntryPrice per POSITION, already averaged across the " +
+            "fills inside it. Where a trader holds several positions in one token we now " +
+            "combine them into a quantity-weighted average; each row reports which " +
+            "computation it used in `entryMethod` and over how many positions.",
+      weighting: "open positions weight by `amount`; closed positions recover quantity from " +
+                 "realized pnl / (exit - entry), because `amount` on a closed position is " +
+                 "what remains (zero), not what was traded",
+      sells: "a sell does not reduce the entry price. This answers what they PAID TO GET IN " +
+             "across their whole record, not what their remaining position cost.",
       marketCap: "avgEntryPrice x tokens.total_supply, both returned so the figure can be rechecked",
+      previously: "this field was the first entry price seen per token and was not " +
+                  "re-averaged; `firstEntryPrice` still carries that value for comparison",
     },
     windows,
     tokensTotal: byToken.length,
@@ -1065,27 +1210,65 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
 
   // No fan-out, no per-holder API call, no 25-holder cap: every trader who has ever traded
   // this token, from one query.
+  /**
+   * ISSUE-4, the K5 half. `entry` was `min(avg_entry_price)` — not the average the field
+   * name promised, and not even the "first value" the doc claimed: the CHEAPEST entry the
+   * trader ever got. The scorecard took the first and this took the minimum, so the two
+   * routes disagreed with each other as well as with their documentation.
+   *
+   * Now a quantity-weighted average per trader, using the same `trade_qty()` rule as the
+   * scorecard's `legQty`. Falls back to the earliest value only when no leg carries a
+   * recoverable quantity, and reports how many legs were weighted so the fallback is
+   * visible rather than inferred.
+   */
   const per = await sql`
-    select t.display_handle as handle,
-           count(*)::int                                          as trades,
-           count(*) filter (where tr.status = 'closed')::int       as closed,
-           coalesce(sum(tr.realized_pnl_usd)
-                    filter (where tr.status = 'closed'), 0)        as realized,
-           coalesce(sum(tr.unrealized_pnl_usd)
-                    filter (where tr.status <> 'closed'), 0)       as unrealized,
-           min(tr.avg_entry_price) filter (where tr.avg_entry_price > 0) as entry,
-           min(tr.avg_exit_price)  filter (where tr.avg_exit_price  > 0) as exit,
-           min(tr.opened_at)                                       as first_buy,
-           max(tr.closed_at)                                       as last_sell
-    from trades tr join traders t on t.handle = tr.handle
-    where tr.token_key = ${key}
-    group by t.display_handle
-    order by realized desc, t.display_handle`;
+    with legs as (
+      select t.display_handle as handle, tr.status, tr.trade_id,
+             tr.realized_pnl_usd, tr.unrealized_pnl_usd,
+             tr.avg_entry_price, tr.avg_exit_price, tr.opened_at, tr.closed_at,
+             trade_qty(tr.status, tr.amount, tr.realized_pnl_usd,
+                       tr.avg_entry_price, tr.avg_exit_price) as qty
+      from trades tr join traders t on t.handle = tr.handle
+      where tr.token_key = ${key}
+    )
+    select handle,
+           count(*)::int                                           as trades,
+           count(*) filter (where status = 'closed')::int           as closed,
+           coalesce(sum(realized_pnl_usd)
+                    filter (where status = 'closed'), 0)            as realized,
+           coalesce(sum(unrealized_pnl_usd)
+                    filter (where status <> 'closed'), 0)           as unrealized,
+           coalesce(
+             sum(avg_entry_price * qty) filter (where avg_entry_price > 0 and qty is not null)
+               / nullif(sum(qty) filter (where avg_entry_price > 0 and qty is not null), 0),
+             (array_agg(avg_entry_price order by opened_at nulls last, trade_id)
+                filter (where avg_entry_price > 0))[1]
+           )                                                        as entry,
+           coalesce(
+             sum(avg_exit_price * qty) filter (where avg_exit_price > 0 and qty is not null)
+               / nullif(sum(qty) filter (where avg_exit_price > 0 and qty is not null), 0),
+             (array_agg(avg_exit_price order by opened_at nulls last, trade_id)
+                filter (where avg_exit_price > 0))[1]
+           )                                                        as exit,
+           count(*) filter (where avg_entry_price > 0)::int          as entry_positions,
+           count(*) filter (where avg_entry_price > 0
+                              and qty is not null)::int              as entry_positions_weighted,
+           min(opened_at)                                           as first_buy,
+           max(closed_at)                                           as last_sell
+    from legs
+    group by handle
+    order by realized desc, handle`;
 
   const withClosed = per.filter((r) => Number(r.closed) > 0);
   const winners = withClosed.filter((r) => (n(r.realized) ?? 0) > 0).length;
   const losers = withClosed.filter((r) => (n(r.realized) ?? 0) < 0).length;
   const entries = per.map((r) => n(r.entry)).filter((x): x is number => x !== null && x > 0);
+  // How much of the crowd figure rests on a real average rather than a single position or a
+  // fallback — reported rather than left for a consumer to assume.
+  const multiPosition = per.filter((r) => Number(r.entry_positions) > 1).length;
+  const fullyWeighted = per.filter((r) =>
+    Number(r.entry_positions) > 0 &&
+    Number(r.entry_positions_weighted) === Number(r.entry_positions)).length;
 
   const opened = per.reduce((s, r) => s + (Number(r.trades) - Number(r.closed)), 0);
   const closedTotal = per.reduce((s, r) => s + Number(r.closed), 0);
@@ -1147,6 +1330,18 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     crowdAvgEntryPrice: {
       value: entries.length ? Number((entries.reduce((a, b) => a + b, 0) / entries.length).toPrecision(8)) : null,
       coverage: cov(entries.length, per.length),
+      /**
+       * One trader, one vote — deliberately NOT weighted by position size.
+       *
+       * This answers "what did a typical leader pay", which is the question the board is
+       * read for. Weighting by size would answer "what did the crowd's money pay" and be
+       * set almost entirely by the largest holder. ISSUE-4 was that the INPUTS were
+       * first-entries rather than averages; that is what changed here, not the way holders
+       * are combined.
+       */
+      method: "unweighted mean across holders of each holder's quantity-weighted entry",
+      holdersMultiPosition: multiPosition,
+      holdersFullyWeighted: fullyWeighted,
     },
     flow: { opened, closed: closedTotal, verdict: flow },
     realizedPnlUsd: round(per.reduce((s, r) => s + (n(r.realized) ?? 0), 0)),
@@ -1155,6 +1350,8 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
       handle: r.handle, trades: Number(r.trades), closed: Number(r.closed),
       realizedPnlUsd: round(n(r.realized)), unrealizedPnlUsd: round(n(r.unrealized)),
       avgEntryPrice: n(r.entry), avgExitPrice: n(r.exit),
+      entryPositions: Number(r.entry_positions),
+      entryPositionsWeighted: Number(r.entry_positions_weighted),
       firstBuyAt: r.first_buy ?? null, lastSellAt: r.last_sell ?? null,
     })),
     plain: !per.length
