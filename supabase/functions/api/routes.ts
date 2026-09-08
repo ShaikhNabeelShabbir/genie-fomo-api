@@ -145,6 +145,17 @@ get("/v1/chains", async () => {
             closedTrades: p ? Number(p.closed) : 0,
             pnlUsd: p ? round(n(p.realized)) : null,
             basis: "sum of realized_pnl_usd over closed trades recorded on this chain",
+            /**
+             * A chain can show `pricedShare: 0` and a dollar profit at the same time, and
+             * that looks like a contradiction unless the response says where each number
+             * comes from. Profit is fomo's REPORTED trade records; pricing is the holdings
+             * snapshot. Different sources, different completeness — so the tier is stated
+             * rather than left to be inferred.
+             */
+            tier: "reported",
+            source: "fomoapi trade records",
+            note: "independent of this chain's price coverage — see coverage.pricedShare, " +
+                  "which describes the holdings snapshot, not these trades",
           };
         })(),
         historyCoverage: {
@@ -762,20 +773,55 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   const meanToMedian = meanTrade !== null && medTrade !== null && meanTrade > 0 && medTrade > 0
     ? Number((meanTrade / medTrade).toFixed(2)) : null;
 
+  // `id` is carried so the caveat below can compare set MEMBERSHIP, not just counts.
   const entryRows = rows
-    .map((r) => ({ amount: n(r.amount), px: n(r.avg_entry_price) }))
-    .filter((r): r is { amount: number; px: number } => r.amount !== null && r.px !== null && r.px > 0);
+    .map((r) => ({ id: String(r.trade_id), amount: n(r.amount), px: n(r.avg_entry_price) }))
+    .filter((r): r is { id: string; amount: number; px: number } =>
+      r.amount !== null && r.px !== null && r.px > 0);
   const exitRows = rows
-    .map((r) => ({ amount: n(r.amount), px: n(r.avg_exit_price) }))
-    .filter((r): r is { amount: number; px: number } => r.amount !== null && r.px !== null && r.px > 0);
+    .map((r) => ({ id: String(r.trade_id), amount: n(r.amount), px: n(r.avg_exit_price) }))
+    .filter((r): r is { id: string; amount: number; px: number } =>
+      r.amount !== null && r.px !== null && r.px > 0);
   const inCov = cov(entryRows.length, rows.length);
   const outCov = cov(exitRows.length, rows.length);
 
+  /**
+   * T3 — return on cost basis, and the derivation matters.
+   *
+   * This previously computed basis as `amount x avgEntryPrice` over closed trades and was
+   * wrong by ~10^17. `amount` on a CLOSED trade is what REMAINS in the position — nothing,
+   * because it was sold. Measured: 2,378 of 3,220 closed trades have amount exactly 0, and
+   * 2,866 have a basis under $1 against a realized P&L over $100. Dividing real dollars by
+   * dust produced numbers like 877,995,983,169,868,200.
+   *
+   * fomo never reports the quantity originally bought, so the basis cannot be read directly.
+   * It can be DERIVED, because for a position closed at avgExitPrice:
+   *
+   *     pnl   = qty x (exit - entry)          ->   qty   = pnl / (exit - entry)
+   *     basis = qty x entry                   ->   basis = pnl x entry / (exit - entry)
+   *
+   * The quantity cancels, so no position size is needed. Summing basis and pnl across trades
+   * then gives a MONEY-WEIGHTED return — a $1M trade counts more than a $10 one, which an
+   * average of per-trade percentages would not.
+   *
+   * Trades where the derivation cannot hold are dropped rather than approximated: exit equal
+   * to entry (a zero divisor), and the 29 of 3,176 whose implied basis is negative — that
+   * means pnl and the price move disagree in sign, so the trade is not a simple long and the
+   * formula does not describe it.
+   */
   const closedPriced = closed
-    .map((r) => ({ amount: n(r.amount), px: n(r.avg_entry_price), pnl: n(r.realized_pnl_usd) }))
-    .filter((r): r is { amount: number; px: number; pnl: number } =>
-      r.amount !== null && r.px !== null && r.px > 0 && r.pnl !== null);
-  const basis = closedPriced.reduce((s, r) => s + r.amount * r.px, 0);
+    .map((r) => {
+      const entry = n(r.avg_entry_price);
+      const exit = n(r.avg_exit_price);
+      const pnl = n(r.realized_pnl_usd);
+      if (entry === null || exit === null || pnl === null) return null;
+      if (entry <= 0 || exit <= 0 || exit === entry) return null;
+      const basis = (pnl * entry) / (exit - entry);
+      if (!Number.isFinite(basis) || basis <= 0) return null;
+      return { basis, pnl };
+    })
+    .filter((r): r is { basis: number; pnl: number } => r !== null);
+  const basis = closedPriced.reduce((s, r) => s + r.basis, 0);
   const closedPnl = closedPriced.reduce((s, r) => s + r.pnl, 0);
 
   const betSizes = entryRows.map((r) => r.amount * r.px).filter((x) => x > 0);
@@ -859,9 +905,22 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     caveats.push(`Entry prices are present on only ${entryRows.length} of ${rows.length} trades, ` +
       `so money-in, return % and typical bet size are computed from a minority of the record.`);
   }
-  if (entryRows.length !== exitRows.length) {
-    caveats.push(`Money-in covers ${entryRows.length} trades and money-out covers ${exitRows.length} ` +
-      `— different subsets of the record. The difference between them is NOT a profit figure.`);
+  /**
+   * Compare the SETS, not their sizes.
+   *
+   * This previously fired only when the two counts differed, which missed the case that
+   * actually misleads: `ether_monk` has 42 entry prices and 42 exit prices — equal counts,
+   * different trades, because 22 of the entry-priced ones are still open and so cannot have
+   * an exit. A reader saw "$3.19M in, $0.4M out" and reasonably concluded a large loss; that
+   * trader's closed trades are in fact +$916,699. Equal cardinality is not overlap.
+   */
+  const entryIds = new Set(entryRows.map((r) => r.id));
+  const exitIds = new Set(exitRows.map((r) => r.id));
+  const shared = [...entryIds].filter((id) => exitIds.has(id)).length;
+  if (shared < entryIds.size || shared < exitIds.size) {
+    caveats.push(`Money-in covers ${entryIds.size} trades and money-out covers ${exitIds.size}, but ` +
+      `only ${shared} are the same trade — money-in includes positions still open, which have no ` +
+      `exit yet. Subtracting one from the other is NOT a profit figure; use returnPct or /pnl.`);
   }
 
   let plain: string;
@@ -1150,8 +1209,16 @@ get("/v1/tokens/momentum", async (_p, url) => {
       holders: Number(r.holders), previousHolders: Number(r.previous_holders), change,
       gained: gained.map((h) => disp.get(h) ?? h), lost: lost.map((h) => disp.get(h) ?? h),
       isNew: Number(r.previous_holders) === 0,
+      /**
+       * A token with no previous snapshot did not necessarily get BOUGHT — it may simply be
+       * the first time the loader saw it. Those are indistinguishable from here, so the
+       * sentence states what is observed (it is present now) rather than asserting a
+       * purchase the data cannot establish. "Opened a position" is reserved for rows with
+       * a previous holder count to compare against.
+       */
       plain: Number(r.previous_holders) === 0
-        ? `New — ${r.holders} leader${Number(r.holders) === 1 ? "" : "s"} opened a position since the last snapshot.`
+        ? `First seen in this snapshot — ${r.holders} leader${Number(r.holders) === 1 ? "" : "s"} hold it. ` +
+          `Whether they just bought it or it is newly tracked cannot be told apart from one snapshot.`
         : change > 0 ? `+${change} holders (${r.previous_holders} to ${r.holders}).`
         : change < 0 ? `${change} holders (${r.previous_holders} to ${r.holders}).`
         : `Same holder count, but ${gained.length} in and ${lost.length} out.`,

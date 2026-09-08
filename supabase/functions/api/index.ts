@@ -34,8 +34,6 @@ const fail = (e: ApiError) =>
         ...(e.retryAfterSeconds ? { retryAfterSeconds: e.retryAfterSeconds } : {}),
         ...(e.extra ?? {}),
       },
-      // Kept alongside `error` so existing callers reading `detail` do not break.
-      detail: e.message,
     },
     e.status,
     e.retryAfterSeconds ? { "Retry-After": String(e.retryAfterSeconds) } : {},
