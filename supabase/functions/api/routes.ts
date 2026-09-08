@@ -36,6 +36,37 @@ export const asOfToken = async (tokenKey: string): Promise<string | null> => {
   return r?.at ? new Date(String(r.at)).toISOString() : null;
 };
 
+
+/**
+ * Read an integer query parameter, or reject it.
+ *
+ * The old pattern was `Number(url.searchParams.get("limit"))` guarded by `isFinite`, which
+ * silently treated anything unparseable as "not supplied" — so `?limit=abc` returned 200 and
+ * the whole list, and `?offset=abc` was ignored. A typo produced a full table scan and a
+ * confidently wrong page rather than an error naming the mistake.
+ *
+ * Absent still means the default: `?limit=` omitted returns everything, which is documented.
+ * PRESENT-but-invalid is what now fails, because that is a caller error and silence hides it.
+ */
+function intParam(
+  url: URL,
+  name: string,
+  opts: { min?: number; max?: number; fallback: number | null },
+): number | null {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw.trim() === "") return opts.fallback;
+
+  const v = Number(raw);
+  const min = opts.min ?? 0;
+  if (!Number.isFinite(v) || !Number.isInteger(v)) {
+    throw badRequest(`'${name}' must be a whole number — got '${raw}'`, { parameter: name });
+  }
+  if (v < min) {
+    throw badRequest(`'${name}' must be at least ${min} — got ${v}`, { parameter: name });
+  }
+  return opts.max !== undefined ? Math.min(v, opts.max) : v;
+}
+
 /** '' is not a value. The columns store empty strings where fomo gave nothing. */
 const nonEmpty = (v: string | null | undefined): string | null =>
   v && v.trim() ? v.trim() : null;
@@ -388,9 +419,8 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
 
 get("/v1/traders", async (_p, url) => {
   const q = (url.searchParams.get("q") ?? "").trim().replace(/^@/, "").toLowerCase();
-  const askedLimit = Number(url.searchParams.get("limit"));
-  const limit = Number.isFinite(askedLimit) && askedLimit >= 1 ? Math.floor(askedLimit) : null;
-  const offset = Math.max(0, Number(url.searchParams.get("offset")) || 0);
+  const limit = intParam(url, "limit", { min: 1, fallback: null });
+  const offset = intParam(url, "offset", { min: 0, fallback: 0 }) ?? 0;
 
   // Ranked by the leaderboard's own `rank`, and search scores exact > prefix > substring so
   // it matches the Node implementation rather than relying on Postgres text ranking.
@@ -546,8 +576,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
 
   const filtered = url.searchParams.get("includeQuote") === "false"
     ? all.filter((r) => !r.isQuoteAsset) : all;
-  const askedLimit = Number(url.searchParams.get("limit"));
-  const limit = Number.isFinite(askedLimit) && askedLimit >= 1 ? Math.floor(askedLimit) : null;
+  const limit = intParam(url, "limit", { min: 1, fallback: null });
   const page = limit === null ? filtered : filtered.slice(0, limit);
   const priced = all.filter((r) => r.valueUsd !== null).length;
 
@@ -568,8 +597,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
 get("/v1/tokens", async (_p, url) => {
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
   const net = await chainWhere(chainQ);
-  const askedMin = Number(url.searchParams.get("minHolders"));
-  const minHolders = Number.isFinite(askedMin) && askedMin >= 1 ? Math.floor(askedMin) : 1;
+  const minHolders = intParam(url, "minHolders", { min: 1, fallback: 1 }) ?? 1;
 
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
 
@@ -616,8 +644,7 @@ get("/v1/tokens", async (_p, url) => {
     disp.set(r.handle as string, r.display_handle as string);
   }
 
-  const askedLimit = Number(url.searchParams.get("limit"));
-  const limit = Number.isFinite(askedLimit) && askedLimit >= 1 ? Math.floor(askedLimit) : null;
+  const limit = intParam(url, "limit", { min: 1, fallback: null });
   const page = limit === null ? rows : rows.slice(0, limit);
 
   return {
@@ -973,8 +1000,7 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     all:   { realizedUsd: round(n(w.all_time)), closedTrades: Number(w.n_all) },
   };
 
-  const askedTokens = Number(url.searchParams.get("tokens"));
-  const tokenLimit = Number.isFinite(askedTokens) && askedTokens >= 1 ? Math.floor(askedTokens) : null;
+  const tokenLimit = intParam(url, "tokens", { min: 0, fallback: null });
 
   return {
     handle: t.display_handle, name: t.name ?? null,
@@ -1228,8 +1254,7 @@ get("/v1/tokens/momentum", async (_p, url) => {
 
   const filtered = dir === "in" ? moved.filter((r) => r.change > 0)
     : dir === "out" ? moved.filter((r) => r.change < 0) : moved;
-  const askedLimit = Number(url.searchParams.get("limit"));
-  const limit = Number.isFinite(askedLimit) && askedLimit >= 1 ? Math.floor(askedLimit) : null;
+  const limit = intParam(url, "limit", { min: 1, fallback: null });
 
   return {
     board: "momentum", available: true, snapshots: gens.length,
@@ -1257,8 +1282,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
 
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
   const net = await chainWhere(chainQ);
-  const askedLimit = Number(url.searchParams.get("limit"));
-  const limit = Number.isFinite(askedLimit) && askedLimit >= 1 ? Math.min(Math.floor(askedLimit), 500) : 50;
+  const limit = intParam(url, "limit", { min: 1, max: 500, fallback: 50 }) ?? 50;
 
   const keys = [t.evm_address, t.sol_address]
     .filter((a): a is string => !!a).map((a) => a.toLowerCase());
