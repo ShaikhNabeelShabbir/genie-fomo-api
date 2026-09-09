@@ -3014,12 +3014,26 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
 // ------------------------------------------------------------------ health
 
 get("/v1/health", async () => {
+  /*
+   * Exact counts everywhere except `transactions`, which is an estimate and says so.
+   *
+   * count(*) over transactions is a sequential scan. At 666,895 rows it measured 23.8s and
+   * hit the 2min statement timeout once -- on the endpoint whose entire job is to answer
+   * quickly whether the service is alive. The planner's own row estimate answers the same
+   * question in microseconds.
+   *
+   * It is reported under `transactions` as before so no consumer breaks, and listed in
+   * `estimatedRows` so nobody mistakes it for a counted figure. An approximate number that
+   * admits it is approximate is honest; one that does not is the failure this API is
+   * organised against.
+   */
   const [c] = await sql`
     select (select count(*) from traders)                        as traders,
            (select count(*) from holdings_current)               as holdings,
            (select count(*) from tokens)                         as tokens,
            (select count(*) from trades)                         as trades,
-           (select count(*) from transactions)                   as transactions,
+           (select greatest(reltuples, 0)::bigint from pg_class
+             where oid = 'public.transactions'::regclass)        as transactions,
            (select count(distinct handle) from wallets)          as wallets,
            (select count(distinct captured_at) from holdings)    as generations`;
   const [b] = await sql`
@@ -3031,6 +3045,8 @@ get("/v1/health", async () => {
     source: "postgres",
     build: { capturedAt: b?.captured_at ?? null, window: b?.window_label ?? null },
     rows: Object.fromEntries(Object.entries(c).map(([k, v]) => [k, Number(v)])),
+    /** Which entries in `rows` are planner estimates rather than counted. */
+    estimatedRows: ["transactions"],
     // Every route here answers from Postgres. Nothing in the request path calls fomoapi,
     // Helius, Bitquery or Etherscan — those keys belong to the scheduled loaders.
     externalCallsPerRequest: 0,

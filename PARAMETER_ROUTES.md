@@ -1,6 +1,7 @@
 # genie-fomo API — complete reference
 
-**Generated: 2026-09-09T09:20Z**
+**Generated: 2026-09-09T09:20Z** · **Updated 2026-09-09** — the directory now carries
+GMGN-sourced traders alongside fomo's. See *§0d. Two sources of trader*.
 
 Everything the API answers, in one document: the **35 PARAMETERS.md parameters**, the **10
 GMGN-parity features** built on top of them, and the corrections from the bug report. One row
@@ -12,6 +13,7 @@ per thing you can ask — what it means in plain words, the exact call, and the 
 | GMGN-parity features (G series) | **12 of 12** — G1–G12, complete |
 | Reported bugs and issues | **10 of 10 fixed** — see Appendix A |
 | Routes | **15**, plus bulk `?include=` |
+| Traders in the directory | **435** — 144 from fomo, **291 from GMGN** |
 
 **Every figure below is a dated example, not current state.** They were pulled from the live
 service at the timestamp above; the pipeline refreshes nightly and the Helius webhook ingests
@@ -43,6 +45,51 @@ more careful than they need to:
 
 ---
 
+## 0d. Two sources of trader
+
+Until 2026-09-09 every trader here came from fomo, and fomo will not serve anyone outside its
+own top 100 — `/v2/users/{handle}` answers *"trader not found"* for everybody else. The
+directory now also carries traders discovered from GMGN's two public wallet lists (KOL and
+smart money), on the key we already hold.
+
+| | fomo | GMGN |
+| --- | --- | --- |
+| Traders | 144 | **291** |
+| `traders.source` | `fomoapi.io` | `gmgn` |
+| Wallets | 141 | 291 |
+| `trades` | 141 traders · 13,184 positions | 291 traders · **33,151 positions** |
+| `trader_stats` | 144 | 291 |
+| Holdings | 140 | 227 |
+
+**No new tables and no new routes.** Every route below works for both, because they key off
+`handle` and `address_key` rather than anything fomo-specific. Verified live across 16 routes
+× 3 traders: all 200, all returning real figures.
+
+Four things worth knowing before you read a GMGN trader's numbers:
+
+- **`rank` and `followers` are `null`.** They are fomo-leaderboard concepts with no on-chain
+  equivalent, and inventing a rank would put a GMGN trader on fomo's ladder as though fomo
+  had placed them there. Sorting by rank puts them last, not first.
+- **Their `trades` are derived, not reported.** fomo hands us finished positions; a GMGN
+  trader's are folded from per-trade activity into the same per-position shape — buys give
+  `avgEntryPrice`, sells give `avgExitPrice` and `realizedPnlUsd` via `cost_usd − buy_cost_usd`.
+  Same table, same meaning, different provenance.
+- **`unrealizedPnlUsd` is `null` for them**, not 0. It needs a current price we do not hold for
+  most of these tokens, and 0 would read as "this position is exactly flat".
+- **Their entry-price coverage is far better.** 89% of GMGN positions carry an entry price
+  against fomo's 45%, so `scorecard.entryPriceCoverage.clearsSpecBar` is often `true` for a
+  GMGN trader and rarely for a fomo one. That is a property of the source, not of the trader.
+
+**The cohort tripled, so percentile ranks moved.** Any axis score computed against the old
+144-trader cohort is not comparable to one computed now.
+
+```bash
+curl -s "$B/traders/feibo03/scorecard?tokens=0" | jq '{winRate, entryPriceCoverage}'
+curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
+```
+
+---
+
 ## Contents
 
 | § | | |
@@ -51,6 +98,7 @@ more careful than they need to:
 | **0a** | [Errors — telling apart "stop", "back off" and "retry"](#0a-errors-telling-apart-stop-back-off-and-retry) | status codes, stable `code`, rate-limit headers |
 | **0b** | [Cursor pagination (G4)](#0b-cursor-pagination-g4) | **G4** |
 | **0c** | [Sorting and range filters (G5)](#0c-sorting-and-range-filters-g5) | **G5** |
+| **0d** | [Two sources of trader](#0d-two-sources-of-trader) | fomo's 144 + **GMGN's 291** |
 | **1** | [Trader — money](#1-trader-money) | T1–T10 |
 | **2** | [Trader — positions](#2-trader-positions) | T11–T15 |
 | **2b** | [Position timing (G1)](#2b-position-timing-g1) | **G1** |
@@ -78,7 +126,7 @@ more careful than they need to:
 
 | Route | In plain words | Live value |
 | --- | --- | --- |
-| `GET $B/health` | "What's in the database, and when was it loaded?" | 137 traders · 3,356 holdings · 12,137 trades · 374,927 transfers |
+| `GET $B/health` | "What's in the database, and when was it loaded?" | **435 traders** · 29,967 holdings · 51,581 trades · ~652k transfers |
 | `GET $B/traders` | "Who are the top 137?" | each entry carries a stable `id` and its own `updatedAt` |
 | `GET $B/traders/unipcs` | "Everything about one trader, and **what else I can ask**" | summary + `links` to all seven sub-routes |
 | `GET $B/traders/unipcs/transactions?limit=5` | "What have their wallets actually done on-chain?" | `?kind=swap` filters to trades; each row carries `kind` and `protocol` |
@@ -1247,6 +1295,21 @@ than the value being withheld — the reader decides. `unipcs` is the worst case
 
 The same rule governs `holdings.value`: most positions have no price at all, and a missing
 price is excluded from every aggregate rather than counted as zero.
+
+---
+
+## Appendix A2 · Found while verifying the routes against GMGN traders (2026-09-09)
+
+Three defects surfaced only once the directory tripled. All three are fixed and deployed.
+
+| What | Symptom | Cause | Fix |
+| --- | --- | --- | --- |
+| **`holdings_current` was 21× too slow** | `/tokens` took 33-39s, `/chains` 27s, a bare `count(*)` 7.4s | the view's anti-join referenced a **CTE**, which has no indexes, so the planner re-scanned 2,918 fomo rows for each of ~27,000 chain rows | anti-join now references `holdings` itself, whose primary key already begins `(handle, network_id)`. Same rows, **345ms** |
+| **`/health` sequential-scanned 666,895 rows** | 13-38s, and it hit the 2min statement timeout once | `count(*) from transactions` on the endpoint whose whole job is a fast liveness answer | the planner's row estimate, reported under the same key and listed in a new **`estimatedRows`** field so it is never mistaken for a counted figure |
+| **163 traders had a blank `display_handle`** | `/v1/traders/:handle` answered 200 with `handle: ""` | GMGN returns `twitter_username: ""` — not null — and `??` only catches null | empty strings normalised to null on the way in; the 163 rows repaired |
+
+The first two were latent before the cohort grew: correct at 144 traders, unusable at 435.
+The third shipped with the GMGN loader and is mine.
 
 ---
 
