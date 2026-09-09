@@ -276,10 +276,42 @@ a small change.
 ~~Axis 4 has a milder version of the same problem.~~ **Closed 2026-09-09.** It was 77 of 144;
 chain-read balances took it to 140. See §6 Fix 1.
 
-**Recommendation:** see §6. A later pass found the cause is narrower than this section implies
-— the entry prices are missing because our on-chain resolver only covers Solana, which is 28%
-of trading. Axis 5 is not blocked by an absence of data; it is blocked by an unfinished
-resolver.
+**Recommendation superseded twice, and the second time settles it.**
+
+The first pass said the cause was an unfinished resolver covering only Solana. Step 4a
+disproved that: the EVM chains have no on-chain swaps to resolve.
+
+**2026-09-09 — four routes to an entry price were tested and all four are closed.** Every one
+was measured, not estimated:
+
+| Route | Result | Verdict |
+| --- | --- | --- |
+| `wallet_swaps` — derive entry from resolved swaps | fills **7 of 7,280** | the tokens it covers are the ones fomo already prices |
+| Algebra — `entry = exit − pnl/qty` | tested against 449 trades whose entry we KNOW: **0 within 10%** | the identity does not hold; `amount` is not the qty relating pnl to the price gap |
+| `transactions.value_usd` | would compute over rows that are mostly inbound transfers | this is precisely the T2.2 error that produced 84% disagreement with fomo |
+| GMGN historical price | `/v1/token/kline`, `/candles`, `/price`, `/price/history` all **404** | our plan exposes `/v1/token/info` and `/v1/token/security`, nothing else |
+
+The algebra one is worth dwelling on: it looked like a free win, and a naive implementation
+would have produced **7,280 plausible entry prices that are all wrong**. It was rejected
+because it was checked against entries we already had, not because it looked suspect.
+
+**What the fix would actually take.** The gap is well-shaped — every one of the 7,280 rows
+carries an `opened_at`, and they span only **1,020 distinct tokens**, so this is a bounded
+job of ~1,020 historical price lookups, not 7,280. If those prices existed, traders clearing
+the spec's 70% bar would go **14 → 141**.
+
+**It needs a historical price provider we do not have.** Birdeye, Codex, Moralis, Dexscreener
+— all new providers, and historical series is the tier they charge for. Under the standing
+constraint of "no paid APIs, no new keys", **Axis 5 cannot be closed.**
+
+**So the decision is a product one, not an engineering one:**
+
+- **Ship it hollow, per the spec.** All five inputs are returned with `coverage` attached; the
+  front end renders Axis 5 for the 14 traders who clear the bar and hollow for the other 127.
+  This is the spec behaving as written, not a defect.
+- **Or renegotiate the threshold.** The 70% bar is the spec's choice. We already return
+  `pricedShare`, so the front end can lower the bar and show what it rests on. That is a
+  conversation with the consuming team, and costs nothing to have.
 
 ---
 
