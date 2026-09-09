@@ -1855,7 +1855,28 @@ const scorecardRows = (handles: string[]) => sql`
          tr.trade_id, tr.network_id, tr.token_address, tr.token_key, tr.token_symbol,
          tr.status, tr.amount, tr.avg_entry_price, tr.avg_exit_price,
          tr.realized_pnl_usd, tr.unrealized_pnl_usd, tr.opened_at, tr.closed_at, tr.captured_at,
-         tk.total_supply, tk.supply_source, tk.supply_read_at,
+         /*
+          * Supply, preferring the one we read ourselves and falling back to GMGN's.
+          *
+          * tokens.total_supply comes from load_token_supply.mjs and is null on 5,623 of
+          * 13,184 trade pairs; token_info carries a supply for 5,000 of those. Where both
+          * exist they agree within 1% on 1,089 of 1,128 tokens, so the fallback is the same
+          * quantity from a second source rather than a different quantity.
+          *
+          * 0 is nulled first: a token cannot have zero supply, so a stored 0 means "not
+          * read", and multiplying a price by it would publish an entry market cap of $0.
+          *
+          * The SOURCE travels with it. An entryMcap built on GMGN's supply is a different
+          * claim from one built on a supply we read, and supplySource is what lets a
+          * consumer tell them apart.
+          */
+         coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0)) as total_supply,
+         case when nullif(tk.total_supply, 0) is not null then tk.supply_source
+              when nullif(ti.total_supply, 0) is not null then 'gmgn_token_info'
+         end as supply_source,
+         case when nullif(tk.total_supply, 0) is not null then tk.supply_read_at
+              when nullif(ti.total_supply, 0) is not null then ti.fetched_at
+         end as supply_read_at,
          -- Axis 5 wants the token's age at entry, which needs its creation time. GMGN carries
          -- it and we already store the whole document, so this is a read rather than a fetch.
          -- 0 means "they did not tell us" and is nulled here, not published as 1970.

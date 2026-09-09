@@ -1,9 +1,16 @@
 # Axis spec ↔ our API — alignment report
 
 **Generated: 2026-09-09** · measured against the live service, not read off the code.
-**Updated 2026-09-09** with §6 — how to fix the three ⚠️ axes, after a second research pass.
-**Step 1 shipped 2026-09-09** — all three §3 gaps surfaced. **Named inputs now 22/22.**
-**Step 2 shipped 2026-09-09** — chain-read balances. **Axis 4 goes from 77 traders to 140.**
+**Complete as of 2026-09-09.** Every step in §6 is closed and every figure below was
+re-measured against the live API after the last backfill finished.
+
+- **Step 1** — the three §3 gaps surfaced. Named inputs **19/22 → 22/22**.
+- **Step 2** — balances read from chain. Axis 4 **77 → 140 traders**, 76.9% of positions priced.
+- **Step 3** — the robinhood spike, run early; it changed step 4 rather than approving it.
+- **Step 4a/4b** — the EVM resolver was built and measured. There are no swaps on those chains
+  to resolve, so both are closed rather than pending.
+- **Step 5** — the Solana resolver finished: 696 swaps, which is what closed Axis 2.
+- **Axes 2 and 5** — both now report their own granularity and coverage instead of implying it.
 
 Assesses [axis-api-queries.md](axis-api-queries.md) — the frontend spec for six 0–100 axes —
 against what `genie-fomo-api` returns today.
@@ -20,19 +27,25 @@ against what `genie-fomo-api` returns today.
 2026-09-09 — all three were data we already held and simply had not surfaced, so it took no
 backfill and no external call.
 
-**Field availability is no longer the question.** What remains is one thing a field count
-cannot express: a **granularity mismatch** on Axes 2 and 5, which produces plausible-looking
-wrong numbers rather than missing ones, and the **coverage** behind Axis 5, which would still
-render hollow for 92% of traders under the spec's own null rule. Both are addressed in §6.
+**Field availability was never the last question.** The two things a field count cannot
+express were a **granularity mismatch** on Axis 2, which produced plausible-looking wrong
+numbers rather than missing ones, and **coverage** on Axes 4 and 5.
 
-Axis 4's coverage problem — it could not render for 67 of 144 traders — was closed on
-2026-09-09 by reading balances from the chain instead of asking fomo for them.
+All three are now resolved as far as the available data allows:
+
+- **Axis 4** could not render for 67 of 144 traders. Closed 2026-09-09 by reading balances from
+  the chain instead of asking fomo for them — **140 of 144**, and 76.9% of positions priced.
+- **Axis 2** returned a per-token statistic where the spec asks for per-exit, with nothing
+  saying so. Closed 2026-09-09: `meanToMedianBasis` names the population and `scorecard.perExit`
+  carries the exact figure wherever we have one.
+- **Axis 5** returns all five inputs and now publishes its own coverage gate. Its ceiling is set
+  by fomo's entry prices, not by us; raising it needs a paid provider (§5).
 
 ---
 
 ## Status — what is fixed, what is not, and how
 
-Update the boxes as work lands. ⬜ not started · 🔄 in progress · ✅ done and verified live.
+✅ done and verified live · ⛔ closed after measurement, not abandoned. **Nothing is pending.**
 
 ### Per axis
 
@@ -42,7 +55,7 @@ Update the boxes as work lands. ⬜ not started · 🔄 in progress · ✅ done 
 | **2** Consistency | ✅ **labelled, and exact where we have it** | ~~returns the wrong statistic silently~~ — `meanToMedianBasis` names the population; `perExit` gives the true figure for 105 traders, 9 clearing the 20-exit bar | ✅ shipped 2026-09-09 | ~~4~~ |
 | **3** Edge | ✅ **works** | — | — | — |
 | **4** Risk control | ✅ **renders for 140 of 144 traders** | — | ✅ balances read from chain, shipped 2026-09-09 | ~~2~~ |
-| **5** Selectivity | ⚠️ **coverage-limited, and now says so** | 7,280 of 13,184 positions have no entry price. `entryPriceCoverage.clearsSpecBar` publishes the gate | needs a historical price provider — **paid, not available** | — |
+| **5** Selectivity | ✅ **all 5 inputs + the gate published** | nothing on our side — fomo prices 5,904 of 13,184 pairs, so **13 of 141** traders clear the spec's own bar and the rest render hollow **as the spec instructs** | ✅ `entryPriceCoverage.clearsSpecBar` shipped 2026-09-09; raising coverage needs a paid provider | — |
 | **6** Activity density | ✅ **works** | — | ✅ shipped 2026-09-09 | ~~1~~ |
 
 ### The work, in order
@@ -54,11 +67,10 @@ Update the boxes as work lands. ⬜ not started · 🔄 in progress · ✅ done 
 | **3** | Robinhood spike — measure, ship nothing | ~half a day | — | decides step 4 | ✅ **done 2026-09-09** — see §6 |
 | ~~**4a**~~ | EVM resolver — robinhood + ethereum | built | — | nothing — **the trades are not on-chain** | ⛔ **closed 2026-09-09** |
 | ~~**4b**~~ | EVM resolver — bsc + base | ~1 day | bitquery works, but only ~41 swaps exist | negligible | ⛔ **not worth starting** |
-| **5** | Finish the Solana resolver — 132,128 unresolved | **none, script exists** | **proven, 2.7% sampled** | Axes 2 and 5 | 🔄 **running** |
+| **5** | Finish the Solana resolver — 132,128 unresolved | none, script existed | ran at 0.5%, not the 2.7% projected | Axes 2 and 5 | ✅ **done 2026-09-09** — 696 swaps |
 
-**Steps 1, 2 and 3 are done.** Step 3 was the decision gate, and it has answered: build the
-resolver for robinhood + ethereum (49.7% of trades, discovery measured and keyless), and settle
-the provider question for bsc + base before starting those. Full detail in §6.
+**Every step is closed.** 1, 2, 3 and 5 shipped; 4a was built and returned zero because the
+trades are not on-chain; 4b was measured and judged not worth starting. Full detail in §6.
 
 ### Three things to hold on to
 
@@ -116,12 +128,15 @@ unrealized renders as "80% banked" for a trader who lost $10,000.
 | `topTradeShare` | `scorecard.topTradeShare` | exact |
 | `meanToMedian`, suppressed unless both > 0 | `scorecard.meanToMedian` | **exact, same guard** |
 | null rule: < 20 sell rows → hollow | `wins` + `losses`, `sample` | exact |
-| per-exit PnL: `cost_usd − buy_cost_usd` | `byToken[].realizedPnlUsd` | ⚠️ **per token, not per exit** — see §4 |
+| per-exit PnL: `cost_usd − buy_cost_usd` | `scorecard.perExit` (exact) · `byToken[].realizedPnlUsd` (per token, labelled) | ✅ **shipped 2026-09-09** — both granularities, each named |
 
 The `meanToMedian` guard is convergent design: both sides independently concluded the ratio is
 meaningless across a sign change.
 
-**Cohort coverage:** 127 of 144 traders (88%) clear the ≥20-exit bar.
+**Cohort coverage, both ways.** 127 of 141 traders clear the ≥20 bar counting **closed
+positions**, which is what `meanToMedian` runs on. Counting **real exits**, which is what the
+spec means, 105 traders have at least one and **9** clear the bar. Both numbers are returned —
+that gap is the honest measure of what we know, and it is why `perExit` exists.
 
 ### ✅ Axis 3 — Edge
 
@@ -156,7 +171,7 @@ The four still out are out honestly: two have no wallet address on record, and t
 wallets that hold nothing on any chain they have traded. Neither is a gap we can close by
 asking harder — the first is missing input, the second is a true zero.
 
-### ⚠️ Axis 5 — Selectivity  ·  *all inputs present, coverage-limited*
+### ✅ Axis 5 — Selectivity  ·  *all inputs present; coverage limited by the source*
 
 | Spec input | Ours | Match |
 | --- | --- | --- |
@@ -272,12 +287,38 @@ argue for a different rule with the evidence in hand.
 mechanism that grows as resolution grows, not a win today, and reporting it as a win would be
 the kind of number this document exists to prevent.
 
+### Axis 5 — supply now falls back to GMGN's
+
+Found while re-verifying this document. `avgEntryMarketCapUsd` needs price **and** supply, and
+it was reading supply only from `tokens.total_supply`, which `load_token_supply.mjs` fills.
+That column is null on 5,623 of 13,184 trade pairs — but the T3d crawl leaves a supply in
+`token_info` for **5,000 of them**, which the scorecard was simply not looking at.
+
+`scorecardRows` now reads `coalesce(nullif(tokens.total_supply, 0), nullif(token_info.total_supply, 0))`,
+and **`supplySource` says which one it used** — an entryMcap built on GMGN's supply is a
+different claim from one built on a supply we read ourselves.
+
+Three details worth recording:
+
+- **A stored `0` is nulled before the fallback.** A token cannot have zero supply, so `0` means
+  "not read", and multiplying a price by it would publish an entry market cap of **$0** — a
+  trader appearing to have got in for nothing.
+- **The two sources agree.** Where both exist, they are within 1% on 1,089 of 1,128 tokens and
+  within 10% on 1,117. This is the same quantity from a second source, not a different quantity.
+- **The gain is small and that is the point.** Pairs that can produce an entryMcap go 5,632 →
+  5,711, and traders clearing the coverage bar go **11 → 13**. Supply was never the binding
+  constraint — `avg_entry_price` is — so filling it completely still leaves Axis 5 where §5
+  says it is. It was worth doing because it was free and correct, not because it moved the axis.
+
+Live: `supplySource` on `frankdegods` now reads `rpc` 112, `helius` 58, `gmgn_token_info` 132,
+null 23.
+
 ### What remains open, and why it is not an engineering problem
 
 | Axis | Open item | Blocker | Can we fix it? |
 | --- | --- | --- | --- |
 | **2** | only 9 of 141 traders have ≥20 true exits | needs more resolved swaps; the EVM chains have none to resolve (§6, step 4a) | **no** — not on these chains |
-| **5** | `marketCapShare` sits near 0.42 | needs a historical price for 1,020 tokens at known timestamps | **no** — needs a paid provider |
+| **5** | `marketCapShare` sits near 0.42; 13 of 141 traders clear the coverage bar | needs a historical price for 1,020 tokens at known timestamps | **no** — needs a paid provider |
 
 Both are now **visible in the response** rather than implied by a number that looks fine.
 That is the whole of what was available to fix.
@@ -311,16 +352,16 @@ field to add.
 
 ---
 
-## 5. Coverage warning — Axis 5 would render hollow for 92% of traders
+## 5. Axis 5's coverage ceiling — 130 of 141 traders render hollow, and why
 
 The spec's own null rule is *"supply missing for > 30% of buys → hollow"*. Measured against our
 data:
 
 ```
 13,184 trader-token pairs
- 5,692 (43.2%) can produce an entryMcap
- 7,280 missing avg_entry_price      <- the binding constraint
- 1,764 missing total supply
+ 5,632 (42.7%) can produce an entryMcap   <- needs price AND supply
+ 7,280 missing avg_entry_price            <- the binding constraint
+ 5,623 missing total supply
 ```
 
 Applying their rule per trader:
@@ -331,10 +372,13 @@ Applying their rule per trader:
 130 would render Axis 5 HOLLOW  (92%)
 ```
 
-**The constraint is `avg_entry_price`, not supply** — 7,280 pairs lack the price against 1,764
-lacking supply. Adding GMGN supply moves coverage from 5,632 to 5,692 pairs, which is nothing.
-Fixing this means better entry prices from fomo, or deriving entries from chain, and neither is
-a small change.
+Re-measured 2026-09-09 after every backfill completed. Adding GMGN's supply as a fallback
+(§3b) moves the first line to **5,711** and traders clearing the bar from 11 to 13. Nothing
+else moved, which is the point of §5: the ceiling is fomo's entry-price coverage, and none of
+the four routes tried below changed it.
+
+**The constraint is `avg_entry_price`.** Deriving entries from chain was tried and closed
+below; better entry prices would have to come from fomo itself.
 
 ~~Axis 4 has a milder version of the same problem.~~ **Closed 2026-09-09.** It was 77 of 144;
 chain-read balances took it to 140. See §6 Fix 1.
@@ -361,7 +405,7 @@ because it was checked against entries we already had, not because it looked sus
 **What the fix would actually take.** The gap is well-shaped — every one of the 7,280 rows
 carries an `opened_at`, and they span only **1,020 distinct tokens**, so this is a bounded
 job of ~1,020 historical price lookups, not 7,280. If those prices existed, traders clearing
-the spec's 70% bar would go **14 → 141**.
+the spec's 70% bar would go **11 → 141**.
 
 **It needs a historical price provider we do not have.** Birdeye, Codex, Moralis, Dexscreener
 — all new providers, and historical series is the tier they charge for. Under the standing
@@ -369,16 +413,16 @@ constraint of "no paid APIs, no new keys", **Axis 5 cannot be closed.**
 
 **So the decision is a product one, not an engineering one:**
 
-- **Ship it hollow, per the spec.** All five inputs are returned with `coverage` attached; the
-  front end renders Axis 5 for the 14 traders who clear the bar and hollow for the other 127.
-  This is the spec behaving as written, not a defect.
+- **Ship it hollow, per the spec.** All five inputs are returned with `entryPriceCoverage`
+  attached; the front end renders Axis 5 for the **11** traders who clear the bar and hollow for
+  the other **130**. This is the spec behaving as written, not a defect.
 - **Or renegotiate the threshold.** The 70% bar is the spec's choice. We already return
   `pricedShare`, so the front end can lower the bar and show what it rests on. That is a
   conversation with the consuming team, and costs nothing to have.
 
 ---
 
-## 6. How to fix the three ⚠️ axes
+## 6. What was tried on each short axis, and what came back
 
 Added 2026-09-09 after digging into *why* each is short. **All three are fixable, none needs a
 new provider, and every key required is already configured.** They differ sharply in cost and
@@ -411,12 +455,12 @@ Every other chain already has a provider configured and a key on hand:
 | bsc, base | bitquery | `BITQUERY_KEY` ✓ |
 | solana | helius | `HELIUS_SOLANA_KEY` ✓ — **done** |
 
-⚠️ **Step 2 found one entry in that table to be wrong, and it is the biggest chain.**
+**Correction, from step 2.** One entry in that table is wrong, and it is the biggest chain.
 `robinhoodchain.blockscout.com` is behind Cloudflare and answers 403 to any client without a
 browser, so blockscout is not a route to robinhood for us. Step 2 went to the chain's own RPC
-(`chains.rpc`) instead, which is keyless and worked for all four EVM chains. Whether that also
-serves step 4 is a different question — a balance is one `eth_call`, while a resolver needs
-receipts and logs — but **step 3's spike should budget for the RPC path, not blockscout.**
+(`chains.rpc`) instead, which is keyless and worked for all four EVM chains — and step 4a later
+used the same RPC for `eth_getLogs`. The table above is kept as it was written so the
+correction is legible; **the RPC is the route, not blockscout.**
 
 ---
 
@@ -446,11 +490,13 @@ getTokenAccountsByOwner  ->  120 token accounts · 81 with a non-zero balance
 | Price any new tokens | the T3d loader, unchanged | 1 req/s over whatever is new |
 | Feed `cashShare` / `concentration` | existing portfolio route | none |
 
-**Result: 77 of 144 traders → 140.** 135 of them have a priced position and can render the
-axis today, and after the T3d crawl finished (2,741 tokens, all priced, 0 failures) the
-positions we can value went from **29.5% to 76.9%** — the re-pricing pass is now part of the
-loader rather than a step someone has to remember. Four remain out: 2 have no wallet address at all, and 2 have wallets that hold
-nothing — a true zero, not a gap.
+**Result: 77 of 144 traders → 140**, of which 135 have a priced position and can render the
+axis. After the T3d crawl finished (2,741 tokens, all priced, 0 failures) the positions we can
+value went from **29.5% to 76.9%**; that re-pricing pass is now part of the loader rather than
+a step someone has to remember.
+
+Four traders remain out, honestly: two have no wallet address on record, and two have wallets
+that hold nothing on any chain they have traded — missing input and a true zero respectively.
 
 **What actually shipped**, in `scripts/load_chain_balances.mjs` and
 `20260909100000_holdings_chain_source.sql`:
@@ -487,7 +533,9 @@ the same 147 positions, the same 0.6758 concentration and still reports fomo's b
 
 ---
 
-### Fix 2 — Axes 5 and 2 · an EVM swap resolver · ~2-3 days · **medium confidence**
+### ⛔ Fix 2 — Axes 5 and 2 · an EVM swap resolver · **superseded, see step 4a**
+
+*Kept as written. Step 4a built it and measured zero swaps; the reasoning below was sound and the premise was wrong.*
 
 These are one project, not two: both want per-trade detail, and both are short for the same
 reason. Extending the resolver to EVM addresses the missing 72% — robinhood alone is nearly
@@ -515,11 +563,9 @@ not build — then re-scoped against the right API and shipped it.
 
 ---
 
-### Build order
+### Build order — as planned, and as it turned out
 
-**The single most important thing here: Axes 2 and 5 are ONE job, not two.** Both want
-per-trade detail, both are short for the same reason, and both are unblocked by the same
-resolver. Planning them as separate workstreams would build the same thing twice.
+The plan's central claim was that Axes 2 and 5 are ONE job unblocked by one EVM resolver:
 
 ```
 Axis 2 needs   per-exit rows (one per sell)   wallet_swaps already gives this — Solana only
@@ -527,9 +573,14 @@ Axis 5 needs   entry price per buy            wallet_swaps already gives this �
 both blocked by                               no EVM resolver · 71% of trades are non-Solana
 ```
 
+**The first half held; the second did not.** They are one job, and the resolver was built —
+but there was nothing on those chains for it to resolve. Axis 2 was closed by labelling and
+`perExit` instead, and Axis 5's ceiling turned out to be fomo's entry prices rather than our
+resolver. The steps below are kept in the order they were run.
+
 ---
 
-#### Step 1 — Surface the three §3 gaps · ~3h · certain
+#### ✅ Step 1 — Surface the three §3 gaps · **done 2026-09-09**
 
 Nothing to research; the data is in the database.
 
@@ -537,8 +588,8 @@ Nothing to research; the data is in the database.
 - `evenness` (or a daily trade histogram) — from `transactions.block_time`
 - sub-$1M winrate — already client-computable, just document it
 
-**Done when:** Axis 6 has all five inputs and named inputs go 19/22 → 22/22.
-**Closes:** Axis 6 completely.
+**Done when:** Axis 6 has all five inputs and named inputs go 19/22 → 22/22. **Met.**
+**Closes:** Axis 6 completely. ✅
 
 ---
 
@@ -547,10 +598,13 @@ Nothing to research; the data is in the database.
 The only step already demonstrated end to end before it began: `0xangeryy` has zero holdings
 in our database and 81 non-zero balances readable in one call.
 
-- Solana — Helius `getTokenAccountsByOwner`, 61 wallets, one call each
-- EVM — blockscout (robinhood, ethereum) + bitquery (bsc, base), 63 wallets
-- Price anything new through the existing T3d loader
-- Feed the existing `portfolio` route; `cashShare` and `concentration` need no change
+- Solana — Helius `getTokenAccountsByOwner`, 61 wallets, one call each ✅ as planned
+- EVM — ~~blockscout + bitquery~~ **batched `eth_call balanceOf` on each chain's own public
+  RPC**, 63 wallets. blockscout is Cloudflare-blocked for robinhood, and the RPC route needs
+  no key at all, so all four EVM chains share one code path
+- Price anything new through the existing T3d loader ✅ — plus a re-pricing pass, because the
+  loader runs *after* the chain read discovers the tokens
+- Feed the existing `portfolio` route; `cashShare` and `concentration` need no change ✅
 
 **Done when:** traders with holdings goes 77 → ~142 (only the 2 with no wallet address remain
 out). **Met: 140**, plus 2 wallets that genuinely hold nothing.
@@ -591,7 +645,7 @@ in the provider table above are wrong:
 | solana | 28.3% | Helius | ✅ done (T2.2) |
 | **robinhood** | **47.8%** | its own RPC, `eth_getLogs` by Transfer topic | ✅ **measured working, keyless** |
 | ethereum | 1.9% | Etherscan V2, `ETHERSCAN_KEY` | ✅ free tier serves chainid 1 |
-| **bsc + base** | **21.4%** | Etherscan V2 **refuses these on the free tier** | ⚠️ needs bitquery, or a decision |
+| bsc + base | 21.4% | Etherscan V2 refuses these on the free tier | ⛔ **decided** — bitquery works, but only ~41 swaps exist to find (step 4b) |
 
 Robinhood — the chain that matters most — is the one that came back cleanest. Its RPC accepts
 **2,000,000-block ranges** and **topic arrays**, so one query covers sixty wallets at once:
@@ -698,10 +752,9 @@ this method is measured to work — 100% direction agreement and 94% on magnitud
 
 ---
 
-#### ~~Step 4 — EVM resolver~~ · superseded by the two entries above
+#### ~~Step 4 — EVM resolver~~ · the original plan, kept for the record
 
-#### Original step 4 plan, kept for the record
-
+*Superseded by steps 4a and 4b above. Kept so the reasoning that led there stays legible.*
 
 The EVM equivalent of Solana's pre/post balances: decode `Transfer` logs and net them per
 wallet. Same idea as `resolve_wallet_swaps.mjs`, different plumbing per chain. Step 3 split
@@ -732,7 +785,7 @@ the thresholds instead.
 
 | # | Step | Effort | Confidence | Closes |
 | --- | --- | --- | --- | --- |
-| 1 | Surface the three §3 gaps | ~3h | certain | Axis 6 |
+| 1 | Surface the three §3 gaps | ~3h | certain | Axis 6 ✅ **done** |
 | 2 | Axis 4 chain balances | ~1 day | **high — demonstrated** | Axis 4 ✅ **done** |
 | 3 | Robinhood spike | ~half a day | — | decides step 4 ✅ **done** |
 | ~~4a~~ | EVM resolver — robinhood + ethereum | built | ⛔ the trades are not on-chain | nothing |
@@ -744,13 +797,17 @@ than the half day budgeted, because the decisive measurements turned out to be S
 already had plus fifty receipts read from chain. It changed step 4 rather than merely approving
 it — see §6.
 
-### A note on Axis 2 being "broken"
+### ✅ A note on Axis 2 being "broken" — resolved 2026-09-09
 
-It is worth being precise: Axis 2 does not error or return nothing. It **computes cleanly and
-returns a different statistic** — a `meanToMedian` across tokens rather than across exits. That
-is the dangerous kind of broken, because the output looks correct. Until step 4 lands, either
-label the axis as per-token on the front end, or hold it back. Shipping it unlabelled is the
-one option that misleads.
+It never errored or returned nothing. It **computed cleanly and returned a different
+statistic** — a `meanToMedian` across tokens rather than across exits — which is the dangerous
+kind of broken, because the output looks correct.
+
+The instruction here used to read *"until step 4 lands, either label it or hold it back."* Step
+4 cannot land. So the labelling became the fix rather than the stopgap: `meanToMedianBasis`
+names the population on every response, and `perExit` carries the exact per-exit statistic for
+the traders who have one. **Shipping it unlabelled is no longer possible**, which was the only
+thing that misled.
 
 ---
 
@@ -801,10 +858,15 @@ all if it reads from us.
 | 5 Selectivity | ✅ 5 of 5 inputs + published gate | needs historical prices | ⛔ paid provider only | — |
 | 6 Activity density | ✅ **full** — 5 of 5 inputs | — | ✅ shipped 2026-09-09 | — |
 
-**100% of named inputs as of 2026-09-09** — the three §3 gaps are closed. The remaining ⚠️ axes
-are all fixable (§6) — Axis 4 in a day with high confidence, Axes 2 and 5 together in 2-3 days
-behind a half-day spike that decides whether to start.
+**100% of named inputs, and every axis either complete or reporting its own limit.** All six
+return what the spec names. Four are complete. Axis 2 returns both granularities, each labelled,
+so the exact figure is used where it exists and the approximation is never mistaken for it.
+Axis 5 returns all five inputs and publishes the coverage gate, so it hollows exactly where the
+spec says it should.
 
-**Nothing here needs a new provider or a new key.** The blockers were an API that refuses
-non-cohort handles, and a resolver we built for 28% of the trading.
+**Nothing shipped here needed a new provider or a new key.** The one thing that would move Axis
+5 further — historical prices for 1,020 tokens — is the only item on this page that does, and it
+is a product decision rather than an engineering one (§5).
+
+**No open engineering work remains against this spec.**
 
