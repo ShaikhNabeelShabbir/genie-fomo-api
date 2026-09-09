@@ -51,11 +51,13 @@ Update the boxes as work lands. ⬜ not started · 🔄 in progress · ✅ done 
 | --- | --- | --- | --- | --- | --- |
 | **1** | Surface the three §3 gaps — `creation_timestamp`, gini, sub-$1M winrate | ~3h | certain | Axis 6 | ✅ **done 2026-09-09** |
 | **2** | Axis 4 — read wallet balances from chain | ~1 day | **high, demonstrated** | Axis 4 | ✅ **done 2026-09-09** |
-| **3** | Robinhood spike — measure, ship nothing | ~half a day | — | decides step 4 | ⬜ |
-| **4** | EVM swap resolver | ~2-3 days | medium | Axes 2 **and** 5 | ⬜ |
+| **3** | Robinhood spike — measure, ship nothing | ~half a day | — | decides step 4 | ✅ **done 2026-09-09** — see §6 |
+| **4a** | EVM resolver — robinhood + ethereum (49.7% of trades) | ~1-1.5 days | **high, measured** | Axes 2 **and** 5 | ⬜ **next** |
+| **4b** | EVM resolver — bsc + base (21.4%) | ~1 day | needs a provider decision | Axes 2 and 5 | ⬜ |
 
-**Steps 1 and 2 are done.** Step 3 is a decision gate, not a build — it exists so step 4 is
-not a bet. Full detail in §6.
+**Steps 1, 2 and 3 are done.** Step 3 was the decision gate, and it has answered: build the
+resolver for robinhood + ethereum (49.7% of trades, discovery measured and keyless), and settle
+the provider question for bsc + base before starting those. Full detail in §6.
 
 ### Three things to hold on to
 
@@ -460,31 +462,71 @@ eighth differs because the trader added to it since — which is the point of re
 
 ---
 
-#### Step 3 — Robinhood spike · ~half a day · **decision gate, not a build**
+#### ✅ Step 3 — Robinhood spike · **run 2026-09-09** · it moved the target
 
-Robinhood alone is 47.8% of all trades and uses blockscout, which needs no key. Resolve a few
-hundred transactions and measure exactly two numbers:
+Ran early and cheaply, off the back of step 2. It did not produce the two numbers it set out
+to produce, because it found the question was wrong.
 
-1. what fraction are the trader's **own two-sided swap** (Solana's answer was 2.8%)
-2. how many usable **entry prices** that yields
+**Finding 1 — the EVM transactions we already store are not the trades.** We hold 50,530
+robinhood rows, 14,546 bsc, 7,059 base, 3,498 ethereum, each with `direction`, `token_key`
+and `amount` already populated. That looked like a resolver's raw material sitting in the
+database. It is not:
 
-**Done when:** those two numbers exist. Nothing ships.
+```
+two-sided within one tx_hash   robinhood 23 of 49,248   bsc 86 of 14,401   base 17   eth 10
+sampled receipts read FROM CHAIN     0 of 50 two-sided · avg 1.0 transfer legs per tx
+our trader's wallet was the tx SENDER in            0 of 50
+```
 
-**This gate is the whole point.** On Solana the same question was scoped in twenty minutes,
-came back 0%, and stopped a two-day build — then re-scoped against the right API and shipped.
-Half a day here decides whether step 4 produces working axes or two rings that are still
-hollow.
+They are overwhelmingly inbound transfers — airdrops and distributions, not trades. **Step 4
+cannot be built by reprocessing what we hold.** That is the finding, and it is worth more
+than the two numbers the spike was scoped to produce.
+
+**Finding 2 — the blocker is DISCOVERY, not decoding.** We do not have the trading
+transactions at all. What it takes to find them differs sharply per chain, and two entries
+in the provider table above are wrong:
+
+| Chain | Share of trades | Discovery route | Status |
+| --- | --- | --- | --- |
+| solana | 28.3% | Helius | ✅ done (T2.2) |
+| **robinhood** | **47.8%** | its own RPC, `eth_getLogs` by Transfer topic | ✅ **measured working, keyless** |
+| ethereum | 1.9% | Etherscan V2, `ETHERSCAN_KEY` | ✅ free tier serves chainid 1 |
+| **bsc + base** | **21.4%** | Etherscan V2 **refuses these on the free tier** | ⚠️ needs bitquery, or a decision |
+
+Robinhood — the chain that matters most — is the one that came back cleanest. Its RPC accepts
+**2,000,000-block ranges** and **topic arrays**, so one query covers sixty wallets at once:
+60 wallets over 500k blocks returned 2,777 logs. Whole-chain discovery for all 139 wallets is
+on the order of **180 requests**, not the 162,000 a naive per-wallet scan would need.
+
+**Finding 3 — attribution must not use `tx.from`.** The wallet was the sender in 0 of 50.
+These traders trade through relayers, exactly as T2.2 found on Solana, where assuming
+`feePayer` was the trader was the second of two wrong diagnoses. Net balance change per
+(wallet, token) is the method that survived there and it is the method to use here.
+
+**Done when:** ~~those two numbers exist~~ — superseded. The gate has answered: **build it for
+robinhood + ethereum, decide separately on bsc + base.**
 
 ---
 
-#### Step 4 — EVM resolver · ~2-3 days · medium confidence · **only if step 3 says so**
+#### Step 4 — EVM resolver · ~2-3 days · **confidence raised for 50% of trades, unchanged for 21%**
 
-The EVM equivalent of Solana's pre/post balances: decode `Transfer` logs from each receipt and
-net them per wallet. Same idea as `resolve_wallet_swaps.mjs`, different plumbing per chain.
+The EVM equivalent of Solana's pre/post balances: decode `Transfer` logs and net them per
+wallet. Same idea as `resolve_wallet_swaps.mjs`, different plumbing per chain. Step 3 split
+this into two jobs that should be scheduled separately:
 
-- robinhood + ethereum via blockscout, bsc + base via bitquery
+**4a — robinhood + ethereum · ~1-1.5 days · high confidence · 49.7% of trades.** Discovery is
+measured and keyless. Two phases: scan `eth_getLogs` by Transfer topic with all wallets OR'd
+into the topic array, then net each transaction per (wallet, token) and keep the two-sided
+ones. Attribution by net balance change, never by `tx.from`.
+
+**4b — bsc + base · ~1 day · 21.4% of trades · needs a decision first.** Etherscan V2's free
+tier refuses both chains. `BITQUERY_KEY` is held and already sourced our existing bsc/base
+rows, so that is the likely route, but its free-tier limits have not been measured against a
+full backfill. **Worth confirming before starting, not during.**
+
 - write into the existing `wallet_swaps` table — the shape already fits
-- backfill: hours, keys already held
+- backfill is real this time: discovery writes new `transactions` rows, resolution writes
+  `wallet_swaps`, then pricing. Hours of runtime, keys already held for 4a
 
 **Done when:** Axis 5's entry-price coverage clears its own 70% bar and Axis 2 has ≥20 sell
 rows for most traders. **If the spike says that is not reachable, do not start** — renegotiate
@@ -499,11 +541,14 @@ the thresholds instead.
 | --- | --- | --- | --- | --- |
 | 1 | Surface the three §3 gaps | ~3h | certain | Axis 6 |
 | 2 | Axis 4 chain balances | ~1 day | **high — demonstrated** | Axis 4 ✅ **done** |
-| 3 | Robinhood spike | ~half a day | — | decides step 4 |
-| 4 | EVM resolver | ~2-3 days | medium | Axes 2 **and** 5 |
+| 3 | Robinhood spike | ~half a day | — | decides step 4 ✅ **done** |
+| 4a | EVM resolver — robinhood + ethereum | ~1-1.5 days | **high, measured** | Axes 2 **and** 5 |
+| 4b | EVM resolver — bsc + base | ~1 day | provider decision first | Axes 2 and 5 |
 
-**Steps 1 and 2 are done.** Both were cheap, certain and independent of everything else.
-Step 3 exists so that step 4 is a decision rather than a bet.
+**Steps 1, 2 and 3 are done.** Step 3 was run early off the back of step 2 and cost far less
+than the half day budgeted, because the decisive measurements turned out to be SQL over data we
+already had plus fifty receipts read from chain. It changed step 4 rather than merely approving
+it — see §6.
 
 ### A note on Axis 2 being "broken"
 
