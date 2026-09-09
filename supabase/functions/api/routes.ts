@@ -7,8 +7,10 @@ import { sql, n, round } from "./db.ts";
  * silently and a consumer cannot tell a fresh total from yesterday's — which is the whole
  * point of the field, so it is computed once here rather than per route.
  */
-export const asOfHoldings = async (): Promise<string | null> => {
-  const [r] = await sql`select max(captured_at) as at from holdings`;
+export const asOfHoldings = async (handle?: string): Promise<string | null> => {
+  const [r] = handle
+    ? await sql`select max(captured_at) as at from holdings_current where handle = ${handle}`
+    : await sql`select max(captured_at) as at from holdings_current`;
   return r?.at ? new Date(String(r.at)).toISOString() : null;
 };
 /**
@@ -264,7 +266,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
     select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
-  const asOf = await asOfHoldings();
+  const asOf = await asOfHoldings(t.handle as string);
 
   /**
    * Per-chain breakdown of what the total actually covers.
@@ -409,7 +411,8 @@ const trustHoldings = (handles: string[]) => sql`
   select handle,
          count(*)::int as positions,
          count(value) filter (where value > 0)::int as priced,
-         coalesce(sum(value) filter (where value > 0), 0) as holdings_value
+         coalesce(sum(value) filter (where value > 0), 0) as holdings_value,
+         max(captured_at) as as_of
   from holdings_current where handle = any(${handles}) group by handle`;
 
 /**
@@ -418,9 +421,14 @@ const trustHoldings = (handles: string[]) => sql`
  * row is treated as zeros.
  */
 /**
- * `asOf` is passed in rather than fetched here. `asOfHoldings()` is a global max with no
- * handle in it, so it returns the same value for every trader — calling it inside the body
- * would have meant 137 identical queries for one answer.
+ * `asOf` is the board-wide fallback, used only for a trader with no holdings row at all —
+ * `trustHoldings` carries each trader's own `as_of` and that is what wins.
+ *
+ * It stopped being safe to share one value the moment chain-read balances landed. Every
+ * fomo row is stamped with one nightly build time, but a chain snapshot is stamped when we
+ * read it, so a single global max would put today's timestamp on a trader whose numbers
+ * came from yesterday's fomo build — the exact complaint the consuming team raised against
+ * /v1/traders, fixed there with a per-trader `updatedAt`.
  */
 // deno-lint-ignore no-explicit-any
 function trustBody(t: any, h: any | undefined, asOf: string | null) {
@@ -492,8 +500,8 @@ function trustBody(t: any, h: any | undefined, asOf: string | null) {
   return {
     handle: t.display_handle, name: t.name ?? null,
     // Every money figure carries its measurement time; these are derived from the holdings
-    // snapshot, so they age with it.
-    asOf,
+    // snapshot, so they age with it — this trader's own, not the board's.
+    asOf: h?.as_of ? new Date(String(h.as_of)).toISOString() : asOf,
     reportedPnlUsd: pnl, volumeUsd: volume,
     flags, pnlToVolume, pnlToHoldings, trades, verdict,
     // What each denominator was, so a consumer can weigh the verdict rather than take it.
@@ -1171,7 +1179,9 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   return {
     handle: t.display_handle,
     name: t.name ?? null,
-    asOf: await asOfHoldings(),
+    // This trader's snapshot, not the board's — chain-read rows and fomo builds are
+    // stamped at different times, so a global max would misdate one of them.
+    asOf: await asOfHoldings(t.handle as string),
     count: page.length,
     positions: filtered.length,
     totalValueUsd: total > 0 ? round(total) : null,
