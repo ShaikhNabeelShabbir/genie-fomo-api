@@ -761,14 +761,19 @@ get("/v1/traders", async (_p, url) => {
    * `any($handles)` is what makes this a bulk route rather than a loop wearing one's coat.
    */
   const handles = page.map((r) => r.handle as string);
-  const [pnlRows, scRows, wRows, trRows] = handles.length
+  const wantsScorecard = include.includes("scorecard");
+  const [pnlRows, scRows, wRows, trRows, ceRows, xeRows] = handles.length
     ? await Promise.all([
       include.includes("pnl") ? pnlAgg(handles) : Promise.resolve([]),
-      include.includes("scorecard") ? scorecardRows(handles) : Promise.resolve([]),
+      wantsScorecard ? scorecardRows(handles) : Promise.resolve([]),
       include.includes("wallets") ? walletRows(handles) : Promise.resolve([]),
       include.includes("trust") ? trustHoldings(handles) : Promise.resolve([]),
+      // Axes 5 and 2. Set-based like every other include, so the bulk route stays one
+      // statement per resource rather than a loop wearing one's coat.
+      wantsScorecard ? chainEntryRows(handles) : Promise.resolve([]),
+      wantsScorecard ? chainExitRows(handles) : Promise.resolve([]),
     ])
-    : [[], [], [], []];
+    : [[], [], [], [], [], []];
 
   // One global value shared by every trader's trust block, fetched once.
   const holdingsAsOf = include.includes("trust") ? await asOfHoldings() : null;
@@ -791,6 +796,10 @@ get("/v1/traders", async (_p, url) => {
   const wBy = byHandle(wRows as any[]);
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
+  // deno-lint-ignore no-explicit-any
+  const ceBy = byHandle(ceRows as any[]);
+  // deno-lint-ignore no-explicit-any
+  const xeBy = byHandle(xeRows as any[]);
 
   /**
    * Sub-resources are nested under `included`, NOT spread onto the entry.
@@ -819,7 +828,13 @@ get("/v1/traders", async (_p, url) => {
        * still reports the real count, so a consumer knows what is there and can fetch the
        * single-trader route for the tokens of whoever they care about.
        */
-      out.scorecard = rows.length ? await scorecardBody(r, rows, 0) : null;
+      out.scorecard = rows.length
+        ? await scorecardBody(r, rows, 0, {
+            entries: new Map((ceBy.get(h) ?? []).map((c: any) =>
+              [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
+            exits: (xeBy.get(h) ?? []).map((x: any) => Number(x.exit_pnl_usd)),
+          })
+        : null;
     }
     return out;
   };
@@ -1851,6 +1866,57 @@ const scorecardRows = (handles: string[]) => sql`
   where tr.handle = any(${handles})`;
 
 /**
+ * Axis 5 — an entry price WE derived, for pairs fomo does not price.
+ *
+ * fomo leaves `avg_entry_price` null on 7,280 of 13,184 trader-token pairs, which is what
+ * holds Axis 5 below its own coverage bar. Where the wallet's own on-chain buys have been
+ * resolved, the entry price is arithmetic on them: dollars paid divided by tokens received.
+ *
+ * This is a fallback, never an override. fomo's figure wins when it exists, so turning this
+ * on cannot move a number that already had a source.
+ */
+const chainEntryRows = (handles: string[]) => sql`
+  select w.handle, ws.network_id, ws.token_key,
+         sum(abs(ws.quote_usd)) / nullif(sum(ws.token_delta), 0) as chain_entry_price,
+         count(*)::int as buys
+  from wallet_swaps ws
+  join wallets w on lower(w.sol_address) = ws.address_key or w.evm_address_key = ws.address_key
+  where w.handle = any(${handles}) and ws.token_delta > 0 and ws.quote_usd is not null
+  group by 1, 2, 3
+  having sum(ws.token_delta) > 0`;
+
+/**
+ * Axis 2 — one row per EXIT, which is the granularity the spec's formula actually assumes.
+ *
+ * The spec computes `meanToMedian` over per-exit P&L: one data point each time the trader
+ * sells. We serve per-position aggregates, so our version is a statistic across TOKENS. Both
+ * compute cleanly and they are different numbers — the failure this codebase is organised
+ * against, because nothing in the output says which you got.
+ *
+ * Each resolved sell gives a real exit: proceeds minus what that quantity cost, using the
+ * wallet's own average entry from its own resolved buys. `token_delta` is negative on a
+ * sell, so the subtraction is an addition.
+ *
+ * Only a position with BOTH sides resolved qualifies. Selling something we never saw bought
+ * has no cost basis, and inventing one would be the whole problem in miniature.
+ */
+const chainExitRows = (handles: string[]) => sql`
+  with buys as (
+    select w.handle, ws.network_id, ws.token_key,
+           sum(abs(ws.quote_usd)) / nullif(sum(ws.token_delta), 0) as entry_px
+    from wallet_swaps ws
+    join wallets w on lower(w.sol_address) = ws.address_key or w.evm_address_key = ws.address_key
+    where w.handle = any(${handles}) and ws.token_delta > 0 and ws.quote_usd is not null
+    group by 1, 2, 3
+    having sum(ws.token_delta) > 0
+  )
+  select w.handle, ws.quote_usd + ws.token_delta * b.entry_px as exit_pnl_usd
+  from wallet_swaps ws
+  join wallets w on lower(w.sol_address) = ws.address_key or w.evm_address_key = ws.address_key
+  join buys b on b.handle = w.handle and b.network_id = ws.network_id and b.token_key = ws.token_key
+  where w.handle = any(${handles}) and ws.token_delta < 0 and ws.quote_usd is not null`;
+
+/**
  * Everything the scorecard computes, over rows already fetched.
  *
  * Split out for ISSUE-8 so `/traders?include=scorecard` runs THIS function rather than a
@@ -1859,7 +1925,12 @@ const scorecardRows = (handles: string[]) => sql`
  * identical by construction rather than by test.
  */
 // deno-lint-ignore no-explicit-any
-async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
+async function scorecardBody(
+  t: any, rows: any[], tokenLimit: number | null,
+  chain?: { entries: Map<string, number>; exits: number[] },
+) {
+  const chainEntry = chain?.entries ?? new Map<string, number>();
+  const chainExits = chain?.exits ?? [];
 
   const closed = rows.filter((r) => r.status === "closed");
   const realized = closed.map((r) => n(r.realized_pnl_usd)).filter((x): x is number => x !== null);
@@ -1998,6 +2069,7 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
     entry: Leg; exit: Leg;
     totalSupply: number | null; supplySource: string | null; supplyReadAt: string | null;
     tokenCreatedUnix: number | null; firstOpenedMs: number | null;
+    chainKey: string;
   }>();
   for (const r of rows) {
     const key = String(r.token_key ?? r.token_symbol ?? "unknown");
@@ -2010,6 +2082,9 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
       tokenCreatedUnix: n(r.token_created_unix),
       // Earliest position opened in this token, so age-at-entry can be derived per token.
       firstOpenedMs: null as number | null,
+      // Chain AND token, because one token_key can exist on two chains and their prices
+      // have nothing to do with each other.
+      chainKey: `${r.network_id}:${r.token_key}`,
     };
     rec.trades++;
     if (r.status === "closed") { rec.closed++; rec.realizedPnlUsd += n(r.realized_pnl_usd) ?? 0; }
@@ -2061,8 +2136,20 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
     return { value, method, legs: a.legs, legsWeighted: a.weighted, first: a.first };
   };
   const byToken = [...byTokenMap.values()]
-    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, ...r }) => {
+    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, chainKey, ...r }) => {
       const e = resolve(entry), x = resolve(exit);
+      /**
+       * Axis 5. fomo prices only 45% of trader-token pairs, and the unpriced ones are what
+       * keeps the axis below its own coverage bar. Where we resolved the wallet's own buys
+       * on chain, the entry price is arithmetic on them.
+       *
+       * A FALLBACK, never an override — `e.value` wins whenever it exists, so this cannot
+       * move a number that already had a source. `entryPriceSource` says which you got,
+       * because a price we derived and a price fomo reported are different kinds of claim
+       * and a consumer weighing them needs to know which is which.
+       */
+      const chainPx = e.value === null ? (chainEntry.get(chainKey) ?? null) : null;
+      const entryPx = e.value ?? chainPx;
       // 12 significant figures, not a decimal rounding: these prices run to 0.0000101253 and
       // `round(v, 2)` would flatten a real entry to zero. At 12 figures every value that was
       // a single position comes back bit-identical to what it returned before, so the only
@@ -2072,8 +2159,10 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
       ...r,
       realizedPnlUsd: round(r.realizedPnlUsd)!,
       unrealizedPnlUsd: round(r.unrealizedPnlUsd)!,
-      avgEntryPrice: px(e.value),
+      avgEntryPrice: px(entryPx),
       avgExitPrice: px(x.value),
+      /** `reported` = fomo's, `chain` = derived from the wallet's own resolved buys. */
+      entryPriceSource: entryPx === null ? null : (e.value !== null ? "reported" : "chain"),
       /**
        * Which of three computations produced the price above, and over how many positions.
        *
@@ -2116,8 +2205,8 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
        * was right. Sending the multiplier we used makes them reconcilable.
        */
       avgEntryMarketCapUsd:
-        e.value !== null && r.totalSupply !== null && r.totalSupply > 0
-          ? Number((e.value * r.totalSupply).toPrecision(10))
+        entryPx !== null && r.totalSupply !== null && r.totalSupply > 0
+          ? Number((entryPx * r.totalSupply).toPrecision(10))
           : null,
       avgExitMarketCapUsd:
         x.value !== null && r.totalSupply !== null && r.totalSupply > 0
@@ -2231,6 +2320,47 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
     bestTradeUsd: round(best), worstTradeUsd: round(worst),
     topTradeShare, meanToMedian,
     meanTradeUsd: round(meanTrade), medianTradeUsd: round(medTrade),
+    /**
+     * Axis 2 — WHICH POPULATION `meanToMedian` above was computed over.
+     *
+     * It is one data point per TOKEN. The spec's formula assumes one per EXIT: a trader with
+     * 200 exits across 40 tokens gives 40 points here and 200 there. Both compute cleanly,
+     * they are different numbers, and until this field existed nothing in the response said
+     * which you had. That is the failure mode this API is organised against — not a value
+     * that is missing, but one that is quietly answering a different question.
+     */
+    meanToMedianBasis: "per_token",
+    /**
+     * The same statistic over real EXITS, which is what the spec actually asks for.
+     *
+     * Each point is one resolved on-chain sell: proceeds minus what that quantity cost at
+     * the wallet's own average entry, both sides from `wallet_swaps`. Only positions whose
+     * buys AND sells we resolved contribute — selling something we never saw bought has no
+     * cost basis, and inventing one would be the whole problem in miniature.
+     *
+     * `null` where we have fewer than two exits, and `clearsSpecBar` reports the spec's own
+     * "< 20 sell rows -> hollow" rule so the front end can apply it without recounting.
+     * Coverage is deliberately visible: this is exact where it exists and absent where it
+     * does not, which is the honest shape for a number this axis will be scored on.
+     */
+    perExit: (() => {
+      const xs = chainExits.filter((v) => Number.isFinite(v));
+      const mean = xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
+      const med = median(xs);
+      return {
+        exits: xs.length,
+        wins: xs.filter((v) => v > 0).length,
+        losses: xs.filter((v) => v < 0).length,
+        // Same sign discipline as the per-token figure: a ratio across a sign change is
+        // arithmetically true and informationally worthless.
+        meanToMedian: xs.length >= 2 && mean !== null && med !== null && mean > 0 && med > 0
+          ? Number((mean / med).toFixed(2)) : null,
+        meanExitUsd: round(mean), medianExitUsd: round(med),
+        clearsSpecBar: xs.length >= 20,
+        basis: "one point per resolved on-chain exit, cost basis from the wallet's own " +
+               "resolved buys — the granularity the axis formula assumes",
+      };
+    })(),
     moneyIn: { usd: entryRows.length ? round(entryRows.reduce((s, r) => s + r.amount * r.px, 0)) : null, coverage: inCov },
     moneyOut: { usd: exitRows.length ? round(exitRows.reduce((s, r) => s + r.amount * r.px, 0)) : null, coverage: outCov },
     returnPct: { value: basis > 0 ? Number(((closedPnl / basis) * 100).toFixed(2)) : null,
@@ -2301,6 +2431,30 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
       };
     })(),
     windows,
+    /**
+     * Axis 5's gate, reported rather than assumed.
+     *
+     * The spec hollows the axis when supply or price is missing for more than 30% of buys.
+     * Publishing the share — and how much of it we had to derive ourselves — lets the front
+     * end apply that rule without recomputing it, and lets it argue for a different rule
+     * with the evidence in front of it.
+     */
+    entryPriceCoverage: (() => {
+      const withPrice = byToken.filter((t) => t.avgEntryPrice !== null);
+      const fromChain = withPrice.filter((t) => t.entryPriceSource === "chain").length;
+      const withCap = byToken.filter((t) => t.avgEntryMarketCapUsd !== null).length;
+      return {
+        tokensPriced: withPrice.length,
+        tokensTotal: byToken.length,
+        pricedShare: byToken.length ? Number((withPrice.length / byToken.length).toFixed(4)) : null,
+        derivedFromChain: fromChain,
+        withMarketCap: withCap,
+        // Both price AND supply are needed for an entryMcap, so this is the share the axis
+        // actually runs on — not the price share, which is always the larger number.
+        marketCapShare: byToken.length ? Number((withCap / byToken.length).toFixed(4)) : null,
+        clearsSpecBar: byToken.length > 0 && withCap / byToken.length >= 0.7,
+      };
+    })(),
     tokensTotal: byToken.length,
     byToken: tokenLimit === null ? byToken : byToken.slice(0, tokenLimit),
     plain, caveats,
@@ -2314,10 +2468,16 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     where t.handle = ${handle.toLowerCase()}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
-  const rows = await scorecardRows([t.handle as string]);
+  const h = t.handle as string;
+  const [rows, ce, xe] = await Promise.all([
+    scorecardRows([h]), chainEntryRows([h]), chainExitRows([h]),
+  ]);
   if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
 
-  return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }));
+  return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
+    entries: new Map(ce.map((c: any) => [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
+    exits: xe.map((x: any) => Number(x.exit_pnl_usd)),
+  });
 });
 
 // ------------------------------------------------------------ K5-K8 (SQL)

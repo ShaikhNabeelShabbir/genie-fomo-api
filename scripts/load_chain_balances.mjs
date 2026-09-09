@@ -375,8 +375,43 @@ async function main() {
     client.release();
   }
 
-  const { rows: [after] } = await pool.query(`select count(distinct handle)::int as handles from holdings_current`);
-  console.log(`traders with holdings now: ${after.handles}`);
+  /*
+   * Re-price anything we could not value at insert time.
+   *
+   * The order matters and is why this is a separate pass: a chain read discovers tokens, and
+   * the T3d loader prices them AFTERWARDS. Pricing only at insert left 7,936 real positions
+   * carrying `value = null` even once their price existed -- Axis 4's priced coverage sat at
+   * 29.5% when the data supported 76.9%. Running it here means the pipeline is correct in one
+   * pass instead of needing someone to remember a follow-up statement.
+   *
+   * Only rows we have NEVER valued are touched. A price already stored is a measurement, and
+   * this pass does not overwrite measurements.
+   */
+  const { rowCount: repriced } = await pool.query(`
+    update holdings h
+       set price = p.px, value = h.human_amount * p.px
+      from (
+        select t.network_id, t.token_key,
+               coalesce(qa.pegged_usd, ti.price_usd, tp.usd) as px
+        from tokens t
+        left join quote_assets qa on qa.network_id = t.network_id and qa.token_key = t.token_key
+        left join token_info  ti on ti.network_id = t.network_id and ti.token_key = t.token_key
+                                and ti.price_usd is not null
+        left join lateral (select usd from token_prices x
+                           where x.network_id = t.network_id and x.token_key = t.token_key
+                           order by day desc limit 1) tp on true
+      ) p
+     where h.source = 'chain' and h.value is null and h.human_amount is not null
+       and p.network_id = h.network_id and p.token_key = h.token_key and p.px is not null`);
+  if (repriced) console.log(`re-priced ${repriced} previously unvalued chain rows`);
+
+  const { rows: [after] } = await pool.query(`
+    select count(distinct handle)::int as handles,
+           count(*)::int as positions,
+           count(value) filter (where value > 0)::int as priced
+    from holdings_current`);
+  console.log(`traders with holdings now: ${after.handles} · ` +
+              `${after.priced}/${after.positions} positions priced`);
   await pool.end();
 }
 

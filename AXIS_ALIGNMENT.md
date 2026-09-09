@@ -39,10 +39,10 @@ Update the boxes as work lands. ⬜ not started · 🔄 in progress · ✅ done 
 | Axis | State today | What is wrong | The fix | Step |
 | --- | --- | --- | --- | --- |
 | **1** Cash-out | ✅ **works** | — | — | — |
-| **2** Consistency | ⚠️ **computes, but returns the wrong statistic** | `meanToMedian` is across TOKENS, not across EXITS. It does not error — the output looks correct | EVM swap resolver → per-exit rows | **4** |
+| **2** Consistency | ✅ **labelled, and exact where we have it** | ~~returns the wrong statistic silently~~ — `meanToMedianBasis` names the population; `perExit` gives the true figure for 105 traders, 9 clearing the 20-exit bar | ✅ shipped 2026-09-09 | ~~4~~ |
 | **3** Edge | ✅ **works** | — | — | — |
 | **4** Risk control | ✅ **renders for 140 of 144 traders** | — | ✅ balances read from chain, shipped 2026-09-09 | ~~2~~ |
-| **5** Selectivity | ⚠️ **would render hollow for 92% of traders** | 7,280 of 13,184 positions have no entry price. Its two *other* inputs are now live | EVM swap resolver → entry price per buy | **4** |
+| **5** Selectivity | ⚠️ **coverage-limited, and now says so** | 7,280 of 13,184 positions have no entry price. `entryPriceCoverage.clearsSpecBar` publishes the gate | needs a historical price provider — **paid, not available** | — |
 | **6** Activity density | ✅ **works** | — | ✅ shipped 2026-09-09 | ~~1~~ |
 
 ### The work, in order
@@ -71,9 +71,10 @@ the provider question for bsc + base before starting those. Full detail in §6.
    a chain's own public RPC, all already configured. The blockers were an API that refuses
    non-cohort handles, and a resolver built for 28% of the trading — neither was ever a
    missing data source.
-3. **Axis 2 is the dangerous one.** It does not fail loudly — it returns a plausible number
-   computed over the wrong population. Until step 4 lands, either label it as per-token on the
-   front end or hold it back. Shipping it unlabelled is the only option that misleads.
+3. ~~**Axis 2 is the dangerous one.**~~ **Closed 2026-09-09.** It used to return a plausible
+   number over the wrong population with nothing in the output saying so. `meanToMedianBasis`
+   now names the population and `perExit` carries the true per-exit statistic wherever we have
+   one. Shipping it unlabelled is no longer possible, which was the only thing that misled.
 
 ---
 
@@ -218,6 +219,68 @@ Three decisions worth recording:
 
 The series is behind `?dailyTrades=true`: it grows with a wallet's lifetime while nearly every
 caller wants only the coefficient. `dailyTradesAvailable` reports its length either way.
+
+---
+
+## 3b. What shipped on 2026-09-09 to close the axis work
+
+Every route was brought up to what the spec asks for, given the data that exists. Two axes
+changed shape rather than gaining a field, and both changes are about **not being wrong
+quietly** — which is the only failure mode left once every named input is present.
+
+### Axis 2 — it can no longer mislead
+
+The doc has said since the first pass that Axis 2 is "the dangerous one": it does not fail
+loudly, it returns a plausible number computed over the wrong population, and *"shipping it
+unlabelled is the only option that misleads."* Step 4a established that the EVM resolver which
+was meant to fix it cannot be built. So the fix is to make shipping it unlabelled impossible:
+
+| Field | What it does |
+| --- | --- |
+| `scorecard.meanToMedianBasis` | literally `"per_token"`. The number above it is one point per TOKEN; the spec's formula assumes one per EXIT. The response now says so. |
+| `scorecard.perExit` | the **same statistic over real exits** — `meanToMedian`, `exits`, `wins`, `losses`, `meanExitUsd`, `medianExitUsd`, plus `clearsSpecBar` for the spec's own "< 20 sell rows → hollow" rule |
+
+Each `perExit` point is one resolved on-chain sell: proceeds minus what that quantity cost at
+the wallet's own average entry, both sides from `wallet_swaps`. Only positions whose buys
+**and** sells we resolved contribute — selling something we never saw bought has no cost
+basis, and inventing one would be this whole problem in miniature.
+
+**825 true exits across 105 traders; 9 clear the 20-exit bar.** Two counts were taken here and
+the smaller one is the one that ships: 1,316 exits across 114 traders have a dollar value, but
+only 825 also have a *resolved cost basis on the same token*, and without that the figure is
+proceeds rather than P&L. `perExit` uses the strict count. That 9 is far below the 127 the
+per-token figure appears to cover, and that gap is the honest measure of what we actually
+know. The front end can now use the exact statistic where it exists and a labelled
+approximation where it does not, instead of one unlabelled number that silently changes
+meaning between traders.
+
+### Axis 5 — the gate is published, not assumed
+
+| Field | What it does |
+| --- | --- |
+| `scorecard.entryPriceCoverage` | `tokensPriced`, `pricedShare`, `withMarketCap`, `marketCapShare`, `derivedFromChain`, and `clearsSpecBar` |
+| `byToken[].entryPriceSource` | `reported` (fomo's) or `chain` (derived from the wallet's own resolved buys) |
+
+`marketCapShare` is the one that matters: an `entryMcap` needs price **and** supply, so it is
+always the smaller number and it is the share the axis actually runs on. Publishing it with
+`clearsSpecBar` lets the front end apply the spec's 30% rule without recomputing it — and
+argue for a different rule with the evidence in hand.
+
+**The chain-derived entry price is wired, correct, and currently adds nothing.** Measured:
+**zero** tokens exist where every fomo row lacks an entry price *and* we hold a chain price.
+`wallet_swaps` covers almost exactly the tokens fomo already prices. The fallback is a
+mechanism that grows as resolution grows, not a win today, and reporting it as a win would be
+the kind of number this document exists to prevent.
+
+### What remains open, and why it is not an engineering problem
+
+| Axis | Open item | Blocker | Can we fix it? |
+| --- | --- | --- | --- |
+| **2** | only 9 of 141 traders have ≥20 true exits | needs more resolved swaps; the EVM chains have none to resolve (§6, step 4a) | **no** — not on these chains |
+| **5** | `marketCapShare` sits near 0.42 | needs a historical price for 1,020 tokens at known timestamps | **no** — needs a paid provider |
+
+Both are now **visible in the response** rather than implied by a number that looks fine.
+That is the whole of what was available to fix.
 
 ---
 
@@ -384,7 +447,9 @@ getTokenAccountsByOwner  ->  120 token accounts · 81 with a non-zero balance
 | Feed `cashShare` / `concentration` | existing portfolio route | none |
 
 **Result: 77 of 144 traders → 140.** 135 of them have a priced position and can render the
-axis today. Four remain out: 2 have no wallet address at all, and 2 have wallets that hold
+axis today, and after the T3d crawl finished (2,741 tokens, all priced, 0 failures) the
+positions we can value went from **29.5% to 76.9%** — the re-pricing pass is now part of the
+loader rather than a step someone has to remember. Four remain out: 2 have no wallet address at all, and 2 have wallets that hold
 nothing — a true zero, not a gap.
 
 **What actually shipped**, in `scripts/load_chain_balances.mjs` and
@@ -607,10 +672,18 @@ swaps across 124 traders. **Do not spend the day.**
 
 #### ✅ What replaces step 4 — finish the Solana resolver
 
-The measurement that reframed everything: `wallet_swaps` holds **2,917** Solana swaps, and
-**132,128 SWAP-tagged transactions have never been resolved**. T2.2 was run once with a limit
-and never completed. A 600-row sample returned **2.7%** — matching T2.2's documented 2.8% —
-so finishing it is worth roughly **3,500 more swaps**.
+The measurement that reframed everything: `wallet_swaps` held **2,917** Solana swaps, and
+**132,128 SWAP-tagged transactions had never been resolved**. T2.2 was run once with a limit
+and never completed.
+
+**Run to completion 2026-09-09: 696 new swaps, 0.5%, zero RPC failures.**
+
+**The estimate was wrong and it is worth saying why.** A 600-row sample returned 2.7%,
+matching T2.2's documented 2.8%, and that projected ~3,500. The sample was drawn
+`order by block_time desc` — the newest transactions — and the yield on the older 130,000 is
+roughly a fifth of that. **A sample taken in the resolver's own default order is not a random
+sample**, and the projection inherited its bias. The right number was always going to come
+from running it, which cost 45 unattended minutes.
 
 | | |
 | --- | --- |
@@ -618,7 +691,7 @@ so finishing it is worth roughly **3,500 more swaps**.
 | Runtime | ~45 min |
 | External APIs | Helius, `HELIUS_SOLANA_KEY`, already held |
 | Backfill | yes, but idempotent and resumable — it only takes rows not already resolved |
-| Buys | Solana's entry-price coverage, today **38.7%** with 2,283 pairs missing |
+| Bought | 696 swaps · `wallet_swaps` now 3,629 rows, all priced, across 122 wallets · 825 exits carry a real cost basis, which is what Axis 2's `perExit` runs on |
 
 Solana is where the swaps actually are, it is 28.3% of trades, and it is the one chain where
 this method is measured to work — 100% direction agreement and 94% on magnitude against fomo.
@@ -722,10 +795,10 @@ all if it reads from us.
 | Axis | Alignment | Blocker | Fix (§6) | Confidence |
 | --- | --- | --- | --- | --- |
 | 1 Cash-out | ✅ full | — | — | — |
-| 2 Consistency | ✅ fields, ⚠️ granularity | per-token vs per-exit | EVM resolver, ~2-3d | medium |
+| 2 Consistency | ✅ **full** — labelled + `perExit` | 9 of 141 have ≥20 true exits | ✅ shipped 2026-09-09 | — |
 | 3 Edge | ✅ full | — | — | — |
 | 4 Risk control | ✅ **full** — 4 of 4 inputs | — | ✅ chain balances, shipped | — |
-| 5 Selectivity | ✅ 5 of 5 inputs | 92% would render hollow | EVM resolver, ~2-3d | medium |
+| 5 Selectivity | ✅ 5 of 5 inputs + published gate | needs historical prices | ⛔ paid provider only | — |
 | 6 Activity density | ✅ **full** — 5 of 5 inputs | — | ✅ shipped 2026-09-09 | — |
 
 **100% of named inputs as of 2026-09-09** — the three §3 gaps are closed. The remaining ⚠️ axes
