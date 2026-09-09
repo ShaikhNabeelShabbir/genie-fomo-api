@@ -902,7 +902,7 @@ get("/v1/traders", async (_p, url) => {
  * first URL anyone tries was the one thing missing. This is a summary plus links, so the
  * response says what else can be asked about them rather than leaving it to be guessed.
  */
-get("/v1/traders/:handle", async ({ handle }) => {
+get("/v1/traders/:handle", async ({ handle }, url) => {
   const h = handle.toLowerCase();
   const [t] = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified,
@@ -917,7 +917,9 @@ get("/v1/traders/:handle", async ({ handle }) => {
 
   const addrs = [t.evm_address, t.sol_address]
     .filter((a): a is string => !!a).map((a) => a.toLowerCase());
-  const [act] = addrs.length ? await walletActivity(addrs) : [undefined];
+  const [[act], daily] = addrs.length
+    ? await Promise.all([walletActivity(addrs), dailyTradeCounts(addrs)])
+    : [[undefined], []];
 
   const [c] = await sql`
     select (select count(*) from holdings_current where handle = ${h})  as positions,
@@ -960,6 +962,32 @@ get("/v1/traders/:handle", async ({ handle }) => {
         swaps: Number(act.swaps),
         tokensTouched: Number(act.tokens_touched),
         activeDays: Number(act.active_days),
+        /**
+         * Axis 6. 1.0 = the same number of trades every active day; toward 0 = it all
+         * happened in a burst. `null` under two active days, where the measure has nothing
+         * to compare.
+         */
+        evenness: evennessOf(daily.map((d) => Number(d.trades))),
+        tradesPerActiveDay: daily.length
+          ? Number((daily.reduce((a, d) => a + Number(d.trades), 0) / daily.length).toFixed(2))
+          : null,
+        /**
+         * The series the evenness came from, so it can be recomputed or replotted — behind
+         * `?dailyTrades=true` because it grows with a wallet's lifetime (59 rows here, and
+         * unbounded for an old one) while almost every caller only wants the coefficient.
+         * The 306ms group-by runs either way; this is about payload, not time.
+         */
+        ...(url.searchParams.get("dailyTrades") === "true"
+          ? {
+            dailyTrades: daily.map((d) => ({
+          // postgres.js returns a Date, whose toString is "Fri Jul 03 2026 …" — slicing that
+          // yields "Fri Jul 03", not a date. Same trap that put firstEntryPrice on the wrong
+          // leg earlier; formatted through toISOString instead.
+              day: new Date(String(d.day)).toISOString().slice(0, 10),
+              trades: Number(d.trades),
+            })),
+          }
+          : { dailyTradesAvailable: daily.length }),
         firstSeenAt: act.first_at ? new Date(String(act.first_at)).toISOString() : null,
         lastActiveAt: act.last_at ? new Date(String(act.last_at)).toISOString() : null,
         tier: "verified",
@@ -1015,6 +1043,43 @@ const positionTiming = (addrs: string[]) => sql`
  * last. A wallet that traded twice a year apart has 2 active days, not 365, and the two
  * readings support very different conclusions about whether someone is actually trading.
  */
+/**
+ * Axis 6's evenness input: how many trades on each active day.
+ *
+ * Returned as a series rather than a single number so a consumer can compute gini, burstiness
+ * or anything else from the same rows — one histogram answers several questions, and a lone
+ * coefficient answers exactly one. `evenness` is also computed server-side below for callers
+ * who just want the figure.
+ */
+const dailyTradeCounts = (addrs: string[]) => sql`
+  select date_trunc('day', block_time)::date as day, count(*)::int as trades
+  from transactions
+  where address_key = any(${addrs}) and block_time is not null
+  group by 1 order by 1`;
+
+/**
+ * Gini over trades-per-day, expressed as evenness (1 − gini).
+ *
+ * 1.0 means every active day carried the same number of trades; 0 approaches all activity in
+ * a single day. Days with NO trades are deliberately excluded — the spec defines `activeDays`
+ * as days with at least one trade, so including silent days would measure how long we have
+ * been watching rather than how evenly they trade.
+ *
+ * `null` below two active days: a gini over one point is 0, which would read as "perfectly
+ * concentrated" when it actually means "nothing to compare".
+ */
+function evennessOf(counts: number[]): number | null {
+  const xs = counts.filter((x) => x > 0).sort((a, b) => a - b);
+  const n = xs.length;
+  if (n < 2) return null;
+  const total = xs.reduce((a, b) => a + b, 0);
+  if (total <= 0) return null;
+  let weighted = 0;
+  for (let i = 0; i < n; i++) weighted += (i + 1) * xs[i];
+  const gini = (2 * weighted) / (n * total) - (n + 1) / n;
+  return Number((1 - Math.max(0, Math.min(1, gini))).toFixed(4));
+}
+
 const walletActivity = (addrs: string[]) => sql`
   select count(*)::int                                             as transfers,
          count(*) filter (where direction = 'in')::int             as inbound,
@@ -1765,9 +1830,14 @@ const scorecardRows = (handles: string[]) => sql`
          tr.trade_id, tr.network_id, tr.token_address, tr.token_key, tr.token_symbol,
          tr.status, tr.amount, tr.avg_entry_price, tr.avg_exit_price,
          tr.realized_pnl_usd, tr.unrealized_pnl_usd, tr.opened_at, tr.closed_at, tr.captured_at,
-         tk.total_supply, tk.supply_source, tk.supply_read_at
+         tk.total_supply, tk.supply_source, tk.supply_read_at,
+         -- Axis 5 wants the token's age at entry, which needs its creation time. GMGN carries
+         -- it and we already store the whole document, so this is a read rather than a fetch.
+         -- 0 means "they did not tell us" and is nulled here, not published as 1970.
+         nullif((ti.raw->>'creation_timestamp')::bigint, 0) as token_created_unix
   from trades tr
   left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
+  left join token_info ti on ti.network_id = tr.network_id and ti.token_key = tr.token_key
   where tr.handle = any(${handles})`;
 
 /**
@@ -1917,6 +1987,7 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
     realizedPnlUsd: number; unrealizedPnlUsd: number;
     entry: Leg; exit: Leg;
     totalSupply: number | null; supplySource: string | null; supplyReadAt: string | null;
+    tokenCreatedUnix: number | null; firstOpenedMs: number | null;
   }>();
   for (const r of rows) {
     const key = String(r.token_key ?? r.token_symbol ?? "unknown");
@@ -1926,10 +1997,18 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
       entry: emptyLeg(), exit: emptyLeg(),
       totalSupply: n(r.total_supply), supplySource: (r.supply_source as string) ?? null,
       supplyReadAt: r.supply_read_at ? new Date(String(r.supply_read_at)).toISOString() : null,
+      tokenCreatedUnix: n(r.token_created_unix),
+      // Earliest position opened in this token, so age-at-entry can be derived per token.
+      firstOpenedMs: null as number | null,
     };
     rec.trades++;
     if (r.status === "closed") { rec.closed++; rec.realizedPnlUsd += n(r.realized_pnl_usd) ?? 0; }
     else rec.unrealizedPnlUsd += n(r.unrealized_pnl_usd) ?? 0;
+
+    const openedAt = ms(r.opened_at);
+    if (openedAt !== null && (rec.firstOpenedMs === null || openedAt < rec.firstOpenedMs)) {
+      rec.firstOpenedMs = openedAt;
+    }
 
     const qty = legQty(r);
     // Ordered by open time, tie-broken on trade_id, so `first` does not depend on the order
@@ -1972,7 +2051,7 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
     return { value, method, legs: a.legs, legsWeighted: a.weighted, first: a.first };
   };
   const byToken = [...byTokenMap.values()]
-    .map(({ entry, exit, ...r }) => {
+    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, ...r }) => {
       const e = resolve(entry), x = resolve(exit);
       // 12 significant figures, not a decimal rounding: these prices run to 0.0000101253 and
       // `round(v, 2)` would flatten a real entry to zero. At 12 figures every value that was
@@ -2001,6 +2080,20 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
       exitMethod: x.method,
       /** The pre-ISSUE-4 value, kept so anyone reading the old field can reconcile. */
       firstEntryPrice: px(e.first),
+      /**
+       * When the token itself was created, and how old it was when this trader first opened a
+       * position in it. Buying something four hours old is a different act from buying it four
+       * months old, and only the second number expresses that.
+       *
+       * `null` on either when GMGN has no creation time for the token (about 9% of them) or
+       * when we hold no open date — never 0, which would read as "created at the epoch".
+       */
+      tokenCreatedAt: tokenCreatedUnix !== null
+        ? new Date(tokenCreatedUnix * 1000).toISOString()
+        : null,
+      tokenAgeAtEntryDays: tokenCreatedUnix !== null && firstOpenedMs !== null
+        ? Number(((firstOpenedMs - tokenCreatedUnix * 1000) / 86_400_000).toFixed(2))
+        : null,
       /**
        * Entry expressed as a MARKET CAP, which is how it is read on screen.
        *
@@ -2163,6 +2256,40 @@ async function scorecardBody(t: any, rows: any[], tokenLimit: number | null) {
       previously: "this field was the first entry price seen per token and was not " +
                   "re-averaged; `firstEntryPrice` still carries that value for comparison",
     },
+    /**
+     * Axis 5's "winrate on hard entries". Restricted to tokens the trader entered below a
+     * $1M market cap — buying something small is a different skill from buying something
+     * established, and a blended win rate hides which one they are good at.
+     *
+     * Per TOKEN, not per trade, because that is the granularity we hold. Coverage travels
+     * with it: entry market cap needs both an entry price and a supply, and we have both on
+     * well under half the record — so this is often computed over a handful of tokens and
+     * must not be read as a headline.
+     */
+    smallCapWinRate: (() => {
+      const priced = byToken.filter((t) => t.avgEntryMarketCapUsd !== null);
+      const small = priced.filter((t) => t.avgEntryMarketCapUsd! < 1_000_000 && t.closed > 0);
+      if (!small.length) {
+        return {
+          value: null,
+          threshold: 1_000_000,
+          basis: "per token, not per trade — we hold positions, not individual fills",
+          coverage: cov(0, byToken.length),
+          note: "no token with a known entry market cap under $1M has a closed position",
+        };
+      }
+      const wins = small.filter((t) => t.realizedPnlUsd > 0).length;
+      return {
+        value: Number((wins / small.length).toFixed(4)),
+        wins,
+        tokens: small.length,
+        threshold: 1_000_000,
+        basis: "per token, not per trade — we hold positions, not individual fills",
+        // Denominator is tokens we could PRICE, not all tokens: a token with no entry market
+        // cap was not judged small or large, and counting it either way would be a guess.
+        coverage: cov(priced.length, byToken.length),
+      };
+    })(),
     windows,
     tokensTotal: byToken.length,
     byToken: tokenLimit === null ? byToken : byToken.slice(0, tokenLimit),
