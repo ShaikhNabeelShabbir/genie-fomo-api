@@ -138,6 +138,10 @@ jobs:
         env:
           GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
         run: node scripts/load_token_info.mjs --stale-hours 20
+        # One pass fetches BOTH endpoints per token — /v1/token/info for fundamentals,
+        # holder concentration, wallet tags and creator signals, then /v1/token/security for
+        # the contract checks. Two requests per token at GMGN's 1/s, so ~35 min for a full
+        # refresh of the ~1,100 held tokens.
 
       # ---------------------------------------------------------------- 7. webhook
       # A trader entering the top 100 is invisible to the live feed until their wallet is

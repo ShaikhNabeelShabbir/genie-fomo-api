@@ -1175,6 +1175,16 @@ get("/v1/tokens", async (_p, url) => {
   const minMarketCap = numParam(url, "minMarketCap"), maxMarketCap = numParam(url, "maxMarketCap");
   const minLiquidity = numParam(url, "minLiquidity");
 
+  /**
+   * T3a. `?excludeHoneypots=true` drops tokens GMGN flags as unsellable.
+   *
+   * Opt-in rather than the default: silently removing rows would misstate the board — a
+   * consumer counting the tokens their leaders hold would get a different number with no
+   * indication why. It also only removes tokens PROVEN unsellable; a Solana token, where the
+   * check does not run, is never dropped for failing a test that was never applied.
+   */
+  const excludeHoneypots = url.searchParams.get("excludeHoneypots") === "true";
+
 
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
 
@@ -1191,6 +1201,13 @@ get("/v1/tokens", async (_p, url) => {
            -- the token detail route with the cap disclosure attached.
            max((ti.raw->'wallet_tags_stat'->>'smart_wallets')::int)    as smart_wallets,
            max((ti.raw->'wallet_tags_stat'->>'renowned_wallets')::int) as renowned_wallets,
+           -- T3a on the board. A honeypot flag is worthless on a detail page nobody opens
+           -- before acting; it has to be visible where the scanning happens.
+           bool_or(ti.is_honeypot)      as is_honeypot,
+           bool_or(ti.can_not_sell)     as can_not_sell,
+           max(ti.sell_tax)             as sell_tax,
+           max(ti.rug_ratio)            as rug_ratio,
+           max(ti.security_fetched_at)  as security_fetched_at,
            count(distinct h.handle)::int              as holders,
            sum(h.value) filter (where h.value > 0)    as total_value,
            count(h.value) filter (where h.value > 0)::int as priced,
@@ -1212,6 +1229,10 @@ get("/v1/tokens", async (_p, url) => {
       ${minMarketCap === null ? sql`` : sql`and max(ti.market_cap_usd) >= ${minMarketCap}`}
       ${maxMarketCap === null ? sql`` : sql`and max(ti.market_cap_usd) <= ${maxMarketCap}`}
       ${minLiquidity === null ? sql`` : sql`and max(ti.liquidity_usd) >= ${minLiquidity}`}
+      ${
+    !excludeHoneypots ? sql`` : sql`and coalesce(bool_or(ti.is_honeypot), false) = false
+                                    and coalesce(bool_or(ti.can_not_sell), false) = false`
+  }
     -- Address is the tiebreak, and it matters: hundreds of tokens tie on holder count with
     -- no price, so without it the board order is whatever the planner produced. It stays on
     -- the end of every sort, unreversed, because T1.4's cursors resume through a total order.
@@ -1307,6 +1328,18 @@ get("/v1/tokens", async (_p, url) => {
        */
       smartWallets: r.smart_wallets === null ? null : Number(r.smart_wallets),
       renownedWallets: r.renowned_wallets === null ? null : Number(r.renowned_wallets),
+      /**
+       * T3a. The risk signal, on the row.
+       *
+       * `null` is "not assessed", never "safe" — it is null on every Solana token, where
+       * GMGN does not evaluate honeypot behaviour. `/tokens/:address` carries the full block
+       * with the per-chain applicable checks.
+       */
+      isHoneypot: r.is_honeypot === null ? null : Boolean(r.is_honeypot),
+      sellBlocked: r.can_not_sell === null ? null : Boolean(r.can_not_sell),
+      sellTax: n(r.sell_tax),
+      rugRatio: n(r.rug_ratio),
+      securityChecked: !!r.security_fetched_at,
       fundamentalsTier: r.info_fetched_at ? "third_party" : null,
       holderShare: Number((Number(r.holders) / Number(traderCount)).toFixed(4)),
       totalValueUsd: Number(r.priced) ? round(n(r.total_value)) : null,
@@ -1346,7 +1379,13 @@ get("/v1/tokens/:address", async ({ address }, url) => {
            ti.raw->'dev'->>'creator_token_status'         as creator_status,
            ti.raw->'dev'->>'cto_flag'                     as cto_flag,
            ti.raw->'dev'->>'creator_open_count'           as creator_open_count,
-           ti.raw->'dev'->'ath_token_info'                as creator_ath
+           ti.raw->'dev'->'ath_token_info'                as creator_ath,
+           -- T3a. Contract safety. Which of these are meaningful depends on the chain, and
+           -- the loader has already nulled the ones that do not apply rather than storing
+           -- GMGN's false for a check that chain does not have.
+           ti.is_honeypot, ti.buy_tax, ti.sell_tax, ti.is_open_source, ti.is_renounced,
+           ti.renounced_mint, ti.renounced_freeze, ti.rug_ratio, ti.burn_ratio,
+           ti.is_blacklisted, ti.can_not_sell, ti.security_fetched_at
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
@@ -1431,6 +1470,74 @@ get("/v1/tokens/:address", async ({ address }, url) => {
           : null,
         estimatedValueBasis: n(group[0].price_usd) !== null
           ? "sum(holdings.amount) x GMGN price — third-party, not our stored value"
+          : null,
+        /**
+         * T3a. Can you actually sell it, and who controls the contract?
+         *
+         * This closes the one place where our silence was dangerous: the API ranks tokens by
+         * how many tracked leaders hold them and, until now, said nothing about whether the
+         * contract permits selling. A crowd of leaders in a honeypot looked identical to a
+         * crowd in a good token. 14 of the tokens on this board are confirmed honeypots.
+         *
+         * **Every field is three-valued and `null` never means safe.** `isHoneypot: null` is
+         * "not assessed on this chain" — always so on Solana, where GMGN does not evaluate it
+         * — and reading that as `false` is exactly the mistake this shape prevents.
+         * `applicableChecks` names what could be judged here, so an absent field is visibly
+         * out of scope rather than silently missing.
+         */
+        security: group[0].security_fetched_at
+          ? (() => {
+            const b = (v: unknown) => (v === null || v === undefined ? null : Boolean(v));
+            const isSol = Number(group[0].network_id) === 1399811149;
+            const flags: string[] = [];
+            if (group[0].is_honeypot === true) flags.push("honeypot");
+            if (group[0].can_not_sell === true) flags.push("sell_blocked");
+            if (group[0].is_blacklisted === true) flags.push("blacklist_function");
+            if ((n(group[0].buy_tax) ?? 0) > 0.1) flags.push("high_buy_tax");
+            if ((n(group[0].sell_tax) ?? 0) > 0.1) flags.push("high_sell_tax");
+            if ((n(group[0].rug_ratio) ?? 0) > 0.3) flags.push("high_rug_ratio");
+            if (isSol && group[0].renounced_mint === false) flags.push("mint_not_renounced");
+            if (isSol && group[0].renounced_freeze === false) flags.push("freeze_not_renounced");
+            if (!isSol && group[0].is_renounced === false) flags.push("owner_not_renounced");
+            return {
+              canSell: group[0].is_honeypot === null
+                ? null
+                : !(group[0].is_honeypot === true || group[0].can_not_sell === true),
+              isHoneypot: b(group[0].is_honeypot),
+              buyTax: n(group[0].buy_tax),
+              sellTax: n(group[0].sell_tax),
+              isOpenSource: b(group[0].is_open_source),
+              ownerRenounced: b(group[0].is_renounced),
+              mintRenounced: b(group[0].renounced_mint),
+              freezeRenounced: b(group[0].renounced_freeze),
+              rugRatio: n(group[0].rug_ratio),
+              burnRatio: n(group[0].burn_ratio),
+              blacklistFunction: b(group[0].is_blacklisted),
+              /**
+               * What this chain can even be asked. GMGN assesses honeypot, source and owner
+               * renouncement on EVM only; mint and freeze authority are Solana-only. Naming
+               * the applicable set stops an absent field reading as a failed check.
+               */
+              applicableChecks: isSol
+                ? ["mintRenounced", "freezeRenounced", "buyTax", "sellTax", "rugRatio", "burnRatio"]
+                : ["isHoneypot", "isOpenSource", "ownerRenounced", "buyTax", "sellTax",
+                   "blacklistFunction", "rugRatio", "burnRatio"],
+              flags,
+              verdict: flags.includes("honeypot") || flags.includes("sell_blocked")
+                ? "cannot_sell"
+                : flags.length
+                ? "caution"
+                : "no_flags_raised",
+              // "No flags raised" is not "safe", and the wording says so. We checked what
+              // GMGN checks; a contract can be hostile in ways none of them cover.
+              note: "flags are what GMGN's checks caught. Nothing raised is not proof of " +
+                    "safety, and null means a check does not apply on this chain — never " +
+                    "that it passed.",
+              tier: "third_party",
+              source: group[0].info_source ?? "gmgn",
+              fetchedAt: new Date(String(group[0].security_fetched_at)).toISOString(),
+            };
+          })()
           : null,
         /**
          * T3b. Concentration across EVERY holder on chain, from GMGN.

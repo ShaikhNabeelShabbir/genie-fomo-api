@@ -36,7 +36,7 @@ about **whether the answer exists in our data at all**:
 | --- | --- | --- |
 | **T1** | Computable from rows we already hold | none | — ✅ 5 of 5 done |
 | **T2** | Computable after a one-off backfill, then free forever | none | — ✅ 2 of 2 done |
-| **T3** | Inherently external — describes the whole chain or a contract, not our traders | cached proxy | — 4 of 5 done |
+| **T3** | Inherently external — describes the whole chain or a contract, not our traders | cached proxy | — ✅ 5 of 5 done |
 | **T4** | Does not fit what this product is | n/a |
 
 **The T3 line is the important one.** `holder_count`, `is_honeypot`, `buy_tax` and
@@ -615,7 +615,7 @@ in our DB with `fetched_at`, serve from cache, label `tier: "third_party"` and
 
 | Item | GMGN endpoint | Why we cannot compute it | Effort |
 | --- | --- | --- | --- |
-| ⬜ Token security — `is_honeypot`, `buy_tax`, `sell_tax`, `owner_renounced`, `rug_ratio` | `GET /v1/token/security` | Contract-level facts. Not in any table we own. | ~4h |
+| ✅ **Token security** — `is_honeypot`, `buy_tax`, `sell_tax`, `owner_renounced`, `rug_ratio` | `GET /v1/token/security` | Contract-level facts. Not in any table we own. | done 2026-09-09 |
 | ✅ **Token fundamentals** — `price`, `liquidity`, `market_cap`, `circulating_supply` | `GET /v1/token/info` | We hold `total_supply` only; no price feed. | done 2026-09-08 |
 | ✅ **True holder counts** — `holder_count`, `top_10_holder_rate` | `GET /v1/token/info` | All chain holders; we see 137 traders. Pairs with T1.3 — ours and theirs side by side is genuinely better than either alone. | done 2026-09-08 |
 | ✅ **Wallet tags** — `smart_degen`, `renowned`, `sniper`, `bundler`, `dev` | `GET /v1/token/info` (`wallet_tags_stat`) | GMGN's own classification of wallets we do not track. | done 2026-09-08 |
@@ -734,6 +734,64 @@ names which tags are capped and says a 1000 means *at least* 1000:
 
 **Verified:** 23/23 routes 200, cursor exact under both new sorts (1,095 rows, 0 duplicates),
 `/tokens/:address` at 2.27s.
+
+### ✅ T3a shipped — 2026-09-09 · **the plan is complete, 12 of 12**
+
+The item this file argued hardest for, and the last one. Its sequencing note read: *"do T3
+security first — it is the one set of fields where absence is actively dangerous."* It was
+right, and the numbers are worse than the argument assumed.
+
+**What a full pass found across all 1,095 held tokens (100% coverage, 0 failures):**
+
+```
+67  honeypots — buying succeeds, selling fails
+49  of our 137 tracked leaders hold at least one
+154 positions across them
+57  tokens whose owner has not renounced
+23  Solana tokens whose mint authority is still live
+ 3  with a sell tax above 10%
+```
+
+Until today every one of those sat on the board indistinguishable from a good token, because
+the only thing we published was how many leaders held it.
+
+**Chain-dependence is the whole subtlety.** GMGN answers with every field on every chain,
+including the ones that do not apply, and the inapplicable ones come back **`false`, not
+null**:
+
+```
+EVM (eth/bsc/base/robinhood)   is_honeypot / is_open_source / is_renounced are real
+                               renounced_mint & freeze return FALSE — Solana concepts,
+                               meaningless there
+Solana                         the exact mirror — honeypot/source/renounced are NULL
+                               (not assessed), mint & freeze carry the signal
+```
+
+Passing those falses through would publish *"mint authority not renounced"* about a chain with
+no mint authority. The loader nulls them per chain, and every response carries
+`applicableChecks` naming what could be judged there — so an absent field reads as out of
+scope rather than as a failed check.
+
+**`null` never means safe.** `isHoneypot: null` is "not assessed on this chain", always so on
+Solana. `verdict` is `cannot_sell` / `caution` / `no_flags_raised`, and the note says plainly
+that nothing raised is not proof of safety — GMGN's checks are not every way a contract can be
+hostile.
+
+**On the board too, not just the detail route.** A honeypot flag on a page nobody opens before
+acting is worthless: `isHoneypot`, `sellBlocked`, `sellTax`, `rugRatio` and `securityChecked`
+are on every row, with `?excludeHoneypots=true` to drop the 67. Opt-in, never the default —
+silently removing rows would misstate a board someone is counting, and it only removes tokens
+PROVEN unsellable, never a Solana token where the check never ran.
+
+**Cost:** one extra GMGN endpoint on the key we already hold, fetched in the same pass as the
+fundamentals. 943 remaining tokens in ~35 minutes, **0 failures**, and zero external calls at
+request time.
+
+**Also repaired here:** the migration file documenting these 13 columns had been deleted in an
+earlier revert while the columns stayed in the database. It is restored, `if not exists`
+throughout, so the migrations folder once again matches the schema.
+
+**Verified:** 19/19 routes 200, rate-limit headers 4/4, `/tokens` 3.16s.
 
 ---
 

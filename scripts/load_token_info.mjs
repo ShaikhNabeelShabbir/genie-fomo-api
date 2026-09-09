@@ -59,14 +59,14 @@ const jsonForPg = (v) => JSON.stringify(v).replace(/\\u0000/g, "");
 const clean = (v) =>
   typeof v === "string" ? v.replace(/\u0000/g, "").replace(/\\u0000/g, "") : (v ?? null);
 
-async function fetchInfo(code, address) {
+async function fetchGmgn(path, code, address) {
   const qs = new URLSearchParams({
     chain: code,
     address,
     timestamp: String(Math.floor(Date.now() / 1000)),
     client_id: crypto.randomUUID(),
   });
-  const r = await fetch(`https://openapi.gmgn.ai/v1/token/info?${qs}`, {
+  const r = await fetch(`https://openapi.gmgn.ai${path}?${qs}`, {
     headers: { "X-APIKEY": KEY, Accept: "application/json" },
     signal: AbortSignal.timeout(30_000),
   });
@@ -75,6 +75,51 @@ async function fetchInfo(code, address) {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   if (j?.code !== 0) throw new Error(String(j?.message ?? j?.error ?? "gmgn error").slice(0, 80));
   return j.data;
+}
+
+const fetchInfo = (code, address) => fetchGmgn("/v1/token/info", code, address);
+const fetchSecurity = (code, address) => fetchGmgn("/v1/token/security", code, address);
+
+/**
+ * T3a. Normalise a security response for the chain it came from.
+ *
+ * GMGN answers with every field on every chain, including the ones that do not apply, and the
+ * inapplicable ones come back as `false` rather than null. Verified live on all five chains
+ * we carry:
+ *
+ *   EVM (eth/bsc/base/robinhood)  is_honeypot / is_open_source / is_renounced are real;
+ *                                 renounced_mint and renounced_freeze_account are FALSE, but
+ *                                 mint and freeze authorities are Solana concepts
+ *   Solana                        the mirror — honeypot / open-source / renounced are NULL
+ *                                 (not assessed), mint/freeze carry the real signal
+ *
+ * Passing those falses through would publish "mint authority not renounced" about a chain
+ * with no mint authority — a scary-sounding claim about something that cannot be true or
+ * false there. Inapplicable checks are stored NULL, which everywhere in this API means "we do
+ * not know", never "safe".
+ */
+function normaliseSecurity(chain, d) {
+  const sol = chain === "solana";
+  const bool = (v) => (v === null || v === undefined || v === "" ? null : Boolean(v));
+  const dec = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const x = Number(v);
+    return Number.isFinite(x) ? x : null;
+  };
+  return {
+    is_honeypot: sol ? null : bool(d.is_honeypot),
+    is_open_source: sol ? null : bool(d.is_open_source),
+    is_renounced: sol ? null : bool(d.is_renounced),
+    renounced_mint: sol ? bool(d.renounced_mint) : null,
+    renounced_freeze: sol ? bool(d.renounced_freeze_account) : null,
+    is_blacklisted: sol ? null : bool(d.is_blacklist),
+    // can_not_sell is a count in their payload, not a flag.
+    can_not_sell: dec(d.can_not_sell) === null ? null : dec(d.can_not_sell) > 0,
+    buy_tax: dec(d.buy_tax),
+    sell_tax: dec(d.sell_tax),
+    rug_ratio: dec(d.rug_ratio),
+    burn_ratio: dec(d.burn_ratio),
+  };
 }
 
 async function main() {
@@ -91,22 +136,26 @@ async function main() {
            on ti.network_id = h.network_id and ti.token_key = h.token_key
         where q.token_key is null
           ${CHAIN ? "and ch.name = $1" : ""}
-          and (ti.fetched_at is null
-               or ti.fetched_at < now() - ($${CHAIN ? 2 : 1} * interval '1 hour'))
-        group by 1,2,3,4, ti.fetched_at
+          -- Either half being stale is reason to refetch: security has its own timestamp
+          -- and can be missing on a token whose fundamentals are current.
+          and (ti.fetched_at is null or ti.security_fetched_at is null
+               or ti.fetched_at < now() - ($${CHAIN ? 2 : 1} * interval '1 hour')
+               or ti.security_fetched_at < now() - ($${CHAIN ? 2 : 1} * interval '1 hour'))
+        group by 1,2,3,4, ti.fetched_at, ti.security_fetched_at
         -- Never-fetched first, then stalest. A run that is cut short still leaves the set
         -- more complete than it found it rather than re-refreshing the same head.
-        order by ti.fetched_at asc nulls first, h.token_key`,
+        order by ti.security_fetched_at asc nulls first, ti.fetched_at asc nulls first, h.token_key`,
       CHAIN ? [CHAIN, STALE_HOURS] : [STALE_HOURS],
     );
 
     const work = LIMIT ? targets.slice(0, LIMIT) : targets;
     if (!work.length) { console.log("nothing to fetch — every held token is fresh"); return; }
 
-    const mins = Math.ceil(work.length * 1.1 / 60);
+    // Two endpoints per token — fundamentals then security — at 1 request/second each.
+    const mins = Math.ceil(work.length * 2.2 / 60);
     console.log(`fetching ${work.length} token(s) at 1/s — about ${mins} min`);
 
-    let ok = 0, failed = 0, priced = 0;
+    let ok = 0, failed = 0, priced = 0, secFailed = 0;
     for (const [i, t] of work.entries()) {
       const code = CHAIN_CODE[t.chain];
       if (!code) { failed++; continue; }
@@ -124,6 +173,22 @@ async function main() {
         }
       }
       if (!d) { failed++; await sleep(1100); continue; }
+
+      /**
+       * Security is a second endpoint, so a second request and a second second of pacing.
+       * It is allowed to fail on its own: fundamentals are still worth storing without it,
+       * and `security_fetched_at` stays null so the next pass retries just the security half.
+       */
+      await sleep(1100);
+      let sec = null;
+      try { sec = normaliseSecurity(t.chain, await fetchSecurity(code, t.address)); }
+      catch (e) {
+        if (String(e.message) === "RATE_LIMIT") {
+          await sleep(3000);
+          try { sec = normaliseSecurity(t.chain, await fetchSecurity(code, t.address)); } catch { /* counted below */ }
+        }
+      }
+      if (!sec) secFailed++;
 
       const price = num(d?.price?.price);
       const circ = num(d.circulating_supply);
@@ -146,19 +211,44 @@ async function main() {
         await c.query(
         `insert into token_info (network_id, token_key, symbol, name, price_usd, liquidity_usd,
            market_cap_usd, total_supply, circulating_supply, max_supply, holder_count,
-           top_10_holder_rate, raw, source, fetched_at)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'gmgn',now())
+           top_10_holder_rate, raw, source, fetched_at,
+           is_honeypot, buy_tax, sell_tax, is_open_source, is_renounced, renounced_mint,
+           renounced_freeze, rug_ratio, burn_ratio, is_blacklisted, can_not_sell,
+           security_fetched_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'gmgn',now(),
+                 $14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+                 case when $25::boolean then now() else null end)
          on conflict (network_id, token_key) do update set
            symbol=excluded.symbol, name=excluded.name, price_usd=excluded.price_usd,
            liquidity_usd=excluded.liquidity_usd, market_cap_usd=excluded.market_cap_usd,
            total_supply=excluded.total_supply, circulating_supply=excluded.circulating_supply,
            max_supply=excluded.max_supply, holder_count=excluded.holder_count,
            top_10_holder_rate=excluded.top_10_holder_rate, raw=excluded.raw,
-           fetched_at=now()`,
+           fetched_at=now(),
+           -- Only overwrite security when this run actually fetched it. A failed security
+           -- call must leave yesterday's answer standing rather than blanking a honeypot
+           -- flag that was true.
+           is_honeypot      = case when $25::boolean then excluded.is_honeypot      else token_info.is_honeypot end,
+           buy_tax          = case when $25::boolean then excluded.buy_tax          else token_info.buy_tax end,
+           sell_tax         = case when $25::boolean then excluded.sell_tax         else token_info.sell_tax end,
+           is_open_source   = case when $25::boolean then excluded.is_open_source   else token_info.is_open_source end,
+           is_renounced     = case when $25::boolean then excluded.is_renounced     else token_info.is_renounced end,
+           renounced_mint   = case when $25::boolean then excluded.renounced_mint   else token_info.renounced_mint end,
+           renounced_freeze = case when $25::boolean then excluded.renounced_freeze else token_info.renounced_freeze end,
+           rug_ratio        = case when $25::boolean then excluded.rug_ratio        else token_info.rug_ratio end,
+           burn_ratio       = case when $25::boolean then excluded.burn_ratio       else token_info.burn_ratio end,
+           is_blacklisted   = case when $25::boolean then excluded.is_blacklisted   else token_info.is_blacklisted end,
+           can_not_sell     = case when $25::boolean then excluded.can_not_sell     else token_info.can_not_sell end,
+           security_fetched_at = case when $25::boolean then now() else token_info.security_fetched_at end`,
         [
           t.network_id, t.token_key, clean(d.symbol), clean(d.name), price,
           num(d.liquidity), mc, num(d.total_supply), circ, num(d.max_supply),
           num(d.holder_count), num(d?.stat?.top_10_holder_rate), jsonForPg(d),
+          sec?.is_honeypot ?? null, sec?.buy_tax ?? null, sec?.sell_tax ?? null,
+          sec?.is_open_source ?? null, sec?.is_renounced ?? null, sec?.renounced_mint ?? null,
+          sec?.renounced_freeze ?? null, sec?.rug_ratio ?? null, sec?.burn_ratio ?? null,
+          sec?.is_blacklisted ?? null, sec?.can_not_sell ?? null,
+          sec !== null,
         ],
       );
       } catch (e) {
@@ -175,7 +265,10 @@ async function main() {
       await sleep(1100);
     }
 
-    console.log(`\ndone · ${ok} stored (${priced} with a price) · ${failed} failed`);
+    console.log(
+      `\ndone · ${ok} stored (${priced} with a price) · ${failed} failed` +
+      ` · ${secFailed} without security`,
+    );
   } finally {
     c.release();
     await pool.end();

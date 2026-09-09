@@ -1,6 +1,6 @@
 # GMGN-parity features → Route
 
-**Generated: 2026-09-08T18:30Z** · 11 of 12 planned features live
+**Generated: 2026-09-09T09:15Z** · **12 of 12 planned features live**
 
 Companion to [PARAMETER_ROUTES.md](PARAMETER_ROUTES.md), same shape: one row per feature —
 what it means in plain words, the exact call that returns it, the field to read. This file
@@ -41,6 +41,7 @@ Postgres (G6's prices are fetched nightly and stored, never at request time) —
 | **G9** | Wallet tags | `wallet_tags_stat` — `smart_wallets`, `renowned_wallets`, … | `/tokens`, `/tokens/:address` | ✅ live |
 | **G10** | Creator / dev signals | `creator_token_status`, `cto_flag`, `creator_ath_info` | `/tokens/:address` | ✅ live |
 | **G11** | Chain-verified P&L | *none — GMGN has no second source to check against* | `/traders/:handle/pnl` | ✅ live |
+| **G12** | Token security | `is_honeypot`, `buy_tax`, `sell_tax`, `owner_renounced`, `rug_ratio` | `/tokens`, `/tokens/:address` | ✅ live |
 
 ---
 
@@ -748,9 +749,91 @@ have no independent second source to check it against. This exists precisely bec
 
 ---
 
+## G12 · Token security
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "Can you actually sell this, or does buying it trap your money?" | `GET $B/tokens/:address` | `entries[].security` | **67 honeypots** on the board, held by **49 of 137 leaders** |
+
+**In layman's terms.** A honeypot is a coin you can buy but cannot sell — the contract accepts
+your money and refuses to give it back. Until now this API ranked coins purely by how many
+tracked leaders held them, which made a honeypot look exactly like a good coin. This adds the
+contract's own answer: can you sell, what tax is charged, and who still controls it.
+
+The first full pass found **67 honeypots** among the coins our leaders hold, spread across
+**154 positions** and **49 of the 137 traders**.
+
+### How to test
+
+```bash
+# a confirmed honeypot
+curl -s "$B/tokens/0x000ae314e2a2172a039b26378814c252734f556a" | jq '.entries[0].security'
+
+# on the board, and filterable
+curl -s "$B/tokens?limit=500" | jq '[.entries[] | select(.isHoneypot == true)] | length'
+curl -s "$B/tokens?excludeHoneypots=true&limit=2000" | jq '.count'
+```
+
+```json
+{
+  "canSell": false,
+  "isHoneypot": true,
+  "buyTax": 0,
+  "sellTax": 0,
+  "isOpenSource": true,
+  "ownerRenounced": true,
+  "mintRenounced": null,
+  "freezeRenounced": null,
+  "rugRatio": null,
+  "flags": [
+    "honeypot"
+  ],
+  "verdict": "cannot_sell",
+  "tier": "third_party",
+  "source": "gmgn"
+}
+```
+
+### ⚠ `null` never means safe
+
+**`isHoneypot: null` is "not assessed on this chain", not "no".** GMGN evaluates honeypot
+behaviour on EVM only, so it is `null` on **every** Solana token. Reading that as `false` is
+exactly the mistake this shape exists to prevent.
+
+**The applicable checks differ by chain**, because the concepts do:
+
+| | assessed | not applicable |
+| --- | --- | --- |
+| **EVM** (eth/bsc/base/robinhood) | `isHoneypot`, `isOpenSource`, `ownerRenounced`, `blacklistFunction` | `mintRenounced`, `freezeRenounced` — Solana concepts |
+| **Solana** | `mintRenounced`, `freezeRenounced` | `isHoneypot`, `isOpenSource`, `ownerRenounced` |
+
+GMGN returns `false` for the inapplicable ones. We store `null` instead — publishing "mint
+authority not renounced" about a chain with no mint authority would be a frightening claim
+about something that cannot be true or false there. Every response carries
+`applicableChecks` naming what could be judged, so an absent field reads as out of scope.
+
+### What else to know
+
+**`verdict` is a summary, not a safety rating.** `cannot_sell` · `caution` ·
+`no_flags_raised`. The last one means *GMGN's checks caught nothing* — not that the token is
+safe. A contract can be hostile in ways none of these checks cover, and the response says so.
+
+**`?excludeHoneypots=true` is opt-in, and only drops the proven.** The default board still
+shows all 1,095 tokens including the 67 — silently removing rows would misstate a count
+someone is relying on. And it never drops a Solana token for failing a check that was never
+run there.
+
+**Refreshed nightly with the fundamentals**, in the same pass. `fetchedAt` says how old the
+answer is; there is no external call at request time.
+
+**Versus GMGN.** Same endpoint, same checks. The difference is that ours arrives beside the
+holder data with the per-chain applicability stated, so a `null` cannot be mistaken for a pass.
+
+---
+
 ## What is not here yet
 
-One of the twelve planned parity features is unbuilt — and **every one of them requires a
+ — and **every one of them requires a
 migration or an external call**, since the pure-code tier is complete, including everything requiring an
 external call — token security (`is_honeypot`, `buy_tax`), fundamentals (`price`, `liquidity`,
 `market_cap`), true chain-wide holder counts, wallet tags and creator signals. See
