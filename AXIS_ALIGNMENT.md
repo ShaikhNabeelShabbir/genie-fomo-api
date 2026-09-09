@@ -52,8 +52,9 @@ Update the boxes as work lands. ⬜ not started · 🔄 in progress · ✅ done 
 | **1** | Surface the three §3 gaps — `creation_timestamp`, gini, sub-$1M winrate | ~3h | certain | Axis 6 | ✅ **done 2026-09-09** |
 | **2** | Axis 4 — read wallet balances from chain | ~1 day | **high, demonstrated** | Axis 4 | ✅ **done 2026-09-09** |
 | **3** | Robinhood spike — measure, ship nothing | ~half a day | — | decides step 4 | ✅ **done 2026-09-09** — see §6 |
-| **4a** | EVM resolver — robinhood + ethereum (49.7% of trades) | ~1-1.5 days | **high, measured** | Axes 2 **and** 5 | ⬜ **next** |
-| **4b** | EVM resolver — bsc + base (21.4%) | ~1 day | needs a provider decision | Axes 2 and 5 | ⬜ |
+| ~~**4a**~~ | EVM resolver — robinhood + ethereum | built | — | nothing — **the trades are not on-chain** | ⛔ **closed 2026-09-09** |
+| ~~**4b**~~ | EVM resolver — bsc + base | ~1 day | bitquery works, but only ~41 swaps exist | negligible | ⛔ **not worth starting** |
+| **5** | Finish the Solana resolver — 132,128 unresolved | **none, script exists** | **proven, 2.7% sampled** | Axes 2 and 5 | 🔄 **running** |
 
 **Steps 1, 2 and 3 are done.** Step 3 was the decision gate, and it has answered: build the
 resolver for robinhood + ethereum (49.7% of trades, discovery measured and keyless), and settle
@@ -61,9 +62,11 @@ the provider question for bsc + base before starting those. Full detail in §6.
 
 ### Three things to hold on to
 
-1. **Axes 2 and 5 are one job.** Both are blocked by the same missing EVM resolver — 71% of
-   trades are on chains it does not cover. Scheduling them separately builds the same thing
-   twice.
+1. **Axes 2 and 5 are one job — but the EVM resolver was never the answer.** It was built
+   on 2026-09-09 and a complete on-chain scan returned zero swaps: robinhood's trading is
+   matched off-chain and only settles on-chain, in Multicall3 batches. Solana yields swaps at
+   fifteen times the rate of the best EVM chain. **The work is finishing Solana, not
+   extending to EVM.**
 2. **No new provider, no new key.** Every fix runs on `HELIUS_SOLANA_KEY`, `BITQUERY_KEY` or
    a chain's own public RPC, all already configured. The blockers were an API that refuses
    non-cohort handles, and a resolver built for 28% of the trading — neither was ever a
@@ -508,7 +511,92 @@ robinhood + ethereum, decide separately on bsc + base.**
 
 ---
 
-#### Step 4 — EVM resolver · ~2-3 days · **confidence raised for 50% of trades, unchanged for 21%**
+#### ⛔ Step 4a — EVM resolver, robinhood + ethereum · **BUILT AND MEASURED 2026-09-09 · the trades are not on-chain**
+
+`scripts/resolve_evm_swaps.mjs` is written, working and committed. It found **zero swaps**,
+and the reason is not a bug in it — it is that the trades it was built to resolve do not
+exist on those chains.
+
+**What was run.** A complete `eth_getLogs` scan of robinhood direct from the chain — not a
+sample, not our stored ingest — over 2,000,000 blocks, every wallet OR'd into the topic array:
+
+```
+robinhood   30,384 (tx, wallet) candidates  ->      0 two-sided swaps
+ethereum     3,565 candidates via Etherscan ->      0 two-sided swaps
+```
+
+**Why.** Grouping every Transfer log by (transaction, wallet) and netting it:
+
+```
+one token leg     5,277 of 5,297     <- a transfer, not a trade
+two token legs           13          <- and those are token<->token, no quote side
+groups touching a quote asset       179, nearly all single-leg deposits
+```
+
+The transactions our wallets appear in are addressed to **Multicall3**
+(`0xca11bde05977b3631167028862bE2a173976CA11`) and carry 50-100 Transfer logs each. They are
+**batch distributions**, and our wallet is one recipient among a hundred. Robinhood Chain
+carries tokenised equities — NVDA, GME, AMC, COST, GLD — and the matching happens in
+Robinhood's own order book. Only settlement reaches the chain. There is no swap to resolve.
+
+Confirmed against every stored EVM transaction we hold, and against Solana as a control:
+
+| Chain | (tx, wallet) groups | 2+ token legs | 1 quote + 1 token = a swap | rate |
+| --- | --- | --- | --- | --- |
+| **solana** | 391,934 | 9,260 | **4,696** | **1.20%** |
+| robinhood | 49,248 | 570 | 40 | 0.08% |
+| bsc | 14,401 | 132 | 25 | 0.17% |
+| base | 6,675 | 124 | 16 | 0.24% |
+| ethereum | 3,443 | 1 | 0 | 0.00% |
+
+Solana yields swaps at **fifteen times** the rate of the best EVM chain, and the EVM total
+across all four chains is **81 swap-shaped groups**. The resolver is not the constraint.
+
+**One thing the build did produce, and it matters.** robinhood had **zero** `quote_assets`
+rows, so no resolver could ever have worked there. Adding them meant identifying the quote
+currency, and the obvious candidate — symbol `USDC` at
+`0x3ae0689f64b8a7683d06a9e358d7346dc5e71e18` — reports `name()` = **"Unstable Coin"** with 18
+decimals. It is a memecoin wearing USDC's ticker. Adding it would have valued every holding
+of it at $1 and counted it as cash in Axis 4's `cashShare`: a wrong number that would have
+looked entirely reasonable. The real quote assets are **USDG** (Paxos Global Dollar, 6
+decimals, the most-transferred token on the chain) and **WETH**, and those are what shipped.
+**A token's `symbol` is attacker-controlled; only `name()` caught this.**
+
+---
+
+#### ⛔ Step 4b — bsc + base · **not worth starting**
+
+`BITQUERY_KEY` was tested and **works** — a live BSC query returned 200 with real data, so the
+provider question has an answer. It is the wrong question. bsc and base carry **25 and 16**
+swap-shaped groups between them. A perfect bitquery integration would resolve roughly forty
+swaps across 124 traders. **Do not spend the day.**
+
+---
+
+#### ✅ What replaces step 4 — finish the Solana resolver
+
+The measurement that reframed everything: `wallet_swaps` holds **2,917** Solana swaps, and
+**132,128 SWAP-tagged transactions have never been resolved**. T2.2 was run once with a limit
+and never completed. A 600-row sample returned **2.7%** — matching T2.2's documented 2.8% —
+so finishing it is worth roughly **3,500 more swaps**.
+
+| | |
+| --- | --- |
+| Effort | **none — the script exists and is proven** (`resolve_wallet_swaps.mjs`) |
+| Runtime | ~45 min |
+| External APIs | Helius, `HELIUS_SOLANA_KEY`, already held |
+| Backfill | yes, but idempotent and resumable — it only takes rows not already resolved |
+| Buys | Solana's entry-price coverage, today **38.7%** with 2,283 pairs missing |
+
+Solana is where the swaps actually are, it is 28.3% of trades, and it is the one chain where
+this method is measured to work — 100% direction agreement and 94% on magnitude against fomo.
+
+---
+
+#### ~~Step 4 — EVM resolver~~ · superseded by the two entries above
+
+#### Original step 4 plan, kept for the record
+
 
 The EVM equivalent of Solana's pre/post balances: decode `Transfer` logs and net them per
 wallet. Same idea as `resolve_wallet_swaps.mjs`, different plumbing per chain. Step 3 split
@@ -542,8 +630,9 @@ the thresholds instead.
 | 1 | Surface the three §3 gaps | ~3h | certain | Axis 6 |
 | 2 | Axis 4 chain balances | ~1 day | **high — demonstrated** | Axis 4 ✅ **done** |
 | 3 | Robinhood spike | ~half a day | — | decides step 4 ✅ **done** |
-| 4a | EVM resolver — robinhood + ethereum | ~1-1.5 days | **high, measured** | Axes 2 **and** 5 |
-| 4b | EVM resolver — bsc + base | ~1 day | provider decision first | Axes 2 and 5 |
+| ~~4a~~ | EVM resolver — robinhood + ethereum | built | ⛔ the trades are not on-chain | nothing |
+| ~~4b~~ | EVM resolver — bsc + base | ~1 day | ⛔ only ~41 swaps exist | negligible |
+| 5 | Finish the Solana resolver | none — script exists | **proven** | Axes 2 and 5 |
 
 **Steps 1, 2 and 3 are done.** Step 3 was run early off the back of step 2 and cost far less
 than the half day budgeted, because the decisive measurements turned out to be SQL over data we
