@@ -3011,6 +3011,161 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
   };
 });
 
+// --------------------------------------------------------------- AUM over time
+
+/** The windows the route accepts, and how far back each reaches. */
+const AUM_WINDOWS: Record<string, number | null> = {
+  "1d": 86_400_000,
+  "1w": 7 * 86_400_000,
+  "1m": 30 * 86_400_000,
+  all: null,
+};
+/** Step sizes, coarsest last. The default picks the coarsest that still leaves >= 24 points. */
+const AUM_STEPS: { name: string; ms: number }[] = [
+  { name: "1h", ms: 3_600_000 },
+  { name: "6h", ms: 6 * 3_600_000 },
+  { name: "1d", ms: 24 * 3_600_000 },
+];
+
+/**
+ * A trader's balance over time — one sampled point per hour, in USD, across every wallet
+ * and chain.
+ *
+ * `/portfolio` answers "now"; this answers "over time", and the two are deliberately not
+ * merged. If the newest sample here disagrees with `/portfolio`, that is a finding worth
+ * chasing, not something to average away.
+ *
+ * NOT bulk-able through `?include=`, for the same reason `/portfolio` is not: it is a series
+ * per trader, and a page of them would be the largest response this API can produce.
+ */
+get("/v1/traders/:handle/aum", async ({ handle }, url) => {
+  const [t] = await sql`
+    select handle, display_handle from traders where handle = ${handle.toLowerCase()}`;
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+
+  const windowKey = (url.searchParams.get("window") ?? "1w").trim();
+  if (!(windowKey in AUM_WINDOWS)) {
+    throw badRequest(
+      `'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")} — got '${windowKey}'`,
+      { parameter: "window" },
+    );
+  }
+  const stepRaw = url.searchParams.get("step");
+  if (stepRaw !== null && !AUM_STEPS.some((s) => s.name === stepRaw.trim())) {
+    throw badRequest(
+      `'step' must be one of ${AUM_STEPS.map((s) => s.name).join(", ")} — got '${stepRaw}'`,
+      { parameter: "step" },
+    );
+  }
+
+  const span = AUM_WINDOWS[windowKey];
+  const to = new Date();
+  const from = span === null ? null : new Date(to.getTime() - span);
+
+  const rows = await sql`
+    select at, total_usd, refused_reason, priced_positions, total_positions,
+           value_share, basis, tier
+    from aum_samples
+    where handle = ${t.handle}
+      and (${from}::timestamptz is null or at >= ${from}::timestamptz)
+    order by at asc`;
+
+  /*
+   * The default step is the coarsest that still leaves at least 24 points, so a week does
+   * not arrive as 168 points nobody plots and a day does not collapse to 1. An explicit
+   * `step` overrides it.
+   */
+  const chosen = stepRaw !== null
+    ? AUM_STEPS.find((s) => s.name === stepRaw.trim())!
+    : [...AUM_STEPS].reverse().find((s) =>
+        span === null || Math.floor(span / s.ms) >= 24
+      ) ?? AUM_STEPS[0];
+
+  /*
+   * Thin by keeping the LAST point in each bucket rather than the first or an average.
+   * Averaging would invent a balance he never held, and a refused hour averaged with a
+   * measured one would launder the refusal into a number.
+   */
+  const kept = new Map<number, typeof rows[number]>();
+  for (const r of rows) {
+    const ms = Date.parse(String(r.at));
+    if (!Number.isFinite(ms)) continue;
+    kept.set(Math.floor(ms / chosen.ms), r);
+  }
+  const points = [...kept.values()].map((r) => ({
+    at: new Date(String(r.at)).toISOString(),
+    totalUsd: round(n(r.total_usd)),
+    basis: r.basis as string,
+    tier: r.tier as string,
+    coverage: {
+      pricedPositions: r.priced_positions === null ? null : Number(r.priced_positions),
+      totalPositions: r.total_positions === null ? null : Number(r.total_positions),
+      valueShare: n(r.value_share),
+    },
+    ...(r.refused_reason ? { refused: r.refused_reason as string } : {}),
+  }));
+
+  /**
+   * The moment real sampling began. Everything before it is a marked rebuild, everything
+   * after is measured, and the response never blurs the two together.
+   */
+  const firstSampled = rows.find((r) => r.basis === "sampled");
+  const trackedSince = firstSampled
+    ? new Date(String(firstSampled.at)).toISOString()
+    : null;
+
+  const newest = rows.length ? rows[rows.length - 1] : null;
+  const chainRows = newest
+    ? await sql`
+        select c.name as chain, a.network_id, a.total_usd, a.priced_share, a.reason
+        from aum_chain_samples a
+        join chains c using (network_id)
+        where a.handle = ${t.handle} and a.at = ${newest.at} and a.basis = ${newest.basis}
+        order by a.total_usd desc nulls last`
+    : [];
+
+  return {
+    handle: t.display_handle,
+    window: windowKey,
+    step: chosen.name,
+    from: from ? from.toISOString() : (points[0]?.at ?? null),
+    to: to.toISOString(),
+    trackedSince,
+    now: newest
+      ? {
+        at: new Date(String(newest.at)).toISOString(),
+        totalUsd: round(n(newest.total_usd)),
+        coverage: {
+          pricedPositions: newest.priced_positions === null ? null : Number(newest.priced_positions),
+          totalPositions: newest.total_positions === null ? null : Number(newest.total_positions),
+          valueShare: n(newest.value_share),
+        },
+        tier: newest.tier as string,
+      }
+      : null,
+    count: points.length,
+    points,
+    chains: chainRows.map((r) => ({
+      chain: r.chain as string,
+      networkId: Number(r.network_id),
+      totalUsd: round(n(r.total_usd)),
+      pricedShare: n(r.priced_share),
+      ...(r.reason ? { reason: r.reason as string } : {}),
+    })),
+    /** Non-null only when the NEWEST sample was refused; the reason names which wall we hit. */
+    refused: newest?.refused_reason ?? null,
+    plain: !newest
+      ? "No balance samples for this trader yet — the sampler has not covered them."
+      : newest.total_usd === null
+      ? `The most recent reading was refused (${newest.refused_reason}), so there is no total for it. ` +
+        `A partial total would read like a real drawdown.`
+      : `${points.length} point${points.length === 1 ? "" : "s"} over ${windowKey} at ${chosen.name} steps.` +
+        (trackedSince === null
+          ? " Every point is a marked rebuild — sampling has not started."
+          : ""),
+  };
+});
+
 // ------------------------------------------------------------------ health
 
 get("/v1/health", async () => {
