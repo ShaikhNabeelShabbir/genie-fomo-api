@@ -114,7 +114,7 @@ async function pricesFor(client, pairs) {
  * Throws on the first unreadable wallet. That is the point: the caller turns the throw into
  * a refusal for the whole trader-hour rather than a total missing one wallet's worth.
  */
-async function readBalances(client, t, chains) {
+async function readBalances(client, t, chains, decimalsCache) {
   const out = [];   // { network_id, token_key, address, amount }
 
   if (t.sol_address) {
@@ -142,9 +142,12 @@ async function readBalances(client, t, chains) {
       if (!byNet.has(k)) byNet.set(k, []);
       byNet.get(k).push({ token_key: r.token_key, address: r.address });
     }
-    const { rows: known } = await client.query(
-      `select network_id::bigint, token_key, decimals from tokens where decimals is not null`);
-    const dec = new Map(known.map((r) => [`${r.network_id}:${r.token_key}`, Number(r.decimals)]));
+    // Decimals are read ONCE for the whole run, not once per trader.
+    //
+    // This previously sat inside the per-trader path, so `tokens` -- 38,586 rows -- was
+    // fetched again for every one of 435 traders: ~16.8 MILLION rows pulled out of the
+    // database for data that does not change during a run. Caught before it ever ran.
+    const dec = decimalsCache;
 
     for (const c of chains) {
       const net = String(c.network_id);
@@ -177,6 +180,16 @@ async function main() {
 
     // The hour this sample describes. Truncated so a run at :07 and one at :52 do not
     // produce two points for the same hour that a chart would draw as a spike.
+    /*
+     * Token decimals, fetched once and shared by every trader. An ERC-20 balance is
+     * meaningless without them and they never change, so re-reading them per trader was
+     * pure waste -- see readBalances.
+     */
+    const { rows: known } = await client.query(
+      `select network_id::bigint, token_key, decimals from tokens where decimals is not null`);
+    const decimals = new Map(known.map((r) => [`${r.network_id}:${r.token_key}`, Number(r.decimals)]));
+    console.log(`decimals cached for ${decimals.size} tokens (once, not per trader)`);
+
     const at = new Date();
     at.setUTCMinutes(0, 0, 0);
     console.log(`sampling ${targets.length} trader(s) for ${at.toISOString()}${DRY ? "  [DRY RUN]" : ""}`);
@@ -185,7 +198,7 @@ async function main() {
     for (const [i, t] of targets.entries()) {
       let positions, reason = null;
       try {
-        positions = await readBalances(client, t, chains);
+        positions = await readBalances(client, t, chains, decimals);
       } catch (e) {
         reason = e.reason ?? "wallet_unreadable";
         positions = null;

@@ -292,7 +292,8 @@
         "npm:express@^4.21.2",
         "npm:pg@^8.23.0",
         "npm:tsx@^4.19.2",
-        "npm:typescript@^5.7.0"
+        "npm:typescript@^5.7.0",
+        "npm:wrangler@^4.130.0"
       ]
     }
   }

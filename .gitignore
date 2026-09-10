@@ -12,6 +12,6 @@ data/wallets.json
 __pycache__/
 
 # Database dumps. A 102 MB binary in git history is permanent and unremovable
-# without a rewrite — and a backup belongs in R2, not in the repo.
+# without a rewrite, and a backup does not belong in the repo.
 *.dump
 genie-fomo-schema-*.sql
