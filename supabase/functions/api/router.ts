@@ -2,6 +2,8 @@
 export type Handler = (
   params: Record<string, string>,
   url: URL,
+  /** Parsed JSON body, for POST routes. `null` on GET. */
+  body?: unknown,
 ) => Promise<unknown> | unknown;
 
 type Route = { method: string; parts: string[]; handler: Handler };
@@ -9,6 +11,16 @@ const routes: Route[] = [];
 
 export function get(pattern: string, handler: Handler): void {
   routes.push({ method: "GET", parts: pattern.split("/").filter(Boolean), handler });
+}
+
+/**
+ * POST, for the batch reads.
+ *
+ * These are reads, not writes -- a list of ids will not fit in a query string once it is
+ * fifty long, and a GET with a 2KB URL breaks proxies and logs. Nothing here mutates.
+ */
+export function post(pattern: string, handler: Handler): void {
+  routes.push({ method: "POST", parts: pattern.split("/").filter(Boolean), handler });
 }
 
 /**

@@ -41,19 +41,56 @@ export const unavailable = (detail: string) =>
   new ApiError(503, "unavailable", detail, undefined, 5);
 
 /**
+ * A sub-resource the caller explicitly asked for could not be produced.
+ *
+ * 503 rather than 200-with-the-block-missing, and this is not a style choice. A consumer
+ * asked `?include=wallets`, got 200 with 435 traders and no wallets on any of them, and
+ * treated the silence as "these traders have no wallets" -- it nearly deleted their entire
+ * watch list. A success-shaped empty answer is worse than an error, because nothing
+ * downstream can tell it from the truth.
+ */
+export const includeUnavailable = (blocks: string[]) =>
+  new ApiError(
+    503,
+    "include_unavailable",
+    `asked for ${blocks.join(", ")} but could not produce ${blocks.length === 1 ? "it" : "them"} — ` +
+    `retry rather than treating this as "there is none"`,
+    { blocks },
+    5,
+  );
+
+/**
  * Classify a thrown error.
  *
  * A database that is unreachable, out of connections or timing out is a RETRYABLE outage,
  * not a bug in the request — returning 500 for it tells the caller to give up when they
  * should be backing off and keeping their last good copy on screen.
  */
+/**
+ * Map anything thrown to a stable, documented code -- and never hand the caller driver text.
+ *
+ * A consumer was once returned `bind message supplies 8 parameters, but prepared statement
+ * requires 0`. That is a postgres wire-protocol detail: it names no route, suggests no
+ * action, and leaks how the service is built. Internal faults now answer `internal_error`
+ * with a fixed sentence and the detail goes to the log, where it belongs.
+ */
 export function classify(e: unknown): ApiError {
   if (e instanceof ApiError) return e;
   const msg = e instanceof Error ? e.message : String(e);
-  if (/timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|connection|terminated|too many clients|shutdown/i.test(msg)) {
-    return unavailable(`database unavailable: ${msg.slice(0, 120)}`);
+
+  // Pool exhaustion is BACK OFF, not "broken". 429 with Retry-After tells a client to pace
+  // itself; a 500 tells it to give up, and a 503 tells it nothing actionable.
+  if (/too many clients|ECHECKOUTTIMEOUT|max client connections|remaining connection slots/i.test(msg)) {
+    console.error("pool saturated:", msg.slice(0, 200));
+    return rateLimited(5);
   }
-  return new ApiError(500, "internal_error", msg.slice(0, 200));
+  if (/timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|connection|terminated|shutdown/i.test(msg)) {
+    console.error("database unavailable:", msg.slice(0, 200));
+    return unavailable("the database is not answering — retry shortly");
+  }
+  // Everything else: log the real thing, return a sentence a consumer can act on.
+  console.error("unhandled:", msg.slice(0, 400));
+  return new ApiError(500, "internal_error", "the service failed to answer this request");
 }
 
 /**

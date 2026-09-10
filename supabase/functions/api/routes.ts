@@ -1,4 +1,5 @@
 import { sql, n, round } from "./db.ts";
+import { includeUnavailable } from "./errors.ts";
 
 /**
  * When the underlying data was measured.
@@ -125,7 +126,7 @@ function sortParam(
 /** '' is not a value. The columns store empty strings where fomo gave nothing. */
 const nonEmpty = (v: string | null | undefined): string | null =>
   v && v.trim() ? v.trim() : null;
-import { get } from "./router.ts";
+import { get, post } from "./router.ts";
 import { notFound, badRequest } from "./errors.ts";
 
 /**
@@ -796,6 +797,25 @@ get("/v1/traders", async (_p, url) => {
   const wBy = byHandle(wRows as any[]);
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
+  /*
+   * A requested include that produced NOTHING is a failure, not an empty truth.
+   *
+   * These queries can resolve to zero rows without throwing -- a degraded pool, a statement
+   * that timed out and came back empty -- and the response would still be 200 with the block
+   * silently absent on every row. That is what cost a consumer their watch list: they asked
+   * for wallets, got 435 traders and no wallets, and believed it.
+   *
+   * 432 of 435 traders have a wallet and every trader has trades, so on a non-empty page a
+   * requested include yielding zero rows is a fault every time. Fail loudly instead.
+   */
+  if (page.length) {
+    const empty: string[] = [];
+    if (include.includes("wallets") && wRows.length === 0) empty.push("wallets");
+    if (include.includes("pnl") && pnlRows.length === 0) empty.push("pnl");
+    if (include.includes("scorecard") && scRows.length === 0) empty.push("scorecard");
+    if (empty.length) throw includeUnavailable(empty);
+  }
+
   // deno-lint-ignore no-explicit-any
   const ceBy = byHandle(ceRows as any[]);
   // deno-lint-ignore no-explicit-any
@@ -1128,6 +1148,10 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
 
   const rows = await sql`
     select tk.address, h.network_id, h.token_key, c.name as chain, h.human_amount, h.price, h.value,
+           -- PRD §3: a price is only judgeable if it says where it came from and when it
+           -- was true. A live quote and a three-week-old reported entry are both usable and
+           -- are not the same claim.
+           h.price_source, h.priced_at, h.captured_at, h.source as balance_source,
            (q.token_key is not null) as is_quote
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
@@ -1168,9 +1192,24 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       networkId: Number(r.network_id),
       chain: r.chain,
       amount: n(r.human_amount) ?? 0,
+      /**
+       * PRD §3. When the balance was read, and whether we read it or were told it.
+       *
+       * `verified` means we called the chain; `reported` means a build said so. Those two
+       * disagreed by more than a tenth on ten of twelve traders, so which one you are
+       * holding is not a detail.
+       */
+      balanceAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
+      tier: r.balance_source === "chain" ? "verified" : "reported",
       priceUsd: n(r.price),
+      /** pegged_usd | gmgn_token_info | token_prices_daily | fomo_reported_entry | wallet_swap_derived */
+      priceSource: (r.price_source as string) ?? null,
+      /** When that price was true. A reported entry price can be weeks old and says so. */
+      pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
       // null, never 0 — 0 would imply we checked and found the position worthless.
       valueUsd: v === null ? null : round(v),
+      /** Why there is no value, rather than an unexplained null. */
+      whyNoPrice: v === null ? "no price for this token in any source we hold" : null,
       share: v !== null && total > 0 ? Number((v / total).toFixed(4)) : null,
       isQuoteAsset: !!r.is_quote,
       /**
@@ -2387,6 +2426,52 @@ async function scorecardBody(
     returnPct: { value: basis > 0 ? Number(((closedPnl / basis) * 100).toFixed(2)) : null,
                  coverage: cov(closedPriced.length, closed.length) },
     typicalBetUsd: bet,
+    /**
+     * PRD §5 — rhythm, on ONE definition, for every trader whatever source they came from.
+     *
+     * These figures already existed as `tradesPerDay`, `holdingTime` and `lastTradeAt`; what
+     * was missing was a block by an agreed name carrying `basis`, `window`, `coverage` and
+     * `asOf` on each one. A consumer that needs a trader's rhythm was refusing every row
+     * because it could not find the block, not because the numbers were absent.
+     *
+     * Unmeasurable is `null` with a `why`, never omitted -- an absent field and a measured
+     * "we cannot say" are different answers and only one of them is honest.
+     */
+    measurements: (() => {
+      const closedCount = closed.length;
+      // Same definition the top-level `tradesPerDay` uses, computed from the same locals.
+      const perDay = spanDays !== null && spanDays >= 1
+        ? Number((rows.length / spanDays).toFixed(2)) : null;
+      const lastTradeIso = lastAt === null ? null : new Date(lastAt).toISOString();
+      return {
+        tradesPerDay: {
+          value: perDay,
+          basis: "closed positions per calendar day between first open and last close",
+          window: "all recorded history",
+          coverage: cov(closedCount, rows.length),
+          why: perDay === null ? "no closed positions on record" : null,
+        },
+        holdTimeDays: {
+          value: medHold === null ? null : Number((medHold / 86_400_000).toFixed(3)),
+          basis: "median open-to-close duration over finished positions",
+          window: "all recorded history",
+          coverage: cov(closedPriced.length, closedCount),
+          why: medHold === null
+            ? "no finished position carries both an open and a close time" : null,
+        },
+        lastTradeAt: {
+          value: lastTradeIso,
+          basis: "most recent close on record",
+          window: "all recorded history",
+          why: lastTradeIso === null ? "no closed positions on record" : null,
+        },
+        asOf: (() => {
+          const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
+            .filter((x): x is number => x !== null && Number.isFinite(x));
+          return times.length ? new Date(Math.max(...times)).toISOString() : null;
+        })(),
+      };
+    })(),
     holdingTime: {
       medianHours: medHold === null ? null : Number((medHold / 3_600_000).toFixed(2)),
       medianDays: medHold === null ? null : Number((medHold / 86_400_000).toFixed(2)),
@@ -3166,6 +3251,254 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
   };
 });
 
+// ------------------------------------------------------------- trades (§4)
+
+/**
+ * The trader's own swaps, both sides, valued from the money side.
+ *
+ * PRD §4 asks for every swap on every chain. This serves what we have RESOLVED, which is
+ * Solana only, and states that in `coverage` rather than implying the rest were quiet.
+ *
+ * Why only Solana: a swap is the wallet's own two-sided trade, and finding those on EVM was
+ * measured and failed. A complete eth_getLogs scan of robinhood -- 2,000,000 blocks, every
+ * wallet in the topic array -- produced 30,384 candidate (tx, wallet) groups and ZERO
+ * two-sided swaps, because that chain matches off-chain and only settles on-chain in
+ * Multicall3 batches. Across all four EVM chains our stored transactions hold 81
+ * swap-shaped groups against Solana's 4,696.
+ *
+ * `valueUsd` comes from the MONEY side -- what was actually paid or received in a coin whose
+ * dollar value we know -- not from multiplying the memecoin by a guessed price. That is why
+ * it can be trusted where a price cannot.
+ */
+get("/v1/traders/:handle/trades", async ({ handle }, url) => {
+  const h = await resolveTrader(handle);
+  const [t] = await sql`
+    select t.handle, t.display_handle, w.evm_address_key, lower(w.sol_address) as sol_key
+    from traders t left join wallets w using (handle) where t.handle = ${h}`;
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+
+  const addrs = [t.sol_key, t.evm_address_key].filter((a): a is string => !!a);
+  const limit = intParam(url, "limit", { min: 1, max: 500, fallback: 100 })!;
+  const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
+  const since = url.searchParams.get("since");
+
+  const rows = addrs.length
+    ? await sql`
+      select ws.tx_hash, ws.block_time, ws.network_id, c.name as chain,
+             ws.token_key, tk.address as token_address,
+             coalesce(ti.symbol, tk.symbol) as token_symbol,
+             ws.token_delta, ws.quote_key, ws.quote_delta, ws.quote_usd,
+             qa.symbol as quote_symbol
+      from wallet_swaps ws
+      join chains c using (network_id)
+      left join tokens tk on tk.network_id = ws.network_id and tk.token_key = ws.token_key
+      left join token_info ti on ti.network_id = ws.network_id and ti.token_key = ws.token_key
+      left join quote_assets qa on qa.network_id = ws.network_id and qa.token_key = ws.quote_key
+      where ws.address_key = any(${addrs})
+        and (${chainQ}::text is null or c.name = ${chainQ})
+        and (${since}::timestamptz is null or ws.block_time >= ${since}::timestamptz)
+      order by ws.block_time desc nulls last, ws.tx_hash
+      limit ${limit + 1}`
+    : [];
+
+  const capped = rows.length > limit;
+  const page = capped ? rows.slice(0, limit) : rows;
+
+  /** Chains this trader has traded on at all, so the gap is visible rather than implied. */
+  const presence = await sql`
+    select chain, trades_seen from wallet_chain_presence where handle = ${h} order by trades_seen desc`;
+  const resolvedChains = new Set(page.map((r: any) => r.chain as string));
+
+  return {
+    handle: t.display_handle,
+    count: page.length,
+    /** The cap is stated on every response — a silently truncated page under-counts a roster. */
+    limit,
+    capped,
+    trades: page.map((r: any) => {
+      const td = n(r.token_delta), qd = n(r.quote_delta), usd = n(r.quote_usd);
+      return {
+        chain: r.chain as string,
+        networkId: Number(r.network_id),
+        txHash: r.tx_hash as string,
+        at: r.block_time ? new Date(String(r.block_time)).toISOString() : null,
+        /** Which way the trader went. Derived from the token side, not from a label. */
+        side: td === null ? null : td > 0 ? "buy" : "sell",
+        token: { address: r.token_address ?? null, symbol: r.token_symbol ?? null,
+                 amount: td === null ? null : Math.abs(td) },
+        /** What it was paid with or received in — the leg whose dollar value we know. */
+        money: { symbol: r.quote_symbol ?? null, tokenKey: r.quote_key ?? null,
+                 amount: qd === null ? null : Math.abs(qd) },
+        valueUsd: usd === null ? null : round(Math.abs(usd)),
+        valueSource: usd === null ? null : "money_side",
+        /** Implied by the two legs, for cross-checking — not a quoted price. */
+        priceUsd: usd !== null && td !== null && td !== 0
+          ? Number((Math.abs(usd) / Math.abs(td)).toPrecision(12)) : null,
+        tier: "verified",
+      };
+    }),
+    /**
+     * What is NOT here. §4 asks for every chain; we resolve Solana. Saying which chains a
+     * trader trades on but we cannot serve is the difference between a gap and a lie.
+     */
+    coverage: {
+      chainsResolved: [...resolvedChains],
+      chainsTradedButUnresolved: presence
+        .map((p: any) => p.chain as string)
+        .filter((c: string) => !resolvedChains.has(c)),
+      why: "swaps are resolved from chain for Solana only — a complete scan of the EVM " +
+           "chains found no two-sided swaps to resolve, so those trades are visible as " +
+           "positions on /positions but not as individual swaps here",
+    },
+    source: "postgres · wallet_swaps (helius rpc pre/post balances)",
+  };
+});
+
+// ----------------------------------------------------------- batch reads (§8)
+
+/** Up to this many traders per batch call. Stated in the answer, never silently applied. */
+const BATCH_MAX = 50;
+
+/**
+ * Read `ids` from a POST body, accepting handles or `trd_` ids, and refusing loudly.
+ *
+ * A background pass over 435 traders cannot make 435 calls an hour. These exist so it can
+ * make nine. The cap is returned on every response because a silently truncated list is how
+ * a roster under-counts without anyone noticing.
+ */
+async function batchIds(body: unknown): Promise<{ handles: string[]; asked: number; capped: boolean }> {
+  const ids = (body as { ids?: unknown })?.ids;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw badRequest("body must be { \"ids\": [...] } with at least one id or handle",
+                     { parameter: "ids" });
+  }
+  const asked = ids.length;
+  const wanted = ids.slice(0, BATCH_MAX).map(String);
+  const handles = await Promise.all(wanted.map((k) => resolveTrader(k)));
+  return { handles, asked, capped: asked > BATCH_MAX };
+}
+
+const batchEnvelope = (asked: number, capped: boolean) => ({
+  limit: BATCH_MAX,
+  asked,
+  /** True when the caller sent more than the cap; the extras were NOT read. */
+  capped,
+  ...(capped
+    ? { note: `only the first ${BATCH_MAX} ids were read — send the rest in another call` }
+    : {}),
+});
+
+/**
+ * Positions for many traders in one call.
+ *
+ * POST rather than GET because fifty ids do not belong in a query string: a 2 KB URL breaks
+ * proxies and fills logs. Nothing here mutates -- it is a read that needs a body.
+ */
+post("/v1/traders/positions", async (_p, _url, body) => {
+  const { handles, asked, capped } = await batchIds(body);
+  const rows = await sql`
+    select h.handle, ch.name as chain, h.network_id, tk.address as token_address,
+           coalesce(ti.symbol, tk.symbol) as symbol,
+           h.human_amount, h.price, h.value, h.source, h.captured_at,
+           h.price_source, h.priced_at
+    from holdings_current h
+    join chains ch using (network_id)
+    join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
+    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
+    where h.handle = any(${handles})
+    order by h.handle, h.value desc nulls last`;
+
+  const by = new Map<string, any[]>();
+  for (const r of rows) {
+    if (!by.has(String(r.handle))) by.set(String(r.handle), []);
+    by.get(String(r.handle))!.push(r);
+  }
+
+  return {
+    ...batchEnvelope(asked, capped),
+    traders: handles.map((h) => {
+      const own = by.get(h) ?? [];
+      const priced = own.filter((r) => n(r.value) !== null && Number(r.value) > 0);
+      return {
+        handle: h,
+        positions: own.map((r) => ({
+          chain: r.chain, networkId: Number(r.network_id),
+          tokenAddress: r.token_address, symbol: r.symbol,
+          amount: n(r.human_amount),
+          /** §3: the moment the balance was read, not the moment you asked. */
+          balanceAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
+          priceUsd: n(r.price),
+          priceSource: (r.price_source as string) ?? null,
+          pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
+          valueUsd: n(r.value),
+          /** null, never 0 — an unpriceable coin is not a worthless one. */
+          whyNoPrice: n(r.value) === null ? "no price for this token in any source we hold" : null,
+          tier: r.source === "chain" ? "verified" : "reported",
+        })),
+        coverage: cov(priced.length, own.length),
+      };
+    }),
+  };
+});
+
+/**
+ * AUM series for many traders in one call. Same cap, same envelope.
+ */
+post("/v1/traders/aum", async (_p, _url, body) => {
+  const { handles, asked, capped } = await batchIds(body);
+  const b = body as { window?: string; step?: string };
+  const windowKey = (b?.window ?? "1w").trim();
+  if (!(windowKey in AUM_WINDOWS)) {
+    throw badRequest(`'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")}`,
+                     { parameter: "window" });
+  }
+  const span = AUM_WINDOWS[windowKey];
+  const from = span === null ? null : new Date(Date.now() - span);
+
+  const rows = await sql`
+    select handle, at, total_usd, refused_reason, priced_positions, total_positions,
+           value_share, basis, tier
+    from aum_samples
+    where handle = any(${handles})
+      and (${from}::timestamptz is null or at >= ${from}::timestamptz)
+    order by handle, at asc`;
+
+  const by = new Map<string, any[]>();
+  for (const r of rows) {
+    if (!by.has(String(r.handle))) by.set(String(r.handle), []);
+    by.get(String(r.handle))!.push(r);
+  }
+
+  return {
+    ...batchEnvelope(asked, capped),
+    window: windowKey,
+    traders: handles.map((h) => {
+      const own = by.get(h) ?? [];
+      const newest = own.length ? own[own.length - 1] : null;
+      const firstSampled = own.find((r) => r.basis === "sampled");
+      return {
+        handle: h,
+        trackedSince: firstSampled ? new Date(String(firstSampled.at)).toISOString() : null,
+        count: own.length,
+        now: newest
+          ? { at: new Date(String(newest.at)).toISOString(),
+              totalUsd: round(n(newest.total_usd)),
+              tier: newest.tier as string,
+              coverage: { pricedPositions: newest.priced_positions === null ? null : Number(newest.priced_positions),
+                          totalPositions: newest.total_positions === null ? null : Number(newest.total_positions),
+                          valueShare: n(newest.value_share) } }
+          : null,
+        points: own.map((r) => ({
+          at: new Date(String(r.at)).toISOString(),
+          totalUsd: round(n(r.total_usd)),
+          basis: r.basis as string,
+          ...(r.refused_reason ? { refused: r.refused_reason as string } : {}),
+        })),
+      };
+    }),
+  };
+});
+
 // ------------------------------------------------------------------ health
 
 get("/v1/health", async () => {
@@ -3194,11 +3527,59 @@ get("/v1/health", async () => {
   const [b] = await sql`
     select captured_at, window_label from builds order by captured_at desc limit 1`;
 
+  /*
+   * Freshness per feed, so "the service is degraded" is distinguishable from "there is
+   * nothing". A consumer comparing a stale figure against a fresh one has no way to know
+   * which feed lagged unless the service says so.
+   *
+   * Each row is the newest measurement time for that feed and how many rows stand behind
+   * it. `null` means the feed has never run, which is a different statement from zero.
+   */
+  const [f] = await sql`
+    select (select max(captured_at) from trades)                         as trades_at,
+           (select max(captured_at) from holdings)                       as holdings_at,
+           (select max(block_time)  from transactions)                   as transactions_at,
+           (select max(fetched_at)  from token_info)                     as token_info_at,
+           (select max(at)          from aum_samples)                    as aum_at,
+           (select max(last_seen_at) from wallets)                       as wallets_at,
+           (select count(*) from aum_samples)::int                       as aum_rows,
+           (select count(distinct handle) from aum_samples)::int         as aum_traders`;
+
+  const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
+
+  /**
+   * The share of traders carrying a usable rhythm figure (§5).
+   *
+   * Reported here rather than left for a consumer to discover by sampling scorecards, which
+   * is how they found out it was zero last time.
+   */
+  const [m] = await sql`
+    select count(*)::int as traders,
+           count(*) filter (where exists (
+             select 1 from trades tr where tr.handle = t.handle and tr.status = 'closed'
+           ))::int as measurable
+    from traders t`;
+
   return {
     status: "ok",
     runtime: "supabase edge function (deno)",
     source: "postgres",
     build: { capturedAt: b?.captured_at ?? null, window: b?.window_label ?? null },
+    /** Per-feed freshness. A stale feed is visible here before it misleads a screen. */
+    feeds: {
+      traders:      { lastRefreshAt: iso(f.trades_at),       rowCount: null },
+      wallets:      { lastRefreshAt: iso(f.wallets_at),      rowCount: null },
+      positions:    { lastRefreshAt: iso(f.holdings_at),     rowCount: null },
+      transactions: { lastRefreshAt: iso(f.transactions_at), rowCount: null },
+      tokenInfo:    { lastRefreshAt: iso(f.token_info_at),   rowCount: null },
+      aum:          { lastRefreshAt: iso(f.aum_at),          rowCount: Number(f.aum_rows),
+                      traders: Number(f.aum_traders) },
+    },
+    measurements: {
+      traders: Number(m.traders),
+      withClosedTrades: Number(m.measurable),
+      share: Number(m.traders) ? Number((Number(m.measurable) / Number(m.traders)).toFixed(4)) : null,
+    },
     rows: Object.fromEntries(Object.entries(c).map(([k, v]) => [k, Number(v)])),
     /** Which entries in `rows` are planner estimates rather than counted. */
     estimatedRows: ["transactions"],
@@ -3212,7 +3593,8 @@ get("/v1/health", async () => {
 
 /** Wallet rows for many traders at once, for the ISSUE-8 bulk route. */
 const walletRows = (handles: string[]) => sql`
-  select t.handle, t.display_handle, t.name, t.bio, t.avatar, t.twitter,
+  select t.handle, t.id, t.display_handle, t.handle_changed_at,
+         t.name, t.bio, t.avatar, t.twitter,
          w.evm_address, w.sol_address, w.evm_source, w.sol_source,
          w.evm_confidence, w.sol_confidence
   from traders t left join wallets w using (handle)
@@ -3244,10 +3626,89 @@ function walletsBody(t: any) {
   };
 }
 
+/**
+ * Resolve a path segment that may be a handle OR a stable id.
+ *
+ * `handle` is a display name and people change them; `id` is the uuid that never moves. Both
+ * are accepted on every per-trader route so a consumer can key on the stable one without
+ * losing the readable one -- PRD §1.
+ */
+async function resolveTrader(key: string): Promise<string> {
+  const k = key.trim();
+  // A uuid, with or without the `trd_` prefix the plugin team uses.
+  const bare = k.replace(/^trd_/, "");
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(bare)) {
+    const [r] = await sql`select handle from traders where id = ${bare}::uuid`;
+    if (r) return r.handle as string;
+  }
+  return k.toLowerCase();
+}
+
+/**
+ * Wallets, each with its FAMILY and the chains it has actually been seen on.
+ *
+ * PRD §2. `family` is `solana` or `evm` and never a chain, because one Ethereum-style
+ * address is the same wallet on Ethereum, Base, BNB Chain and Robinhood Chain at once --
+ * 140 of our 260 EVM-only traders trade on four of them. A consumer that assumes one chain
+ * per address files a third of them as quiet while they trade daily.
+ *
+ * `chains` is what we have OBSERVED, never inferred from the address format. A chain we have
+ * never seen the wallet on is absent, not `tradesSeen: 0` -- those are different claims.
+ */
 get("/v1/traders/:handle/wallets", async ({ handle }) => {
-  const [t] = await walletRows([handle.toLowerCase()]);
+  const h = await resolveTrader(handle);
+  const [t] = await walletRows([h]);
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
-  return walletsBody(t);
+
+  const presence = await sql`
+    select chain, network_id, trades_seen, last_active_at
+    from wallet_chain_presence where handle = ${h} order by trades_seen desc`;
+
+  const seen = presence.map((p: any) => ({
+    chain: p.chain as string,
+    networkId: Number(p.network_id),
+    tradesSeen: Number(p.trades_seen),
+    lastActiveAt: p.last_active_at ? new Date(String(p.last_active_at)).toISOString() : null,
+  }));
+  const SOLANA = 1399811149;
+
+  const wallets = [];
+  if (t.sol_address) {
+    wallets.push({
+      address: t.sol_address as string,
+      family: "solana",
+      source: t.sol_source ?? null,
+      chains: seen.filter((c) => c.networkId === SOLANA),
+    });
+  }
+  if (t.evm_address) {
+    wallets.push({
+      address: t.evm_address as string,
+      family: "evm",
+      source: t.evm_source ?? null,
+      chains: seen.filter((c) => c.networkId !== SOLANA),
+    });
+  }
+
+  return {
+    ...walletsBody(t),
+    /**
+     * The stable key. `handle` above is a display name and may change; this does not.
+     */
+    id: t.id ? `trd_${t.id}` : null,
+    /** When the display handle last changed; a consumer can notice a rename. */
+    handleChangedAt: t.handle_changed_at
+      ? new Date(String(t.handle_changed_at)).toISOString() : null,
+    /**
+     * `[]` for a trader we hold no wallet for -- 3 of 435 today. An empty list is the
+     * correct answer to "which wallets", not an error: they are registered, we simply
+     * have no address.
+     */
+    wallets,
+    /** A wallet with no observed chain says so rather than implying it is idle. */
+    presence: wallets.every((w) => w.chains.length === 0) && wallets.length
+      ? "not_yet_scanned" : "observed",
+  };
 });
 
 // ------------------------------------------------------ T1 banked vs on paper

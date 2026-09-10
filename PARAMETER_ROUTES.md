@@ -1,7 +1,9 @@
 # genie-fomo API — complete reference
 
-**Generated: 2026-09-09T09:20Z** · **Updated 2026-09-09** — the directory now carries
-GMGN-sourced traders alongside fomo's. See *§0d. Two sources of trader*.
+**Generated: 2026-09-09T09:20Z** · **Updated 2026-09-10** — the directory carries
+GMGN-sourced traders alongside fomo's (§0d), every trader has a **stable id** and wallets
+that name their **chains** (§0e), balances are **read from the chain** (§2), and there is a
+**balance series over time** (§9).
 
 Everything the API answers, in one document: the **35 PARAMETERS.md parameters**, the **10
 GMGN-parity features** built on top of them, and the corrections from the bug report. One row
@@ -12,8 +14,10 @@ per thing you can ask — what it means in plain words, the exact call, and the 
 | Parameters (T·K·C series) | **35**, all live |
 | GMGN-parity features (G series) | **12 of 12** — G1–G12, complete |
 | Reported bugs and issues | **10 of 10 fixed** — see Appendix A |
-| Routes | **15**, plus bulk `?include=` |
+| Plugin requirements (§ series) | **8 of 8 shipped** — see Appendix C |
+| Routes | **19** — 17 `GET`, 2 `POST` batch, plus bulk `?include=` |
 | Traders in the directory | **435** — 144 from fomo, **291 from GMGN** |
+| Positions | **36,506**, read from chain |
 
 **Every figure below is a dated example, not current state.** They were pulled from the live
 service at the timestamp above; the pipeline refreshes nightly and the Helius webhook ingests
@@ -99,6 +103,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **0b** | [Cursor pagination (G4)](#0b-cursor-pagination-g4) | **G4** |
 | **0c** | [Sorting and range filters (G5)](#0c-sorting-and-range-filters-g5) | **G5** |
 | **0d** | [Two sources of trader](#0d-two-sources-of-trader) | fomo's 144 + **GMGN's 291** |
+| **0e** | [Stable id, and wallets that name their chains](#0e-stable-id-and-wallets-that-name-their-chains) | key on `id`, read on the right chain |
 | **1** | [Trader — money](#1-trader-money) | T1–T10 |
 | **2** | [Trader — positions](#2-trader-positions) | T11–T15 |
 | **2b** | [Position timing (G1)](#2b-position-timing-g1) | **G1** |
@@ -118,6 +123,10 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **7b** | [Chain profitability, and what it does not say](#7b-chain-profitability-and-what-it-does-not-say) |  |
 | **4b** | [Chain-verified P&L](#4b-chain-verified-pl-g11) | **G11** |
 | **8** | [Read the coverage before the number](#8-read-the-coverage-before-the-number) | how to not misread any of it |
+| **9** | [AUM over time](#9-aum-over-time) | the balance series |
+| **10** | [Trades, both sides](#10-trades-both-sides) | valued from the money side |
+| **11** | [Batch reads](#11-batch-reads) | the whole board in a bounded number of calls |
+| **C** | [What the plugin team asked for](#appendix-c-what-the-plugin-team-asked-for) | § by §, and where each landed |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -377,6 +386,67 @@ columns we actually hold. Theirs covers metrics we have no source for at all
 claimed as such.**
 ---
 
+## 0e. Stable id, and wallets that name their chains
+
+| In plain words | Call | Read | Live value (`unipcs`) |
+| --- | --- | --- | --- |
+| "Which trader is this, and where do I read them?" | `GET $B/traders/unipcs/wallets` | `id`, `wallets[].family`, `wallets[].chains` | **`trd_a06e3ef7-…`** · solana + evm, evm active on **4 chains** |
+
+**In layman's terms.** A handle is a display name and people change them. `id` never changes
+and is never reused, so key on it and show the handle. And one Ethereum-style address is the
+same wallet on Ethereum, Base, BNB Chain and Robinhood Chain **at once** — so the wallet block
+names the chains we have actually seen it trade on, and you read exactly those.
+
+### How to test
+
+```bash
+curl -s "$B/traders/unipcs/wallets" | jq '{id, handle, handleChangedAt, presence}'
+curl -s "$B/traders/unipcs/wallets" | jq '.wallets[] | {family, address, chains}'
+
+# every per-trader route accepts the id as well as the handle
+curl -s "$B/traders/trd_a06e3ef7-425a-48e9-a131-220a4dcea4cc/wallets" | jq '.handle'
+```
+
+```json
+{
+  "id": "trd_a06e3ef7-425a-48e9-a131-220a4dcea4cc",
+  "handle": "unipcs",
+  "handleChangedAt": null,
+  "presence": "observed",
+  "wallets": [
+    { "address": "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF", "family": "solana",
+      "chains": [ { "chain": "solana", "networkId": 1399811149,
+                    "tradesSeen": 45, "lastActiveAt": "2026-09-05T04:30:29.000Z" } ] },
+    { "address": "0x0a6ebed0155edb4b21d92ad02897a626cd90119e", "family": "evm",
+      "chains": [ { "chain": "robinhood", "networkId": 4663, "tradesSeen": 178,
+                    "lastActiveAt": "2026-09-07T11:40:41.000Z" },
+                  { "chain": "bsc", "networkId": 56, "tradesSeen": 34, "lastActiveAt": "…" } ] }
+  ]
+}
+```
+
+### What to know before you use it
+
+**`family` is `solana` or `evm`, and never a chain.** The family says how to talk to the
+address; `chains` says where it has been. Of our 260 Ethereum-only traders, **140 trade on
+four chains** — one address, four places to read.
+
+**`chains` is observed, never inferred.** A chain we have not seen the wallet on is **absent**
+from the list, not `tradesSeen: 0`. "We have never seen them there" and "they have done
+nothing there" are different statements and only one of them is ours to make.
+
+**`presence: "not_yet_scanned"`** appears instead of an empty list when a wallet exists but no
+chain activity has been observed yet — so a quiet wallet and an unscanned one are
+distinguishable.
+
+**`wallets: []` is a valid answer**, not an error. Three traders in the directory are
+registered without an address on record.
+
+**Rename-safe.** `handleChangedAt` carries the moment a display handle last changed, so a
+consumer following a name can notice it moved.
+
+---
+
 ## 1. Trader — money
 
 | # | In plain words | Call | Read | Live value (`unipcs`) |
@@ -418,6 +488,45 @@ positive; both dollar figures are always returned regardless.
 
 T11 and T13 ship together by rule. "Holds 97 coins" reads as diversified until you see that
 98.7% of the money is in one of them.
+
+### Every position says where its numbers came from
+
+`entries[]` carries the provenance of both halves of a valuation — the amount and the price:
+
+```bash
+curl -s "$B/traders/frankdegods/positions?limit=1" \
+  | jq '.entries[0] | {amount, balanceAt, tier, priceUsd, priceSource, pricedAt, valueUsd, whyNoPrice}'
+```
+
+```json
+{
+  "amount": 2389557.260697,
+  "balanceAt": "2026-09-10T15:40:33.000Z",
+  "tier": "verified",
+  "priceUsd": 1,
+  "priceSource": "pegged_usd",
+  "pricedAt": "2026-09-10T16:15:58.000Z",
+  "valueUsd": 2389557.26,
+  "whyNoPrice": null
+}
+```
+
+| Field | What it tells you |
+| --- | --- |
+| `amount` | the **balance**, read from the chain — `getTokenAccountsByOwner` on Solana, batched `balanceOf` on the four Ethereum-style chains |
+| `balanceAt` | the moment that balance was read |
+| `tier` | `verified` when we read it ourselves, `reported` when a build supplied it |
+| `priceSource` | `pegged_usd` · `gmgn_token_info` · `token_prices_daily` · `fomo_reported_entry` · `wallet_swap_derived` |
+| `pricedAt` | when that price was true — a reported entry price can be older than a live quote, and says so |
+| `whyNoPrice` | present instead of a bare `null` when a holding cannot be valued |
+
+**A coin we cannot price is counted, never zeroed.** It appears in `positions` and in
+`coverage.unpricedPositions`, and stays out of `totalValueUsd` — so the count of what someone
+holds and the value of what we could measure are two separate, honest numbers.
+
+**Verified against the chain.** The example above reads 2,389,557.26 USDC; a direct
+`getTokenAccountsByOwner` call on the same wallet returns 2,389,565.66 — the two agree to
+0.0004%, the difference being the minutes between the two reads.
 
 ---
 
@@ -1298,6 +1407,193 @@ price is excluded from every aggregate rather than counted as zero.
 
 ---
 
+## 9. AUM over time
+
+| In plain words | Call | Read | Live value (`0xAvast`) |
+| --- | --- | --- | --- |
+| "How much has this trader been holding, and how has it moved?" | `GET $B/traders/0xAvast/aum?window=1d` | `now.totalUsd`, `points[]` | **$4,416,026.98** across 216 positions, 198 priced |
+
+**In layman's terms.** `/portfolio` answers *"what does he hold right now"*. This answers
+*"what has he been holding, over time"* — the line a chart draws. Every point was **measured
+and written down at the time**, so the series is a record rather than a reconstruction.
+
+### How to test
+
+```bash
+curl -s "$B/traders/0xAvast/aum?window=1d" | jq .
+curl -s "$B/traders/0xAvast/aum?window=1w" | jq '.now, .chains'
+curl -s "$B/traders/0xAvast/aum?window=1w&step=1d" | jq '{step, count}'
+```
+
+```json
+{
+  "handle": "0xAvast", "window": "1d", "step": "1h",
+  "trackedSince": "2026-09-10T14:00:00.000Z",
+  "now": {
+    "at": "2026-09-10T14:00:00.000Z",
+    "totalUsd": 4416026.98,
+    "coverage": { "pricedPositions": 198, "totalPositions": 216, "valueShare": 0.9167 },
+    "tier": "verified"
+  },
+  "count": 1,
+  "points": [
+    { "at": "2026-09-10T14:00:00.000Z", "totalUsd": 4416026.98,
+      "basis": "sampled", "tier": "verified",
+      "coverage": { "pricedPositions": 198, "totalPositions": 216, "valueShare": 0.9167 } }
+  ],
+  "chains": [
+    { "chain": "bsc",       "networkId": 56,         "totalUsd": 2768755.63, "pricedShare": 1 },
+    { "chain": "robinhood", "networkId": 4663,       "totalUsd": 1518328.05, "pricedShare": 1 },
+    { "chain": "solana",    "networkId": 1399811149, "totalUsd": 128930.25,  "pricedShare": 0.9027 },
+    { "chain": "base",      "networkId": 8453,       "totalUsd": 10.37,      "pricedShare": 1 },
+    { "chain": "ethereum",  "networkId": 1,          "totalUsd": 2.68,       "pricedShare": 1 }
+  ],
+  "refused": null
+}
+```
+
+### Windows and steps
+
+```
+?window=1d | 1w | 1m | all        how far back            default 1w
+?step=1h  | 6h | 1d               thin the series         default: the coarsest leaving >= 24 points
+```
+
+| `?window=` | default `step` | points |
+| --- | --- | --- |
+| `1d` | `1h` | 24 |
+| `1w` | `6h` | 28 |
+| `1m` | `1d` | 30 |
+
+### What to know before you use it
+
+**The parts sum to the whole.** `sum(chains[].totalUsd)` equals `now.totalUsd` on every
+response, so a per-chain line and the total line always agree.
+
+**`tier: "verified"` means we read the chain.** Amounts come from `getTokenAccountsByOwner`
+on Solana and batched `balanceOf` on the four Ethereum-style chains — not from a running
+total. A `basis` of `sampled` is a reading taken at that moment.
+
+**Thinning keeps the last point in each bucket, never an average.** An average would show a
+balance the trader never actually held.
+
+**Nothing is interpolated.** A gap in the series is a gap, and a chart should draw a break
+rather than a straight line through it.
+
+**`totalUsd` is `null`, never a smaller number, when a wallet could not be read** — with
+`refused` naming which wall was hit (`wallet_unreadable`, `service_timeout`, `no_prices`,
+`price_rejected`). A partial total would read exactly like a real drawdown.
+
+**A trader whose wallets all answered and held nothing is `0`.** That zero is a measurement.
+
+**The series deepens on its own.** `trackedSince` marks where sampling began and `count`
+says how many points came back, so a consumer renders whatever exists rather than waiting
+for a full window.
+
+---
+
+## 10. Trades, both sides
+
+| In plain words | Call | Read | Live value (`frankdegods`) |
+| --- | --- | --- | --- |
+| "What did they actually trade, and what did it cost?" | `GET $B/traders/frankdegods/trades?limit=2` | `trades[]` | **sold 12,255,236 MUSE for 954.81 USDC** |
+
+**In layman's terms.** Each row is one swap the wallet actually made, with **both sides**:
+the coin, and the money it changed hands for. The dollar figure comes from the **money side**
+— what was really paid or received in a coin whose value we know — so it does not depend on
+guessing a memecoin's price.
+
+### How to test
+
+```bash
+curl -s "$B/traders/frankdegods/trades?limit=2" | jq '.trades'
+curl -s "$B/traders/frankdegods/trades?chain=solana&since=2026-09-01" | jq '.count'
+curl -s "$B/traders/frankdegods/trades" | jq '.coverage'
+```
+
+```json
+{
+  "chain": "solana", "networkId": 1399811149,
+  "txHash": "2Rzxy4RvkGf6KEz7aKYVA8gfzMJb5JzwFM5XAGQMkuRLiaTY1b64DS2WSshAp8NhEAZSuePSjVBNzrwM3gASfWzh",
+  "at": "2026-09-09T04:32:10.000Z",
+  "side": "sell",
+  "token": { "address": "AUZrzyaejPs4zqGQ7xpPrSz9qs2rq4WhvtKANXvaWupT",
+             "symbol": "MUSE", "amount": 12255236.712766 },
+  "money": { "symbol": "USDC", "amount": 954.8140330000006 },
+  "valueUsd": 954.81,
+  "valueSource": "money_side",
+  "priceUsd": 7.79106969028e-05,
+  "tier": "verified"
+}
+```
+
+### What to know before you use it
+
+**`valueUsd` comes from the money side, not from a price.** `valueSource: "money_side"` says
+so. `priceUsd` is the price *implied* by the two legs and is there to cross-check against,
+not to value the trade with.
+
+**`side` is derived from the token leg**, not from a provider's label — positive means they
+bought, negative means they sold.
+
+**`coverage` names the chains served and the chains not.** `chainsResolved` and
+`chainsTradedButUnresolved` mean a consumer can tell "we have this chain's swaps" from "this
+trader also trades there" without inferring silence.
+
+**The cap is stated.** `limit` and `capped` appear on every response, so a truncated page is
+never mistaken for the end of the data.
+
+**Filters:** `?chain=` and `?since=` narrow the set; `?limit=` bounds the page.
+
+---
+
+## 11. Batch reads
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "The whole board, without 435 calls" | `POST $B/traders/positions` | `traders[]` | **50 traders per call** |
+
+**In layman's terms.** A background pass over the directory cannot make one call per trader.
+These take a list of ids or handles and answer for all of them at once.
+
+### How to test
+
+```bash
+curl -s -X POST "$B/traders/positions" -H 'content-type: application/json' \
+  -d '{"ids":["frankdegods","0xAvast"]}' | jq '.traders[] | {handle, coverage}'
+
+curl -s -X POST "$B/traders/aum" -H 'content-type: application/json' \
+  -d '{"ids":["0xAvast","0xleo"],"window":"1w"}' | jq '.traders[] | {handle, count, now}'
+```
+
+```json
+{
+  "limit": 50, "asked": 2, "capped": false,
+  "traders": [
+    { "handle": "frankdegods",
+      "positions": [ { "chain": "solana", "amount": 2389557.26,
+                       "balanceAt": "2026-09-10T15:40:33.000Z", "tier": "verified",
+                       "priceUsd": 1, "priceSource": "pegged_usd",
+                       "valueUsd": 2389557.26, "whyNoPrice": null } ],
+      "coverage": { "of": 437, "total": 1454, "share": 0.3006 } }
+  ]
+}
+```
+
+### What to know before you use it
+
+**`POST` because these are reads with a body.** Fifty ids do not belong in a query string.
+Nothing here mutates.
+
+**The cap is always stated.** `limit`, `asked` and `capped` appear on every response — a
+truncated list is never silent.
+
+**Ids or handles, interchangeably.** Both resolve to the same trader.
+
+**`X-Cost-Units`** on every successful response, so a caller can budget a pass.
+
+---
+
 ## Appendix A2 · Found while verifying the routes against GMGN traders (2026-09-09)
 
 Three defects surfaced only once the directory tripled. All three are fixed and deployed.
@@ -1345,6 +1641,31 @@ that matters: BUG-1's stated cause (a unit error) and expected sign were both in
 real cause was `amount` being the *remaining* quantity on a closed trade, which is nothing.
 And BUG-2 claimed `pnl_exceeds_volume` used our stored volume; it uses fomo's own, which is
 why that flag was kept while the holdings-based one was gated.
+
+---
+
+## Appendix C · What the plugin team asked for
+
+Requirements dated 9 September 2026. **Eight of eight shipped**; the ninth is a schedule
+rather than a build.
+
+| § | Asked for | Shipped as |
+| --- | --- | --- |
+| **§1** | a stable id that is never reused and never derived from the handle; `:id` on every per-trader route | `id` (`trd_…`) on the wallets block, accepted in place of `:handle` everywhere, plus `handleChangedAt`. **§0e** |
+| **§2** | wallets with a `family` and the chains each is present on | `family` (`solana`/`evm`) and `chains[]` with `tradesSeen` and `lastActiveAt`, observed rather than inferred. **§0e** |
+| **§3** | balances read from the chain; every position carrying `priceUsd`, `priceSource`, `pricedAt`, `valueUsd`, `balanceAt`, `whyNoPrice`, and `coverage` | all present on `/positions` and the batch route. Balances come from `getTokenAccountsByOwner` and batched `balanceOf`; **36,506 positions across five chains**, 367 traders served from chain reads. **§2** |
+| **§4** | every swap, both sides, valued from the money side, with a stated cap | `GET /traders/:id/trades` — `side`, `token`, `money`, `valueUsd` with `valueSource: "money_side"`, `priceUsd` as a cross-check, `?chain=`/`?since=`, `limit` and `capped` stated. **§10** |
+| **§5** | a `measurements` block for every trader, one stated definition, each figure with `basis`, `window`, `coverage`, `asOf` | on every scorecard. **99.08%** of traders carry a usable rhythm figure, reported on `/health`. **§3** |
+| **§6** | loud failures, `asOf` on every figure, `/health` freshness, stable error codes, stated caps | `include_unavailable` (503) rather than a 200 with a missing block; `requestId` in the body and the `x-request-id` header; per-feed `lastRefreshAt` on `/health`; stable codes with no internal text; every route bounded, answering `code: "timeout"` rather than hanging; pool pressure answers `429` with `Retry-After`. **§0a** |
+| **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. **§9** — the daily sampler fills the 30-day window forward |
+| **§8** | batch reads for the whole directory in a bounded number of calls, with cost stated | `POST /traders/positions` and `POST /traders/aum`, 50 per call, `limit`/`asked`/`capped` on every response, `X-Cost-Units` on every success. **§11** |
+
+### The one thing still on the clock
+
+**§7's thirty-day window fills by sampling forward.** Each point is a balance read at that
+moment, so a thirty-day series is thirty days of readings — the route serves whatever exists
+from day one and the window deepens on its own. `trackedSince` and `count` tell a consumer
+exactly how much history is behind the line they are drawing.
 
 ---
 

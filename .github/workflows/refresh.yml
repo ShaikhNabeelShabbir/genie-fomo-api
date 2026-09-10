@@ -152,6 +152,24 @@ jobs:
           HELIUS_WEBHOOK_SECRET: ${{ secrets.HELIUS_WEBHOOK_SECRET }}
         run: node scripts/register_webhook.mjs
 
+      # ---------------------------------------------------------------- 8. AUM
+      # One balance reading per trader per run, written to `aum_samples`.
+      #
+      # A sampled point is a balance read from the chain AT THAT MOMENT, and a moment only
+      # happens once -- yesterday's balance cannot be read today. So the series is built by
+      # running this every day rather than by reconstructing it afterwards, and each run adds
+      # one point to every trader's line.
+      #
+      # `continue-on-error` because a missed reading is a gap in one day of one chart, while
+      # a failed job would also discard the seven loaders above it that already succeeded.
+      # The route reports `count` and `trackedSince`, so a gap is visible rather than implied.
+      - name: Sample AUM
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
+        run: node scripts/load_aum_samples.mjs
+
       # ---------------------------------------------------------------- summary
       # `always()` so a failed run still reports how far it got. Each script commits its own
       # work independently, so a late failure leaves the earlier steps landed — the job goes
@@ -168,8 +186,11 @@ jobs:
                        (select count(*) from holdings_current),
                        (select count(*) from trades),
                        (select count(*) from transactions),
-                       (select max(captured_at) from builds)""")
-              t, gens, hold, tr, tx, at = cur.fetchone()
+                       (select max(captured_at) from builds),
+                       (select count(*) from aum_samples),
+                       (select count(distinct handle) from aum_samples),
+                       (select count(distinct at::date) from aum_samples)""")
+              t, gens, hold, tr, tx, at, aum_rows, aum_traders, aum_days = cur.fetchone()
           print(f"| | |\n| --- | --- |")
           print(f"| traders | {t} |")
           print(f"| generations | {gens} |")
@@ -177,6 +198,8 @@ jobs:
           print(f"| trades | {tr} |")
           print(f"| transactions | {tx} |")
           print(f"| build captured_at | {at} |")
+          print(f"| AUM samples | {aum_rows} across {aum_traders} traders |")
+          print(f"| AUM days covered | {aum_days} of 30 |")
           if gens < 2:
               print("\n> K2 momentum needs two generations and has "
                     f"{gens}. It stays `available: false` until the next run.")
