@@ -32,6 +32,12 @@ No API key. **Zero external calls per request** — every route answers from Pos
 keys belong to the scheduled loaders, and GMGN-sourced figures (G7–G10) are fetched nightly
 and cached, never at request time.
 
+> **Deploying:** the public-access promise above is a deploy flag, not a code setting. The
+> function must go out as
+> `supabase functions deploy api --project-ref gxnonqlmujmtgczvhvzp --no-verify-jwt`.
+> The CLI defaults to requiring a JWT, so omitting the flag makes every route answer
+> `UNAUTHORIZED_NO_AUTH_HEADER` until it is redeployed with it.
+
 Supabase already serves this function under `/functions/v1/api`, so an extra `/v1` is
 **optional** — `$B/traders/unipcs` and `$B/v1/traders/unipcs` both resolve. The short form is
 used throughout.
