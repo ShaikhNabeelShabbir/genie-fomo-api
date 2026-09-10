@@ -1414,8 +1414,9 @@ price is excluded from every aggregate rather than counted as zero.
 | "How much has this trader been holding, and how has it moved?" | `GET $B/traders/0xAvast/aum?window=1d` | `now.totalUsd`, `points[]` | **$4,416,026.98** across 216 positions, 198 priced |
 
 **In layman's terms.** `/portfolio` answers *"what does he hold right now"*. This answers
-*"what has he been holding, over time"* — the line a chart draws. Every point was **measured
-and written down at the time**, so the series is a record rather than a reconstruction.
+*"what has he been holding, over time"* — the line a chart draws. Every sampled point was
+**measured and written down at the time**, so the series is a record rather than a running
+total. Add `?chain=` and the same line narrows to a single chain.
 
 ### How to test
 
@@ -1457,6 +1458,7 @@ curl -s "$B/traders/0xAvast/aum?window=1w&step=1d" | jq '{step, count}'
 ```
 ?window=1d | 1w | 1m | all        how far back            default 1w
 ?step=1h  | 6h | 1d               thin the series         default: the coarsest leaving >= 24 points
+?chain=robinhood | solana | ...   one chain instead of the whole portfolio
 ```
 
 | `?window=` | default `step` | points |
@@ -1464,6 +1466,55 @@ curl -s "$B/traders/0xAvast/aum?window=1w&step=1d" | jq '{step, count}'
 | `1d` | `1h` | 24 |
 | `1w` | `6h` | 28 |
 | `1m` | `1d` | 30 |
+
+### One chain at a time — `?chain=`
+
+```bash
+curl -s "$B/traders/0xAvast/aum?window=1m&chain=robinhood" | jq .
+```
+
+```json
+{
+  "handle": "0xAvast", "chain": "robinhood", "window": "1m", "step": "1d",
+  "trackedSince": "2026-09-10T14:00:00.000Z",
+  "now": {
+    "at": "2026-09-10T16:00:00.000Z",
+    "totalUsd": 1518328.05,
+    "coverage": { "pricedPositions": null, "totalPositions": null, "valueShare": 1 },
+    "tier": "verified"
+  },
+  "count": 1,
+  "points": [
+    { "at": "2026-09-10T16:00:00.000Z", "totalUsd": 1518328.05,
+      "basis": "sampled", "tier": "verified",
+      "coverage": { "pricedPositions": null, "totalPositions": null, "valueShare": 1 } }
+  ],
+  "refused": null
+}
+```
+
+A chain series answers *"how much of him is on this chain, and how has that moved"*. The five
+chains all answer; `chain` on the response echoes which one you narrowed to, and `null` there
+means you are looking at the whole portfolio.
+
+**`count` is how much history is behind the line, and it is honest about it.** The series
+deepens by one point per sampling run, so a consumer should draw `count` points rather than
+assume a full window — `trackedSince` says when the record starts.
+
+| Ask for | You get |
+| --- | --- |
+| no `chain` | the whole portfolio, every chain summed |
+| `chain=robinhood` \| `solana` \| `bsc` \| `base` \| `ethereum` | that chain alone |
+
+**`trackedSince` is the seam, and the response never blends the two sides of it.** Points
+after it carry `basis: "sampled"` / `tier: "verified"` — read from the chain at that moment.
+Points before it carry `basis: "rebuilt"` / `tier: "reported"` — worked out backwards from the
+chain's own `Transfer` logs. `plain` names the seam in words.
+
+**On a chain series the coverage field is `pricedShare`, and the position counts are `null`.**
+The counts on a portfolio point describe the whole trader, so showing them beside one chain's
+dollars would make the line look like it changed scope halfway along. `pricedShare` means the
+same thing on every point.
 
 ### What to know before you use it
 
@@ -1657,7 +1708,7 @@ rather than a build.
 | **§4** | every swap, both sides, valued from the money side, with a stated cap | `GET /traders/:id/trades` — `side`, `token`, `money`, `valueUsd` with `valueSource: "money_side"`, `priceUsd` as a cross-check, `?chain=`/`?since=`, `limit` and `capped` stated. **§10** |
 | **§5** | a `measurements` block for every trader, one stated definition, each figure with `basis`, `window`, `coverage`, `asOf` | on every scorecard. **99.08%** of traders carry a usable rhythm figure, reported on `/health`. **§3** |
 | **§6** | loud failures, `asOf` on every figure, `/health` freshness, stable error codes, stated caps | `include_unavailable` (503) rather than a 200 with a missing block; `requestId` in the body and the `x-request-id` header; per-feed `lastRefreshAt` on `/health`; stable codes with no internal text; every route bounded, answering `code: "timeout"` rather than hanging; pool pressure answers `429` with `Retry-After`. **§0a** |
-| **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. **§9** — the daily sampler fills the 30-day window forward |
+| **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. `?chain=` narrows the series to one chain, with `basis` and `tier` on every point and `trackedSince` marking where measured sampling begins. **§9** — the daily sampler fills the window forward from `trackedSince` |
 | **§8** | batch reads for the whole directory in a bounded number of calls, with cost stated | `POST /traders/positions` and `POST /traders/aum`, 50 per call, `limit`/`asked`/`capped` on every response, `X-Cost-Units` on every success. **§11** |
 
 ### The one thing still on the clock

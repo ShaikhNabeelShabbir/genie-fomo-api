@@ -3147,13 +3147,53 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
   const to = new Date();
   const from = span === null ? null : new Date(to.getTime() - span);
 
-  const rows = await sql`
-    select at, total_usd, refused_reason, priced_positions, total_positions,
-           value_share, basis, tier
-    from aum_samples
-    where handle = ${t.handle}
-      and (${from}::timestamptz is null or at >= ${from}::timestamptz)
-    order by at asc`;
+  /*
+   * A CHAIN SERIES IS A DIFFERENT CLAIM FROM A TRADER SERIES, and the backfill is why this
+   * parameter exists. Reconstructing a past balance needs a chain that will answer for the
+   * whole window, and only robinhood does -- so the rebuilt history is a robinhood figure,
+   * not a portfolio one. Only 31 of the 276 traders holding robinhood hold nothing else, so
+   * serving it as a trader total would draw a drawdown that never happened. Ask for the
+   * chain and you get the chain.
+   */
+  const chainKey = (url.searchParams.get("chain") ?? "").trim().toLowerCase();
+  let chainFilter: { network_id: number; name: string } | null = null;
+  if (chainKey) {
+    const [c] = await sql`
+      select network_id, name from chains where name = ${chainKey}`;
+    if (!c) {
+      const all = await sql`select name from chains order by name`;
+      throw badRequest(
+        `'chain' must be one of ${all.map((r) => r.name).join(", ")} — got '${chainKey}'`,
+        { parameter: "chain" },
+      );
+    }
+    chainFilter = { network_id: Number(c.network_id), name: String(c.name) };
+  }
+
+  /*
+   * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
+   * parent row are whole-trader for a sampled point and robinhood-only for a rebuilt one;
+   * putting those two in one column would make the series look like it changed scope
+   * mid-chart. `pricedShare` means the same thing on both.
+   */
+  const rows = chainFilter
+    ? await sql`
+        select a.at, a.total_usd, a.reason as refused_reason,
+               null::int as priced_positions, null::int as total_positions,
+               a.priced_share as value_share, a.basis, s.tier
+        from aum_chain_samples a
+        join aum_samples s
+          on s.handle = a.handle and s.at = a.at and s.basis = a.basis
+        where a.handle = ${t.handle} and a.network_id = ${chainFilter.network_id}
+          and (${from}::timestamptz is null or a.at >= ${from}::timestamptz)
+        order by a.at asc`
+    : await sql`
+        select at, total_usd, refused_reason, priced_positions, total_positions,
+               value_share, basis, tier
+        from aum_samples
+        where handle = ${t.handle}
+          and (${from}::timestamptz is null or at >= ${from}::timestamptz)
+        order by at asc`;
 
   /*
    * The default step is the coarsest that still leaves at least 24 points, so a week does
@@ -3211,6 +3251,8 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
 
   return {
     handle: t.display_handle,
+    /** Null means the whole portfolio. A name means this series is that chain alone. */
+    chain: chainFilter ? chainFilter.name : null,
     window: windowKey,
     step: chosen.name,
     from: from ? from.toISOString() : (points[0]?.at ?? null),
@@ -3244,9 +3286,12 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
       : newest.total_usd === null
       ? `The most recent reading was refused (${newest.refused_reason}), so there is no total for it. ` +
         `A partial total would read like a real drawdown.`
-      : `${points.length} point${points.length === 1 ? "" : "s"} over ${windowKey} at ${chosen.name} steps.` +
+      : `${points.length} point${points.length === 1 ? "" : "s"} over ${windowKey} at ${chosen.name} steps` +
+        (chainFilter ? ` on ${chainFilter.name} alone` : "") + "." +
         (trackedSince === null
           ? " Every point is a marked rebuild — sampling has not started."
+          : rows.some((r) => r.basis === "rebuilt")
+          ? ` Points before ${trackedSince} are rebuilt from chain transfers, not measured.`
           : ""),
   };
 });

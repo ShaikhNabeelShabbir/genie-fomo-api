@@ -1,7 +1,7 @@
 # AUM over time — build plan
 
 **Written 2026-09-10** against the product requirement dated 2026-09-09.
-**Status: phases 1-3 written locally 2026-09-10, nothing applied or deployed.** The migration,
+**Status: phases 1-4 built. The backfill ran 2026-09-10 against robinhood.** The migration,
 the route and the sampler exist and type-check; none has run, because the database was down
 while they were written. Three decisions remain open (§9) and one still blocks hourly cadence.
 
@@ -209,12 +209,46 @@ Thinning keeps the **last** point in each bucket, never an average: averaging wo
 balance he never held, and a refused hour averaged with a measured one would launder the
 refusal into a number.
 
-### Phase 4 — the marked rebuild · ~1-2 days
+### ✅ Phase 4 — the marked rebuild · built · `scripts/rebuild_aum_robinhood.mjs`
 
-Backfill the past from `wallet_swaps` and `transactions`, `basis: "rebuilt"`,
-`tier: "reported"`, never mixed with sampled points inside a segment. Expected to be lower,
-and expected to be labelled. **Worth doing last** — the sampler is the feature; the rebuild
-only makes the first week look less empty.
+Thirty days of history, reconstructed backwards from the chain's own `Transfer` logs and
+written `basis: "rebuilt"` / `tier: "reported"` so it is never mixed into a measured segment.
+
+**Which chains it covers, and why that set.** A rebuild needs the chain to answer for the
+whole window. We measured all five before writing the script:
+
+| Chain | Held value | Rebuilt | What the chain gives us |
+| --- | --- | --- | --- |
+| robinhood | $148.3M | **yes** | `eth_getLogs` serves 500,000-block windows with 64 addresses in the topic array |
+| solana | $62.1M | no | no historical-balance method; stored transfers reach a full 30 days for 17 of 170 wallets |
+| bsc | $18.2M | no | every keyless RPC is pruned — historical state answers `missing trie node` |
+| base | $3.4M | no | archive works; 139 positions is 0.9% of value |
+| ethereum | $1.0M | no | archive works on one endpoint; 1,462 positions is 0.7% of value |
+
+**The output is a chain series, not a trader series.** Only 31 of the 276 traders holding
+robinhood hold robinhood alone. A robinhood-only figure sitting in the same line as a
+whole-portfolio sample would draw a 36% drawdown that never happened, so rebuilt points live
+in `aum_chain_samples` and are served by `GET /traders/:id/aum?chain=robinhood`. The parent
+row states a total only for the 31, and otherwise carries
+`refused_reason: "chains_unrebuildable"` with the coverage intact.
+
+**How it is proved.** robinhood keeps no archive state, so a past balance cannot be checked
+against the chain directly — but it can be checked forward. `--verify` takes the balance the
+walk is anchored on, adds every transfer since that block, and requires the result to equal
+what the wallet holds right now. That exercises the same transfer set and the same sum the
+backward walk depends on. **40 of 40 sampled balances reproduced exactly**, and the script
+refuses to write anything if even one does not.
+
+```bash
+node scripts/rebuild_aum_robinhood.mjs --days 30 --verify --dry-run   # read-only
+node scripts/rebuild_aum_robinhood.mjs --days 30 --verify             # write
+```
+
+**Two things it will not do.** A range the node refuses is halved and retried rather than
+skipped — a missing range is not a gap in one trader, it is a wrong balance for everyone who
+moved a coin inside it, so an unreadable range ends the run before anything is written. And a
+walk that goes negative means our view of that coin is incomplete: it is counted as a position
+we cannot state, never clamped to zero, because a clamp looks exactly like a real exit.
 
 ---
 

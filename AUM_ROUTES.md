@@ -34,6 +34,7 @@ The two conventions the rest of this API runs on hold here too:
 | --- | --- | --- |
 | **1** | [The route](#1-the-route) | the call, the shape, the fields |
 | **2** | [Windows and steps](#2-windows-and-steps) | `?window=` and `?step=` |
+| **2b** | [One chain at a time](#2b-one-chain-at-a-time--chain) | `?chain=` and the 30-day rebuild |
 | **3** | [Coverage — read it before the number](#3-coverage-read-it-before-the-number) | `valueShare` and why it matters |
 | **4** | [Refusals](#4-refusals) | why a whole hour can be `null` |
 | **5** | [Where the numbers come from](#5-where-the-numbers-come-from) | the sampler |
@@ -111,6 +112,7 @@ curl -s "$B/traders/frankdegods/aum" | jq '.plain'
 | `chains[]` | Per-chain split of the **newest** sample. `totalUsd: null` + `reason` when a chain could not be priced. |
 | `count` | How many points came back after thinning — not how many samples exist. |
 | `refused` | Non-null only when the newest sample was refused. |
+| `chain` | `null` for the whole portfolio; a chain name when `?chain=` narrowed the series to it. |
 
 **`sum(chains[].totalUsd)` equals `now.totalUsd`.** Verified on 7 of 8 traders; see §6 for the
 one that is a penny out.
@@ -122,6 +124,7 @@ one that is a penny out.
 ```
 ?window=1d | 1w | 1m | all        how far back            default 1w
 ?step=1h  | 6h | 1d               thin the series         default: see below
+?chain=robinhood | solana | ...   one chain, not the whole portfolio
 ```
 
 **The default step is the coarsest that still leaves at least 24 points.** A week arrives as
@@ -152,6 +155,34 @@ where the honest answer was "we could not read it".
 
 **Nothing is interpolated.** A gap in the series is a gap. If the sampler did not run, or was
 refused, there is no point there — the chart should show a break, not a straight line.
+
+---
+
+## 2b. One chain at a time — `?chain=`
+
+```bash
+curl -s "$B/traders/0xAvast/aum?window=1m&chain=robinhood" | jq '{chain, count, trackedSince}'
+```
+
+A chain series answers a different question from a portfolio series: **how much of him is on
+this chain, and how has that moved.** It is also where thirty days of reconstructed history
+live, because a rebuild is only possible on a chain that will answer for the whole window.
+
+| Ask for | You get |
+| --- | --- |
+| no `chain` | the whole portfolio, every chain summed, from `aum_samples` |
+| `chain=robinhood` | robinhood alone — sampled points **and** the 30-day rebuild behind them |
+| `chain=` anything else | that chain's sampled points |
+
+**Coverage on a chain series is `pricedShare`, and the position counts are `null`.** That is
+deliberate: the counts on a portfolio point are whole-trader, and putting those beside a
+single chain's dollars would make the series look like it changed scope mid-chart.
+`pricedShare` means the same thing on every point.
+
+**`trackedSince` is the seam.** Points before it are `basis: "rebuilt"` / `tier: "reported"` —
+inferred backwards from the chain's own transfer logs. Points after it are `basis: "sampled"`
+/ `tier: "verified"` — read from the chain at the time. The response never blends them, and
+`plain` names the seam in words.
 
 ---
 
