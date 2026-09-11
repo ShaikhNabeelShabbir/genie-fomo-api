@@ -3305,16 +3305,44 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
    * are what let a reader tell those apart.
    */
   const [presence] = await sql`
-    select count(distinct network_id)::int as chains
+    select count(distinct network_id)::int as chains,
+           bool_or(network_id = 1399811149) as on_solana,
+           bool_or(network_id <> 1399811149) as on_evm
     from holdings_current where handle = ${t.handle} and human_amount > 0`;
   const totalChains = Number(presence?.chains ?? 0);
-  const [answered] = newestRow
+
+  const answeredRows = newestRow
     ? await sql`
-        select count(*)::int as chains
+        select network_id
         from aum_chain_samples
         where handle = ${t.handle} and at = ${newestRow.at} and basis = ${newestRow.basis}
           and total_usd is not null`
-    : [{ chains: 0 }];
+    : [];
+  const answeredChains = answeredRows.length;
+
+  /*
+   * WALLETS, NOT JUST CHAINS (PRD §3.2). A trader carries one EVM address that serves four
+   * chains and one Solana address that serves the fifth, so "three of four chains answered"
+   * can still mean either wallet was unreadable -- and which of the two it was changes what
+   * the number is missing. A wallet counts as answered when any chain it serves reported.
+   */
+  const SOLANA = 1399811149;
+  const answeredNets = new Set(answeredRows.map((r) => Number(r.network_id)));
+  const totalWallets = (presence?.on_evm ? 1 : 0) + (presence?.on_solana ? 1 : 0);
+  const answeredWallets =
+    ([...answeredNets].some((n) => n !== SOLANA) ? 1 : 0) +
+    (answeredNets.has(SOLANA) ? 1 : 0);
+
+  /*
+   * WARMING IS A PROMISE THAT THIS GETS BETTER (PRD §5), and it is the one state a consumer
+   * should wait on rather than report as a failure. So it is separated from the refusals: a
+   * series that is short because the backfill has not reached this trader is warming, and one
+   * that is short because a wallet would not answer is not.
+   */
+  const warming = drawable === false && (reason === "warming" || reason === "short_coverage");
+  const nextRun = new Date();
+  nextRun.setUTCHours(6, 0, 0, 0);
+  if (nextRun.getTime() <= Date.now()) nextRun.setUTCDate(nextRun.getUTCDate() + 1);
 
   return {
     handle: t.display_handle,
@@ -3356,11 +3384,27 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
      */
     drawing: { drawable, usablePoints: usable.length, reason },
 
-    /** Coverage of the newest point, in chains rather than positions. */
+    /** Coverage of the newest point, in wallets and chains rather than positions. */
     coverage: {
-      answeredChains: Number(answered?.chains ?? 0),
+      answeredWallets,
+      totalWallets,
+      answeredChains,
       totalChains,
     },
+
+    /**
+     * Whether this is as good as it gets, or as good as it is SO FAR.
+     * `ready` means the stored series is what we have to offer; `warming` means a backfill
+     * or the sampler is still filling it and the same request will return more later.
+     */
+    status: warming ? "warming" : "ready",
+    ...(warming
+      ? { progress: {
+            coveredDays,
+            targetDays: requestedDays ?? coveredDays,
+            nextRunAt: nextRun.toISOString(),
+          } }
+      : {}),
 
     /** Holes in the record, with their reasons. A chart breaks its line at each of these. */
     gaps,

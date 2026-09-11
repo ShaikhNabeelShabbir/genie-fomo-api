@@ -1503,11 +1503,21 @@ A chain series answers *"how much of him is on this chain, and how has that move
 chains all answer; `chain` on the response echoes which one you narrowed to, and `null` there
 means you are looking at the whole portfolio.
 
-**On robinhood the series reaches thirty days back.** 10,230 reconstructed points across 341
-traders, worked out backwards from that chain's own `Transfer` logs and written
-`basis: "rebuilt"` / `tier: "reported"`. The balances are proved forward before anything is
-written: the anchor balance plus every transfer since that block must equal what the wallet
-holds now, and it did for **40 of 40** sampled balances in each of the seven address batches.
+**The series reaches thirty days back on all five chains**, written `basis: "rebuilt"` /
+`tier: "reported"` so a reconstruction is never mistaken for a measurement.
+
+| Chain | Points | Traders | How the balance was obtained |
+| --- | --- | --- | --- |
+| robinhood | 10,230 | 341 | every `Transfer` log replayed backwards from today's balance |
+| bsc | 8,010 | 267 | asked an archive node for the balance at that block |
+| ethereum | 7,440 | 248 | asked an archive node for the balance at that block |
+| base | 4,500 | 150 | asked an archive node for the balance at that block |
+| solana | 1,980 | 66 | the balance each transaction recorded, from Helius |
+
+**Nothing is written until it reproduces the wallet.** Where a balance is inferred rather than
+read — robinhood and Solana — the anchor plus every movement since it must equal what the
+wallet holds now before a single row is stored. robinhood passed **40 of 40** in each of its
+seven address batches; Solana is gated the same way, per wallet.
 
 **`count` is how much history is behind the line, and it is honest about it.** The series
 deepens by one point per sampling run, so a consumer should draw `count` points rather than
@@ -1542,10 +1552,25 @@ curl -s "$B/traders/pointfarmcap/aum?window=1m&chain=robinhood" | jq '{reach, dr
 
 ```json
 {
+  "status": "ready",
   "reach": { "requestedFrom": "2026-08-12T08:38:38Z", "coveredFrom": "2026-08-13T00:00:00Z",
              "coveredTo": "2026-09-10T16:00:00Z",
              "requestedDays": 30, "coveredDays": 29, "complete": true },
-  "drawing": { "drawable": true, "usablePoints": 29, "reason": null }
+  "drawing": { "drawable": true, "usablePoints": 29, "reason": null },
+  "coverage": { "answeredWallets": 1, "totalWallets": 1,
+                "answeredChains": 1, "totalChains": 1 }
+}
+```
+
+**`status` separates "this is all there is" from "this is all there is SO FAR".** A `ready`
+series is the finished answer; a `warming` one will be longer if the same request is made
+later, and carries a `progress` block saying how much longer and when:
+
+```json
+{
+  "status": "warming",
+  "drawing": { "drawable": false, "usablePoints": 1, "reason": "warming" },
+  "progress": { "coveredDays": 0, "targetDays": 30, "nextRunAt": "2026-09-12T06:00:00.000Z" }
 }
 ```
 
@@ -1569,9 +1594,11 @@ or from missing data, so it makes the call rather than leaving each consumer to 
 chart breaks its line at each gap rather than drawing through it, because joining two points
 across a hole draws a balance the trader never held.
 
-**`coverage.answeredChains` / `totalChains` say how much of the trader a point could see.** A
+**`coverage` says how much of the trader a point could see, in wallets and in chains.** A
 chain with no row at that moment did not contribute zero dollars; it contributed nothing at
-all, and those are different facts.
+all, and those are different facts. Wallets are counted as well as chains because one EVM
+address serves four of the five chains — so "three of four chains" can still mean either
+wallet went unread, and which one it was changes what the number is missing.
 
 ### What to know before you use it
 
@@ -1765,7 +1792,7 @@ rather than a build.
 | **§4** | every swap, both sides, valued from the money side, with a stated cap | `GET /traders/:id/trades` — `side`, `token`, `money`, `valueUsd` with `valueSource: "money_side"`, `priceUsd` as a cross-check, `?chain=`/`?since=`, `limit` and `capped` stated. **§10** |
 | **§5** | a `measurements` block for every trader, one stated definition, each figure with `basis`, `window`, `coverage`, `asOf` | on every scorecard. **99.08%** of traders carry a usable rhythm figure, reported on `/health`. **§3** |
 | **§6** | loud failures, `asOf` on every figure, `/health` freshness, stable error codes, stated caps | `include_unavailable` (503) rather than a 200 with a missing block; `requestId` in the body and the `x-request-id` header; per-feed `lastRefreshAt` on `/health`; stable codes with no internal text; every route bounded, answering `code: "timeout"` rather than hanging; pool pressure answers `429` with `Retry-After`. **§0a** |
-| **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. `?chain=` narrows the series to one chain, with `basis` and `tier` on every point and `trackedSince` marking where measured sampling begins. On robinhood it reaches **thirty days** back — 10,230 points across 341 traders, rebuilt from that chain's transfer logs and proved forward on 40 of 40 balances per batch. **§9** — the daily sampler fills the window forward from `trackedSince` |
+| **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. `?chain=` narrows the series to one chain. **Thirty days of history on all five chains** — 32,160 reconstructed points, each proved against the wallet before it was stored. `reach` states the covered span, `drawing.drawable` is the service's own call on whether it can be plotted, `status` distinguishes ready from warming, `coverage` counts answered wallets and chains, and `gaps[]` names every hole. **§9** — the daily sampler fills the window forward from `trackedSince` |
 | **§8** | batch reads for the whole directory in a bounded number of calls, with cost stated | `POST /traders/positions` and `POST /traders/aum`, 50 per call, `limit`/`asked`/`capped` on every response, `X-Cost-Units` on every success. **§11** |
 
 ### The one thing still on the clock
