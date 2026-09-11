@@ -171,8 +171,12 @@ live, because a rebuild is only possible on a chain that will answer for the who
 | Ask for | You get |
 | --- | --- |
 | no `chain` | the whole portfolio, every chain summed, from `aum_samples` |
-| `chain=robinhood` | robinhood alone — sampled points **and** the 30-day rebuild behind them |
+| `chain=robinhood` | robinhood alone — sampled points **and** 30 days of rebuild behind them |
 | `chain=` anything else | that chain's sampled points |
+
+**Live:** 10,230 rebuilt points across 341 traders, 2026-08-10 to 2026-09-08. Each of the
+seven address batches was proved forward — anchor plus transfers since equals the live
+balance — **40 of 40** every time, and a batch that failed was not written until it passed.
 
 **Coverage on a chain series is `pricedShare`, and the position counts are `null`.** That is
 deliberate: the counts on a portfolio point are whole-trader, and putting those beside a

@@ -47,6 +47,16 @@ const VERIFY = flag("verify");
  * lands, so a re-run resumes instead of restarting. Delete the directory to force a refetch.
  */
 const CACHE = arg("cache-dir", ".cache/rebuild_robinhood");
+/*
+ * Rebuild ONE address chunk instead of all seven.
+ *
+ * The older windows are cached for every chunk, so the gap is only in recent blocks -- and
+ * closing it for all 394 wallets means 7x the requests against a node that rate-limits us
+ * into the ground. Closing it for one chunk gives those 64 wallets unbroken coverage across
+ * the whole window, which is what correctness actually requires. Every other wallet is
+ * DROPPED from the run rather than rebuilt from transfers we only half have.
+ */
+const ONLY_CHUNK = arg("only-chunk") === null ? null : Number(arg("only-chunk"));
 
 const RH_NETWORK_ID = 4663;
 const RPC_URL   = "https://rpc.mainnet.chain.robinhood.com";
@@ -90,8 +100,49 @@ const PRICE_GAP_DAYS = 7;
  */
 const LOG_TRIES = 10;
 
+/*
+ * A LONG, PATIENT WAIT, and only for this job.
+ *
+ * chain_reads.rpc backs off to 12s, which is right for a loader that can come back next hour.
+ * This job cannot: it holds ~500MB of transfers in memory and a 30-day scan takes hours, so
+ * dying on a rate limit throws all of it away. robinhood limits us for minutes at a time, so
+ * this rides the limit out instead of failing into it. Sleeping is free; refetching is not.
+ */
+const PATIENT_WAITS = [5_000, 15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000, 300_000];
+
+/*
+ * Only a rate limit is worth waiting out. "log query timed out" means the RANGE IS TOO BIG,
+ * and splitLogs above it halves the range to fix that -- so waiting on one costs ten minutes
+ * and then splits anyway. Rethrowing immediately lets the split happen at once. Getting this
+ * wrong is easy: both arrive as a failed request, and only one of them gets better with time.
+ */
+const isRateLimit = (e) => /HTTP 429|HTTP 403/.test(String(e && e.message));
+
+async function patient(label, fn) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (!isRateLimit(e) || i >= PATIENT_WAITS.length) throw e;
+      const w = PATIENT_WAITS[i];
+      console.log(`  ${label}: ${e.message} — waiting ${w / 1000}s (attempt ${i + 1}/${PATIENT_WAITS.length})`);
+      await new Promise((r) => setTimeout(r, w));
+    }
+  }
+}
+
 const pool  = new pg.Pool({ connectionString: DB, ssl: { rejectUnauthorized: false }, max: 3 });
 const hex   = (n) => "0x" + BigInt(n).toString(16);
+
+/*
+ * THE ANCHOR TIME IS EXACT, TO THE SECOND, and rounding it was a real bug.
+ *
+ * Truncating to the hour put the anchor block up to an hour BEFORE the balance was actually
+ * read, so every transfer in that gap was counted as happening after the anchor when it was
+ * already inside it -- double-counted. It showed up as a wallet whose live balance equalled
+ * its anchor exactly while we claimed 1.4 million tokens had moved. There are only three
+ * distinct capture times in the table, so the precision costs three block lookups.
+ */
+const anchorSec = (t) => Math.floor(new Date(t).getTime() / 1000);
 const padTopic = (a) => "0x" + a.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 const addrOf   = (topic) => "0x" + topic.slice(-40).toLowerCase();
 
@@ -145,7 +196,8 @@ let cacheHits = 0;
  */
 async function splitLogs(from, to, topics, depth = 0) {
   try {
-    return await call("eth_getLogs", [{ fromBlock: hex(from), toBlock: hex(to), topics }], LOG_TRIES);
+    return await patient(`logs ${from}-${to}`,
+      () => call("eth_getLogs", [{ fromBlock: hex(from), toBlock: hex(to), topics }], LOG_TRIES));
   } catch (e) {
     const span = to - from + 1;
     if (!/timed out|too large|limit|range/i.test(String(e.message)) || span <= MIN_WINDOW) throw e;
@@ -158,9 +210,27 @@ async function splitLogs(from, to, topics, depth = 0) {
 }
 let splits = 0;
 
+/*
+ * BLOCK TIMESTAMPS ARE CACHED TOO, and leaving them out was what made "resume" a fiction.
+ * Resolving 30 day-boundaries plus the anchor hours costs ~250 reads BEFORE the first log is
+ * fetched, so every restart spent its whole rate-limit budget re-deriving numbers it had
+ * already derived, and died in the same place. They are pure functions of the chain; once
+ * known they are known.
+ */
+let tsCache = {};
+const tsFile   = () => path.join(CACHE, "_block_timestamps.json");
+const gridFile = () => path.join(CACHE, "_grid.json");
+
 async function blockTimestamp(n) {
-  const b = await call("eth_getBlockByNumber", [hex(n), false]);
-  return b ? Number(BigInt(b.timestamp)) : null;
+  const k = String(n);
+  if (tsCache[k] !== undefined) return tsCache[k];
+  const b = await patient(`block ${n}`, () => call("eth_getBlockByNumber", [hex(n), false], LOG_TRIES));
+  const ts = b ? Number(BigInt(b.timestamp)) : null;
+  if (ts !== null) {
+    tsCache[k] = ts;
+    fs.writeFileSync(tsFile(), JSON.stringify(tsCache));
+  }
+  return ts;
 }
 
 /** The chain's true recent block rate, from two real reads. Never assumed. */
@@ -200,6 +270,11 @@ async function blockAtTime(targetSec, head, headTs, rate) {
 }
 
 async function main() {
+  fs.mkdirSync(CACHE, { recursive: true });
+  if (fs.existsSync(tsFile())) {
+    try { tsCache = JSON.parse(fs.readFileSync(tsFile(), "utf8")); } catch { tsCache = {}; }
+    console.log(`${Object.keys(tsCache).length} block timestamps resumed from cache`);
+  }
   const client = await pool.connect();
   try {
     // ------------------------------------------------------------------ inputs
@@ -210,8 +285,23 @@ async function main() {
         ${ONLY ? "and w.handle = $1" : ""}`, ONLY ? [ONLY.toLowerCase()] : []);
     if (!wallets.length) { console.error("no EVM wallets to rebuild"); process.exit(1); }
 
-    const handleOf = new Map(wallets.map((w) => [w.evm_address_key.toLowerCase(), w.handle]));
-    const addresses = [...handleOf.keys()];
+    const allAddresses = wallets.map((w) => w.evm_address_key.toLowerCase());
+    /*
+     * The chunk split happens HERE, before anything else reads the wallet list, so the set we
+     * fetch and the set we rebuild can never disagree. A wallet outside the chunk is absent
+     * from handleOf, so its transfers are ignored and no anchor for it is ever walked.
+     */
+    const addresses = ONLY_CHUNK === null
+      ? allAddresses
+      : allAddresses.slice(ONLY_CHUNK * ADDR_CHUNK, (ONLY_CHUNK + 1) * ADDR_CHUNK);
+    const keep = new Set(addresses);
+    const handleOf = new Map(wallets
+      .filter((w) => keep.has(w.evm_address_key.toLowerCase()))
+      .map((w) => [w.evm_address_key.toLowerCase(), w.handle]));
+    if (ONLY_CHUNK !== null) {
+      console.log(`chunk ${ONLY_CHUNK}: ${addresses.length} of ${allAddresses.length} wallets ` +
+                  `— every other wallet is excluded from this run, not partially rebuilt`);
+    }
 
     const { rows: anchorRows } = await client.query(`
       select h.handle, h.token_key, h.human_amount::float8 as amount, h.captured_at,
@@ -237,23 +327,65 @@ async function main() {
                 `${decimalsOf.size} token decimals · ${robinhoodOnly.size} robinhood-only traders`);
 
     // ------------------------------------------------------- day boundaries
-    const head   = Number(BigInt(await call("eth_blockNumber", [])));
+    const head   = Number(BigInt(await patient("head", () => call("eth_blockNumber", [], LOG_TRIES))));
     const headTs = await blockTimestamp(head);
     const rate   = await calibrate(head, headTs);
     console.log(`block rate measured at ${rate.toFixed(4)} s/block (hint was ${BLOCK_SEC_HINT})`);
     const midnight = new Date();
     midnight.setUTCHours(0, 0, 0, 0);
 
-    const boundaries = [];
-    for (let d = DAYS; d >= 1; d--) {
-      const at = new Date(midnight.getTime() - d * 86400_000);
-      boundaries.push({ at, sec: Math.floor(at.getTime() / 1000) });
+    /*
+     * THE SCAN GRID IS PINNED ON FIRST RUN, and not pinning it is what made the cache
+     * useless. Every cache key starts with the window's first block, and the first block came
+     * from re-resolving "30 days ago" against a head that had moved -- run 1 landed on
+     * 33,213,277 and run 2 on 33,213,275. Two blocks apart, every key different, 505 cached
+     * ranges silently refetched. Resolve the grid once, write it down, and a resume is a
+     * resume.
+     */
+    let grid = null;
+    if (fs.existsSync(gridFile())) {
+      try { grid = JSON.parse(fs.readFileSync(gridFile(), "utf8")); } catch { grid = null; }
+      if (grid && (grid.windowBlocks !== WINDOW_BLOCKS || grid.days !== DAYS)) {
+        console.log("cached grid was built for different settings — starting a new one");
+        grid = null;
+      }
     }
-    for (const b of boundaries) b.block = await blockAtTime(b.sec, head, headTs, rate);
-    const startBlock = boundaries[0].block;
-    console.log(`head ${head} (${new Date(headTs * 1000).toISOString()}) · ` +
-                `oldest boundary ${boundaries[0].at.toISOString().slice(0, 10)} at block ${startBlock} · ` +
-                `${(head - startBlock).toLocaleString()} blocks to scan`);
+
+    /*
+     * BOUNDARIES ARE PINNED; THE HEAD IS NOT.
+     *
+     * The day boundaries fix the cache keys and must never move. The head is different: it is
+     * where the walk is anchored, and pinning it to a head from hours ago makes the forward
+     * check compare today's wallet against a transfer set that stops yesterday -- which reads
+     * as a mismatch when nothing is actually wrong. Advancing it costs almost nothing: every
+     * window except the last has a fixed [from, from+size-1] key, so only the final window is
+     * refetched and a couple of new ones are appended.
+     */
+    let boundaries, scanHead;
+    if (grid) {
+      boundaries = grid.boundaries.map((b) => ({ at: new Date(b.at), sec: b.sec, block: b.block }));
+      scanHead = Math.max(grid.head, head);
+      if (scanHead !== grid.head) {
+        fs.writeFileSync(gridFile(), JSON.stringify({ ...grid, head: scanHead }));
+        console.log(`grid resumed: ${boundaries.length} boundaries · head advanced ` +
+                    `${grid.head} -> ${scanHead} (+${(scanHead - grid.head).toLocaleString()} blocks)`);
+      } else {
+        console.log(`grid resumed: ${boundaries.length} boundaries, head at ${scanHead}`);
+      }
+    } else {
+      boundaries = [];
+      for (let d = DAYS; d >= 1; d--) {
+        const at = new Date(midnight.getTime() - d * 86400_000);
+        boundaries.push({ at, sec: Math.floor(at.getTime() / 1000) });
+      }
+      for (const b of boundaries) b.block = await blockAtTime(b.sec, head, headTs, rate);
+      scanHead = head;
+      fs.writeFileSync(gridFile(), JSON.stringify({
+        windowBlocks: WINDOW_BLOCKS, days: DAYS, head: scanHead,
+        boundaries: boundaries.map((b) => ({ at: b.at.toISOString(), sec: b.sec, block: b.block })),
+      }));
+      console.log(`grid pinned: head ${scanHead}, oldest boundary block ${boundaries[0].block}`);
+    }
 
     /*
      * Every trader's anchor was captured at a slightly different moment, and the walk back
@@ -263,17 +395,24 @@ async function main() {
      */
     const anchorBlockAt = new Map();
     for (const r of anchorRows) {
-      const hr = Math.floor(new Date(r.captured_at).getTime() / 3600_000) * 3600;
-      if (!anchorBlockAt.has(hr)) anchorBlockAt.set(hr, await blockAtTime(hr, head, headTs, rate));
+      const sec = anchorSec(r.captured_at);
+      if (!anchorBlockAt.has(sec)) anchorBlockAt.set(sec, await blockAtTime(sec, head, headTs, rate));
     }
+    console.log(`${anchorBlockAt.size} distinct capture times resolved to blocks`);
+
+    const startBlock = boundaries[0].block;
+    console.log(`scanning ${startBlock.toLocaleString()} -> ${scanHead.toLocaleString()} ` +
+                `(${(scanHead - startBlock).toLocaleString()} blocks) for ` +
+                `${boundaries[0].at.toISOString().slice(0, 10)} .. ` +
+                `${boundaries[boundaries.length - 1].at.toISOString().slice(0, 10)}`);
 
     // --------------------------------------------------------------- the logs
     const chunks = [];
     for (let i = 0; i < addresses.length; i += ADDR_CHUNK) chunks.push(addresses.slice(i, i + ADDR_CHUNK).map(padTopic));
 
     const windows = [];
-    for (let from = startBlock; from <= head; from += WINDOW_BLOCKS) {
-      windows.push([from, Math.min(head, from + WINDOW_BLOCKS - 1)]);
+    for (let from = startBlock; from <= scanHead; from += WINDOW_BLOCKS) {
+      windows.push([from, Math.min(scanHead, from + WINDOW_BLOCKS - 1)]);
     }
     const planned = windows.length * chunks.length * 2;
     console.log(`fetching logs: ${windows.length} windows x ${chunks.length} address chunks x 2 sides = ${planned} requests`);
@@ -286,7 +425,8 @@ async function main() {
       for (const [ci, chunk] of chunks.entries()) {
         for (const side of [1, 2]) {
           const topics = side === 1 ? [TRANSFER, chunk, null] : [TRANSFER, null, chunk];
-          for (const l of await cachedLogs(from, to, topics, `${from}-${to}-c${ci}-s${side}`)) {
+          const realCi = ONLY_CHUNK === null ? ci : ONLY_CHUNK;
+          for (const l of await cachedLogs(from, to, topics, `${from}-${to}-c${realCi}-s${side}`)) {
             const k = `${l.transactionHash}:${l.logIndex}`;
             if (seen.has(k)) continue;       // an internal transfer matches both sides
             seen.add(k);
@@ -324,12 +464,19 @@ async function main() {
       if (hTo)   push(hTo,   l.token, l.block,  l.raw);
     }
 
+    const inScope = new Set(handleOf.values());
     const anchorOf = new Map();  // handle:token -> { amount, decimals, isNative, anchorBlock }
     for (const r of anchorRows) {
-      const hr = Math.floor(new Date(r.captured_at).getTime() / 3600_000) * 3600;
+      if (!inScope.has(r.handle)) continue;
+      const sec = anchorSec(r.captured_at);
       anchorOf.set(`${r.handle}:${r.token_key}`, {
         amount: Number(r.amount), decimals: r.decimals === null ? null : Number(r.decimals),
-        isNative: r.is_native === true, anchorBlock: anchorBlockAt.get(hr) ?? head,
+        /*
+         * Clamped to the pinned head: the scan stops there, so an anchor above it would be
+         * missing the transfers between, and every balance under it would be wrong.
+         */
+        isNative: r.is_native === true,
+        anchorBlock: Math.min(anchorBlockAt.get(sec) ?? scanHead, scanHead),
       });
     }
     // A coin fully sold inside the window has no anchor row. Its past balance is still
@@ -337,7 +484,7 @@ async function main() {
     for (const k of deltas.keys()) {
       if (anchorOf.has(k)) continue;
       const token = k.slice(k.indexOf(":") + 1);
-      anchorOf.set(k, { amount: 0, decimals: decimalsOf.get(token) ?? null, isNative: false, anchorBlock: head });
+      anchorOf.set(k, { amount: 0, decimals: decimalsOf.get(token) ?? null, isNative: false, anchorBlock: scanHead });
     }
 
     // ------------------------------------------------------------------ verify
@@ -350,6 +497,42 @@ async function main() {
      * rebuilt point is wrong.
      */
     if (VERIFY) {
+      /*
+       * CLOSE THE RACE FIRST.
+       *
+       * The transfer set stops at scanHead, fixed when the run started; the live balance we
+       * are about to read is from right now. On an actively trading wallet those are minutes
+       * apart, and a coin sold in between shows up as "moved 0 vs live 0" -- a mismatch that
+       * fails the run while nothing is actually wrong. So pull the few thousand blocks since
+       * scanHead before comparing. Anchors sit far below this, so the walk is untouched; only
+       * the forward check needs it.
+       */
+      const liveHead = Number(BigInt(await patient("head", () => call("eth_blockNumber", [], LOG_TRIES))));
+      if (liveHead > scanHead) {
+        let tail = 0;
+        for (const chunk of chunks) {
+          for (const side of [1, 2]) {
+            const topics = side === 1 ? [TRANSFER, chunk, null] : [TRANSFER, null, chunk];
+            for (const l of await splitLogs(scanHead + 1, liveHead, topics)) {
+              if (!l.topics || l.topics.length < 3) continue;
+              const k = `${l.transactionHash}:${l.logIndex}`;
+              if (seen.has(k)) continue;
+              seen.add(k);
+              let raw; try { raw = BigInt(l.data); } catch { continue; }
+              const token = l.address.toLowerCase();
+              const hFrom = handleOf.get(addrOf(l.topics[1]));
+              const hTo   = handleOf.get(addrOf(l.topics[2]));
+              const blk   = Number(BigInt(l.blockNumber));
+              if (hFrom) push(hFrom, token, blk, -raw);
+              if (hTo)   push(hTo,   token, blk,  raw);
+              tail++;
+            }
+          }
+        }
+        console.log(`  caught up ${(liveHead - scanHead).toLocaleString()} blocks since the scan ` +
+                    `(${tail} transfers) so the forward check is not racing the chain`);
+      }
+
       const addrOfHandle = new Map();
       for (const [addr, h] of handleOf) if (!addrOfHandle.has(h)) addrOfHandle.set(h, addr);
 

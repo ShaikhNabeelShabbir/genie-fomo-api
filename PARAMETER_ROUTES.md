@@ -1503,6 +1503,12 @@ A chain series answers *"how much of him is on this chain, and how has that move
 chains all answer; `chain` on the response echoes which one you narrowed to, and `null` there
 means you are looking at the whole portfolio.
 
+**On robinhood the series reaches thirty days back.** 10,230 reconstructed points across 341
+traders, worked out backwards from that chain's own `Transfer` logs and written
+`basis: "rebuilt"` / `tier: "reported"`. The balances are proved forward before anything is
+written: the anchor balance plus every transfer since that block must equal what the wallet
+holds now, and it did for **40 of 40** sampled balances in each of the seven address batches.
+
 **`count` is how much history is behind the line, and it is honest about it.** The series
 deepens by one point per sampling run, so a consumer should draw `count` points rather than
 assume a full window — `trackedSince` says when the record starts.
@@ -1521,6 +1527,12 @@ chain's own `Transfer` logs. `plain` names the seam in words.
 The counts on a portfolio point describe the whole trader, so showing them beside one chain's
 dollars would make the line look like it changed scope halfway along. `pricedShare` means the
 same thing on every point.
+
+**Read `pricedShare` before comparing a rebuilt point to a sampled one.** A rebuilt point is
+valued from prices carrying a date, a sampled point from live prices, and the two cover
+different fractions of the same wallet — so the step at `trackedSince` reflects how much of
+him each side could value, not a move he made. `pricedShare` gives the fraction on both, and
+a day nothing could be valued returns `totalUsd: null` rather than a zero.
 
 ### What to know before you use it
 
@@ -1714,7 +1726,7 @@ rather than a build.
 | **§4** | every swap, both sides, valued from the money side, with a stated cap | `GET /traders/:id/trades` — `side`, `token`, `money`, `valueUsd` with `valueSource: "money_side"`, `priceUsd` as a cross-check, `?chain=`/`?since=`, `limit` and `capped` stated. **§10** |
 | **§5** | a `measurements` block for every trader, one stated definition, each figure with `basis`, `window`, `coverage`, `asOf` | on every scorecard. **99.08%** of traders carry a usable rhythm figure, reported on `/health`. **§3** |
 | **§6** | loud failures, `asOf` on every figure, `/health` freshness, stable error codes, stated caps | `include_unavailable` (503) rather than a 200 with a missing block; `requestId` in the body and the `x-request-id` header; per-feed `lastRefreshAt` on `/health`; stable codes with no internal text; every route bounded, answering `code: "timeout"` rather than hanging; pool pressure answers `429` with `Retry-After`. **§0a** |
-| **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. `?chain=` narrows the series to one chain, with `basis` and `tier` on every point and `trackedSince` marking where measured sampling begins. **§9** — the daily sampler fills the window forward from `trackedSince` |
+| **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. `?chain=` narrows the series to one chain, with `basis` and `tier` on every point and `trackedSince` marking where measured sampling begins. On robinhood it reaches **thirty days** back — 10,230 points across 341 traders, rebuilt from that chain's transfer logs and proved forward on 40 of 40 balances per batch. **§9** — the daily sampler fills the window forward from `trackedSince` |
 | **§8** | batch reads for the whole directory in a bounded number of calls, with cost stated | `POST /traders/positions` and `POST /traders/aum`, 50 per call, `limit`/`asked`/`capped` on every response, `X-Cost-Units` on every success. **§11** |
 
 ### The one thing still on the clock
