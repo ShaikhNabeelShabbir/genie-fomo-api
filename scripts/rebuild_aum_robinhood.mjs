@@ -605,11 +605,24 @@ async function main() {
       a.push({ t, px: Number(r.px) });
     }
     for (const a of series.values()) a.sort((x, y) => x.t - y.t);
-    console.log(`${pxRows.length.toLocaleString()} dated price observations across ${series.size.toLocaleString()} tokens`);
+
+    /*
+     * A pegged coin is worth its peg on every date -- the one price that applies to a past
+     * balance without guessing. Valuing an old balance at today's price would fold price
+     * movement into a chart about balance movement; a stablecoin has no such ambiguity.
+     */
+    const { rows: pegged } = await client.query(
+      `select token_key, pegged_usd::float8 px from quote_assets
+       where network_id = ${RH_NETWORK_ID} and pegged_usd is not null`);
+    const peg = new Map(pegged.map((r) => [r.token_key, Number(r.px)]));
+    console.log(`${pxRows.length.toLocaleString()} dated price observations across ${series.size.toLocaleString()} tokens` +
+                ` · ${peg.size} pegged assets priced at any date`);
 
     /** Nearest dated observation, within PRICE_GAP_DAYS. Beyond that the day is unpriced. */
     const GAP = PRICE_GAP_DAYS * 86400_000;
     const priceAt = (token, ms) => {
+      const fixed = peg.get(token);
+      if (fixed !== undefined) return fixed;
       const a = series.get(token); if (!a) return null;
       let lo = 0, hi = a.length - 1, best = null, bestD = Infinity;
       while (lo <= hi) {

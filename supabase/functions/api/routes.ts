@@ -3249,6 +3249,73 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
         order by a.total_usd desc nulls last`
     : [];
 
+  /*
+   * REACH -- what the stored data actually covers, as opposed to what was asked for
+   * (AUM_CHART_PRD.md §3.3). `from` echoes the request and is not evidence of anything; a
+   * caller that reads it as coverage will label a one-point series "30D". So the span the
+   * rows genuinely cover is stated separately, and `complete` is the service's own answer
+   * to "does this reach the window you asked for".
+   */
+  const firstAt = points.length ? Date.parse(points[0].at) : null;
+  const lastAt  = points.length ? Date.parse(points[points.length - 1].at) : null;
+  const requestedDays = span === null ? null : Math.round(span / 86_400_000);
+  const coveredDays = firstAt !== null && lastAt !== null
+    ? Math.max(0, Math.round((lastAt - firstAt) / 86_400_000))
+    : 0;
+
+  /*
+   * Points that can actually be plotted together. A refused point has no number, and two
+   * numbers valued on different bases are not a line -- so "usable" means numeric, and the
+   * decision about whether that is enough belongs here rather than in every consumer.
+   */
+  const usable = points.filter((p) => p.totalUsd !== null);
+  const newestRow = rows.length ? rows[rows.length - 1] : null;
+
+  let drawable = true;
+  let reason: string | null = null;
+  if (usable.length < 3) {
+    /*
+     * Fewer than three numbers. Which of these it is matters to the reader: a backfill that
+     * has not finished is temporary and worth waiting for, a refusal is not, and "we have
+     * two points" is neither. The newest row's own refusal reason is the most specific
+     * answer available, so it wins when there is one.
+     */
+    drawable = false;
+    reason = newestRow?.refused_reason
+      ? String(newestRow.refused_reason)
+      : (coveredDays === 0 ? "warming" : "too_few_points");
+  } else if (requestedDays !== null && coveredDays + 1 < requestedDays) {
+    // Enough points to draw, but not across the span that was asked for. Both facts are true
+    // and the consumer needs the second one to label its axis honestly.
+    drawable = false;
+    reason = "short_coverage";
+  }
+
+  /*
+   * Gaps are returned, never smoothed over (§3.4). A bucket with no number is a hole in the
+   * record, and a chart that joins across it draws a balance the trader never held.
+   */
+  const gaps = points
+    .filter((p) => p.totalUsd === null)
+    .map((p) => ({ at: p.at, reason: (p as { refused?: string }).refused ?? "no_prices" }));
+
+  /*
+   * How much of the trader each point could see (§3.2). A chain we hold no row for at that
+   * moment did not contribute zero dollars -- it contributed nothing at all, and the counts
+   * are what let a reader tell those apart.
+   */
+  const [presence] = await sql`
+    select count(distinct network_id)::int as chains
+    from holdings_current where handle = ${t.handle} and human_amount > 0`;
+  const totalChains = Number(presence?.chains ?? 0);
+  const [answered] = newestRow
+    ? await sql`
+        select count(*)::int as chains
+        from aum_chain_samples
+        where handle = ${t.handle} and at = ${newestRow.at} and basis = ${newestRow.basis}
+          and total_usd is not null`
+    : [{ chains: 0 }];
+
   return {
     handle: t.display_handle,
     /** Null means the whole portfolio. A name means this series is that chain alone. */
@@ -3271,6 +3338,33 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
       }
       : null,
     count: points.length,
+
+    /** What the stored data covers, as opposed to what was requested. */
+    reach: {
+      requestedFrom: from ? from.toISOString() : null,
+      coveredFrom: points.length ? points[0].at : null,
+      coveredTo: points.length ? points[points.length - 1].at : null,
+      requestedDays,
+      coveredDays,
+      complete: requestedDays === null ? points.length > 0 : coveredDays + 1 >= requestedDays,
+    },
+
+    /**
+     * The service's own answer to "can this be drawn". Consumers must not infer readiness
+     * from `window`, `from`, `count` or the position counts -- only this service knows
+     * whether a change in the line came from the trader or from missing data.
+     */
+    drawing: { drawable, usablePoints: usable.length, reason },
+
+    /** Coverage of the newest point, in chains rather than positions. */
+    coverage: {
+      answeredChains: Number(answered?.chains ?? 0),
+      totalChains,
+    },
+
+    /** Holes in the record, with their reasons. A chart breaks its line at each of these. */
+    gaps,
+
     points,
     chains: chainRows.map((r) => ({
       chain: r.chain as string,

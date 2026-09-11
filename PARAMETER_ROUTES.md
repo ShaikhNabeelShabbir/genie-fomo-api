@@ -1534,6 +1534,45 @@ different fractions of the same wallet — so the step at `trackedSince` reflect
 him each side could value, not a move he made. `pricedShare` gives the fraction on both, and
 a day nothing could be valued returns `totalUsd: null` rather than a zero.
 
+### The service decides whether the series can be drawn
+
+```bash
+curl -s "$B/traders/pointfarmcap/aum?window=1m&chain=robinhood" | jq '{reach, drawing}'
+```
+
+```json
+{
+  "reach": { "requestedFrom": "2026-08-12T08:38:38Z", "coveredFrom": "2026-08-13T00:00:00Z",
+             "coveredTo": "2026-09-10T16:00:00Z",
+             "requestedDays": 30, "coveredDays": 29, "complete": true },
+  "drawing": { "drawable": true, "usablePoints": 29, "reason": null }
+}
+```
+
+**`from` echoes the request. `reach` is the evidence.** Asking for a month does not create a
+month, so the span the stored rows actually cover is stated separately, and `complete` answers
+"does this reach the window you asked for" directly.
+
+**Do not infer readiness from `window`, `from`, `count` or the position counts** — read
+`drawing.drawable`. Only the service knows whether a change in the line came from the trader
+or from missing data, so it makes the call rather than leaving each consumer to guess.
+
+| `drawing.reason` | What it means |
+| --- | --- |
+| `null` | drawable — plot it |
+| `warming` | backfill or first sampling still running; temporary |
+| `too_few_points` | fewer than three comparable numeric points |
+| `short_coverage` | enough points, but not across the requested window |
+| `wallet_unreadable` · `service_timeout` · `no_prices` · `price_rejected` | the newest point's own refusal |
+
+**`gaps[]` lists every bucket with no number, and its reason.** Nothing is interpolated — a
+chart breaks its line at each gap rather than drawing through it, because joining two points
+across a hole draws a balance the trader never held.
+
+**`coverage.answeredChains` / `totalChains` say how much of the trader a point could see.** A
+chain with no row at that moment did not contribute zero dollars; it contributed nothing at
+all, and those are different facts.
+
 ### What to know before you use it
 
 **The parts sum to the whole.** `sum(chains[].totalUsd)` equals `now.totalUsd` on every
