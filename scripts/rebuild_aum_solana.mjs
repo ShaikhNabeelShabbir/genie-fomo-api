@@ -249,6 +249,24 @@ async function main() {
         catch (e) { console.log(`${tag} live read failed: ${e.message} — skipped`); skipped++; continue; }
       }
 
+      /*
+       * RECONCILE PER MINT, NOT PER WALLET, and the old all-or-nothing gate was the mistake.
+       *
+       * Diagnosed on frankdegods: 1,337 of 1,354 positions reproduced exactly, yet only 1.1%
+       * of his money did -- because 99.94% of the failure was ONE position, USDC. Helius does
+       * not fully attribute high-velocity quote-asset flows on a heavy trader: the outbound
+       * legs arrive and the matching inbound legs do not, so USDC over-subtracts by ~808k
+       * while everything else is right. It is not staleness (adding fresh pages made it
+       * worse), not duplicate token accounts (0 of 2,180), and not double-counted changes
+       * (0 repeats).
+       *
+       * Discarding the wallet over that threw away 1,337 good positions to avoid one bad one.
+       * So the gate moved down a level: a mint that reproduces is used, a mint that does not
+       * is counted as a position we cannot value and never contributes a number. That is how
+       * native ETH is already handled on robinhood, and it is the same rule -- a thing we
+       * cannot state is absent from the total and present in the denominator.
+       */
+      const failedMint = new Set();
       let pass = 0, fail = 0, usdOk = 0, usdAll = 0;
       for (const [mint, a] of live ? anchors : []) {
         const actual = live.get(mint);
@@ -258,23 +276,19 @@ async function main() {
         const predicted = a.amount + since;
         const d = Math.abs(predicted - actual) / Math.max(Math.abs(actual), 1e-9);
         usdAll += a.usd;
-        if (d < VERIFY_TOL) { pass++; usdOk += a.usd; } else fail++;
+        if (d < VERIFY_TOL) { pass++; usdOk += a.usd; }
+        else { fail++; failedMint.add(mint); }
       }
       const checked = pass + fail;
-      /*
-       * A wallet whose money does not reconcile is not written at all. When every position
-       * we could check is worth nothing, there is no value to weigh, so the count is the only
-       * evidence left and it has to carry the decision.
-       */
       const share = usdAll > 0 ? usdOk / usdAll : (checked ? pass / checked : 1);
-      if (checked >= 3 && share < VERIFY_MIN_VALUE_SHARE) {
-        console.log(`${tag} verify ${pass}/${checked} · ${(share * 100).toFixed(1)}% of value ` +
-                    `— skipped, the money does not reconcile`);
-        /*
-         * Remove anything an earlier unverified pass wrote for this wallet. A wallet that
-         * fails the check must not keep serving numbers just because it was written before
-         * we could check it.
-         */
+
+      /*
+       * The wallet is only refused outright when NOTHING reconciles. At that point the
+       * movement stream says nothing trustworthy about this wallet at all, and the mints we
+       * could not check have no credibility to borrow from the ones we could.
+       */
+      if (checked >= 3 && pass === 0) {
+        console.log(`${tag} verify 0/${checked} — skipped, nothing reconciles`);
         if (!DRY) {
           try {
             const gone = await client.query(
@@ -282,8 +296,6 @@ async function main() {
                  and network_id = ${NETWORK_ID} returning 1`, [w.handle]);
             console.log(`${tag}   removed ${gone.rowCount} previously written rows`);
           } catch (e) {
-            // Loudly, because the alternative is a wallet that failed its check quietly
-            // continuing to serve numbers.
             console.log(`${tag}   DELETE FAILED (${e.message}) — stale rows may still be served`);
           }
         }
@@ -309,11 +321,17 @@ async function main() {
           const ms = boundaries[bi].getTime();
           let c = perDay.get(ms); if (!c) perDay.set(ms, c = { usd: 0, priced: 0, total: 0 });
           c.total++;
+          /*
+           * A mint whose own balance we could not reproduce is counted and never valued. It
+           * is a real holding we cannot state, which is exactly what the denominator is for.
+           */
+          if (failedMint.has(mint)) continue;
           const v = value(bal, priceAt(mint, ms));
           if (v.usd !== undefined) { c.usd += v.usd; c.priced++; }
         }
       }
-      console.log(`${tag} ${live ? `verify ${pass}/${checked} · ${(share * 100).toFixed(1)}% of value` : "UNVERIFIED (offline)"} · ` +
+      console.log(`${tag} ${live ? `verify ${pass}/${checked} · ${(share * 100).toFixed(1)}% of value` +
+                    (failedMint.size ? ` · ${failedMint.size} mint(s) excluded` : "") : "UNVERIFIED (offline)"} · ` +
                   `${changes.length} changes · ${perDay.size} days`);
       if (!perDay.size || DRY) { if (DRY) wrote += perDay.size; continue; }
 

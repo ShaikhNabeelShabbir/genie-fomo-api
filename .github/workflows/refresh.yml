@@ -170,6 +170,18 @@ jobs:
           HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
         run: node scripts/load_aum_samples.mjs
 
+      # Derived from the transactions loaded above, so it runs after them and before anyone
+      # reads the route. GET /traders/:id/positions used to recompute this per request and
+      # spent ~9 seconds of CPU on our busiest wallet, returning 503 past the route budget.
+      # Precomputing it takes ~13 seconds for the whole table.
+      #
+      # continue-on-error because a stale timing table serves slightly old first-seen dates,
+      # which is a far smaller problem than failing a run whose loaders all succeeded.
+      - name: Refresh position timing
+        continue-on-error: true
+        timeout-minutes: 15
+        run: node scripts/refresh_position_timing.mjs
+
       # ---------------------------------------------------------------- summary
       # `always()` so a failed run still reports how far it got. Each script commits its own
       # work independently, so a late failure leaves the earlier steps landed — the job goes

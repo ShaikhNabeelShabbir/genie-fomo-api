@@ -510,6 +510,22 @@ positive; both dollar figures are always returned regardless.
 T11 and T13 ship together by rule. "Holds 97 coins" reads as diversified until you see that
 98.7% of the money is in one of them.
 
+### Paging the asset list
+
+```bash
+curl -s "$B/traders/unipcs/positions?limit=100" | jq '{count, positions, complete, nextCursor}'
+curl -s "$B/traders/unipcs/positions?limit=100&cursor=<nextCursor>" | jq '{count, complete}'
+```
+
+**`complete: false` means rows remain, and a `false` page is not a portfolio.** `positions` is
+the full count, `count` is what this page holds, and `nextCursor` is null only on the last
+page. Walked end to end on `unipcs`: **521 assets over 6 pages, no asset repeated, none lost.**
+
+**The cursor names the last row returned, not an offset**, so a position appearing or
+disappearing between pages cannot make the sequence skip or repeat one. Row identity is
+`(chain, tokenAddress)` — never `symbol`, which is display metadata two different coins can
+share.
+
 ### Every position says where its numbers came from
 
 `entries[]` carries the provenance of both halves of a valuation — the amount and the price:
@@ -1526,13 +1542,24 @@ means you are looking at the whole portfolio.
 | robinhood | 10,230 | 341 | every `Transfer` log replayed backwards from today's balance |
 | bsc | 8,010 | 267 | asked an archive node for the balance at that block |
 | ethereum | 7,440 | 248 | asked an archive node for the balance at that block |
+| solana | 5,091 | 169 | the balance each transaction recorded, from Helius |
 | base | 4,500 | 150 | asked an archive node for the balance at that block |
-| solana | 1,980 | 66 | the balance each transaction recorded, from Helius |
+
+**35,271 points across 388 of 435 traders**, and **363 traders have at least one series with
+three or more usable points** — enough for the service to call it drawable.
 
 **Nothing is written until it reproduces the wallet.** Where a balance is inferred rather than
 read — robinhood and Solana — the anchor plus every movement since it must equal what the
 wallet holds now before a single row is stored. robinhood passed **40 of 40** in each of its
-seven address batches; Solana is gated the same way, per wallet.
+seven address batches. Solana is checked **per coin**: 169 of 170 wallets reconcile, and a coin
+whose own balance cannot be reproduced is counted as a position and never valued, exactly as
+native ETH is on robinhood. One wallet reconciles nothing and is not written at all.
+
+**`reach.complete` is judged against the data's own granularity.** Rebuilt history is daily, so
+a week requested at six-hour steps is not "short" merely because its oldest point sits inside
+a boundary computed to the millisecond. The slack is the larger of the requested step and the
+median spacing of the points actually held — so a complete daily month reports `complete: true`
+rather than 29 of 30.
 
 **`count` is how much history is behind the line, and it is honest about it.** The series
 deepens by one point per sampling run, so a consumer should draw `count` points rather than

@@ -1059,21 +1059,23 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
 /**
  * T1.1. When a wallet first received a token, last sent it, and last did anything.
  *
- * Straight off `transactions`, which the Helius webhook keeps current — no external call and
- * no new table. `transactions_address_idx` covers it: a bitmap index scan over one trader's
- * ~30k rows measures 63ms server-side.
+ * READ, NOT COMPUTED. This used to aggregate the wallet's whole transaction history on every
+ * request. For our busiest wallet that is 66,773 rows and about 9 seconds of CPU -- per view
+ * -- which put GET /traders/:id/positions past its 15-second budget and returned 503 to the
+ * traders people most want to look at. A covering index cut the disk reads a hundredfold and
+ * left the CPU cost untouched, because the work was the wrong shape rather than merely slow.
  *
- * Addresses are passed already resolved. Both of a trader's wallets go in one `any()` rather
- * than a query each, so a trader costs one round-trip regardless of how many chains they use.
+ * These values change only when new transactions arrive, so the nightly loader derives them
+ * once into position_timing and the route reads them by index. See
+ * scripts/refresh_position_timing.mjs.
+ *
+ * Both of a trader's wallets go in one `any()` rather than a query each, so a trader costs
+ * one round-trip regardless of how many chains they use.
  */
 const positionTiming = (addrs: string[]) => sql`
-  select network_id, token_key,
-         min(block_time) filter (where direction = 'in')  as start_at,
-         max(block_time) filter (where direction = 'out') as end_at,
-         max(block_time)                                  as last_at
-  from transactions
-  where address_key = any(${addrs})
-  group by network_id, token_key`;
+  select network_id, token_key, start_at, end_at, last_at
+  from position_timing
+  where address_key = any(${addrs})`;
 
 /**
  * T1.2. On-chain activity counters for a set of wallets.
@@ -1226,8 +1228,25 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
 
   const filtered = url.searchParams.get("includeQuote") === "false"
     ? all.filter((r) => !r.isQuoteAsset) : all;
-  const limit = intParam(url, "limit", { min: 1, fallback: null });
-  const page = limit === null ? filtered : filtered.slice(0, limit);
+  /*
+   * PAGED, AND HONEST ABOUT IT. This route used to return the first `limit` rows with nothing
+   * saying more existed -- so 50 of unipcs' 521 positions looked exactly like his whole
+   * portfolio, and a `cursor` parameter was accepted and silently ignored. The PRD forbids
+   * precisely that: "Paged or capped assets are visibly incomplete and never presented as the
+   * entire portfolio."
+   *
+   * The cursor names the last row returned, not an offset, so inserting or removing a
+   * position between pages cannot skip or repeat one. Identity is (chain, token address) --
+   * never the symbol, which is display metadata two different coins can share.
+   */
+  const limit = intParam(url, "limit", { min: 1, max: 500, fallback: null });
+  const cursor = url.searchParams.get("cursor");
+  const rowId = (r: { chain: string; tokenAddress: string | null }) =>
+    `${r.chain}:${String(r.tokenAddress ?? "").toLowerCase()}`;
+  const from = cursor ? resumeAfter(filtered, cursor, rowId) : 0;
+  const page = limit === null ? filtered.slice(from) : filtered.slice(from, from + limit);
+  const last = page.length ? page[page.length - 1] : null;
+  const more = from + page.length < filtered.length;
   const priced = all.filter((r) => r.valueUsd !== null).length;
 
   return {
@@ -1238,6 +1257,16 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     asOf: await asOfHoldings(t.handle as string),
     count: page.length,
     positions: filtered.length,
+    /** What was asked for, so a short page is legible as a page rather than a total. */
+    limit,
+    /**
+     * Null when this page is the end of the list. Pass it back as `?cursor=` for the next
+     * page; it names the row you stopped on, so the sequence survives the list changing
+     * underneath you.
+     */
+    nextCursor: more && last ? encodeCursor([rowId(last)]) : null,
+    /** False whenever rows remain. A consumer must not call a `false` page a portfolio. */
+    complete: !more,
     totalValueUsd: total > 0 ? round(total) : null,
     coverage: { pricedPositions: priced, unpricedPositions: all.length - priced },
     /**
@@ -3236,6 +3265,39 @@ function buildAum(
     ? Math.max(0, Math.round((lastAt - firstAt) / 86_400_000))
     : 0;
 
+  /*
+   * DOES THE DATA REACH BACK TO WHAT WAS ASKED FOR -- measured as a gap, not a day count.
+   *
+   * The first version compared coveredDays against requestedDays, which is off by one bucket
+   * by construction: thirty daily points span twenty-nine days of difference, so a complete
+   * month always reported 29 of 30 and `complete: false`. pointfarmcap had all thirty days
+   * present and valued and still failed the PRD's own acceptance test.
+   *
+   * What actually matters is whether the oldest point we hold sits at or before the start of
+   * the requested window, allowing one step of slack -- a daily series cannot be expected to
+   * land exactly on a boundary computed to the millisecond.
+   */
+  /*
+   * The slack is the DATA's granularity, not the requested step. Rebuilt history is daily, so
+   * a week asked for at six-hour steps would judge a complete daily series "short" purely
+   * because its oldest point sits a day inside a boundary computed to the millisecond. That
+   * is a category error, not a coverage gap -- pointfarmcap held all thirty days and was
+   * reported short on the 1w window. So the tolerance is the larger of the requested step and
+   * the median spacing of the points we actually hold.
+   */
+  const spacings: number[] = [];
+  for (let i = 1; i < points.length; i++) {
+    const gap = Date.parse(points[i].at) - Date.parse(points[i - 1].at);
+    if (Number.isFinite(gap) && gap > 0) spacings.push(gap);
+  }
+  spacings.sort((a, b) => a - b);
+  const medianGap = spacings.length ? spacings[Math.floor(spacings.length / 2)] : 0;
+  const slack = Math.max(chosen.ms, medianGap);
+
+  const reachesBack = from === null
+    ? points.length > 0
+    : firstAt !== null && firstAt - from.getTime() <= slack;
+
   const usable = points.filter((p) => p.totalUsd !== null);
   let drawable = true;
   let reason: string | null = null;
@@ -3248,7 +3310,9 @@ function buildAum(
     reason = newest?.refused_reason
       ? String(newest.refused_reason)
       : (coveredDays === 0 ? "warming" : "too_few_points");
-  } else if (requestedDays !== null && coveredDays + 1 < requestedDays) {
+  } else if (!reachesBack) {
+    // Enough points to draw, but not across the span that was asked for. Both facts are true
+    // and the consumer needs the second one to label its axis honestly.
     drawable = false;
     reason = "short_coverage";
   }
@@ -3307,7 +3371,7 @@ function buildAum(
       coveredTo: points.length ? points[points.length - 1].at : null,
       requestedDays,
       coveredDays,
-      complete: requestedDays === null ? points.length > 0 : coveredDays + 1 >= requestedDays,
+      complete: reachesBack,
     },
 
     /**
