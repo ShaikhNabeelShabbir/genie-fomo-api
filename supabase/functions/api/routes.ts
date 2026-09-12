@@ -3094,6 +3094,15 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     transfers: rows.map((r) => ({
       chain: r.chain,
       networkId: Number(r.network_id),
+      /**
+       * `txHash` is the name every other route uses -- /trades has always spelled it that
+       * way. This route emitted `tx_hash` alone, the one snake_case key in an otherwise
+       * camelCase API, which is an oversight rather than a convention.
+       *
+       * Both are returned: the old spelling stays so nothing reading it breaks, and new
+       * consumers get the name that matches the rest of the API. `tx_hash` is deprecated.
+       */
+      txHash: r.tx_hash,
       tx_hash: r.tx_hash,
       time: r.block_time ?? null,
       side: r.direction ?? null,

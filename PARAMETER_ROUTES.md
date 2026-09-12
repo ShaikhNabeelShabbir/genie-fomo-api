@@ -1,9 +1,11 @@
 # genie-fomo API — complete reference
 
-**Generated: 2026-09-09T09:20Z** · **Updated 2026-09-10** — the directory carries
-GMGN-sourced traders alongside fomo's (§0d), every trader has a **stable id** and wallets
-that name their **chains** (§0e), balances are **read from the chain** (§2), and there is a
-**balance series over time** (§9).
+**Generated: 2026-09-09T09:20Z** · **Updated 2026-09-12** — the directory carries
+GMGN-sourced traders alongside fomo's (§0d); the **stable id works on every per-trader route**
+and wallets name their **chains** (§0e); balances are **read from the chain** and the asset
+list **pages** (§2); the **balance series reaches thirty days back on all five chains**, with
+the service's own `reach` and `drawing` verdict (§9); and the batch routes answer with
+**identity-safe rows carrying the complete AUM object** under `contractVersion: 2` (§11).
 
 Everything the API answers, in one document: the **35 PARAMETERS.md parameters**, the **10
 GMGN-parity features** built on top of them, and the corrections from the bug report. One row
@@ -17,7 +19,8 @@ per thing you can ask — what it means in plain words, the exact call, and the 
 | Plugin requirements (§ series) | **8 of 8 shipped** — see Appendix C |
 | Routes | **19** — 17 `GET`, 2 `POST` batch, plus bulk `?include=` |
 | Traders in the directory | **435** — 144 from fomo, **291 from GMGN** |
-| Positions | **36,506**, read from chain |
+| Positions | **36,506**, read from chain across **5 chains** |
+| Balance history | **35,271 rebuilt points** over 30 days · **388 of 435** traders · **363** with a drawable series |
 
 **Every figure below is a dated example, not current state.** They were pulled from the live
 service at the timestamp above; the pipeline refreshes nightly and the Helius webhook ingests
@@ -772,6 +775,9 @@ in dollars, from the blockchain.
 # per-transfer dollar size
 curl -s "$B/traders/unipcs/transactions?kind=swap&limit=10" | jq '.transfers[] | {side, token, amount, costUsd}'
 
+# one transfer row in full
+curl -s "$B/traders/unipcs/transactions?limit=1" | jq '.transfers[0]'
+
 # whole-wallet totals
 curl -s "$B/traders/unipcs/transactions?limit=1" | jq '.money'
 
@@ -790,6 +796,11 @@ curl -s "$B/traders/Quanterty/transactions?limit=1" | jq '.money'
 ```
 
 ### What to know before you use it
+
+**A transfer row is keyed by `txHash`.** Every route in this API spells it that way. This one
+also still returns `tx_hash`, the same value under the older snake_case name it was first
+published with, so nothing reading it breaks — but `txHash` is the one to use and `tx_hash`
+is deprecated.
 
 **This is how much money MOVED, not the price paid per token.** We stored the quote side of a
 swap — the SOL or USDC — far more often than the memecoin side, which is exactly what makes
