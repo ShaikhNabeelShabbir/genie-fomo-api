@@ -5,7 +5,10 @@ GMGN-sourced traders alongside fomo's (§0d); the **stable id works on every per
 and wallets name their **chains** (§0e); balances are **read from the chain** and the asset
 list **pages** (§2); the **balance series reaches thirty days back on all five chains**, with
 the service's own `reach` and `drawing` verdict (§9); and the batch routes answer with
-**identity-safe rows carrying the complete AUM object** under `contractVersion: 2` (§11).
+**identity-safe rows carrying the complete AUM object** under `contractVersion: 2`, and a
+`chain` of their own (§11). A day is now stated from the chains that answered rather than
+refused whole, which took traders who can draw a line from 96 to **372 of 435** — see
+Appendix A3.
 
 Everything the API answers, in one document: the **35 PARAMETERS.md parameters**, the **10
 GMGN-parity features** built on top of them, and the corrections from the bug report. One row
@@ -20,7 +23,7 @@ per thing you can ask — what it means in plain words, the exact call, and the 
 | Routes | **19** — 17 `GET`, 2 `POST` batch, plus bulk `?include=` |
 | Traders in the directory | **435** — 144 from fomo, **291 from GMGN** |
 | Positions | **36,506**, read from chain across **5 chains** |
-| Balance history | **35,271 rebuilt points** over 30 days · **388 of 435** traders · **363** with a drawable series |
+| Balance history | **35,271 rebuilt points** over 30 days · **389 of 435** traders · **372** can draw a line (2+ dated figures), on **all four windows** |
 
 **Every figure below is a dated example, not current state.** They were pulled from the live
 service at the timestamp above; the pipeline refreshes nightly and the Helius webhook ingests
@@ -1591,6 +1594,45 @@ The counts on a portfolio point describe the whole trader, so showing them besid
 dollars would make the line look like it changed scope halfway along. `pricedShare` means the
 same thing on every point.
 
+**`now` is the newest reading we hold, whatever window you asked for.** Asking for one day
+used to return `now: null` on a trader carrying a month of history and a $5.1M balance — what
+someone is worth does not depend on how much of their past you requested. A null total there
+now means the newest reading was genuinely refused, and `refused` names why.
+
+**A short window borrows the readings just before it, marked `outsideWindow`.** History steps
+once a day, so a 24-hour window held at most one point and usually none — `window=1d` drew
+nothing for anybody. A one-day chart wants two figures: what he was worth at the start of the
+day and what he is worth now, and we hold both. The older one simply sat outside the filter.
+
+```bash
+curl -s "$B/traders/unipcs/aum?window=1d" | jq '{now: .now.totalUsd, points: [.points[] | {at, totalUsd, outsideWindow}]}'
+```
+
+Three rules keep that honest:
+
+- a borrowed point is **a real dated reading**, never interpolated, and carries `outsideWindow: true`
+- `reach.coveredFrom` / `coveredTo` report the span the line **actually** covers, not the span requested
+- borrowed points must share the newest point's **`basis`**, because a sampled figure and a
+  rebuilt one count different things. `@unipcs` held $15,665,318 sampled and $5,101,125 rebuilt
+  eight hours apart — borrowing across that seam would have drawn a 67% fall that never happened
+
+It borrows until the series holds **two readings that carry a figure**, not merely two rows: a
+refused day is not half a line.
+
+**A day is stated from the chains that answered, and says so.** Every point carries
+`coverage.chainsAnswered`, `coverage.chainsTotal` and `coverage.partial`:
+
+```json
+{ "pricedPositions": 2, "totalPositions": 83, "valueShare": 0,
+  "chainsAnswered": 1, "chainsTotal": 3, "partial": true }
+```
+
+A day used to be refused outright unless every chain the trader touches answered at it — which
+refused 8,894 days across the directory while the per-chain figures for those days existed all
+along. `partial: true` means the total is a **real figure for part of him**, not an estimate of
+all of him, and whether to draw it is the caller's decision. A day where *nothing* answered is
+still refused with a reason, because there is no number to state.
+
 **Read `pricedShare` before comparing a rebuilt point to a sampled one.** A rebuilt point is
 valued from prices carrying a date, a sampled point from live prices, and the two cover
 different fractions of the same wallet — so the step at `trackedSince` reflects how much of
@@ -1634,6 +1676,8 @@ month, so the span the stored rows actually cover is stated separately, and `com
 **Do not infer readiness from `window`, `from`, `count` or the position counts** — read
 `drawing.drawable`. Only the service knows whether a change in the line came from the trader
 or from missing data, so it makes the call rather than leaving each consumer to guess.
+
+**Two dated figures are a line; one never is.** That is the threshold `drawable` applies.
 
 | `drawing.reason` | What it means |
 | --- | --- |
@@ -1798,6 +1842,17 @@ curl -s -X POST "$B/traders/aum" -H 'content-type: application/json' \
 }
 ```
 
+**A batch can name a chain.** `chain` on the body does what `?chain=` does on the individual
+route, through the same resolver and the same code:
+
+```bash
+curl -s -X POST "$B/traders/aum" -H 'content-type: application/json' \
+  -d '{"contractVersion":2,"ids":["unipcs","zakum"],"window":"1m","chain":"robinhood"}' \
+  | jq '{chain, rows: [.traders[] | {requested, points: .aum.count}]}'
+```
+
+Without it, a screen of fifty traders on one chain was fifty calls. It is now one.
+
 **`requested` is the value you sent; `id` is canonical.** Join on either. A handle can change
 between your request and the answer — `requested` cannot, so a row is never ambiguous.
 
@@ -1879,6 +1934,37 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 **Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
 `RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
+
+---
+
+## Appendix A3 · The balance-history report, and what changed (2026-09-12)
+
+The consumer read the whole directory — 434 traders, 1,342 requests in one 47-minute run — and
+sent eight asks ranked by value. **All eight are done.** Their measurements were taken on 11–12
+September; four of the eight were already fixed by work that landed after their run, which is
+why some figures below look nothing like theirs.
+
+| # | What they asked for | What was wrong | What changed |
+| --- | --- | --- | --- |
+| **1** | Stop refusing a whole day because one chain could not be rebuilt | **8,894 days** across the directory came back as the single word `chains_unrebuildable`, while the per-chain answers carried real figures for the other chains on those very days. Only **109 of 434** could draw from the all-chains answer; among the hundred largest, **3 of 100** | the day is now stated from the chains that answered, and every point carries `chainsAnswered` / `chainsTotal` / `partial` so a part is never mistaken for a whole. Days with a figure went **1,855 → 9,305**; traders who can draw **96 → 372 of 435**. `@ethersole` went from 2 real points to **29** |
+| **2** | A close date on each closed trade, or a realised total per day | the scorecard grouped realised profit by `closed_at` and published four windows, and the per-coin breakdown carried 21 fields with no trading date among them — so nothing could say what a trader made on a Tuesday | `realizedByDay` for the last thirty days, plus `firstClosedAt` / `lastClosedAt` on every `byToken` row. Verified against their own figure: the daily rows for `@unipcs` sum to **−$131,120.08 over 43 closed trades**, matching the 30-day window exactly |
+| **3** | Backfill the balance history, solana first | **147 of 169** solana answers contained a single step; 22 of 169 could draw | solana rebuilt from the balance each transaction records, checked per coin. **169 of 170 wallets** verified, **29 real points** where there was one |
+| **4** | What is the `drawable` flag meant to mean? | every one of their 1,327 reads said `false`, **including all 188 carrying a full 28 days** — the flag compared a span in days against a day count, and N daily points span N−1 days, so a complete month always reported 29 of 30 | the reach test now measures whether the oldest point reaches the requested window, with slack taken from the data's own granularity. `@unipcs` on robinhood: 28 points, `drawable: true`. Their instinct to ignore it was right; it was ours to fix |
+| **5** | The directory's identifier is refused by the balance route | the id from `GET /traders` answered **404** on `/aum` while the handle answered 200, so every read cost two calls | the resolver is now the single way in to **all ten** per-trader routes. **§0e** |
+| **6** | Let the batch balance call name a chain | the batch took traders and a window with nowhere to name a chain, so a screen of fifty traders on one chain was fifty calls | `chain` on the POST body, same resolver and same code path as `?chain=` on the individual route. **§11** |
+| **8** | One trader 404s on the balance route | `yeon__ (gmgn)` — the one handle of 435 with a source in brackets — could not be charted at all. A migration had appended the source to the *display* name to separate two traders sharing a folded handle, and the resolver never matched on it | the resolver falls back to `display_handle` after the plain handle misses. Both spellings answer 200 |
+
+| **7** | `window=1d` answers nothing for anybody | the window was a `WHERE` clause, so a 24-hour span could not see the reading just outside it. Worse, `now` was computed from the windowed rows — so asking for one day returned **no current total either**, on traders carrying a month of history | `now` and `trackedSince` are window-independent, and a short window borrows the readings just before it, marked `outsideWindow`, until it holds two that carry a figure. **All four windows now draw** for every trader in a twelve-trader sample including all five of their worked examples |
+
+**What Ask 7 does NOT give them: an intraday curve.** The 1D line is two real dated figures
+about a day apart, and the line between them is straight because we hold no prices in between
+— `token_info` carries one price per token, fetched once. A chart meant to show movement
+*through* the day needs a moving price feed, which is a data-source decision rather than a
+code change. What they now get is a correct one-day line and a current total, instead of a
+blank panel.
+
+Three of the seven were defects of ours that their report is what surfaced: the `drawable`
+arithmetic in #4, the unroutable display handle in #8, and the windowed `now` in #7.
 
 ---
 

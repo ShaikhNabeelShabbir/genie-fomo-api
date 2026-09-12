@@ -2178,6 +2178,8 @@ async function scorecardBody(
     entry: Leg; exit: Leg;
     totalSupply: number | null; supplySource: string | null; supplyReadAt: string | null;
     tokenCreatedUnix: number | null; firstOpenedMs: number | null;
+    /* When this coin was first and last closed, so a per-coin row carries its own dates. */
+    firstClosedMs: number | null; lastClosedMs: number | null;
     chainKey: string;
   }>();
   for (const r of rows) {
@@ -2191,12 +2193,20 @@ async function scorecardBody(
       tokenCreatedUnix: n(r.token_created_unix),
       // Earliest position opened in this token, so age-at-entry can be derived per token.
       firstOpenedMs: null as number | null,
+      firstClosedMs: null as number | null, lastClosedMs: null as number | null,
       // Chain AND token, because one token_key can exist on two chains and their prices
       // have nothing to do with each other.
       chainKey: `${r.network_id}:${r.token_key}`,
     };
     rec.trades++;
-    if (r.status === "closed") { rec.closed++; rec.realizedPnlUsd += n(r.realized_pnl_usd) ?? 0; }
+    if (r.status === "closed") {
+      rec.closed++; rec.realizedPnlUsd += n(r.realized_pnl_usd) ?? 0;
+      const cms = r.closed_at ? Date.parse(String(r.closed_at)) : NaN;
+      if (Number.isFinite(cms)) {
+        rec.firstClosedMs = rec.firstClosedMs === null ? cms : Math.min(rec.firstClosedMs, cms);
+        rec.lastClosedMs  = rec.lastClosedMs  === null ? cms : Math.max(rec.lastClosedMs, cms);
+      }
+    }
     else rec.unrealizedPnlUsd += n(r.unrealized_pnl_usd) ?? 0;
 
     const openedAt = ms(r.opened_at);
@@ -2245,7 +2255,7 @@ async function scorecardBody(
     return { value, method, legs: a.legs, legsWeighted: a.weighted, first: a.first };
   };
   const byToken = [...byTokenMap.values()]
-    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, chainKey, ...r }) => {
+    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, firstClosedMs, lastClosedMs, chainKey, ...r }) => {
       const e = resolve(entry), x = resolve(exit);
       /**
        * Axis 5. fomo prices only 45% of trader-token pairs, and the unpriced ones are what
@@ -2302,6 +2312,16 @@ async function scorecardBody(
       tokenAgeAtEntryDays: tokenCreatedUnix !== null && firstOpenedMs !== null
         ? Number(((firstOpenedMs - tokenCreatedUnix * 1000) / 86_400_000).toFixed(2))
         : null,
+      /**
+       * When this coin was closed, first and last.
+       *
+       * The realised figure on this row was always summed by close date, and the row carried
+       * no date to go with it -- the only dates here were about the coin, not the trading.
+       * Null while nothing in this coin has closed yet, which is a different state from
+       * closed at the epoch.
+       */
+      firstClosedAt: firstClosedMs !== null ? new Date(firstClosedMs).toISOString() : null,
+      lastClosedAt:  lastClosedMs  !== null ? new Date(lastClosedMs).toISOString()  : null,
       /**
        * Entry expressed as a MARKET CAP, which is how it is read on screen.
        *
@@ -2406,6 +2426,32 @@ async function scorecardBody(
     return { realizedUsd: round(total), closedTrades: inWindow.length };
   };
 
+  /*
+   * THE SAME SUM, BROKEN OUT BY DAY.
+   *
+   * The four windows above already group realised profit by closed_at, so a consumer could
+   * see that a trader made money over 30 days and had nothing that could say what he made on
+   * a Tuesday -- a thirty-day calendar drew thirty empty squares. The dates were here the
+   * whole time; only the grouping was missing.
+   *
+   * Days with no closed trade are ABSENT rather than zero: a day he closed nothing is not a
+   * day he earned nothing, and a calendar should show those differently.
+   */
+  const dayBuckets = new Map<string, { realizedUsd: number; closedTrades: number }>();
+  const since30 = nowMs - 30 * 86_400_000;
+  for (const r of closedDated) {
+    const ms = Date.parse(String(r.closed_at));
+    if (!Number.isFinite(ms) || ms <= since30) continue;
+    const day = new Date(ms).toISOString().slice(0, 10);
+    const b = dayBuckets.get(day) ?? { realizedUsd: 0, closedTrades: 0 };
+    b.realizedUsd += n(r.realized_pnl_usd) ?? 0;
+    b.closedTrades++;
+    dayBuckets.set(day, b);
+  }
+  const realizedByDay = [...dayBuckets.entries()]
+    .sort((a, b) => a[0] < b[0] ? -1 : 1)
+    .map(([day, v]) => ({ day, realizedUsd: round(v.realizedUsd), closedTrades: v.closedTrades }));
+
   const windows = {
     basis: "realized profit only — closed trades, summed by closed_at. Unrealised movement " +
            "is not included; see /pnl for banked versus on paper.",
@@ -2418,6 +2464,11 @@ async function scorecardBody(
   return {
     handle: t.display_handle, name: t.name ?? null,
     source: "postgres · trades (loaded from fomoapi)",
+    /**
+     * Realised profit per day for the last thirty days, same basis as `realized` below.
+     * A day with no closed trade is absent, not zero.
+     */
+    realizedByDay,
     // max(captured_at) over the same rows — identical to the query this replaces, and free.
     asOf: (() => {
       const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
@@ -3241,6 +3292,68 @@ function buildAum(
   const from = span === null ? null : new Date(to.getTime() - span);
 
   /*
+   * THE READING JUST BEFORE THE WINDOW IS KEPT, as an anchor.
+   *
+   * History steps once a day, so a 24-hour window contained at most one point and usually
+   * none -- `window=1d` drew nothing for anybody. But a one-day chart wants exactly two
+   * figures: what he was worth at the start of the day and what he is worth now. We hold
+   * both; the older one simply sat one row outside the filter.
+   *
+   * So the newest reading BEFORE the window joins the series, marked `outsideWindow` so it is
+   * never mistaken for one inside it. `reach.coveredFrom` reports where the line really
+   * starts. This also stops 7d and 30d beginning a day late for the same reason.
+   */
+  const inWindow = from === null ? rows : rows.filter((r) => Date.parse(String(r.at)) >= from.getTime());
+  const before = from === null
+    ? []
+    : rows.filter((r) => Date.parse(String(r.at)) < from.getTime());
+
+  /*
+   * Reach back far enough for a LINE, not just for one point.
+   *
+   * One anchor is not always enough. History steps once a day and the newest step can be a
+   * day and a half old, so the last 24 hours held nothing and the single preceding reading
+   * gave one point -- still not a line. Taking preceding readings until the series holds two
+   * turns `window=1d` into the two figures a one-day chart actually wants.
+   *
+   * Nothing here is invented: every point is a real dated reading, the ones from before the
+   * window carry `outsideWindow`, and `reach.coveredFrom`/`coveredTo` report the span the
+   * line truly covers rather than the span that was asked for.
+   */
+  /*
+   * BORROWED POINTS MUST SHARE THE NEWEST POINT'S BASIS.
+   *
+   * Two numbers valued on different bases are not a line. unipcs held a sampled reading of
+   * $15,665,318 and a rebuilt one of $5,101,125 eight hours apart -- a 67% fall that never
+   * happened, because the two count different things. Borrowing across that seam would have
+   * drawn exactly the cliff the whole basis/tier distinction exists to prevent.
+   *
+   * So a borrowed reading has to be the same kind as the one it is being compared with.
+   */
+  const NEED = 2;
+  const newestBasis = rows.length ? String(rows[rows.length - 1].basis) : null;
+  const comparable = newestBasis === null
+    ? before
+    : before.filter((r) => String(r.basis) === newestBasis);
+
+  /*
+   * Borrow until the series holds two readings THAT CARRY A FIGURE.
+   *
+   * Counting rows rather than figures was not enough: GeorgeDroid holds 28 real points, but
+   * his two most recent rebuilt readings are both refused, so taking "the last two rows"
+   * took two blanks and drew nothing. A refused day is not half a line.
+   */
+  const hasFigure = (r: Record<string, unknown>) => n(r.total_usd) !== null;
+  const anchors: Record<string, unknown>[] = [];
+  let have = inWindow.filter(hasFigure).length;
+  for (let i = comparable.length - 1; i >= 0 && have < NEED; i--) {
+    anchors.unshift(comparable[i]);
+    if (hasFigure(comparable[i])) have++;
+  }
+  const windowed = [...anchors, ...inWindow];
+  const anchorAts = new Set(anchors.map((r) => new Date(String(r.at)).toISOString()));
+
+  /*
    * The default step is the coarsest that still leaves at least 24 points, so a week does
    * not arrive as 168 points nobody plots and a day does not collapse to 1.
    */
@@ -3256,7 +3369,7 @@ function buildAum(
    * measured one would launder the refusal into a number.
    */
   const kept = new Map<number, Record<string, unknown>>();
-  for (const r of rows) {
+  for (const r of windowed) {
     const ms = Date.parse(String(r.at));
     if (!Number.isFinite(ms)) continue;
     kept.set(Math.floor(ms / chosen.ms), r);
@@ -3270,13 +3383,36 @@ function buildAum(
       pricedPositions: r.priced_positions === null ? null : Number(r.priced_positions),
       totalPositions: r.total_positions === null ? null : Number(r.total_positions),
       valueShare: n(r.value_share),
+      /*
+       * HOW MUCH OF HIM THIS DAY IS, per point rather than per response.
+       *
+       * A rebuilt day used to be refused outright unless every chain answered at it, which
+       * refused 8,894 days across the directory while the per-chain figures for those days
+       * existed all along. The day is now stated with the chains that answered -- and these
+       * two numbers are the reason that is safe. `chainsAnswered` below `chainsTotal` means
+       * the total is a real figure for PART of him, and a consumer can decide whether to
+       * draw it. Null on a single-chain series, where the question does not apply.
+       */
+      chainsAnswered: r.chains_answered === null ? null : Number(r.chains_answered),
+      chainsTotal: r.chains_expected === null ? null : Number(r.chains_expected),
+      partial: r.chains_answered === null || r.chains_expected === null
+        ? null
+        : Number(r.chains_answered) < Number(r.chains_expected),
     },
     ...(r.refused_reason ? { refused: r.refused_reason as string } : {}),
+    /** True for a real dated reading borrowed from just before the requested window. */
+    ...(anchorAts.has(new Date(String(r.at)).toISOString()) ? { outsideWindow: true } : {}),
   }));
 
   /**
    * The moment real sampling began. Everything before it is a marked rebuild, everything
    * after is measured, and the response never blurs the two together.
+   */
+  /*
+   * WINDOW-INDEPENDENT, both of them. What a trader is worth right now does not depend on how
+   * much of his past you asked for, and computing these from the windowed rows meant asking
+   * for one day hid the current total entirely -- `now: null` on a trader carrying a month of
+   * history and a $5.1M balance.
    */
   const firstSampled = rows.find((r) => r.basis === "sampled");
   const trackedSince = firstSampled ? new Date(String(firstSampled.at)).toISOString() : null;
@@ -3327,10 +3463,21 @@ function buildAum(
     ? points.length > 0
     : firstAt !== null && firstAt - from.getTime() <= slack;
 
+  /*
+   * TWO DATED FIGURES ARE A LINE. One never is.
+   *
+   * This threshold was three, taken from the compatibility rule in
+   * GENIE_FOMO_V7_BATCH_AUM_AND_COVERAGE_PRD.md -- but that rule is what the CONSUMER applies
+   * when we decline to say anything, not what we should demand of ourselves. Their own
+   * measurement states the rule they actually draw by: "two or more real points, which is the
+   * owner's rule (one point is never a line)". Holding out for a third made a real two-point
+   * series undrawable and put our flag out of step with the figures we report.
+   */
+  const MIN_DRAWABLE_POINTS = 2;
   const usable = points.filter((p) => p.totalUsd !== null);
   let drawable = true;
   let reason: string | null = null;
-  if (usable.length < 3) {
+  if (usable.length < MIN_DRAWABLE_POINTS) {
     /*
      * Fewer than three numbers. Which of these it is matters: a backfill that has not
      * finished is temporary and worth waiting for, a refusal is not.
@@ -3338,7 +3485,7 @@ function buildAum(
     drawable = false;
     reason = newest?.refused_reason
       ? String(newest.refused_reason)
-      : (coveredDays === 0 ? "warming" : "too_few_points");
+      : (usable.length === 0 ? "warming" : "too_few_points");
   } else if (!reachesBack) {
     // Enough points to draw, but not across the span that was asked for. Both facts are true
     // and the consumer needs the second one to label its axis honestly.
@@ -3465,9 +3612,12 @@ async function aumFor(
   if (!handles.length) return out;
 
   const to = new Date();
-  const span = AUM_WINDOWS[opts.windowKey];
-  const from = span === null ? null : new Date(to.getTime() - span);
 
+  /*
+   * EVERY ROW, WINDOWED IN MEMORY. The window used to be a WHERE clause, which meant a short
+   * window could not see the reading just outside it -- and `window=1d` returned nothing at
+   * all, not even the current total, for a trader we hold a month of history for.
+   */
   const traders = await sql`
     select handle, display_handle from traders where handle = any(${handles})`;
   if (!traders.length) return out;
@@ -3481,19 +3631,18 @@ async function aumFor(
     ? await sql`
         select a.handle, a.at, a.total_usd, a.reason as refused_reason,
                null::int as priced_positions, null::int as total_positions,
-               a.priced_share as value_share, a.basis, s.tier
+               a.priced_share as value_share, a.basis, s.tier,
+               null::int as chains_answered, null::int as chains_expected
         from aum_chain_samples a
         join aum_samples s
           on s.handle = a.handle and s.at = a.at and s.basis = a.basis
         where a.handle = any(${present}) and a.network_id = ${opts.chainFilter.network_id}
-          and (${from}::timestamptz is null or a.at >= ${from}::timestamptz)
         order by a.handle, a.at asc`
     : await sql`
         select handle, at, total_usd, refused_reason, priced_positions, total_positions,
-               value_share, basis, tier
+               value_share, basis, tier, chains_answered, chains_expected
         from aum_samples
         where handle = any(${present})
-          and (${from}::timestamptz is null or at >= ${from}::timestamptz)
         order by handle, at asc`;
 
   const byHandle = new Map<string, Record<string, unknown>[]>();
@@ -3925,7 +4074,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
  */
 post("/v1/traders/aum", async (_p, _url, body) => {
   const { requested, handles, asked, capped } = await batchIds(body);
-  const b = body as { window?: string; step?: string; contractVersion?: number };
+  const b = body as { window?: string; step?: string; contractVersion?: number; chain?: string };
   const windowKey = (b?.window ?? "1w").trim();
   if (!(windowKey in AUM_WINDOWS)) {
     throw badRequest(`'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")}`,
@@ -3937,7 +4086,14 @@ post("/v1/traders/aum", async (_p, _url, body) => {
                      { parameter: "step" });
   }
 
-  const envelopes = await aumFor(handles, { windowKey, stepRaw, chainFilter: null });
+  /*
+   * A BATCH CAN NAME A CHAIN, because the history mostly lives in the per-chain answers.
+   * Without this a screen of fifty traders on one chain was fifty calls; it is now one.
+   * The individual route has always taken `?chain=`, and aumFor() is the same code for both,
+   * so the two cannot disagree about what a chain series means.
+   */
+  const chainFilter = await resolveChain((b?.chain ?? "").trim().toLowerCase());
+  const envelopes = await aumFor(handles, { windowKey, stepRaw, chainFilter });
 
   if (Number(b?.contractVersion) === 2) {
     const idRows = await sql`
@@ -3948,6 +4104,8 @@ post("/v1/traders/aum", async (_p, _url, body) => {
       contractVersion: 2,
       ...batchEnvelope(asked, capped),
       window: windowKey,
+      /** Null when the batch asked for the whole portfolio; a name when it named a chain. */
+      chain: chainFilter ? chainFilter.name : null,
       /*
        * EXACTLY ONE ROW PER REQUESTED ID, INCLUDING THE ONES THAT FAILED. An omitted row is
        * indistinguishable from a trader with no data, so an id we could not resolve comes
@@ -3980,6 +4138,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
   return {
     ...batchEnvelope(asked, capped),
     window: windowKey,
+    ...(chainFilter ? { chain: chainFilter.name } : {}),
     traders: handles.map((h) => {
       const aum = envelopes.get(h);
       return {
@@ -4154,7 +4313,27 @@ async function resolveTrader(key: string): Promise<string> {
     const [r] = await sql`select handle from traders where id = ${bare}::uuid`;
     if (r) return r.handle as string;
   }
-  return k.toLowerCase();
+
+  /*
+   * THE DIRECTORY'S OWN HANDLE HAS TO WORK, and for one trader it did not.
+   *
+   * `display_handle` is what every listing shows, and it is usually identical to `handle`.
+   * It is not for `yeon__ (gmgn)`: two traders arrived sharing one folded handle, so a
+   * migration appended the source to the display name to tell them apart. The directory then
+   * published a name that this resolver could not resolve -- the only trader of 435 who
+   * could not be charted at all, and the failure was ours, not the caller's.
+   *
+   * Tried only after the plain handle misses, so the ordinary case still costs no query.
+   */
+  const lower = k.toLowerCase();
+  const [exact] = await sql`select handle from traders where handle = ${lower}`;
+  if (exact) return exact.handle as string;
+
+  const [byDisplay] = await sql`
+    select handle from traders where lower(display_handle) = ${lower} limit 1`;
+  if (byDisplay) return byDisplay.handle as string;
+
+  return lower;
 }
 
 /**

@@ -1,0 +1,19 @@
+rows in the table: 1328
+traders with an all-chains row: 435
+per-chain rows: 893
+rows that failed outright: [('yeon__ (gmgn)', 'Yeon', 'not_found')]
+traders we could ask about: 434
+can draw from the all-chains answer (2+ real points): 109 of 434
+can draw from their best single chain: 309 of 434
+refused days on the all-chains answers, by word: {'chains_unrebuildable': 8894, 'no_prices': 9, 'wallet_unreadable': 2}
+  robinhood: 255 holders, 252 can draw on it alone, 0 answers containing a single step
+  ethereum: 239 holders, 194 can draw on it alone, 3 answers containing a single step
+  bsc: 189 holders, 174 can draw on it alone, 6 answers containing a single step
+  solana: 169 holders, 22 can draw on it alone, 147 answers containing a single step
+  base: 41 holders, 36 can draw on it alone, 3 answers containing a single step
+distinct values of the service's drawable flag, all rows: Counter({'false': 1327, '': 1})
+rows with all 28 real points: 164 — their drawable flags: Counter({'false': 164})
+top 100 by current total: largest unipcs 15665318.55 ; hundredth sebdegen 729031.0
+  of the top 100, can draw from the all-chains answer: 3
+  of the top 100, can draw from their best single chain: 98
+  refused days on the top 100's all-chains answers: {'chains_unrebuildable': 2680}

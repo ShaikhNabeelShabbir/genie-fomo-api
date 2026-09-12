@@ -55,9 +55,10 @@ async function main() {
         from aum_chain_samples where basis = 'rebuilt' group by handle, at
       )
       select count(*)::int rebuilt_days,
-             count(*) filter (where a.n >= e.n)::int complete_days,
+             count(*) filter (where a.n > 0)::int days_with_a_figure,
+             count(*) filter (where a.n >= e.n)::int days_covering_every_chain,
              count(distinct a.handle)::int traders,
-             count(distinct a.handle) filter (where a.n >= e.n)::int traders_with_any_total
+             count(distinct a.handle) filter (where a.n > 0)::int traders_with_any_total
       from answered a join expected e using (handle)`);
     console.table(summary.rows);
 
@@ -66,13 +67,8 @@ async function main() {
     const upd = await client.query(`
       with expected as (
         /*
-         * EVERY CHAIN WE KNOW HE TOUCHED, not just the ones he holds today.
-         *
-         * Using current holdings alone is too lenient for a past day: a trader who has since
-         * exited a chain would be judged against a denominator of one, so a single answered
-         * chain would mark the day complete while the chain holding most of him that day was
-         * missing entirely. Measured on gmgn_0xc84248de -- holds only bsc now, but was on
-         * robinhood for $15,925 two days earlier. The union is what he could have been on.
+         * EVERY CHAIN WE KNOW HE TOUCHED, not just the ones he holds today. A trader who has
+         * since exited a chain would otherwise be judged against a denominator of one.
          */
         select handle, count(distinct network_id)::int n from (
           select handle, network_id from holdings_current where human_amount > 0
@@ -85,9 +81,19 @@ async function main() {
         from aum_chain_samples where basis = 'rebuilt' group by handle, at
       )
       update aum_samples s
-         set total_usd = case when a.n >= e.n then a.total else null end,
-             refused_reason = case when a.n >= e.n then null else 'chains_unrebuildable' end,
-             sampled_at = now()
+         /*
+          * STATE THE DAY, AND STATE WHAT IT COVERS.
+          *
+          * The total is the sum of the chains that answered -- a real figure for a real part
+          * of him. It is only null when NOTHING answered, because then there is no number to
+          * state. chains_answered beside chains_expected is what keeps a partial day from
+          * being a silent one, and is why publishing it is safe where the old rule was not.
+          */
+         set total_usd       = case when a.n > 0 then a.total else null end,
+             refused_reason  = case when a.n > 0 then null else 'chains_unrebuildable' end,
+             chains_answered = a.n,
+             chains_expected = e.n,
+             sampled_at      = now()
         from answered a join expected e using (handle)
        where s.handle = a.handle and s.at = a.at and s.basis = 'rebuilt'
       returning 1`);
@@ -95,8 +101,12 @@ async function main() {
 
     const after = await client.query(`
       select count(*)::int rows, count(total_usd)::int with_total,
+             count(*) filter (where chains_answered >= chains_expected)::int fully_covered,
              count(distinct handle)::int traders,
-             count(distinct handle) filter (where total_usd is not null)::int traders_with_total
+             count(distinct handle) filter (where total_usd is not null)::int traders_with_total,
+             (select count(*)::int from (
+                select handle from aum_samples where basis='rebuilt' and total_usd is not null
+                group by handle having count(*) >= 2) z) as traders_drawable
       from aum_samples where basis = 'rebuilt'`);
     console.table(after.rows);
 
