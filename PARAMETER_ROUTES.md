@@ -396,12 +396,24 @@ claimed as such.**
 
 | In plain words | Call | Read | Live value (`unipcs`) |
 | --- | --- | --- | --- |
-| "Which trader is this, and where do I read them?" | `GET $B/traders/unipcs/wallets` | `id`, `wallets[].family`, `wallets[].chains` | **`trd_a06e3ef7-…`** · solana + evm, evm active on **4 chains** |
+| "Which trader is this, and where do I read them?" | `GET $B/traders/unipcs/wallets` | `id`, `wallets[].family`, `wallets[].chains` | **`a06e3ef7-425a-…`** · solana + evm, evm active on **4 chains** |
 
 **In layman's terms.** A handle is a display name and people change them. `id` never changes
 and is never reused, so key on it and show the handle. And one Ethereum-style address is the
 same wallet on Ethereum, Base, BNB Chain and Robinhood Chain **at once** — so the wallet block
 names the chains we have actually seen it trade on, and you read exactly those.
+
+**The id is an opaque string.** Today's values happen to be UUID-shaped; do not parse them,
+match on a format, or assume a prefix. Compare them whole.
+
+**One spelling, and every route accepts both.** The id is returned bare — the same characters
+from `GET /traders` and from `/wallets`. The older `trd_`-prefixed form is still accepted as
+*input* everywhere and always will be, so a consumer holding either keeps working.
+
+**It works on every per-trader route**, not just some of them:
+`/`, `/aum`, `/portfolio`, `/positions`, `/scorecard`, `/transactions`, `/trust`, `/pnl`,
+`/wallets`, `/trades` — all ten answer to the id and to the handle, and both return the same
+trader. This is the contract `GENIE_FOMO_V7_BATCH_AUM_AND_COVERAGE_PRD.md` §1 requires.
 
 ### How to test
 
@@ -409,13 +421,16 @@ names the chains we have actually seen it trade on, and you read exactly those.
 curl -s "$B/traders/unipcs/wallets" | jq '{id, handle, handleChangedAt, presence}'
 curl -s "$B/traders/unipcs/wallets" | jq '.wallets[] | {family, address, chains}'
 
-# every per-trader route accepts the id as well as the handle
-curl -s "$B/traders/trd_a06e3ef7-425a-48e9-a131-220a4dcea4cc/wallets" | jq '.handle'
+# the id from the directory works on EVERY per-trader route, not only this one
+ID=$(curl -s "$B/traders?limit=1" | jq -r '.entries[0].id')
+for r in aum portfolio positions scorecard transactions trust pnl wallets trades; do
+  curl -s -o /dev/null -w "$r %{http_code}\n" "$B/traders/$ID/$r"
+done
 ```
 
 ```json
 {
-  "id": "trd_a06e3ef7-425a-48e9-a131-220a4dcea4cc",
+  "id": "a06e3ef7-425a-48e9-a131-220a4dcea4cc",
   "handle": "unipcs",
   "handleChangedAt": null,
   "presence": "observed",
@@ -1715,17 +1730,117 @@ curl -s -X POST "$B/traders/aum" -H 'content-type: application/json' \
 }
 ```
 
+### `contractVersion: 2` — identity-safe rows and the whole AUM object
+
+Send `contractVersion: 2` in the body and both batch routes answer with the permanent
+contract. Leave it out and the older shape comes back unchanged, so a consumer already
+reading it keeps working until it migrates.
+
+```bash
+curl -s -X POST "$B/traders/aum" -H 'content-type: application/json' \
+  -d '{"contractVersion":2,"ids":["a06e3ef7-425a-48e9-a131-220a4dcea4cc"],"window":"1w"}' \
+  | jq '.traders[0] | {ok, requested, id, handle, drawable: .aum.drawing.drawable}'
+```
+
+```json
+{
+  "contractVersion": 2, "limit": 50, "asked": 2, "capped": false, "window": "1w",
+  "traders": [
+    { "ok": true,
+      "requested": "a06e3ef7-425a-48e9-a131-220a4dcea4cc",
+      "id": "a06e3ef7-425a-48e9-a131-220a4dcea4cc",
+      "handle": "unipcs",
+      "aum": { "window": "1w", "step": "6h", "stepMs": 21600000, "status": "ready",
+               "reach": {}, "drawing": {}, "progress": null, "gaps": [],
+               "coverage": {}, "now": {}, "points": [], "chains": [],
+               "refused": null, "plain": "…" } },
+    { "ok": false, "requested": "nope", "id": null, "handle": null,
+      "error": { "code": "not_found", "detail": "no trader 'nope' in the directory" } }
+  ]
+}
+```
+
+**`requested` is the value you sent; `id` is canonical.** Join on either. A handle can change
+between your request and the answer — `requested` cannot, so a row is never ambiguous.
+
+**`row.aum` is the individual response, not a summary of it.** Both are produced by the same
+function from the same rows, so they cannot drift. Verified on all four windows: identical
+apart from `from`/`to`/`reach.requestedFrom`, which differ by the seconds between the two
+HTTP calls.
+
+**One row per id you sent, including the ones that failed.** An omitted row is
+indistinguishable from a trader with no data, so an unresolvable id comes back as
+`ok: false` with a reason and never removes the rows that succeeded.
+
+**Batch positions carries the same envelope**, plus `positionCount`, `pricedPositionCount`,
+`totalValueUsd`, `coverage`, `complete` and `nextCursor`:
+
+```bash
+curl -s -X POST "$B/traders/positions" -H 'content-type: application/json' \
+  -d '{"contractVersion":2,"ids":["unipcs"]}' \
+  | jq '.traders[0] | {ok, id, positionCount, pricedPositionCount, totalValueUsd, complete}'
+```
+
+**`totalValueUsd: null` and `0` are different answers.** Zero means he was read and holds
+nothing; null means nothing he holds could be valued. `complete: true` because a batch row
+carries every position — it does not page.
+
+**Batch positions omits the holding and activity times** the individual route returns. They
+come from an aggregate over `transactions` that costs 12.5 seconds for our busiest trader;
+fifty of those would not fit in any sane budget. Read the individual route for the one trader
+you are showing.
+
+**Fifty traders, four windows, measured:**
+
+| Call | 50 ids |
+| --- | --- |
+| `aum` `window=1d` | 3.4 s |
+| `aum` `window=1w` | 3.8 s |
+| `aum` `window=1m` | 3.9 s |
+| `aum` `window=all` | 4.2 s |
+| `positions` | 4.7 s |
+
 ### What to know before you use it
 
 **`POST` because these are reads with a body.** Fifty ids do not belong in a query string.
 Nothing here mutates.
 
-**The cap is always stated.** `limit`, `asked` and `capped` appear on every response — a
-truncated list is never silent.
+**More than 50 ids is refused, not trimmed.** `POST` with 51 returns `400` naming the cap:
+
+```json
+{ "error": { "code": "bad_request",
+             "detail": "at most 50 ids per call — got 51; split the list rather than relying on truncation" } }
+```
+
+Truncating would return `200` for a list the caller asked about in full, and the ids that were
+never read would look exactly like ids with no data. `limit`, `asked` and `capped` still appear
+on every response.
+
+**A duplicate id is refused**, because two entries mean the caller expects two rows and
+returning one silently breaks the one-result-per-input guarantee:
+
+```json
+{ "error": { "code": "duplicate_identifier",
+             "detail": "'0xangeryy' appears more than once — every id must be distinct" } }
+```
+
+This is checked **after** resolution too — sending a trader's id *and* their handle in the same
+call is the same trader named twice, and is refused with the same code.
 
 **Ids or handles, interchangeably.** Both resolve to the same trader.
 
-**`X-Cost-Units`** on every successful response, so a caller can budget a pass.
+**`X-Cost-Units` is the number of traders asked for, not the number of HTTP calls.** A batch of
+ten reports `10`; every non-batch route reports `1`. A batch is capped at 50, so one call never
+costs more than 50. Cost is charged per **requested** trader, whether or not each one resolved,
+so a caller can predict a pass before making it.
+
+```bash
+curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/json' \
+  -d '{"ids":["0xAvast"],"window":"1w"}' | grep -i x-cost-units     # 1
+```
+
+**Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
+`RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
 
 ---
 
@@ -1786,14 +1901,14 @@ rather than a build.
 
 | § | Asked for | Shipped as |
 | --- | --- | --- |
-| **§1** | a stable id that is never reused and never derived from the handle; `:id` on every per-trader route | `id` (`trd_…`) on the wallets block, accepted in place of `:handle` everywhere, plus `handleChangedAt`. **§0e** |
+| **§1** | a stable id that is never reused and never derived from the handle; `:id` on every per-trader route | `id` on the directory and the wallets block in one spelling, accepted in place of `:handle` on **all ten** per-trader routes, plus `handleChangedAt`. The `trd_` prefix remains accepted as input. **§0e** |
 | **§2** | wallets with a `family` and the chains each is present on | `family` (`solana`/`evm`) and `chains[]` with `tradesSeen` and `lastActiveAt`, observed rather than inferred. **§0e** |
 | **§3** | balances read from the chain; every position carrying `priceUsd`, `priceSource`, `pricedAt`, `valueUsd`, `balanceAt`, `whyNoPrice`, and `coverage` | all present on `/positions` and the batch route. Balances come from `getTokenAccountsByOwner` and batched `balanceOf`; **36,506 positions across five chains**, 367 traders served from chain reads. **§2** |
 | **§4** | every swap, both sides, valued from the money side, with a stated cap | `GET /traders/:id/trades` — `side`, `token`, `money`, `valueUsd` with `valueSource: "money_side"`, `priceUsd` as a cross-check, `?chain=`/`?since=`, `limit` and `capped` stated. **§10** |
 | **§5** | a `measurements` block for every trader, one stated definition, each figure with `basis`, `window`, `coverage`, `asOf` | on every scorecard. **99.08%** of traders carry a usable rhythm figure, reported on `/health`. **§3** |
 | **§6** | loud failures, `asOf` on every figure, `/health` freshness, stable error codes, stated caps | `include_unavailable` (503) rather than a 200 with a missing block; `requestId` in the body and the `x-request-id` header; per-feed `lastRefreshAt` on `/health`; stable codes with no internal text; every route bounded, answering `code: "timeout"` rather than hanging; pool pressure answers `429` with `Retry-After`. **§0a** |
 | **§7** | AUM per trader per chain over 30 days, `chains[]` per point, coverage windows | `GET /traders/:id/aum` live, `chains[]` on the response, `coverage` and `trackedSince` on every point, `sum(chains) == now.totalUsd`. `?chain=` narrows the series to one chain. **Thirty days of history on all five chains** — 32,160 reconstructed points, each proved against the wallet before it was stored. `reach` states the covered span, `drawing.drawable` is the service's own call on whether it can be plotted, `status` distinguishes ready from warming, `coverage` counts answered wallets and chains, and `gaps[]` names every hole. **§9** — the daily sampler fills the window forward from `trackedSince` |
-| **§8** | batch reads for the whole directory in a bounded number of calls, with cost stated | `POST /traders/positions` and `POST /traders/aum`, 50 per call, `limit`/`asked`/`capped` on every response, `X-Cost-Units` on every success. **§11** |
+| **§8** | batch reads for the whole directory in a bounded number of calls, with cost stated | `POST /traders/positions` and `POST /traders/aum`, 50 per call, `limit`/`asked`/`capped` on every response, `X-Cost-Units` reporting the traders asked for. `contractVersion: 2` adds `ok`/`requested`/canonical `id` per row and the complete AUM object, deep-equal to the individual route on all four windows. **§11** |
 
 ### The one thing still on the clock
 

@@ -276,10 +276,16 @@ async function main() {
          * we could check it.
          */
         if (!DRY) {
-          const gone = await client.query(
-            `delete from aum_chain_samples where handle = $1 and basis = 'rebuilt'
-               and network_id = ${NETWORK_ID} returning 1`, [w.handle]);
-          if (gone.rowCount) console.log(`${tag}   removed ${gone.rowCount} previously written rows`);
+          try {
+            const gone = await client.query(
+              `delete from aum_chain_samples where handle = $1 and basis = 'rebuilt'
+                 and network_id = ${NETWORK_ID} returning 1`, [w.handle]);
+            console.log(`${tag}   removed ${gone.rowCount} previously written rows`);
+          } catch (e) {
+            // Loudly, because the alternative is a wallet that failed its check quietly
+            // continuing to serve numbers.
+            console.log(`${tag}   DELETE FAILED (${e.message}) — stale rows may still be served`);
+          }
         }
         skipped++; continue;
       }

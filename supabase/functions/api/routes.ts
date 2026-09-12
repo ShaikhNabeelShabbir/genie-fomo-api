@@ -127,7 +127,7 @@ function sortParam(
 const nonEmpty = (v: string | null | undefined): string | null =>
   v && v.trim() ? v.trim() : null;
 import { get, post } from "./router.ts";
-import { notFound, badRequest } from "./errors.ts";
+import { notFound, badRequest, ApiError } from "./errors.ts";
 
 /**
  * PARAMETERS.md routes, served from Postgres.
@@ -264,7 +264,7 @@ get("/v1/chains", async () => {
 
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
-    select handle, display_handle, name from traders where handle = ${handle.toLowerCase()}`;
+    select handle, display_handle, name from traders where handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const asOf = await asOfHoldings(t.handle as string);
@@ -529,7 +529,7 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
   const [t] = await sql`
     select t.handle, t.display_handle, t.name, s.pnl_usd, s.volume_usd, s.trade_count
     from traders t left join trader_stats_current s using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
+    where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
   const [h, asOf] = await Promise.all([
     trustHoldings([t.handle as string]).then((r) => r[0]),
@@ -946,7 +946,7 @@ get("/v1/traders", async (_p, url) => {
  * response says what else can be asked about them rather than leaving it to be guessed.
  */
 get("/v1/traders/:handle", async ({ handle }, url) => {
-  const h = handle.toLowerCase();
+  const h = await resolveTrader(handle);
   const [t] = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified,
            t.last_seen_at, s.captured_at,
@@ -1140,7 +1140,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const [t] = await sql`
     select t.handle, t.display_handle, t.name, w.evm_address, w.sol_address
     from traders t left join wallets w using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
+    where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const addrs = [t.evm_address, t.sol_address]
@@ -2571,7 +2571,7 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   const [t] = await sql`
     select t.handle, t.display_handle, t.name, s.volume_usd, s.trade_count
     from traders t left join trader_stats_current s using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
+    where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const h = t.handle as string;
@@ -2871,7 +2871,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
   const [t] = await sql`
     select t.handle, t.display_handle, t.name, w.evm_address, w.sol_address
     from traders t left join wallets w using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
+    where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
@@ -3123,11 +3123,14 @@ const AUM_STEPS: { name: string; ms: number }[] = [
  * NOT bulk-able through `?include=`, for the same reason `/portfolio` is not: it is a series
  * per trader, and a page of them would be the largest response this API can produce.
  */
-get("/v1/traders/:handle/aum", async ({ handle }, url) => {
-  const [t] = await sql`
-    select handle, display_handle from traders where handle = ${handle.toLowerCase()}`;
-  if (!t) throw notFound(`no trader '${handle}' in the directory`);
-
+/**
+ * Parse and validate the three AUM query parameters, once.
+ *
+ * Shared so the individual route and the batch route cannot drift on what a window means or
+ * which steps exist -- GENIE_FOMO_V7_BATCH_AUM_TDR.md §4 requires the two to agree exactly,
+ * and the cheapest way to guarantee that is to have one of them.
+ */
+function aumOptions(url: URL): { windowKey: string; stepRaw: string | null; chainKey: string } {
   const windowKey = (url.searchParams.get("window") ?? "1w").trim();
   if (!(windowKey in AUM_WINDOWS)) {
     throw badRequest(
@@ -3142,63 +3145,46 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
       { parameter: "step" },
     );
   }
+  return { windowKey, stepRaw, chainKey: (url.searchParams.get("chain") ?? "").trim().toLowerCase() };
+}
 
+async function resolveChain(chainKey: string): Promise<{ network_id: number; name: string } | null> {
+  if (!chainKey) return null;
+  const [c] = await sql`select network_id, name from chains where name = ${chainKey}`;
+  if (!c) {
+    const all = await sql`select name from chains order by name`;
+    throw badRequest(
+      `'chain' must be one of ${all.map((r) => r.name).join(", ")} — got '${chainKey}'`,
+      { parameter: "chain" },
+    );
+  }
+  return { network_id: Number(c.network_id), name: String(c.name) };
+}
+
+/** Solana's network id, needed to tell the one Solana wallet from the one EVM wallet. */
+const SOLANA_NET = 1399811149;
+
+/**
+ * Build one trader's AUM envelope from rows already fetched.
+ *
+ * Pure: it does no I/O, so the same rows always produce the same answer. That is what lets
+ * `POST /v1/traders/aum` return a row identical to `GET /v1/traders/:id/aum` instead of a
+ * summary that drifts from it.
+ */
+function buildAum(
+  t: { handle: string; display_handle: string },
+  rows: Record<string, unknown>[],
+  chainRows: Record<string, unknown>[],
+  presence: { chains: number; on_solana: boolean; on_evm: boolean } | null,
+  opts: { windowKey: string; stepRaw: string | null; chainFilter: { network_id: number; name: string } | null; to: Date },
+) {
+  const { windowKey, stepRaw, chainFilter, to } = opts;
   const span = AUM_WINDOWS[windowKey];
-  const to = new Date();
   const from = span === null ? null : new Date(to.getTime() - span);
 
   /*
-   * A CHAIN SERIES IS A DIFFERENT CLAIM FROM A TRADER SERIES, and the backfill is why this
-   * parameter exists. Reconstructing a past balance needs a chain that will answer for the
-   * whole window, and only robinhood does -- so the rebuilt history is a robinhood figure,
-   * not a portfolio one. Only 31 of the 276 traders holding robinhood hold nothing else, so
-   * serving it as a trader total would draw a drawdown that never happened. Ask for the
-   * chain and you get the chain.
-   */
-  const chainKey = (url.searchParams.get("chain") ?? "").trim().toLowerCase();
-  let chainFilter: { network_id: number; name: string } | null = null;
-  if (chainKey) {
-    const [c] = await sql`
-      select network_id, name from chains where name = ${chainKey}`;
-    if (!c) {
-      const all = await sql`select name from chains order by name`;
-      throw badRequest(
-        `'chain' must be one of ${all.map((r) => r.name).join(", ")} — got '${chainKey}'`,
-        { parameter: "chain" },
-      );
-    }
-    chainFilter = { network_id: Number(c.network_id), name: String(c.name) };
-  }
-
-  /*
-   * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
-   * parent row are whole-trader for a sampled point and robinhood-only for a rebuilt one;
-   * putting those two in one column would make the series look like it changed scope
-   * mid-chart. `pricedShare` means the same thing on both.
-   */
-  const rows = chainFilter
-    ? await sql`
-        select a.at, a.total_usd, a.reason as refused_reason,
-               null::int as priced_positions, null::int as total_positions,
-               a.priced_share as value_share, a.basis, s.tier
-        from aum_chain_samples a
-        join aum_samples s
-          on s.handle = a.handle and s.at = a.at and s.basis = a.basis
-        where a.handle = ${t.handle} and a.network_id = ${chainFilter.network_id}
-          and (${from}::timestamptz is null or a.at >= ${from}::timestamptz)
-        order by a.at asc`
-    : await sql`
-        select at, total_usd, refused_reason, priced_positions, total_positions,
-               value_share, basis, tier
-        from aum_samples
-        where handle = ${t.handle}
-          and (${from}::timestamptz is null or at >= ${from}::timestamptz)
-        order by at asc`;
-
-  /*
    * The default step is the coarsest that still leaves at least 24 points, so a week does
-   * not arrive as 168 points nobody plots and a day does not collapse to 1. An explicit
-   * `step` overrides it.
+   * not arrive as 168 points nobody plots and a day does not collapse to 1.
    */
   const chosen = stepRaw !== null
     ? AUM_STEPS.find((s) => s.name === stepRaw.trim())!
@@ -3211,7 +3197,7 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
    * Averaging would invent a balance he never held, and a refused hour averaged with a
    * measured one would launder the refusal into a number.
    */
-  const kept = new Map<number, typeof rows[number]>();
+  const kept = new Map<number, Record<string, unknown>>();
   for (const r of rows) {
     const ms = Date.parse(String(r.at));
     if (!Number.isFinite(ms)) continue;
@@ -3235,26 +3221,13 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
    * after is measured, and the response never blurs the two together.
    */
   const firstSampled = rows.find((r) => r.basis === "sampled");
-  const trackedSince = firstSampled
-    ? new Date(String(firstSampled.at)).toISOString()
-    : null;
-
+  const trackedSince = firstSampled ? new Date(String(firstSampled.at)).toISOString() : null;
   const newest = rows.length ? rows[rows.length - 1] : null;
-  const chainRows = newest
-    ? await sql`
-        select c.name as chain, a.network_id, a.total_usd, a.priced_share, a.reason
-        from aum_chain_samples a
-        join chains c using (network_id)
-        where a.handle = ${t.handle} and a.at = ${newest.at} and a.basis = ${newest.basis}
-        order by a.total_usd desc nulls last`
-    : [];
 
   /*
-   * REACH -- what the stored data actually covers, as opposed to what was asked for
-   * (AUM_CHART_PRD.md §3.3). `from` echoes the request and is not evidence of anything; a
-   * caller that reads it as coverage will label a one-point series "30D". So the span the
-   * rows genuinely cover is stated separately, and `complete` is the service's own answer
-   * to "does this reach the window you asked for".
+   * REACH -- what the stored data actually covers, as opposed to what was asked for.
+   * `from` echoes the request and is not evidence of anything; a caller that reads it as
+   * coverage will label a one-point series "30D".
    */
   const firstAt = points.length ? Date.parse(points[0].at) : null;
   const lastAt  = points.length ? Date.parse(points[points.length - 1].at) : null;
@@ -3263,82 +3236,40 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
     ? Math.max(0, Math.round((lastAt - firstAt) / 86_400_000))
     : 0;
 
-  /*
-   * Points that can actually be plotted together. A refused point has no number, and two
-   * numbers valued on different bases are not a line -- so "usable" means numeric, and the
-   * decision about whether that is enough belongs here rather than in every consumer.
-   */
   const usable = points.filter((p) => p.totalUsd !== null);
-  const newestRow = rows.length ? rows[rows.length - 1] : null;
-
   let drawable = true;
   let reason: string | null = null;
   if (usable.length < 3) {
     /*
-     * Fewer than three numbers. Which of these it is matters to the reader: a backfill that
-     * has not finished is temporary and worth waiting for, a refusal is not, and "we have
-     * two points" is neither. The newest row's own refusal reason is the most specific
-     * answer available, so it wins when there is one.
+     * Fewer than three numbers. Which of these it is matters: a backfill that has not
+     * finished is temporary and worth waiting for, a refusal is not.
      */
     drawable = false;
-    reason = newestRow?.refused_reason
-      ? String(newestRow.refused_reason)
+    reason = newest?.refused_reason
+      ? String(newest.refused_reason)
       : (coveredDays === 0 ? "warming" : "too_few_points");
   } else if (requestedDays !== null && coveredDays + 1 < requestedDays) {
-    // Enough points to draw, but not across the span that was asked for. Both facts are true
-    // and the consumer needs the second one to label its axis honestly.
     drawable = false;
     reason = "short_coverage";
   }
 
-  /*
-   * Gaps are returned, never smoothed over (§3.4). A bucket with no number is a hole in the
-   * record, and a chart that joins across it draws a balance the trader never held.
-   */
+  /** Gaps are returned, never smoothed over. A chart breaks its line at each of these. */
   const gaps = points
     .filter((p) => p.totalUsd === null)
     .map((p) => ({ at: p.at, reason: (p as { refused?: string }).refused ?? "no_prices" }));
 
   /*
-   * How much of the trader each point could see (§3.2). A chain we hold no row for at that
-   * moment did not contribute zero dollars -- it contributed nothing at all, and the counts
-   * are what let a reader tell those apart.
+   * How much of the trader the newest point could see, in wallets and chains. A chain we
+   * hold no row for did not contribute zero dollars -- it contributed nothing at all.
    */
-  const [presence] = await sql`
-    select count(distinct network_id)::int as chains,
-           bool_or(network_id = 1399811149) as on_solana,
-           bool_or(network_id <> 1399811149) as on_evm
-    from holdings_current where handle = ${t.handle} and human_amount > 0`;
   const totalChains = Number(presence?.chains ?? 0);
-
-  const answeredRows = newestRow
-    ? await sql`
-        select network_id
-        from aum_chain_samples
-        where handle = ${t.handle} and at = ${newestRow.at} and basis = ${newestRow.basis}
-          and total_usd is not null`
-    : [];
-  const answeredChains = answeredRows.length;
-
-  /*
-   * WALLETS, NOT JUST CHAINS (PRD §3.2). A trader carries one EVM address that serves four
-   * chains and one Solana address that serves the fifth, so "three of four chains answered"
-   * can still mean either wallet was unreadable -- and which of the two it was changes what
-   * the number is missing. A wallet counts as answered when any chain it serves reported.
-   */
-  const SOLANA = 1399811149;
-  const answeredNets = new Set(answeredRows.map((r) => Number(r.network_id)));
+  const answeredNets = new Set(
+    chainRows.filter((r) => r.total_usd !== null).map((r) => Number(r.network_id)));
   const totalWallets = (presence?.on_evm ? 1 : 0) + (presence?.on_solana ? 1 : 0);
   const answeredWallets =
-    ([...answeredNets].some((n) => n !== SOLANA) ? 1 : 0) +
-    (answeredNets.has(SOLANA) ? 1 : 0);
+    ([...answeredNets].some((x) => x !== SOLANA_NET) ? 1 : 0) +
+    (answeredNets.has(SOLANA_NET) ? 1 : 0);
 
-  /*
-   * WARMING IS A PROMISE THAT THIS GETS BETTER (PRD §5), and it is the one state a consumer
-   * should wait on rather than report as a failure. So it is separated from the refusals: a
-   * series that is short because the backfill has not reached this trader is warming, and one
-   * that is short because a wallet would not answer is not.
-   */
   const warming = drawable === false && (reason === "warming" || reason === "short_coverage");
   const nextRun = new Date();
   nextRun.setUTCHours(6, 0, 0, 0);
@@ -3350,6 +3281,8 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
     chain: chainFilter ? chainFilter.name : null,
     window: windowKey,
     step: chosen.name,
+    /** The step in milliseconds, so a consumer need not parse "6h". */
+    stepMs: chosen.ms,
     from: from ? from.toISOString() : (points[0]?.at ?? null),
     to: to.toISOString(),
     trackedSince,
@@ -3379,36 +3312,20 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
 
     /**
      * The service's own answer to "can this be drawn". Consumers must not infer readiness
-     * from `window`, `from`, `count` or the position counts -- only this service knows
-     * whether a change in the line came from the trader or from missing data.
+     * from `window`, `from`, `count` or the position counts.
      */
     drawing: { drawable, usablePoints: usable.length, reason },
 
     /** Coverage of the newest point, in wallets and chains rather than positions. */
-    coverage: {
-      answeredWallets,
-      totalWallets,
-      answeredChains,
-      totalChains,
-    },
+    coverage: { answeredWallets, totalWallets, answeredChains: answeredNets.size, totalChains },
 
-    /**
-     * Whether this is as good as it gets, or as good as it is SO FAR.
-     * `ready` means the stored series is what we have to offer; `warming` means a backfill
-     * or the sampler is still filling it and the same request will return more later.
-     */
+    /** `ready` means this is what we have; `warming` means the same call returns more later. */
     status: warming ? "warming" : "ready",
-    ...(warming
-      ? { progress: {
-            coveredDays,
-            targetDays: requestedDays ?? coveredDays,
-            nextRunAt: nextRun.toISOString(),
-          } }
-      : {}),
+    progress: warming
+      ? { coveredDays, targetDays: requestedDays ?? coveredDays, nextRunAt: nextRun.toISOString() }
+      : null,
 
-    /** Holes in the record, with their reasons. A chart breaks its line at each of these. */
     gaps,
-
     points,
     chains: chainRows.map((r) => ({
       chain: r.chain as string,
@@ -3432,6 +3349,126 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
           ? ` Points before ${trackedSince} are rebuilt from chain transfers, not measured.`
           : ""),
   };
+}
+
+/**
+ * AUM envelopes for MANY traders in a fixed number of queries.
+ *
+ * WHY SET-BASED AND NOT A LOOP. The individual route answers in about 3.1 seconds, so fifty
+ * of them in sequence is roughly 158 -- an order of magnitude past the 15-second route
+ * budget. That is the reason the batch route used to return a five-field summary instead of
+ * the real envelope, and why Genie could not read the service's own drawing verdict. Four
+ * queries answer fifty traders as readily as one.
+ *
+ * The per-trader arithmetic stays in buildAum(), which does no I/O, so the batch row and the
+ * individual response are the same object built by the same code rather than two shapes kept
+ * in sync by hand.
+ */
+async function aumFor(
+  handles: string[],
+  opts: { windowKey: string; stepRaw: string | null; chainFilter: { network_id: number; name: string } | null },
+): Promise<Map<string, ReturnType<typeof buildAum>>> {
+  const out = new Map<string, ReturnType<typeof buildAum>>();
+  if (!handles.length) return out;
+
+  const to = new Date();
+  const span = AUM_WINDOWS[opts.windowKey];
+  const from = span === null ? null : new Date(to.getTime() - span);
+
+  const traders = await sql`
+    select handle, display_handle from traders where handle = any(${handles})`;
+  if (!traders.length) return out;
+  const present = traders.map((r) => String(r.handle));
+
+  /*
+   * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
+   * parent row are whole-trader for a sampled point and one chain's for a rebuilt one.
+   */
+  const rows = opts.chainFilter
+    ? await sql`
+        select a.handle, a.at, a.total_usd, a.reason as refused_reason,
+               null::int as priced_positions, null::int as total_positions,
+               a.priced_share as value_share, a.basis, s.tier
+        from aum_chain_samples a
+        join aum_samples s
+          on s.handle = a.handle and s.at = a.at and s.basis = a.basis
+        where a.handle = any(${present}) and a.network_id = ${opts.chainFilter.network_id}
+          and (${from}::timestamptz is null or a.at >= ${from}::timestamptz)
+        order by a.handle, a.at asc`
+    : await sql`
+        select handle, at, total_usd, refused_reason, priced_positions, total_positions,
+               value_share, basis, tier
+        from aum_samples
+        where handle = any(${present})
+          and (${from}::timestamptz is null or at >= ${from}::timestamptz)
+        order by handle, at asc`;
+
+  const byHandle = new Map<string, Record<string, unknown>[]>();
+  for (const r of rows) {
+    const h = String(r.handle);
+    let a = byHandle.get(h); if (!a) byHandle.set(h, a = []);
+    a.push(r);
+  }
+
+  /*
+   * The chain split of each trader's NEWEST point, in one query rather than one per trader.
+   * The (handle, at, basis) triples are joined through unnest so the database matches them
+   * instead of us issuing fifty lookups.
+   */
+  const nh: string[] = [], na: string[] = [], nb: string[] = [];
+  for (const h of present) {
+    const rs = byHandle.get(h);
+    if (!rs?.length) continue;
+    const newest = rs[rs.length - 1];
+    nh.push(h); na.push(String(newest.at)); nb.push(String(newest.basis));
+  }
+  const chainRows = nh.length
+    ? await sql`
+        select a.handle, c.name as chain, a.network_id, a.total_usd, a.priced_share, a.reason
+        from aum_chain_samples a
+        join chains c using (network_id)
+        join unnest(${nh}::text[], ${na}::timestamptz[], ${nb}::text[]) as u(handle, at, basis)
+          on u.handle = a.handle and u.at = a.at and u.basis = a.basis
+        order by a.handle, a.total_usd desc nulls last`
+    : [];
+  const chainsBy = new Map<string, Record<string, unknown>[]>();
+  for (const r of chainRows) {
+    const h = String(r.handle);
+    let a = chainsBy.get(h); if (!a) chainsBy.set(h, a = []);
+    a.push(r);
+  }
+
+  const presenceRows = await sql`
+    select handle, count(distinct network_id)::int as chains,
+           bool_or(network_id = ${SOLANA_NET}) as on_solana,
+           bool_or(network_id <> ${SOLANA_NET}) as on_evm
+    from holdings_current where handle = any(${present}) and human_amount > 0
+    group by handle`;
+  const presBy = new Map(presenceRows.map((r) => [String(r.handle), {
+    chains: Number(r.chains), on_solana: r.on_solana === true, on_evm: r.on_evm === true,
+  }]));
+
+  for (const t of traders) {
+    const h = String(t.handle);
+    out.set(h, buildAum(
+      { handle: h, display_handle: String(t.display_handle) },
+      byHandle.get(h) ?? [],
+      chainsBy.get(h) ?? [],
+      presBy.get(h) ?? null,
+      { ...opts, to },
+    ));
+  }
+  return out;
+}
+
+get("/v1/traders/:handle/aum", async ({ handle }, url) => {
+  const h = await resolveTrader(handle);
+  const { windowKey, stepRaw, chainKey } = aumOptions(url);
+  const chainFilter = await resolveChain(chainKey);
+  const got = await aumFor([h], { windowKey, stepRaw, chainFilter });
+  const envelope = got.get(h);
+  if (!envelope) throw notFound(`no trader '${handle}' in the directory`);
+  return envelope;
 });
 
 // ------------------------------------------------------------- trades (§4)
@@ -3549,16 +3586,91 @@ const BATCH_MAX = 50;
  * make nine. The cap is returned on every response because a silently truncated list is how
  * a roster under-counts without anyone noticing.
  */
-async function batchIds(body: unknown): Promise<{ handles: string[]; asked: number; capped: boolean }> {
+async function batchIds(
+  body: unknown,
+): Promise<{ requested: string[]; handles: string[]; asked: number; capped: boolean }> {
   const ids = (body as { ids?: unknown })?.ids;
   if (!Array.isArray(ids) || ids.length === 0) {
     throw badRequest("body must be { \"ids\": [...] } with at least one id or handle",
                      { parameter: "ids" });
   }
-  const asked = ids.length;
-  const wanted = ids.slice(0, BATCH_MAX).map(String);
-  const handles = await Promise.all(wanted.map((k) => resolveTrader(k)));
-  return { handles, asked, capped: asked > BATCH_MAX };
+
+  /*
+   * OVER THE CAP IS A REFUSAL, NOT A TRIM.
+   *
+   * This used to read the first fifty and set `capped: true`. That is a correct description
+   * of what happened and still the wrong behaviour: the caller asked about sixty traders and
+   * got a 200, so the ten it never heard about look exactly like ten traders with no data.
+   * GENIE_FOMO_V7_BATCH_AUM_TDR.md §6 asks for the refusal instead, and a 400 naming the cap
+   * is a bug the caller fixes once rather than a silent under-count it never notices.
+   */
+  if (ids.length > BATCH_MAX) {
+    throw badRequest(
+      `at most ${BATCH_MAX} ids per call — got ${ids.length}; split the list rather than ` +
+      `relying on truncation`,
+      { parameter: "ids" });
+  }
+
+  const wanted = ids.map(String);
+
+  /*
+   * A DUPLICATE IS AMBIGUOUS, so it is refused rather than collapsed. Two entries for one
+   * trader mean the caller expects two rows, and returning one silently breaks the
+   * one-result-per-input guarantee the same section requires. Duplicates are detected after
+   * resolution too, because a handle and its stable id are the same trader spelled twice.
+   */
+  const seen = new Set<string>();
+  for (const k of wanted) {
+    const norm = k.trim().toLowerCase();
+    if (seen.has(norm)) {
+      throw new ApiError(400, "duplicate_identifier",
+        `'${k}' appears more than once — every id must be distinct`,
+        { parameter: "ids" });
+    }
+    seen.add(norm);
+  }
+
+  /*
+   * RESOLVE ALL FIFTY IN ONE QUERY, not one query each.
+   *
+   * resolveTrader() looks an id up in the database, so mapping it over the list issued fifty
+   * round trips through the pooler -- about nine seconds of a call whose actual data costs
+   * 1.2. Measured on a 50-id batch: 9.9s for a window returning 65KB, which is the giveaway
+   * that the payload was never the problem. One `any()` answers the whole list.
+   */
+  const uuidish = wanted.filter((k) => UUID_RE.test(k.trim().replace(/^trd_/, "")));
+  const byId = new Map<string, string>();
+  if (uuidish.length) {
+    const bare = uuidish.map((k) => k.trim().replace(/^trd_/, ""));
+    const found = await sql`
+      select id, handle from traders where id = any(${bare}::uuid[])`;
+    for (const r of found) byId.set(String(r.id).toLowerCase(), String(r.handle));
+  }
+  const handles = wanted.map((k) => {
+    const bare = k.trim().replace(/^trd_/, "").toLowerCase();
+    return byId.get(bare) ?? k.trim().toLowerCase();
+  });
+
+  const resolved = new Set<string>();
+  for (const [i, h] of handles.entries()) {
+    if (resolved.has(h)) {
+      throw new ApiError(400, "duplicate_identifier",
+        `'${wanted[i]}' resolves to a trader already named earlier in the list — ` +
+        `an id and its handle are the same trader`,
+        { parameter: "ids" });
+    }
+    resolved.add(h);
+  }
+
+  /*
+   * `requested` is what the caller actually sent, kept beside the resolved handle.
+   *
+   * Without it a response is ambiguous the moment a handle changes: the caller asked about
+   * an id, the row comes back under a handle, and nothing in between says they are the same
+   * trader. GENIE_FOMO_V7_BATCH_AUM_TDR.md §5 asks for the submitted value to be echoed for
+   * exactly this reason, so a row can be joined back without guessing.
+   */
+  return { requested: wanted, handles, asked: wanted.length, capped: false };
 }
 
 const batchEnvelope = (asked: number, capped: boolean) => ({
@@ -3577,8 +3689,28 @@ const batchEnvelope = (asked: number, capped: boolean) => ({
  * POST rather than GET because fifty ids do not belong in a query string: a 2 KB URL breaks
  * proxies and fills logs. Nothing here mutates -- it is a read that needs a body.
  */
+/**
+ * Positions for many traders in one call.
+ *
+ * POST rather than GET because fifty ids do not belong in a query string: a 2 KB URL breaks
+ * proxies and fills logs. Nothing here mutates -- it is a read that needs a body.
+ *
+ * TWO CONTRACTS, CHOSEN BY THE CALLER, for the same reason as batch AUM. `contractVersion: 2`
+ * names every row by the value submitted and the canonical id, states explicitly whether each
+ * one succeeded, and reports the counts and completeness
+ * GENIE_FOMO_V7_BATCH_AUM_TDR.md §3 asks for. Without that field the older shape is returned
+ * unchanged.
+ *
+ * DELIBERATELY NOT INCLUDED: the holding/activity times the individual route returns. Those
+ * come from an aggregate over `transactions` that costs 12.5 seconds for our busiest trader,
+ * measured; running it fifty times would take the call far past any sane budget. A consumer
+ * that needs them reads the individual route for the trader it is showing, which is the one
+ * place the cost is worth paying.
+ */
 post("/v1/traders/positions", async (_p, _url, body) => {
-  const { handles, asked, capped } = await batchIds(body);
+  const { requested, handles, asked, capped } = await batchIds(body);
+  const v2 = Number((body as { contractVersion?: number })?.contractVersion) === 2;
+
   const rows = await sql`
     select h.handle, ch.name as chain, h.network_id, tk.address as token_address,
            coalesce(ti.symbol, tk.symbol) as symbol,
@@ -3597,6 +3729,78 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     by.get(String(r.handle))!.push(r);
   }
 
+  const position = (r: Record<string, unknown>) => ({
+    chain: r.chain, networkId: Number(r.network_id),
+    tokenAddress: r.token_address, symbol: r.symbol,
+    amount: n(r.human_amount),
+    /** §3: the moment the balance was read, not the moment you asked. */
+    balanceAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
+    priceUsd: n(r.price),
+    priceSource: (r.price_source as string) ?? null,
+    pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
+    valueUsd: n(r.value),
+    /** null, never 0 — an unpriceable coin is not a worthless one. */
+    whyNoPrice: n(r.value) === null ? "no price for this token in any source we hold" : null,
+    tier: r.source === "chain" ? "verified" : "reported",
+  });
+
+  if (v2) {
+    const known = await sql`
+      select handle, display_handle, id from traders where handle = any(${handles})`;
+    const metaBy = new Map(known.map((r) => [String(r.handle), r]));
+
+    return {
+      contractVersion: 2,
+      ...batchEnvelope(asked, capped),
+      /* One row per requested id, successes and failures alike. */
+      traders: requested.map((req, i) => {
+        const h = handles[i];
+        const meta = metaBy.get(h);
+        if (!meta) {
+          return {
+            ok: false as const,
+            requested: req,
+            id: null,
+            handle: null,
+            error: { code: "not_found", detail: `no trader '${req}' in the directory` },
+          };
+        }
+        const own = by.get(h) ?? [];
+        const priced = own.filter((r) => n(r.value) !== null && Number(r.value) > 0);
+        /*
+         * A null total means we could not value ANY of what he holds; zero means he was read
+         * and holds nothing. Collapsing the two would turn an unreadable portfolio into an
+         * empty one, which is the difference between "we do not know" and "there is nothing".
+         */
+        const totalValueUsd = own.length === 0
+          ? 0
+          : priced.length === 0
+          ? null
+          : round(priced.reduce((sum, r) => sum + Number(r.value), 0));
+        return {
+          ok: true as const,
+          requested: req,
+          id: meta.id ? String(meta.id) : null,
+          handle: String(meta.display_handle),
+          positions: own.map(position),
+          positionCount: own.length,
+          pricedPositionCount: priced.length,
+          totalValueUsd,
+          coverage: cov(priced.length, own.length),
+          /*
+           * Every position this trader holds is in this row -- the batch does not page, so a
+           * consumer never has to wonder whether it saw all of them. `nextCursor` is null for
+           * the same reason, and is present so the field means the same thing here as on the
+           * individual route.
+           */
+          complete: true,
+          nextCursor: null,
+        };
+      }),
+    };
+  }
+
+  // ---- the pre-version-2 projection, unchanged so existing consumers keep working
   return {
     ...batchEnvelope(asked, capped),
     traders: handles.map((h) => {
@@ -3604,20 +3808,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
       const priced = own.filter((r) => n(r.value) !== null && Number(r.value) > 0);
       return {
         handle: h,
-        positions: own.map((r) => ({
-          chain: r.chain, networkId: Number(r.network_id),
-          tokenAddress: r.token_address, symbol: r.symbol,
-          amount: n(r.human_amount),
-          /** §3: the moment the balance was read, not the moment you asked. */
-          balanceAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
-          priceUsd: n(r.price),
-          priceSource: (r.price_source as string) ?? null,
-          pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
-          valueUsd: n(r.value),
-          /** null, never 0 — an unpriceable coin is not a worthless one. */
-          whyNoPrice: n(r.value) === null ? "no price for this token in any source we hold" : null,
-          tier: r.source === "chain" ? "verified" : "reported",
-        })),
+        positions: own.map(position),
         coverage: cov(priced.length, own.length),
       };
     }),
@@ -3625,57 +3816,92 @@ post("/v1/traders/positions", async (_p, _url, body) => {
 });
 
 /**
- * AUM series for many traders in one call. Same cap, same envelope.
+ * AUM for many traders in one call.
+ *
+ * TWO CONTRACTS, CHOSEN BY THE CALLER. `contractVersion: 2` returns the identity-safe
+ * envelope: one row per requested id, carrying the value submitted, the canonical id, and
+ * the COMPLETE AUM object -- byte-identical to what `GET /v1/traders/:id/aum` returns for
+ * the same trader and window, because both are built by the same function from the same
+ * rows. Without that field the older projection is returned unchanged, so a consumer already
+ * reading it keeps working until it migrates.
+ *
+ * The older shape identifies rows by display handle alone, which cannot survive a rename or
+ * a folded-handle collision, and it drops the service's own `drawing` verdict -- leaving a
+ * consumer to guess whether a short series is a warming backfill or a real refusal. That is
+ * why version 2 exists; see GENIE_FOMO_V7_BATCH_AUM_AND_COVERAGE_PRD.md.
  */
 post("/v1/traders/aum", async (_p, _url, body) => {
-  const { handles, asked, capped } = await batchIds(body);
-  const b = body as { window?: string; step?: string };
+  const { requested, handles, asked, capped } = await batchIds(body);
+  const b = body as { window?: string; step?: string; contractVersion?: number };
   const windowKey = (b?.window ?? "1w").trim();
   if (!(windowKey in AUM_WINDOWS)) {
     throw badRequest(`'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")}`,
                      { parameter: "window" });
   }
-  const span = AUM_WINDOWS[windowKey];
-  const from = span === null ? null : new Date(Date.now() - span);
-
-  const rows = await sql`
-    select handle, at, total_usd, refused_reason, priced_positions, total_positions,
-           value_share, basis, tier
-    from aum_samples
-    where handle = any(${handles})
-      and (${from}::timestamptz is null or at >= ${from}::timestamptz)
-    order by handle, at asc`;
-
-  const by = new Map<string, any[]>();
-  for (const r of rows) {
-    if (!by.has(String(r.handle))) by.set(String(r.handle), []);
-    by.get(String(r.handle))!.push(r);
+  const stepRaw = typeof b?.step === "string" ? b.step : null;
+  if (stepRaw !== null && !AUM_STEPS.some((s) => s.name === stepRaw.trim())) {
+    throw badRequest(`'step' must be one of ${AUM_STEPS.map((s) => s.name).join(", ")}`,
+                     { parameter: "step" });
   }
 
+  const envelopes = await aumFor(handles, { windowKey, stepRaw, chainFilter: null });
+
+  if (Number(b?.contractVersion) === 2) {
+    const idRows = await sql`
+      select handle, id from traders where handle = any(${handles})`;
+    const idBy = new Map(idRows.map((r) => [String(r.handle), r.id ? String(r.id) : null]));
+
+    return {
+      contractVersion: 2,
+      ...batchEnvelope(asked, capped),
+      window: windowKey,
+      /*
+       * EXACTLY ONE ROW PER REQUESTED ID, INCLUDING THE ONES THAT FAILED. An omitted row is
+       * indistinguishable from a trader with no data, so an id we could not resolve comes
+       * back as an explicit refusal rather than a hole in the list.
+       */
+      traders: requested.map((req, i) => {
+        const h = handles[i];
+        const aum = envelopes.get(h);
+        if (!aum) {
+          return {
+            ok: false as const,
+            requested: req,
+            id: null,
+            handle: null,
+            error: { code: "not_found", detail: `no trader '${req}' in the directory` },
+          };
+        }
+        return {
+          ok: true as const,
+          requested: req,
+          id: idBy.get(h) ?? null,
+          handle: aum.handle,
+          aum,
+        };
+      }),
+    };
+  }
+
+  // ---- the pre-version-2 projection, unchanged so existing consumers keep working
   return {
     ...batchEnvelope(asked, capped),
     window: windowKey,
     traders: handles.map((h) => {
-      const own = by.get(h) ?? [];
-      const newest = own.length ? own[own.length - 1] : null;
-      const firstSampled = own.find((r) => r.basis === "sampled");
+      const aum = envelopes.get(h);
       return {
         handle: h,
-        trackedSince: firstSampled ? new Date(String(firstSampled.at)).toISOString() : null,
-        count: own.length,
-        now: newest
-          ? { at: new Date(String(newest.at)).toISOString(),
-              totalUsd: round(n(newest.total_usd)),
-              tier: newest.tier as string,
-              coverage: { pricedPositions: newest.priced_positions === null ? null : Number(newest.priced_positions),
-                          totalPositions: newest.total_positions === null ? null : Number(newest.total_positions),
-                          valueShare: n(newest.value_share) } }
+        trackedSince: aum?.trackedSince ?? null,
+        count: aum?.count ?? 0,
+        now: aum?.now
+          ? { at: aum.now.at, totalUsd: aum.now.totalUsd, tier: aum.now.tier,
+              coverage: aum.now.coverage }
           : null,
-        points: own.map((r) => ({
-          at: new Date(String(r.at)).toISOString(),
-          totalUsd: round(n(r.total_usd)),
-          basis: r.basis as string,
-          ...(r.refused_reason ? { refused: r.refused_reason as string } : {}),
+        points: (aum?.points ?? []).map((p) => ({
+          at: p.at,
+          totalUsd: p.totalUsd,
+          basis: p.basis,
+          ...((p as { refused?: string }).refused ? { refused: (p as { refused?: string }).refused } : {}),
         })),
       };
     }),
@@ -3813,14 +4039,25 @@ function walletsBody(t: any) {
  * Resolve a path segment that may be a handle OR a stable id.
  *
  * `handle` is a display name and people change them; `id` is the uuid that never moves. Both
- * are accepted on every per-trader route so a consumer can key on the stable one without
- * losing the readable one -- PRD §1.
+ * are accepted on EVERY per-trader route so a consumer can key on the stable one without
+ * losing the readable one.
+ *
+ * This existed before and was wired into two routes out of ten. The other eight looked the
+ * path segment up as a handle directly, so the id printed by the directory answered 404 on
+ * the route the directory exists to point at -- exactly the failure
+ * GENIE_FOMO_V7_BATCH_AUM_AND_COVERAGE_PRD.md reports as its first blocker. A resolver that
+ * only some routes call is not a resolver, so it is now the single way in.
+ *
+ * Both spellings of the id are accepted, with and without the `trd_` prefix, because both
+ * have been published and a consumer holding either must keep working.
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function resolveTrader(key: string): Promise<string> {
   const k = key.trim();
   // A uuid, with or without the `trd_` prefix the plugin team uses.
   const bare = k.replace(/^trd_/, "");
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(bare)) {
+  if (UUID_RE.test(bare)) {
     const [r] = await sql`select handle from traders where id = ${bare}::uuid`;
     if (r) return r.handle as string;
   }
@@ -3877,8 +4114,14 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
     ...walletsBody(t),
     /**
      * The stable key. `handle` above is a display name and may change; this does not.
+     *
+     * ONE SPELLING, and it is the directory's. This route used to prefix the uuid with
+     * `trd_` while `GET /traders` returned it bare, so the same trader had two ids depending
+     * on which route you asked -- a consumer storing one and looking up the other found
+     * nothing. The directory is what a consumer reads first, so the directory's form wins.
+     * Both spellings are still ACCEPTED as input, forever; only the output is now consistent.
      */
-    id: t.id ? `trd_${t.id}` : null,
+    id: t.id ?? null,
     /** When the display handle last changed; a consumer can notice a rename. */
     handleChangedAt: t.handle_changed_at
       ? new Date(String(t.handle_changed_at)).toISOString() : null,
@@ -4010,7 +4253,7 @@ get("/v1/traders/:handle/pnl", async ({ handle }) => {
   const [t] = await sql`
     select t.handle, t.display_handle, t.name, w.sol_address
     from traders t left join wallets w using (handle)
-    where t.handle = ${handle.toLowerCase()}`;
+    where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const addrs = t.sol_address ? [String(t.sol_address).toLowerCase()] : [];

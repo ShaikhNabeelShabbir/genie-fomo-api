@@ -26,6 +26,8 @@ const port = Number(Deno.env.get("PORT") ?? 8000);
  * query work on those three routes, not a smaller number here.
  */
 const ROUTE_TIMEOUT_MS = Number(Deno.env.get("ROUTE_TIMEOUT_MS") ?? 15000);
+/** A batch is capped at 50, so a single call can never cost more than that. */
+const BATCH_MAX_COST = 50;
 
 const headers = (extra: Record<string, string> = {}) => ({
   "Content-Type": "application/json",
@@ -158,7 +160,20 @@ Deno.serve({ port }, async (req) => {
           `this route did not answer within ${ROUTE_TIMEOUT_MS / 1000}s — retry`,
           undefined, 5)), ROUTE_TIMEOUT_MS)),
     ]);
-    return json(answered, 200, { ...rateHeaders(rate), "x-cost-units": "1" });
+    /*
+     * COST IS WHAT THE CALL ACTUALLY ASKED FOR, not a flat 1.
+     *
+     * A batch of fifty traders does fifty traders' worth of work, and reporting it as one
+     * unit -- the same as asking for a single trader -- gives a consumer no way to pace
+     * itself or predict a budget. Batch responses carry `asked`, so that is the cost; every
+     * other route costs one. GENIE_FOMO_V7_BATCH_AUM_TDR.md §7 requires the accounting to be
+     * deterministic and documented, and a number that ignores the request size is neither.
+     */
+    const asked = (answered as { asked?: unknown } | null)?.asked;
+    const cost = typeof asked === "number" && Number.isFinite(asked) && asked > 0
+      ? Math.min(asked, BATCH_MAX_COST)
+      : 1;
+    return json(answered, 200, { ...rateHeaders(rate), "x-cost-units": String(cost) });
   } catch (e) {
     const err = classify(e);
     if (err.status >= 500) console.error(`${url.pathname}: ${err.code} ${err.message}`);
