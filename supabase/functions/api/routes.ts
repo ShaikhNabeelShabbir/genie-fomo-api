@@ -1376,7 +1376,17 @@ get("/v1/tokens", async (_p, url) => {
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
-    join trader_stats_current st on st.handle = h.handle
+    /*
+     * LEFT, because this was silently hiding a third of the directory.
+     *
+     * An inner join here dropped every trader with no leaderboard-stats row -- which is all
+     * 144 fomo-sourced traders, none of whom have one. The visible effect was that a token
+     * held by 105 real traders answered "no leader holds it", and 5,244 tokens held by
+     * someone were invisible on these routes entirely. Nothing in the response needs a stats
+     * row: st.rank is only a tiebreak in the ordering below, and it already sorts nulls
+     * last. A holder is a holder whether or not the leaderboard has scored them.
+     */
+    left join trader_stats_current st on st.handle = h.handle
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     where q.token_key is null ${net === null ? sql`` : sql`and h.network_id = ${net}`}
@@ -1548,7 +1558,17 @@ get("/v1/tokens/:address", async ({ address }, url) => {
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
     join traders t on t.handle = h.handle
-    join trader_stats_current st on st.handle = h.handle
+    /*
+     * LEFT, because this was silently hiding a third of the directory.
+     *
+     * An inner join here dropped every trader with no leaderboard-stats row -- which is all
+     * 144 fomo-sourced traders, none of whom have one. The visible effect was that a token
+     * held by 105 real traders answered "no leader holds it", and 5,244 tokens held by
+     * someone were invisible on these routes entirely. Nothing in the response needs a stats
+     * row: st.rank is only a tiebreak in the ordering below, and it already sorts nulls
+     * last. A holder is a holder whether or not the leaderboard has scored them.
+     */
+    left join trader_stats_current st on st.handle = h.handle
     left join token_info ti
       on ti.network_id = h.network_id and ti.token_key = h.token_key
     where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}
