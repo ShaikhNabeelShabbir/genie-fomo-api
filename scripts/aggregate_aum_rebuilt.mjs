@@ -99,6 +99,32 @@ async function main() {
       returning 1`);
     console.log(`${upd.rowCount} rebuilt parent rows re-stated`);
 
+    /*
+     * SAMPLED POINTS GET THEIR CHAIN COUNTS TOO -- only the counts, never the total.
+     *
+     * A sampled reading's total is measured and authoritative; nothing here may touch it.
+     * But its `chainsAnswered` / `chainsTotal` were left null, so a consumer could see how
+     * much of a trader a REBUILT point covered and not a measured one, which is backwards:
+     * the measured points are the ones people read first.
+     */
+    const samp = await client.query(`
+      with expected as (
+        select handle, count(distinct network_id)::int n from (
+          select handle, network_id from holdings_current where human_amount > 0
+          union
+          select handle, network_id from aum_chain_samples
+        ) u group by handle
+      ), answered as (
+        select handle, at, count(*) filter (where total_usd is not null)::int n
+        from aum_chain_samples where basis = 'sampled' group by handle, at
+      )
+      update aum_samples s
+         set chains_answered = a.n, chains_expected = e.n
+        from answered a join expected e using (handle)
+       where s.handle = a.handle and s.at = a.at and s.basis = 'sampled'
+      returning 1`);
+    console.log(`${samp.rowCount} sampled rows given their chain counts (totals untouched)`);
+
     const after = await client.query(`
       select count(*)::int rows, count(total_usd)::int with_total,
              count(*) filter (where chains_answered >= chains_expected)::int fully_covered,

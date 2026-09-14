@@ -979,6 +979,12 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     rank: t.rank ?? null,
     verified: !!t.verified,
     updatedAt: t.captured_at ? new Date(String(t.captured_at)).toISOString() : null,
+    /**
+     * The same value as `updatedAt`, under the name every other route uses for it. Both are
+     * kept: `updatedAt` is what consumers already read here, `asOf` is what they read
+     * everywhere else, and a profile should not be the one route that spells it differently.
+     */
+    asOf: t.captured_at ? new Date(String(t.captured_at)).toISOString() : null,
     bio: nonEmpty(t.bio as string | null),
     profilePicture: nonEmpty(t.avatar as string | null),
     twitter: nonEmpty(t.twitter as string | null),
@@ -2952,6 +2958,8 @@ get("/v1/tokens/momentum", async (_p, url) => {
 
   return {
     board: "momentum", available: true, snapshots: gens.length,
+    /** The newer of the two snapshots compared -- this board is as recent as that reading. */
+    asOf: to ? new Date(String(to)).toISOString() : null,
     from, to,
     spanHours: Number(((Date.parse(String(to)) - Date.parse(String(from))) / 3_600_000).toFixed(1)),
     direction: dir || "all",
@@ -3285,7 +3293,13 @@ function buildAum(
   rows: Record<string, unknown>[],
   chainRows: Record<string, unknown>[],
   presence: { chains: number; on_solana: boolean; on_evm: boolean } | null,
-  opts: { windowKey: string; stepRaw: string | null; chainFilter: { network_id: number; name: string } | null; to: Date },
+  opts: {
+    windowKey: string; stepRaw: string | null;
+    chainFilter: { network_id: number; name: string } | null; to: Date;
+    /** Every point's chain split, keyed "<iso at>|<basis>". Null when not fetched. */
+    pointChains?: Map<string, { chain: string; usd: number | null }[]> | null;
+    sampler?: { lastAt: Date | null; lastSuccess: Date | null };
+  },
 ) {
   const { windowKey, stepRaw, chainFilter, to } = opts;
   const span = AUM_WINDOWS[windowKey];
@@ -3404,6 +3418,101 @@ function buildAum(
     ...(anchorAts.has(new Date(String(r.at)).toISOString()) ? { outsideWindow: true } : {}),
   }));
 
+  /*
+   * ===================== THE SEAM BETWEEN TWO KINDS OF POINT =====================
+   *
+   * Section 9 already says a sampled figure and a rebuilt one count different things, and
+   * refuses to borrow across that seam. The series itself was not held to the same rule: two
+   * neighbouring points could be valued over different sets of chains, and the difference was
+   * printed as a move in the balance. `fhn_gt` read $65,367.54, then $33.26, then $52,276.29,
+   * and a card said "+155,855.5% in 7 days". He did not lose 99.9% of his money -- the second
+   * point answered for robinhood alone, having dropped the ethereum leg the first one had.
+   *
+   * The consumer asked for three things, best first. What each one costs, measured over the
+   * last week across all 435 traders (1,418 consecutive valued steps, 865 of which move the
+   * line by half or more):
+   *
+   *   1. "Value both kinds the same way." NOT POSSIBLE from what is stored, and the reason is
+   *      specific rather than a shrug. Per chain, a rebuilt point prices 39% of the positions
+   *      on average and a sampled one 77-84%; the cliffs concentrate exactly on the steps that
+   *      cross between them (60% of sampled-after-rebuilt steps, 74% of rebuilt-after-sampled,
+   *      against 14% of sampled-after-sampled). Equalising that needs the per-token history the
+   *      rebuild did not keep -- only the per-chain totals were stored. Valuing every point
+   *      over the chains they all share was tried and measured: it removes the chain-set
+   *      cliffs and leaves the coverage ones, 548 of 1,074 steps still moving by half or more.
+   *      A column called "comparable" that is wrong half the time is the failure this API is
+   *      organised against, so it is not published.
+   *
+   *   2. "Mark every change of method." Done, and WIDENED, because as asked it would have
+   *      missed a quarter of them: 542 of the 865 big moves change `basis`, but 226 more keep
+   *      the same method and change the set of chains -- both of `fhn_gt`'s first two steps
+   *      among them. Marking either catches 768 of 865.
+   *
+   *   3. "Failing both, don't call it drawable." Not needed, and not done: `drawable` stays
+   *      the service's answer about whether a line exists, which is a different question, and
+   *      85% of rebuilt points are partial -- refusing all of them would delete the history
+   *      rather than describe it.
+   */
+  const pointChains = opts.pointChains ?? null;
+  const keyOf = (at: string, basis: string) => `${at}|${basis}`;
+
+  /** The chains a point actually put a number on. Empty when we hold no split for it. */
+  const chainsAt = (at: string, basis: string): string[] => {
+    if (!pointChains) return [];
+    const rowsHere = pointChains.get(keyOf(at, basis)) ?? [];
+    const names = rowsHere.filter((x) => x.usd !== null).map((x) => x.chain);
+    // A one-chain series has no chain-set question to answer; it is already comparable.
+    return (chainFilter ? names.filter((c) => c === chainFilter.name) : names).sort();
+  };
+
+  /*
+   * EVERY SEAM BETWEEN TWO VALUED POINTS, in either direction. A change of method and a
+   * change of chain set are both reasons two figures cannot be subtracted, and a step can be
+   * both at once. This is a statement about what the two numbers COUNT, not about how far
+   * apart they are: a step that changed composition and barely moved is still marked, because
+   * the next one like it will move a great deal.
+   */
+  const valued = points.filter((p) => p.totalUsd !== null);
+  const breaks: {
+    at: string; previousAt: string; reason: string;
+    chainsAdded: string[]; chainsRemoved: string[];
+  }[] = [];
+  for (let i = 1; i < valued.length; i++) {
+    const prev = valued[i - 1], cur = valued[i];
+    const a = chainsAt(prev.at, prev.basis), b = chainsAt(cur.at, cur.basis);
+    const added = b.filter((c) => !a.includes(c));
+    const removed = a.filter((c) => !b.includes(c));
+    const methodChanged = prev.basis !== cur.basis;
+    const chainsChanged = added.length > 0 || removed.length > 0;
+    if (!methodChanged && !chainsChanged) continue;
+    breaks.push({
+      at: cur.at,
+      previousAt: prev.at,
+      reason: methodChanged && chainsChanged
+        ? "method_and_chains_changed"
+        : (methodChanged ? "method_changed" : "chains_changed"),
+      chainsAdded: added,
+      chainsRemoved: removed,
+    });
+  }
+  const breakAt = new Set(breaks.map((b) => b.at));
+
+  /** The seam fields live on the point, so a chart reading `points[]` alone still sees them. */
+  const pointsOut = points.map((p, i) => ({
+    ...p,
+    /**
+     * The chains this point put a number on, by name. `coverage.chainsAnswered` gives the
+     * count; this says WHICH, which is what makes a step explicable rather than mysterious.
+     */
+    chains: chainsAt(p.at, p.basis),
+    /**
+     * False when this figure and the one before it do not count the same thing. Never measure
+     * a percentage across a `false` -- break the line there. Null on the first point, which
+     * has nothing before it.
+     */
+    comparableWithPrevious: i === 0 || p.totalUsd === null ? null : !breakAt.has(p.at),
+  }));
+
   /**
    * The moment real sampling began. Everything before it is a marked rebuild, everything
    * after is measured, and the response never blurs the two together.
@@ -3416,7 +3525,58 @@ function buildAum(
    */
   const firstSampled = rows.find((r) => r.basis === "sampled");
   const trackedSince = firstSampled ? new Date(String(firstSampled.at)).toISOString() : null;
-  const newest = rows.length ? rows[rows.length - 1] : null;
+
+  /*
+   * `now` IS THE MOST COMPLETE RECENT READING, NOT SIMPLY THE NEWEST.
+   *
+   * It used to be the last row by time, and that published a number three times too small.
+   * When the sampler fell behind, the newest row became a REBUILT point covering 1 of a
+   * trader's 5 chains, and unipcs was reported at $5.1M -- eight hours after a measured
+   * reading of $15.7M, against a portfolio route saying $15.8M. The figure people read first
+   * was a fifth of him, presented as all of him.
+   *
+   * So completeness wins over recency: the newest reading that answered for every chain he is
+   * known to be on, falling back to the newest that answered for the most of them, and only
+   * then to the newest row at all. Recency still breaks ties, so a fresh full reading always
+   * beats a stale one.
+   */
+  const withFigure = rows.filter((r) => n(r.total_usd) !== null);
+  const cover = (r: Record<string, unknown>) =>
+    r.chains_answered === null || r.chains_answered === undefined ? -1 : Number(r.chains_answered);
+  const wanted = (r: Record<string, unknown>) =>
+    r.chains_expected === null || r.chains_expected === undefined ? -1 : Number(r.chains_expected);
+
+  let newest: Record<string, unknown> | null = null;
+  if (withFigure.length) {
+    /*
+     * RECENT FIRST, THEN COMPLETE. Completeness alone is not enough -- ranking purely on it
+     * picked a five-day-old rebuild covering 5 of 5 chains over a measured reading taken that
+     * morning covering 4 of 5, which is a different way of publishing the wrong number.
+     *
+     * So only readings close to the freshest one compete, using the same 36-hour allowance
+     * the sampler is judged by. Among those: widest coverage wins, a measured reading beats an
+     * inferred one at equal coverage, and recency settles the rest.
+     */
+    const freshest = Date.parse(String(withFigure[withFigure.length - 1].at));
+    const RECENT_MS = 36 * 3_600_000;
+    const recent = withFigure.filter((r) => freshest - Date.parse(String(r.at)) <= RECENT_MS);
+    const pool = recent.length ? recent : [withFigure[withFigure.length - 1]];
+
+    const score = (r: Record<string, unknown>): [number, number, number] => [
+      cover(r),
+      r.basis === "sampled" ? 1 : 0,
+      Date.parse(String(r.at)),
+    ];
+    let best = pool[0];
+    for (const r of pool) {
+      const a = score(r), b = score(best);
+      if (a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])))) best = r;
+    }
+    newest = best;
+  } else if (rows.length) {
+    // Every reading was refused. The newest one still carries the reason, which is the answer.
+    newest = rows[rows.length - 1];
+  }
 
   /*
    * REACH -- what the stored data actually covers, as opposed to what was asked for.
@@ -3515,11 +3675,48 @@ function buildAum(
   nextRun.setUTCHours(6, 0, 0, 0);
   if (nextRun.getTime() <= Date.now()) nextRun.setUTCDate(nextRun.getUTCDate() + 1);
 
+  /*
+   * SAMPLER STATE, NAMED RATHER THAN IMPLIED.
+   *
+   * The sampler runs daily, so a reading inside 36 hours is on schedule -- one run plus a
+   * fully missed one, the same allowance the staleness check uses. Past that the readings are
+   * still true, they are simply old, and the answer has to say so instead of reporting
+   * `ready` over three-day-old figures.
+   *
+   * `lastAttemptAt` is null on purpose: we record successes, not attempts, and inventing a
+   * value would be worse than admitting the gap.
+   */
+  const STALE_AFTER_H = 36;
+  const lastSuccess = opts.sampler?.lastSuccess ?? null;
+  const sinceSuccessH = lastSuccess === null
+    ? null
+    : (to.getTime() - lastSuccess.getTime()) / 3_600_000;
+  const samplerState = lastSuccess === null
+    ? "warming"
+    : (sinceSuccessH! > STALE_AFTER_H ? "stale" : "current");
+  const samplerBlock = {
+    state: samplerState,
+    lastAttemptAt: null,
+    lastSuccessAt: lastSuccess ? lastSuccess.toISOString() : null,
+    nextExpectedAt: nextRun.toISOString(),
+    ageSeconds: sinceSuccessH === null ? null : Math.round(sinceSuccessH * 3600),
+    staleAfterHours: STALE_AFTER_H,
+    reason: samplerState === "stale"
+      ? `no measured reading for ${sinceSuccessH!.toFixed(1)}h — readings are true but old`
+      : null,
+  };
+
   return {
     handle: t.display_handle,
     /** Null means the whole portfolio. A name means this series is that chain alone. */
     chain: chainFilter ? chainFilter.name : null,
     window: windowKey,
+    /**
+     * When the figure this answer is anchored on was taken. Every route carries `asOf` so a
+     * profile can date each panel separately instead of assuming they share a moment -- they
+     * do not: balances, trades and the directory are refreshed by different jobs.
+     */
+    asOf: newest ? new Date(String(newest.at)).toISOString() : null,
     step: chosen.name,
     /** The step in milliseconds, so a consumer need not parse "6h". */
     stepMs: chosen.ms,
@@ -3530,12 +3727,20 @@ function buildAum(
       ? {
         at: new Date(String(newest.at)).toISOString(),
         totalUsd: round(n(newest.total_usd)),
+        /** How old this reading is, so a card can say "as of Thursday" without doing date maths. */
+        ageSeconds: Math.max(0, Math.round((to.getTime() - Date.parse(String(newest.at))) / 1000)),
+        /** `sampled` was read from the chain at the time; `rebuilt` was inferred afterwards. */
+        basis: newest.basis as string,
+        tier: newest.tier as string,
+        /** True when this figure covers only part of the trader. See `coverage` below. */
+        partial: cover(newest) >= 0 && wanted(newest) >= 0 ? cover(newest) < wanted(newest) : null,
         coverage: {
           pricedPositions: newest.priced_positions === null ? null : Number(newest.priced_positions),
           totalPositions: newest.total_positions === null ? null : Number(newest.total_positions),
           valueShare: n(newest.value_share),
+          chainsAnswered: newest.chains_answered === null ? null : Number(newest.chains_answered),
+          chainsTotal: newest.chains_expected === null ? null : Number(newest.chains_expected),
         },
-        tier: newest.tier as string,
       }
       : null,
     count: points.length,
@@ -3559,14 +3764,53 @@ function buildAum(
     /** Coverage of the newest point, in wallets and chains rather than positions. */
     coverage: { answeredWallets, totalWallets, answeredChains: answeredNets.size, totalChains },
 
-    /** `ready` means this is what we have; `warming` means the same call returns more later. */
-    status: warming ? "warming" : "ready",
+    /**
+     * `ready` — this is what we have to offer.
+     * `warming` — a backfill or first sampling is still filling it.
+     * `stale` — the readings are true but the sampler has not written for a while; see
+     *   `sampler`. This never used to be said, and 432 of 435 answers claimed `ready` over
+     *   figures three days old.
+     */
+    status: warming ? "warming" : (samplerState === "stale" ? "stale" : "ready"),
+
+    /** When measurement last succeeded, and when it is next due. */
+    sampler: samplerBlock,
     progress: warming
       ? { coveredDays, targetDays: requestedDays ?? coveredDays, nextRunAt: nextRun.toISOString() }
       : null,
 
     gaps,
-    points,
+
+    /**
+     * WHY TWO NEIGHBOURING FIGURES MAY NOT BE SUBTRACTABLE, stated once for the series.
+     *
+     * `equalised: false` is the honest answer to "value both kinds the same way": a rebuilt
+     * point and a sampled one price different fractions of the same wallet, and the per-token
+     * history that would let us equalise them was never stored -- only per-chain totals were.
+     * So the seam is MARKED rather than removed, and `breaks` below is where it is marked.
+     */
+    comparability: {
+      equalised: false,
+      reason: "coverage_differs_by_method",
+      detail: "a rebuilt point prices about 39% of a chain's positions and a sampled one " +
+              "77-84%, so the two count different fractions of the same wallet. Break the " +
+              "line at every entry in `breaks` and do not measure a percentage across one.",
+    },
+
+    /**
+     * EVERY SEAM, shaped like `gaps` because that is the list a chart already breaks on.
+     *
+     * A step appears here when the two figures do not count the same thing: the method
+     * changed (`method_changed`), the set of answered chains changed (`chains_changed`), or
+     * both. `chainsAdded` / `chainsRemoved` name which chains moved, so the step is
+     * explicable rather than mysterious.
+     *
+     * `chains_changed` is the one a method marker alone would miss, and it is not rare:
+     * measured over the last week across the whole directory, 226 of the 865 steps that move
+     * a line by half or more keep the same method and change only the chain set.
+     */
+    breaks,
+    points: pointsOut,
     chains: chainRows.map((r) => ({
       chain: r.chain as string,
       networkId: Number(r.network_id),
@@ -3680,6 +3924,50 @@ async function aumFor(
     a.push(r);
   }
 
+  /*
+   * THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a
+   * chart is a change in WHICH CHAINS a point could answer for, and nothing above can see it.
+   *
+   * unipcs measured 15.1M (5 chains, rebuilt), then 5.4M (4 chains, rebuilt, robinhood
+   * missing), then 15.7M (3 chains, sampled). The middle step is a 64% fall that never
+   * happened: the same trader, one chain short. Both points are rebuilt, so marking changes
+   * of METHOD -- which is what the consumer asked for -- would not have caught it. Measured
+   * over the last week across all 435 traders: 865 steps move the line by half or more, 542
+   * change method, and 226 change only the chain set. A method marker alone misses a quarter
+   * of them.
+   *
+   * Costed before adding: 5,979 rows for fifty traders in 188 ms against a table of 37,062.
+   * Cheap enough to fetch outright rather than approximate.
+   */
+  const allChainRows = present.length
+    ? await sql`
+        select a.handle, a.at, a.basis, c.name as chain, a.total_usd
+        from aum_chain_samples a
+        join chains c using (network_id)
+        where a.handle = any(${present})
+        order by a.handle, a.at asc`
+    : [];
+  /** handle -> "<iso at>|<basis>" -> [{ chain, usd }]. One map, built once for the batch. */
+  const pointChainsBy = new Map<string, Map<string, { chain: string; usd: number | null }[]>>();
+  for (const r of allChainRows) {
+    const h = String(r.handle);
+    let m = pointChainsBy.get(h); if (!m) pointChainsBy.set(h, m = new Map());
+    const k = `${new Date(String(r.at)).toISOString()}|${r.basis}`;
+    let a = m.get(k); if (!a) m.set(k, a = []);
+    a.push({ chain: String(r.chain), usd: n(r.total_usd) });
+  }
+
+  /*
+   * WHEN THE SAMPLER LAST SUCCEEDED, read once for the whole batch.
+   *
+   * The consumer measured every answer saying `ready` while the newest reading anywhere was
+   * 75 hours old, and nothing in the response said so. Freshness has to travel WITH the
+   * number rather than be reconstructed from dates by every caller.
+   */
+  const [samplerRow] = await sql`
+    select max(at) as last_at, max(sampled_at) as last_success
+    from aum_samples where basis = 'sampled'`;
+
   const presenceRows = await sql`
     select handle, count(distinct network_id)::int as chains,
            bool_or(network_id = ${SOLANA_NET}) as on_solana,
@@ -3697,7 +3985,10 @@ async function aumFor(
       byHandle.get(h) ?? [],
       chainsBy.get(h) ?? [],
       presBy.get(h) ?? null,
-      { ...opts, to },
+      { ...opts, to, pointChains: pointChainsBy.get(h) ?? null, sampler: {
+        lastAt: samplerRow?.last_at ? new Date(String(samplerRow.last_at)) : null,
+        lastSuccess: samplerRow?.last_success ? new Date(String(samplerRow.last_success)) : null,
+      } },
     ));
   }
   return out;
@@ -3777,6 +4068,12 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
     /** The cap is stated on every response — a silently truncated page under-counts a roster. */
     limit,
     capped,
+    /**
+     * The newest trade we hold for this trader under the filters asked for. Every route carries
+     * an `asOf` so a caller can age the answer without knowing how the answer was produced.
+     */
+    asOf: page.length && page[0].block_time
+      ? new Date(String(page[0].block_time)).toISOString() : null,
     trades: page.map((r: any) => {
       const td = n(r.token_delta), qd = n(r.quote_delta), usd = n(r.quote_usd);
       return {
@@ -3915,11 +4212,17 @@ async function batchIds(
   return { requested: wanted, handles, asked: wanted.length, capped: false };
 }
 
-const batchEnvelope = (asked: number, capped: boolean) => ({
+const batchEnvelope = (asked: number, capped: boolean, asOf: string | null = null) => ({
   limit: BATCH_MAX,
   asked,
   /** True when the caller sent more than the cap; the extras were NOT read. */
   capped,
+  /**
+   * When the data behind this batch was taken. The batch routes had no `asOf` while every
+   * individual route had one, so a consumer reading fifty traders at once could not date the
+   * answer without calling a route it was trying to avoid.
+   */
+  asOf,
   ...(capped
     ? { note: `only the first ${BATCH_MAX} ids were read — send the rest in another call` }
     : {}),
@@ -3971,6 +4274,16 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     by.get(String(r.handle))!.push(r);
   }
 
+  /*
+   * The newest balance read across the traders asked for -- taken from the rows already in
+   * hand rather than from a second query, so dating the batch costs nothing.
+   */
+  const positionsAsOf = rows.reduce<string | null>((best, r) => {
+    if (!r.captured_at) return best;
+    const at = new Date(String(r.captured_at)).toISOString();
+    return best === null || at > best ? at : best;
+  }, null);
+
   const position = (r: Record<string, unknown>) => ({
     chain: r.chain, networkId: Number(r.network_id),
     tokenAddress: r.token_address, symbol: r.symbol,
@@ -3993,7 +4306,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
 
     return {
       contractVersion: 2,
-      ...batchEnvelope(asked, capped),
+      ...batchEnvelope(asked, capped, positionsAsOf),
       /* One row per requested id, successes and failures alike. */
       traders: requested.map((req, i) => {
         const h = handles[i];
@@ -4044,7 +4357,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
 
   // ---- the pre-version-2 projection, unchanged so existing consumers keep working
   return {
-    ...batchEnvelope(asked, capped),
+    ...batchEnvelope(asked, capped, positionsAsOf),
     traders: handles.map((h) => {
       const own = by.get(h) ?? [];
       const priced = own.filter((r) => n(r.value) !== null && Number(r.value) > 0);
@@ -4095,6 +4408,16 @@ post("/v1/traders/aum", async (_p, _url, body) => {
   const chainFilter = await resolveChain((b?.chain ?? "").trim().toLowerCase());
   const envelopes = await aumFor(handles, { windowKey, stepRaw, chainFilter });
 
+  /*
+   * The newest reading anywhere in this batch. Each trader carries his own `now.at`; this is
+   * the one date for the answer as a whole, and matches what the individual route reports for
+   * the freshest trader in the list.
+   */
+  const batchAsOf = [...envelopes.values()].reduce<string | null>((best, e) => {
+    const at = e.asOf ?? null;
+    return at !== null && (best === null || at > best) ? at : best;
+  }, null);
+
   if (Number(b?.contractVersion) === 2) {
     const idRows = await sql`
       select handle, id from traders where handle = any(${handles})`;
@@ -4102,7 +4425,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
 
     return {
       contractVersion: 2,
-      ...batchEnvelope(asked, capped),
+      ...batchEnvelope(asked, capped, batchAsOf),
       window: windowKey,
       /** Null when the batch asked for the whole portfolio; a name when it named a chain. */
       chain: chainFilter ? chainFilter.name : null,
@@ -4136,7 +4459,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
 
   // ---- the pre-version-2 projection, unchanged so existing consumers keep working
   return {
-    ...batchEnvelope(asked, capped),
+    ...batchEnvelope(asked, capped, batchAsOf),
     window: windowKey,
     ...(chainFilter ? { chain: chainFilter.name } : {}),
     traders: handles.map((h) => {
@@ -4202,11 +4525,59 @@ get("/v1/health", async () => {
            (select max(block_time)  from transactions)                   as transactions_at,
            (select max(fetched_at)  from token_info)                     as token_info_at,
            (select max(at)          from aum_samples)                    as aum_at,
+           (select max(sampled_at)  from aum_samples
+              where basis = 'sampled')                                   as aum_success_at,
            (select max(last_seen_at) from wallets)                       as wallets_at,
            (select count(*) from aum_samples)::int                       as aum_rows,
            (select count(distinct handle) from aum_samples)::int         as aum_traders`;
 
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
+
+  /*
+   * EVERY FEED SAYS WHETHER IT IS STILL ARRIVING, NOT ONLY WHEN IT LAST DID.
+   *
+   * `lastRefreshAt` was already here and a consumer could in principle subtract it from the
+   * clock -- but nobody did, and the balance readings sat 75 hours old while every answer
+   * said `ready`. A date is not a verdict. Each feed now carries its own allowance and the
+   * verdict that follows from it, so one call to /health shows which feed stopped.
+   *
+   * The allowances are the schedules themselves plus one missed run: the daily jobs get 36
+   * hours, the trade loader 72 because it is the expensive one and skips runs by design.
+   * `state` is `current`, `stale`, or `never` -- and `never` is not `stale`, because a feed
+   * that has not run once has a different cause and a different fix.
+   */
+  const nowMs = Date.now();
+  const feed = (at: unknown, staleAfterHours: number, extra: Record<string, unknown> = {}) => {
+    const t = at ? Date.parse(String(at)) : NaN;
+    const ageSeconds = Number.isFinite(t) ? Math.round((nowMs - t) / 1000) : null;
+    return {
+      lastRefreshAt: iso(at),
+      rowCount: null,
+      ageSeconds,
+      staleAfterHours,
+      state: ageSeconds === null
+        ? "never"
+        : (ageSeconds > staleAfterHours * 3600 ? "stale" : "current"),
+      ...extra,
+    };
+  };
+
+  const feeds = {
+    traders:      feed(b?.captured_at ?? null, 36),
+    trades:       feed(f.trades_at, 72),
+    wallets:      feed(f.wallets_at, 36),
+    positions:    feed(f.holdings_at, 36),
+    transactions: feed(f.transactions_at, 36),
+    tokenInfo:    feed(f.token_info_at, 24 * 14),
+    aum:          feed(f.aum_success_at ?? f.aum_at, 36, {
+                    rowCount: Number(f.aum_rows),
+                    traders: Number(f.aum_traders),
+                    newestReadingAt: iso(f.aum_at),
+                    lastSuccessAt: iso(f.aum_success_at),
+                  }),
+  };
+  const staleFeeds = Object.entries(feeds)
+    .filter(([, v]) => v.state !== "current").map(([k]) => k).sort();
 
   /**
    * The share of traders carrying a usable rhythm figure (§5).
@@ -4226,16 +4597,27 @@ get("/v1/health", async () => {
     runtime: "supabase edge function (deno)",
     source: "postgres",
     build: { capturedAt: b?.captured_at ?? null, window: b?.window_label ?? null },
-    /** Per-feed freshness. A stale feed is visible here before it misleads a screen. */
-    feeds: {
-      traders:      { lastRefreshAt: iso(f.trades_at),       rowCount: null },
-      wallets:      { lastRefreshAt: iso(f.wallets_at),      rowCount: null },
-      positions:    { lastRefreshAt: iso(f.holdings_at),     rowCount: null },
-      transactions: { lastRefreshAt: iso(f.transactions_at), rowCount: null },
-      tokenInfo:    { lastRefreshAt: iso(f.token_info_at),   rowCount: null },
-      aum:          { lastRefreshAt: iso(f.aum_at),          rowCount: Number(f.aum_rows),
-                      traders: Number(f.aum_traders) },
-    },
+    /**
+     * Per-feed freshness AND a verdict on it. A stale feed is visible here before it misleads
+     * a screen.
+     *
+     * `traders` is the directory build, which is what the directory's own `capturedAt`
+     * reports. It used to be filled from the trade loader's clock -- two different jobs under
+     * one name, so a five-day-old trade load read as a five-day-old directory and the loader
+     * itself had no entry at all. `trades` is now its own feed.
+     *
+     * `aum.lastRefreshAt` is the newest reading's own timestamp; `lastSuccessAt` is when the
+     * sampler last wrote one. They differ, and the second is the one that says the job ran.
+     */
+    feeds,
+    /**
+     * `status` stays `ok` while the service answers, because that is what it has always meant
+     * and a consumer checks it for liveness. Whether the DATA is still arriving is a separate
+     * question with a separate field, and `staleFeeds` names the ones that stopped, so nobody
+     * has to read seven dates to find out.
+     */
+    dataState: staleFeeds.length ? "degraded" : "current",
+    staleFeeds,
     measurements: {
       traders: Number(m.traders),
       withClosedTrades: Number(m.measurable),
@@ -4333,6 +4715,19 @@ async function resolveTrader(key: string): Promise<string> {
     select handle from traders where lower(display_handle) = ${lower} limit 1`;
   if (byDisplay) return byDisplay.handle as string;
 
+  /*
+   * A LEADING `@` IS HOW PEOPLE WRITE A HANDLE, and it 404s today.
+   *
+   * We store handles bare. The consumer's own report names every trader `@unipcs` in its
+   * prose and `unipcs` in its curl lines -- the same trader, one spelling of which does not
+   * resolve. Tried last, after the bare handle and the display handle, so a handle that
+   * genuinely begins with `@` still wins on its own terms.
+   */
+  if (lower.startsWith("@")) {
+    const [at] = await sql`select handle from traders where handle = ${lower.slice(1)}`;
+    if (at) return at.handle as string;
+  }
+
   return lower;
 }
 
@@ -4394,6 +4789,8 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
      * Both spellings are still ACCEPTED as input, forever; only the output is now consistent.
      */
     id: t.id ?? null,
+    /** When this wallet record was last confirmed. See the note on `asOf` in the aum route. */
+    asOf: t.last_seen_at ? new Date(String(t.last_seen_at)).toISOString() : null,
     /** When the display handle last changed; a consumer can notice a rename. */
     handleChangedAt: t.handle_changed_at
       ? new Date(String(t.handle_changed_at)).toISOString() : null,
@@ -4542,6 +4939,12 @@ get("/v1/traders/:handle/pnl", async ({ handle }) => {
   ]);
 
   const body = pnlBody(t, r) as Record<string, unknown>;
+  /*
+   * The fomo figures in `body` date from the trade load; `chainDerived` below dates from the
+   * swaps we resolved ourselves. `asOf` names the first, and `chainDerived.lastSwapAt` the
+   * second, so neither one is read as speaking for the other.
+   */
+  body.asOf = await asOfTrades(t.handle as string);
   const swaps = Number(chain?.swaps ?? 0);
   body.chainDerived = swaps
     ? {

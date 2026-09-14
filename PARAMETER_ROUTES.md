@@ -116,6 +116,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **0c** | [Sorting and range filters (G5)](#0c-sorting-and-range-filters-g5) | **G5** |
 | **0d** | [Two sources of trader](#0d-two-sources-of-trader) | fomo's 144 + **GMGN's 291** |
 | **0e** | [Stable id, and wallets that name their chains](#0e-stable-id-and-wallets-that-name-their-chains) | key on `id`, read on the right chain |
+| **0f** | [How old is this answer](#0f-how-old-is-this-answer) | `asOf` everywhere, and feeds that say they stopped |
 | **1** | [Trader — money](#1-trader-money) | T1–T10 |
 | **2** | [Trader — positions](#2-trader-positions) | T11–T15 |
 | **2b** | [Position timing (G1)](#2b-position-timing-g1) | **G1** |
@@ -454,6 +455,9 @@ done
 
 ### What to know before you use it
 
+**A leading `@` is accepted.** `@unipcs` and `unipcs` resolve to the same trader, because that
+is how a handle is written in prose and a consumer should not have to strip it.
+
 **`family` is `solana` or `evm`, and never a chain.** The family says how to talk to the
 address; `chains` says where it has been. Of our 260 Ethereum-only traders, **140 trade on
 four chains** — one address, four places to read.
@@ -471,6 +475,128 @@ registered without an address on record.
 
 **Rename-safe.** `handleChangedAt` carries the moment a display handle last changed, so a
 consumer following a name can notice it moved.
+
+---
+
+## 0f. How old is this answer
+
+Nothing in this API is live. Every figure was read at some moment by some job, and the jobs run
+on different schedules — balances nightly, trades less often, the directory on its own build.
+Two panels on one screen can be days apart while both look current.
+
+So **every route carries `asOf`**, and the ones that depend on a job running carry the job's
+state as well.
+
+### `asOf` on every route
+
+```bash
+curl -s "$B/traders/unipcs/aum?window=1w" | jq .asOf
+curl -s "$B/traders/unipcs/portfolio"     | jq .asOf
+curl -s "$B/traders/unipcs/trades"        | jq .asOf
+curl -s -X POST "$B/traders/aum" -H 'content-type: application/json' \
+  -d '{"contractVersion":2,"ids":["unipcs"],"window":"1w"}' | jq .asOf
+```
+
+| Route | What its `asOf` is the moment of |
+| --- | --- |
+| `/traders/:id` | the directory build this trader's row came from (same value as `updatedAt`) |
+| `/traders/:id/aum` | the reading `now` is taken from |
+| `/traders/:id/portfolio`, `/positions` | when the balances were read |
+| `/traders/:id/scorecard`, `/pnl` | when the trades behind it were loaded |
+| `/traders/:id/trades` | the newest trade on the page, under the filters asked for |
+| `/traders/:id/transactions` | the newest transfer stored |
+| `/traders/:id/wallets` | when the wallet record was last confirmed |
+| `/traders/:id/trust` | the holdings capture the checks ran against |
+| `/tokens`, `/tokens/:address`, `/tokens/momentum` | the snapshot behind the figures |
+| `POST /traders/aum`, `POST /traders/positions` | the newest reading anywhere in the batch |
+
+A batch answer dates itself once, at the top, next to `limit` and `asked`. Each trader still
+carries his own `now.at`, which is the one to use when they differ.
+
+### The balance series says whether the sampler is still running
+
+A date is not a verdict. `asOf` tells you when the reading was taken; `sampler` tells you
+whether more are coming.
+
+```bash
+curl -s "$B/traders/unipcs/aum?window=1w" | jq '{status, asOf, now: .now.ageSeconds, sampler}'
+```
+
+```json
+{
+  "status": "ready",
+  "asOf": "2026-09-14T04:00:00.000Z",
+  "now": 5485,
+  "sampler": {
+    "state": "current",
+    "lastAttemptAt": null,
+    "lastSuccessAt": "2026-09-14T04:28:37.000Z",
+    "nextExpectedAt": "2026-09-14T06:00:00.000Z",
+    "ageSeconds": 3768,
+    "staleAfterHours": 36,
+    "reason": null
+  }
+}
+```
+
+| `sampler.state` | What it means |
+| --- | --- |
+| `current` | a reading was written inside `staleAfterHours` — the series is keeping up |
+| `stale` | past that allowance. The points are still true, they are simply old, and `reason` says how old |
+| `warming` | no measured reading yet for this trader |
+
+**The allowance is 36 hours and it is on the response**, not buried in a doc: the sampler runs
+daily, so one run plus a fully missed one is still on schedule, and anything past that is not.
+
+**`status` tells the truth when the sampler falls behind.** A series whose readings have gone
+stale answers `status: "stale"`, not `ready`. `ready` never describes a two-day-old figure.
+
+**`now.ageSeconds`** is the age of the chosen reading in seconds, so a caller can print "as of
+Thursday" without parsing a date.
+
+**`lastAttemptAt` is `null` on purpose.** We record successes, not attempts. Inventing a value
+would be worse than admitting the gap.
+
+### `/health` says which feed stopped
+
+```bash
+curl -s "$B/health" | jq '{dataState, staleFeeds, feeds}'
+```
+
+```json
+{
+  "dataState": "current",
+  "staleFeeds": [],
+  "feeds": {
+    "traders":      { "lastRefreshAt": "…", "ageSeconds": 3600,   "staleAfterHours": 36,  "state": "current" },
+    "trades":       { "lastRefreshAt": "…", "ageSeconds": 410000, "staleAfterHours": 72,  "state": "stale" },
+    "wallets":      { "…": "…" },
+    "positions":    { "…": "…" },
+    "transactions": { "…": "…" },
+    "tokenInfo":    { "…": "…" },
+    "aum":          { "lastSuccessAt": "…", "newestReadingAt": "…", "rowCount": 0, "traders": 0 }
+  }
+}
+```
+
+**Each feed carries its own allowance and the verdict that follows from it**, so one call
+answers "has anything stopped arriving" without subtracting seven dates from the clock.
+`state` is `current`, `stale`, or `never` — and `never` is not `stale`, because a feed that has
+never run has a different cause and a different fix.
+
+**`staleFeeds` names them**, and `dataState` is `current` or `degraded`.
+
+**`status` stays `ok` while the service answers.** It has always meant liveness and consumers
+check it for that. Whether the *data* is still arriving is the separate question `dataState`
+answers.
+
+**`aum` reports two moments.** `newestReadingAt` is the newest reading's own timestamp;
+`lastSuccessAt` is when the sampler last wrote one. They differ, and the second is the one that
+says the job ran.
+
+**`traders` is the directory build.** It used to be filled from the trade loader's clock — two
+different jobs under one name — so a five-day-old trade load read as a five-day-old directory
+while the loader had no entry of its own. `trades` is now its own feed.
 
 ---
 
@@ -1696,6 +1822,62 @@ chain with no row at that moment did not contribute zero dollars; it contributed
 all, and those are different facts. Wallets are counted as well as chains because one EVM
 address serves four of the five chains — so "three of four chains" can still mean either
 wallet went unread, and which one it was changes what the number is missing.
+
+### Two neighbouring points may not count the same thing — `breaks[]`
+
+A gap is a bucket with no number. A **break** is two numbers that cannot be subtracted.
+
+```bash
+curl -s "$B/traders/unipcs/aum?window=1w" | jq '{comparability, breaks}'
+```
+
+```json
+{
+  "comparability": { "equalised": false, "reason": "coverage_differs_by_method" },
+  "breaks": [
+    { "at": "2026-09-10T00:00:00Z", "previousAt": "2026-09-09T00:00:00Z",
+      "reason": "chains_changed", "chainsAdded": [], "chainsRemoved": ["robinhood"] },
+    { "at": "2026-09-10T16:00:00Z", "previousAt": "2026-09-10T00:00:00Z",
+      "reason": "method_and_chains_changed",
+      "chainsAdded": ["robinhood"], "chainsRemoved": ["base", "bsc"] }
+  ]
+}
+```
+
+**Break the line at every entry, and never measure a percentage across one.** Each point also
+carries `comparableWithPrevious` (`null` on the first), so a chart reading `points[]` alone
+sees the same thing, and `chains[]` naming which chains that point answered for.
+
+| `reason` | What changed between the two figures |
+| --- | --- |
+| `method_changed` | one is a measured reading, the other a rebuild |
+| `chains_changed` | the same method answered for a different set of chains |
+| `method_and_chains_changed` | both |
+
+**`chains_changed` is the one that catches what a method marker misses.** `fhn_gt` read
+$65,367.54, then $33.26, then $52,276.29 in three days, and a consumer's card printed
+"+155,855.5% in 7 days". He did not lose 99.9% of his money — the second point answered for
+robinhood alone, having dropped the ethereum leg the first one had. **Both** of those steps are
+rebuilt-to-rebuilt: the method never changed. Measured over the last week across all 435
+traders, of the 865 consecutive steps that move a line by half or more, 542 change method and
+**226 more change only the chain set**.
+
+**The two kinds are marked, not equalised, and `comparability` says so.** Valuing both the same
+way is the better answer and it is not available: per chain, a rebuilt point prices about 39% of
+the positions and a sampled one 77–84%, and the cliffs concentrate exactly on the steps that
+cross between them — 60% of sampled-after-rebuilt steps, 74% of rebuilt-after-sampled, against
+14% of sampled-after-sampled. Equalising needs the per-token history the rebuild did not keep;
+only per-chain totals were stored. Valuing every point over the chains they all share was tried
+and measured: it removes the chain-set cliffs and leaves the coverage ones, with 548 of 1,074
+steps still moving by half or more. A column called "comparable" that is wrong half the time is
+worse than no column, so there is not one.
+
+**Asking one chain at a time removes half the problem.** With `?chain=`, every point answers for
+that chain, so `chains_changed` cannot occur and only `method_changed` remains.
+
+**`drawable` is unchanged by any of this.** Whether a line exists and whether two of its points
+can be subtracted are different questions. 85% of rebuilt points answer for fewer chains than
+the trader trades on; refusing them would delete the history rather than describe it.
 
 ### What to know before you use it
 

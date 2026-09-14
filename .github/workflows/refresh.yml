@@ -98,16 +98,29 @@ jobs:
       # Tokens traded but no longer held match nothing in `tokens`, so their trades carry no
       # network_id. Left unresolved that bucket held -$2.46M of realized P&L, which is far
       # too large to publish a per-chain breakdown around.
+      # ---------------------------------------------------------------- free of fomoapi
+      # `!cancelled()` on everything from here down, because none of it spends a fomoapi
+      # credit: transfers come from Helius, fundamentals from GMGN, balances from the chains
+      # themselves, and the AUM sampler and timing table read our own tables.
+      #
+      # Without it, a failure in the two steps above -- which DO spend credits, and which fail
+      # when the quota is gone or fomo sheds load -- skipped all of this. That is how the
+      # balance readings went 75 hours old while the data needed to refresh them was free and
+      # available the whole time. A missed directory is a stale roster; a missed sampler is a
+      # gap in every chart.
       - name: Resolve chains for newly traded tokens
+        if: '!cancelled()'
         run: node scripts/resolve_trade_chains.mjs
 
       # ---------------------------------------------------------------- 5. supply
       # Needed to express average entry as a market cap rather than a per-token price.
       - name: Resolve supply for new tokens
+        if: '!cancelled()'
         run: node scripts/load_token_supply.mjs
 
       # ---------------------------------------------------------------- 6. transfers
       - name: Refresh on-chain transfers
+        if: '!cancelled()'
         run: node scripts/backfill_transactions.mjs --pages 5 --fanout 3
 
       # ---------------------------------------------------------------- 6b. prices
@@ -120,6 +133,7 @@ jobs:
       # UPDATE. Batched because the single-statement version hit the 2-minute
       # statement_timeout and rolled back everything it had written.
       - name: Price quote-asset transfers
+        if: '!cancelled()'
         run: node scripts/load_quote_prices.mjs
 
       # ---------------------------------------------------------------- 6c. token info
@@ -134,6 +148,7 @@ jobs:
       # `fundamentals` to a stale `fetchedAt`, which the response already states; failing the
       # whole job over it would discard the directory and trade refreshes that did succeed.
       - name: Refresh token fundamentals
+        if: '!cancelled()'
         continue-on-error: true
         env:
           GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
@@ -148,6 +163,7 @@ jobs:
       # registered with Helius — every other route would show them while transactions stayed
       # empty. Re-syncing here keeps the watch list in step with the directory automatically.
       - name: Sync the Helius watch list
+        if: '!cancelled()'
         env:
           HELIUS_WEBHOOK_SECRET: ${{ secrets.HELIUS_WEBHOOK_SECRET }}
         run: node scripts/register_webhook.mjs
@@ -163,7 +179,21 @@ jobs:
       # `continue-on-error` because a missed reading is a gap in one day of one chart, while
       # a failed job would also discard the seven loaders above it that already succeeded.
       # The route reports `count` and `trackedSince`, so a gap is visible rather than implied.
+      # Balances read from the chains themselves, for every trader -- not just the hundred the
+      # fomo directory carries. Without this step holdings_current only moved when the paid
+      # directory build ran, so /positions and /portfolio aged with it: the consumer measured
+      # both stuck at 10 September while the chains were answering the whole time. It spends
+      # no fomoapi credit.
+      - name: Read chain balances
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
+        run: node scripts/load_chain_balances.mjs
+
       - name: Sample AUM
+        if: '!cancelled()'
         continue-on-error: true
         timeout-minutes: 45
         env:
@@ -178,6 +208,7 @@ jobs:
       # continue-on-error because a stale timing table serves slightly old first-seen dates,
       # which is a far smaller problem than failing a run whose loaders all succeeded.
       - name: Refresh position timing
+        if: '!cancelled()'
         continue-on-error: true
         timeout-minutes: 15
         run: node scripts/refresh_position_timing.mjs
