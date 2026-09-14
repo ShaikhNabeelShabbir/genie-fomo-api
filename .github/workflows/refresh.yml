@@ -213,6 +213,38 @@ jobs:
         timeout-minutes: 15
         run: node scripts/refresh_position_timing.mjs
 
+      # A7 — what each transaction cost to make. Free: the public RPC in `chains.rpc` for the
+      # four EVM chains and the Helius key we already hold for Solana, both batched. Resumable
+      # by construction, so a timeout here costs nothing and the next run continues.
+      - name: Read transaction fees (EVM)
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 25
+        run: node scripts/load_transaction_fees.mjs --chain=bsc --batch=100 && node scripts/load_transaction_fees.mjs --chain=ethereum --batch=100 && node scripts/load_transaction_fees.mjs --chain=robinhood --batch=10
+
+      # base caps a JSON-RPC batch at 10 and answers HTTP 200 with a refusal in the body
+      # rather than an error, so it gets its own step at its own size.
+      - name: Read transaction fees (base)
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 20
+        run: node scripts/load_transaction_fees.mjs --chain=base --batch=10
+
+      # Solana scoped to the transactions behind resolved swaps: those are the ones a per-trade
+      # fee can attach to, and it is ~37 requests rather than 6,367 for the whole chain.
+      - name: Read transaction fees (solana swaps)
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 15
+        run: node scripts/load_transaction_fees.mjs --chain=solana --swaps-only --batch=10
+
+      # Roll those into the daily buckets the scorecard reads. Must follow the loaders.
+      - name: Refresh trader fees
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 30
+        run: node scripts/refresh_trader_fees.mjs
+
       # ---------------------------------------------------------------- summary
       # `always()` so a failed run still reports how far it got. Each script commits its own
       # work independently, so a late failure leaves the earlier steps landed — the job goes

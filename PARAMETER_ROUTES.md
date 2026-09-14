@@ -143,6 +143,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **A4** | [The version 8 report, and what changed](#appendix-a4-the-version-8-report-and-what-changed-2026-09-14) | freshness, `now`, and the seam |
 | **A5** | [The version 8 report, the rest of the asks](#appendix-a5-the-version-8-report-the-rest-of-the-asks-2026-09-14) | ten more, measured |
 | **A6** | [Cost basis, reasons, and paired trades](#appendix-a6-cost-basis-reasons-and-paired-trades-2026-09-14) | the last code-only three |
+| **A7** | [Fees, read from chain](#appendix-a7-fees-read-from-chain-2026-09-14) | the fee gap, closed |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -924,6 +925,59 @@ The leaderboard gives one lifetime figure with nothing to slice it by, so "volum
 trip trades twice — over the closed positions carrying an entry price, an exit price and a
 recoverable quantity, with `volumeCoverage` saying how many that was. `volume.reportedLifetimeUsd`
 keeps the leaderboard's number beside it; the two are different measurements and will not agree.
+
+### Fees — what each trade cost to make
+
+Nothing in this database could answer this before: no fee or gas column existed on any table,
+and `transactions.raw` is empty on all 1,025,559 rows, so it was not recoverable from what was
+already stored either. It is read from chain now — free, on the public RPC in `chains.rpc` for
+the four Ethereum-style chains and the Helius key we already hold for Solana.
+
+```bash
+curl -s "$B/traders/unipcs/scorecard" | jq '.fees, (.windows["30d"] | {realizedUsd, feesUsd, feesCoverage})'
+```
+
+```json
+{ "includedInRealized": false,
+  "paidUsd": 676.9,
+  "byWindowUsd": { "24h": 0.03, "7d": 77.54, "30d": 674.35, "all": 676.9 },
+  "paidNative": [ { "symbol": "ETH", "amount": 0.271543412, "chains": 3 },
+                  { "symbol": "BNB", "amount": 0.089880785, "chains": 1 },
+                  { "symbol": "SOL", "amount": 0.037769357, "chains": 1 } ],
+  "transactions": 1156,
+  "coverage": { "of": 4, "total": 5, "share": 0.8 },
+  "usdBasis": "native fee valued at the current native price, not the price when it was paid" }
+```
+
+**`includesFees` is still `false`, and that is the point.** Fees are now measured and still not
+deducted. A consumer that wants "after fees" subtracts `paidUsd` itself; one that reads
+`realizedUsd` is not silently handed a net figure where it expected a gross one. The flag is on
+every window.
+
+**`paidNative` is the measurement; `paidUsd` is derived.** A fee is paid once, in the chain's
+own coin, at a moment. We hold no historical price for those coins, so the dollar figure applies
+**today's** rate to a past payment — `usdBasis` says so. The native amount does not move.
+
+**ETH is summed once, not three times.** It is the native coin of three of our five chains, and
+`chains` says how many it was paid across.
+
+**bsc contributes nothing to `paidUsd`, and `coverage` says 4 of 5.** There is no market price
+for BNB anywhere in our store, so its fees are real, exact in `paidNative`, and deliberately not
+converted. Adding zero for it would state that trading on bsc was free.
+
+**Per trade, on `/trades`** — where a row genuinely *is* a transaction:
+
+```json
+{ "feeNative": 0.000029182, "feeNativeSymbol": "SOL", "feeUsd": 0.003,
+  "feeUsdBasis": "native fee valued at the current native price, not the price when it was paid" }
+```
+
+A Solana fee is a fraction of a cent, so fee dollars carry six decimals. Rounding them to two
+would print `0`, and no trade on any chain costs nothing.
+
+**A stored position cannot carry a fee, and `perTradeWhy` says why.** The scorecard is built
+from positions, which have no transaction hash — there is nothing to look up. Per-trade fees
+live on `/trades`.
 
 ### Is this the whole record? — `sample`
 
@@ -2512,6 +2566,63 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 **Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
 `RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
+
+---
+
+## Appendix A7 · Fees, read from chain (2026-09-14)
+
+The consumer's A7 asked for five things. Four were answered from stored data; the fifth — fees
+in dollars — could not be, because **no fee or gas column existed on any table** and
+`transactions.raw` was empty on all 1,025,559 rows. It is now read from chain.
+
+**No paid API, no new key.** Measured before any of it was written:
+
+| Chain | Call | Batches |
+| --- | --- | --- |
+| robinhood, bsc, base, ethereum | `eth_getTransactionReceipt` on the public RPC in `chains.rpc` | yes |
+| solana | `getTransaction` on the Helius key already held | yes |
+
+A receipt carries `gasUsed` and `effectiveGasPrice`; Solana carries `meta.fee`. Both batch, so
+52,420 EVM transactions cost about 525 requests rather than 52,420.
+
+### Where each chain stands
+
+| Chain | Fees read | Traders covered | Dollars |
+| --- | --- | --- | --- |
+| bsc | **10,644** — complete | 149 | **native only** — no market price for BNB exists in our store |
+| base | **9,267** of 9,377 | 219 | priced |
+| solana | **3,629** — every transaction behind a resolved swap | 122 | priced |
+| ethereum | 2,956 of 3,456 | 131 | priced |
+| robinhood | in progress, resumable | 128 | priced |
+
+**Solana is scoped on purpose.** 3,629 is every transaction behind a resolved swap — the ones a
+per-trade fee can attach to. The chain holds 636,689 transactions in total; sweeping all of them
+is ~6,367 requests and buys fees on transfers that are not trades.
+
+**ethereum's 500 shortfall is not a fee problem.** Those hashes return `result: null` — the node
+has no receipt for them, so they are not Ethereum mainnet transactions. That is an ingest
+question about how they were attributed, and it is recorded here rather than hidden.
+
+### Three measurements that shaped the build
+
+- **Summing fees at request time took 24.5 seconds** for our busiest trader, because the honest
+  query takes DISTINCT transactions out of a table holding one row per transfer leg. That is the
+  bill that made `/positions` answer 503 once. It moved off the request path into
+  `trader_fees_daily`; the same answer now takes **0.78 ms**. Daily buckets rather than window
+  totals, because windows roll and a closed day stays true.
+- **base caps a JSON-RPC batch at 10** and returns HTTP 200 with the refusal in the body. The
+  loader reads a non-array reply as a refusal and stops, rather than recording "these
+  transactions have no fee" across a whole chain.
+- **Solana 429s at batch 100 and works at 10.** A rate limit, not exhausted credits — the same
+  key had answered a batch of 2 minutes earlier.
+
+### What is deliberately still missing
+
+- **`includesFees` stays `false`.** Fees are measured, not deducted.
+- **`feesUsd` is null for bsc** and `coverage` reports 4 of 5. Its fees are real and exact in
+  `paidNative`; there is simply no BNB price to convert them with.
+- **A stored position can never carry a fee.** It has no transaction hash. Per-trade fees are on
+  `/trades`, where a row is a transaction, and `fees.perTradeWhy` says so on the scorecard.
 
 ---
 

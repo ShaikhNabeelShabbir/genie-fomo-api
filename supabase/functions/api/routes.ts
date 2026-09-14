@@ -290,9 +290,10 @@ async function nativePrices(): Promise<Map<number, NativePrice>> {
                limit 1) as token_key
       from chains c)
     select n.network_id, n.native_symbol,
-           coalesce(tp.usd, hp.price) as usd,
+           coalesce(tp.usd, hp.price, xc.usd) as usd,
            case when tp.usd is not null then 'token_prices_daily'
                 when hp.price is not null then hp.price_source
+                when xc.usd is not null then xc.source || ' (via ' || xc.chain || ')'
                 else null end as source
     from native n
     left join lateral (
@@ -304,7 +305,31 @@ async function nativePrices(): Promise<Map<number, NativePrice>> {
       where h.network_id = n.network_id and h.token_key = n.token_key
         and h.price is not null
         and h.price_source is not null and h.price_source <> 'fomo_reported_entry'
-      order by h.priced_at desc nulls last limit 1) hp on true`;
+      order by h.priced_at desc nulls last limit 1) hp on true
+    /*
+     * ETH IS ETH, whichever chain it is the native coin of.
+     *
+     * ethereum and base carry no market price for their own native in our store, while
+     * robinhood's curated WETH is priced at 2,478.49 and Solana's at 2,497.98 -- two
+     * independent sources agreeing within 0.8%, which is a real price for the asset rather
+     * than a quirk of one chain. Refusing to use it would leave two chains unpriced for no
+     * reason a reader would accept.
+     *
+     * Matched on the NATIVE SYMBOL against the curated quote assets only, never on any token
+     * calling itself ETH: the store holds several impostors under that symbol, one of them
+     * priced at 0.00. The chain it came from is named in the source string, so the borrowing
+     * is visible rather than implied.
+     */
+    left join lateral (
+      select h.price as usd, h.price_source as source, c2.name as chain
+      from quote_assets q2
+      join chains c2 on c2.network_id = q2.network_id
+      join holdings_current h
+        on h.network_id = q2.network_id and h.token_key = q2.token_key
+      where upper(q2.symbol) in ('W' || upper(n.native_symbol), upper(n.native_symbol))
+        and h.price is not null and h.price > 0
+        and h.price_source is not null and h.price_source <> 'fomo_reported_entry'
+      order by h.priced_at desc nulls last limit 1) xc on true`;
   const by = new Map<number, NativePrice>();
   for (const r of rows) {
     by.set(Number(r.network_id), {
@@ -922,6 +947,10 @@ get("/v1/traders", async (_p, url) => {
   const knownChainsBy = include.includes("wallets")
     ? await knownChainsFor(page.map((r) => String(r.handle)))
     : new Map<string, KnownChain[]>();
+  /** Same rule for fees: one read of the daily buckets for the whole page. */
+  const feesBy = include.includes("scorecard")
+    ? await nativePrices().then((nat) => feesFor(page.map((r) => String(r.handle)), nat))
+    : new Map<string, FeeWindows>();
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
   /*
@@ -980,7 +1009,7 @@ get("/v1/traders", async (_p, url) => {
             entries: new Map((ceBy.get(h) ?? []).map((c: any) =>
               [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
             exits: (xeBy.get(h) ?? []).map((x: any) => Number(x.exit_pnl_usd)),
-          })
+          }, feesBy.get(h) ?? null)
         : null;
     }
     return out;
@@ -2267,6 +2296,95 @@ const chainExitRows = (handles: string[]) => sql`
   where w.handle = any(${handles}) and ws.token_delta < 0 and ws.quote_usd is not null`;
 
 /**
+ * Dollars for a FEE, which is often a fraction of a cent.
+ *
+ * `round()` keeps two decimals, and a Solana fee of 0.0000292 SOL is $0.003 -- which came
+ * back as `0`. Zero states that the trade cost nothing to make, and no trade on any chain
+ * does. Six decimals keep the smallest fee we have measured visible while a large one still
+ * prints as money: 0.003 and 676.9, not 0 and 676.9.
+ */
+const feeUsd = (v: number | null): number | null =>
+  v === null || !Number.isFinite(v) ? null : Number(v.toFixed(6));
+
+/**
+ * Fees a trader paid, per window, in dollars.
+ *
+ * Read from `trader_fees_daily`, which is built off the request path: summing this from
+ * `transactions` at request time measured 24.5 seconds for our busiest trader, because that
+ * table holds one row per transfer leg and the honest sum has to take DISTINCT transactions
+ * out of it. Against the daily buckets the same answer takes 0.78 ms.
+ *
+ * Dollars are computed here rather than stored, from the same native price the portfolio
+ * uses, so a fee and a balance can never be converted at two different rates.
+ *
+ * THE CONVERSION IS AN APPROXIMATION AND THE RESPONSE SAYS SO. We hold no historical native
+ * price, so a fee paid in July is valued at today's rate. The native figure beside it is
+ * exact and is the one to trust.
+ */
+type FeeWindows = {
+  usd: Record<string, number | null>;
+  native: { symbol: string; amount: number; chains: number }[];
+  txCount: number;
+  chainsPriced: number;
+  chainsTotal: number;
+};
+
+async function feesFor(
+  handles: string[], natives: Map<number, NativePrice>,
+): Promise<Map<string, FeeWindows>> {
+  const out = new Map<string, FeeWindows>();
+  if (!handles.length) return out;
+  const rows = await sql`
+    select handle, network_id,
+           sum(fee_native) filter (where day > (now() at time zone 'utc')::date - 1)  as w24h,
+           sum(fee_native) filter (where day > (now() at time zone 'utc')::date - 7)  as w7d,
+           sum(fee_native) filter (where day > (now() at time zone 'utc')::date - 30) as w30d,
+           sum(fee_native)  as wall,
+           sum(tx_count)::int as txs
+    from trader_fees_daily
+    where handle = any(${handles})
+    group by handle, network_id`;
+
+  for (const r of rows) {
+    const h = String(r.handle);
+    let f = out.get(h);
+    if (!f) {
+      out.set(h, f = {
+        usd: { "24h": null, "7d": null, "30d": null, all: null },
+        native: [], txCount: 0, chainsPriced: 0, chainsTotal: 0,
+      });
+    }
+    const nat = natives.get(Number(r.network_id)) ?? null;
+    f.txCount += Number(r.txs ?? 0);
+    f.chainsTotal++;
+    /*
+     * Summed by SYMBOL, not by chain. ETH is the native coin of three of our five chains, so
+     * a per-chain list showed "ETH" three times and left the reader to add them up -- and to
+     * wonder whether the three were the same asset. They are.
+     */
+    const all = n(r.wall);
+    if (all !== null && nat) {
+      const hit = f.native.find((x) => x.symbol === nat.symbol);
+      if (hit) { hit.amount += all; hit.chains++; }
+      else f.native.push({ symbol: nat.symbol, amount: all, chains: 1 });
+    }
+    /*
+     * A chain whose native coin we cannot price contributes NOTHING to the dollar total and
+     * is counted in `chainsTotal` but not in `chainsPriced`. Adding zero for it would state
+     * that trading there was free.
+     */
+    if (!nat?.usd) continue;
+    f.chainsPriced++;
+    for (const [key, col] of [["24h", "w24h"], ["7d", "w7d"], ["30d", "w30d"], ["all", "wall"]] as const) {
+      const v = n(r[col]);
+      if (v === null) continue;
+      f.usd[key] = feeUsd((f.usd[key] ?? 0) + v * nat.usd);
+    }
+  }
+  return out;
+}
+
+/**
  * Everything the scorecard computes, over rows already fetched.
  *
  * Split out for ISSUE-8 so `/traders?include=scorecard` runs THIS function rather than a
@@ -2278,9 +2396,11 @@ const chainExitRows = (handles: string[]) => sql`
 async function scorecardBody(
   t: any, rows: any[], tokenLimit: number | null,
   chain?: { entries: Map<string, number>; exits: number[] },
+  feeWindows?: FeeWindows | null,
 ) {
   const chainEntry = chain?.entries ?? new Map<string, number>();
   const chainExits = chain?.exits ?? [];
+  const fw = feeWindows ?? null;
 
   const closed = rows.filter((r) => r.status === "closed");
   const realized = closed.map((r) => n(r.realized_pnl_usd)).filter((x): x is number => x !== null);
@@ -2727,7 +2847,7 @@ async function scorecardBody(
   const nowMs = Date.now();
   const closedDated = rows.filter((r) =>
     r.status === "closed" && r.closed_at !== null && r.closed_at !== undefined);
-  const windowAgg = (sinceMs: number | null) => {
+  const windowAgg = (sinceMs: number | null, windowKey: string) => {
     const inWindow = sinceMs === null
       ? closedDated
       : closedDated.filter((r) => Date.parse(String(r.closed_at)) > sinceMs);
@@ -2774,8 +2894,14 @@ async function scorecardBody(
        * claim this window cost nothing to trade, which is certainly false.
        */
       includesFees: false,
-      feesUsd: null,
-      feesCoverage: cov(0, inWindow.length),
+      /**
+       * What this window cost to trade. Null, never 0, when we hold no fee for it -- a window
+       * with trades in it was never free. `fees` on the response carries the caveat: the
+       * dollar figure applies today's native price to a payment made in the past, because no
+       * historical native price is stored. The native figure there is the exact one.
+       */
+      feesUsd: fw ? (fw.usd[windowKey] ?? null) : null,
+      feesCoverage: fw ? cov(fw.chainsPriced, fw.chainsTotal) : cov(0, 0),
     };
   };
 
@@ -2880,10 +3006,10 @@ async function scorecardBody(
   const windows = {
     basis: "realized profit only — closed trades, summed by closed_at. Unrealised movement " +
            "is not included; see /pnl for banked versus on paper. Gross of fees: see `fees`.",
-    "24h": windowAgg(nowMs - 86_400_000),
-    "7d":  windowAgg(nowMs - 7 * 86_400_000),
-    "30d": windowAgg(nowMs - 30 * 86_400_000),
-    all:   windowAgg(null),
+    "24h": windowAgg(nowMs - 86_400_000, "24h"),
+    "7d":  windowAgg(nowMs - 7 * 86_400_000, "7d"),
+    "30d": windowAgg(nowMs - 30 * 86_400_000, "30d"),
+    all:   windowAgg(null, "all"),
   };
 
   return {
@@ -2985,12 +3111,45 @@ async function scorecardBody(
      * travels on every realised window so the claim cannot be lost.
      */
     fees: {
+      /**
+       * Fees are now MEASURED, and still not deducted. Both facts matter: a consumer that
+       * wants "after fees" can subtract `paidUsd` itself, and one that reads `realizedUsd`
+       * is not silently given a net figure where it expected a gross one.
+       */
       includedInRealized: false,
-      paidUsd: null,
+      paidUsd: fw ? (fw.usd.all ?? null) : null,
+      byWindowUsd: fw
+        ? { "24h": fw.usd["24h"] ?? null, "7d": fw.usd["7d"] ?? null,
+            "30d": fw.usd["30d"] ?? null, all: fw.usd.all ?? null }
+        : null,
+      /** Exact, in each chain's own coin. This is the measurement; the dollars are derived. */
+      paidNative: fw
+        ? fw.native.map((x) => ({
+            symbol: x.symbol,
+            amount: Number(x.amount.toPrecision(12)),
+            /** How many chains that coin was paid on — ETH is native to three of our five. */
+            chains: x.chains,
+          }))
+        : [],
+      transactions: fw?.txCount ?? 0,
+      coverage: fw ? cov(fw.chainsPriced, fw.chainsTotal) : cov(0, 0),
+      source: fw
+        ? "gas_used x effective_gas_price from the transaction receipt on the EVM chains, " +
+          "meta.fee on Solana"
+        : null,
       perTradeUsd: null,
-      source: null,
-      why: "no fee or gas figure is stored on any trade or transfer we hold. Realised profit " +
-           "is gross of fees, on every window and every per-coin row.",
+      /**
+       * WHY THE DOLLARS ARE AN APPROXIMATION AND THE COIN FIGURE IS NOT.
+       *
+       * A fee is paid once, in the chain's own coin, at a moment. We hold no historical price
+       * for those coins, so the dollar figure applies today's rate to a past payment. The
+       * native amount is exact and does not move.
+       */
+      usdBasis: "native fee valued at the current native price, not the price when it was paid",
+      why: fw ? null : "no fee has been read for this trader's transactions yet",
+      perTradeWhy: "a stored position carries no transaction hash, so a fee cannot be " +
+                   "attached to one. Per-trade fees are on /trades, where a row IS a " +
+                   "transaction",
     },
     /**
      * VOLUME, both the reported lifetime figure and the measured per-window one.
@@ -3083,8 +3242,8 @@ async function scorecardBody(
       }
       if (bet.value === null) why.typicalBetUsd = "historical_input_missing";
       if (spanDays === null) why.trackRecordDays = "historical_input_missing";
-      /* Fees are a permanent absence, not a pending one: nothing stores them. */
-      why.feesUsd = "source_unavailable";
+      /* Only when no fee has been read for this trader yet -- it is now a loadable fact. */
+      if (!fw || fw.chainsPriced === 0) why.feesUsd = "not_yet_calculated";
       why.startCapitalUsd = "historical_input_missing";
       return why;
     })(),
@@ -3247,15 +3406,16 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const h = t.handle as string;
-  const [rows, ce, xe] = await Promise.all([
+  const [rows, ce, xe, feeBy] = await Promise.all([
     scorecardRows([h]), chainEntryRows([h]), chainExitRows([h]),
+    nativePrices().then((nat) => feesFor([h], nat)),
   ]);
   if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
 
   return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
     entries: new Map(ce.map((c: any) => [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
     exits: xe.map((x: any) => Number(x.exit_pnl_usd)),
-  });
+  }, feeBy.get(h) ?? null);
 });
 
 // ------------------------------------------------------------ K5-K8 (SQL)
@@ -4814,6 +4974,27 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
     }
   }
 
+  /*
+   * The fee each row's transaction paid. A row here IS a transaction, so unlike a stored
+   * position it can carry one. Looked up for the page only -- at most 500 hashes.
+   */
+  const pageHashes = rows.map((r: Record<string, unknown>) => String(r.tx_hash));
+  const [feeRows, feeNatives] = pageHashes.length
+    ? await Promise.all([
+      sql`select network_id, tx_hash, fee_native, fee_native_symbol
+          from transaction_fees
+          where tx_hash = any(${pageHashes})`,
+      nativePrices(),
+    ])
+    : [[], new Map<number, NativePrice>()];
+  const feeBy = new Map<string, { native: number; symbol: string; net: number }>();
+  for (const f of feeRows) {
+    const v = n(f.fee_native);
+    if (v === null) continue;
+    feeBy.set(`${Number(f.network_id)}|${f.tx_hash}`,
+      { native: v, symbol: String(f.fee_native_symbol), net: Number(f.network_id) });
+  }
+
   const capped = rows.length > limit;
   /*
    * `pageRaw` is the page as the database returned it; `page` is what survives `?status=`.
@@ -4898,10 +5079,30 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
         source: "helius rpc pre/post balances",
         confidence: usd !== null ? "high" : "medium",
         /**
-         * Null and staying null until fees are stored. Zero would claim this trade cost
-         * nothing to make, which is never true on any chain.
+         * WHAT THIS TRADE COST TO MAKE.
+         *
+         * `feeNative` is the measurement and is exact -- gas_used x effective_gas_price from
+         * the receipt on the EVM chains, meta.fee on Solana. `feeUsd` values it at the
+         * CURRENT native price, because we hold no historical one; it is an approximation and
+         * `feeUsdBasis` says so. Null, never 0: a trade is never free, so a missing fee is a
+         * gap in our reading, not a costless trade.
          */
-        feeUsd: null,
+        ...(() => {
+          const f = feeBy.get(`${Number(r.network_id)}|${r.tx_hash}`) ?? null;
+          const px = f ? (feeNatives.get(f.net)?.usd ?? null) : null;
+          return {
+            feeNative: f?.native ?? null,
+            feeNativeSymbol: f?.symbol ?? null,
+            feeUsd: f && px ? feeUsd(f.native * px) : null,
+            feeUsdBasis: f && px
+              ? "native fee valued at the current native price, not the price when it was paid"
+              : null,
+            whyNoFee: f
+              ? (px ? null : "no market price for this chain's own coin, so the fee cannot be " +
+                             "stated in dollars — `feeNative` is exact")
+              : "no fee has been read for this transaction yet",
+          };
+        })(),
       };
     }),
     /**
