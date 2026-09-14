@@ -4639,7 +4639,7 @@ const walletRows = (handles: string[]) => sql`
   select t.handle, t.id, t.display_handle, t.handle_changed_at,
          t.name, t.bio, t.avatar, t.twitter,
          w.evm_address, w.sol_address, w.evm_source, w.sol_source,
-         w.evm_confidence, w.sol_confidence
+         w.evm_confidence, w.sol_confidence, w.last_seen_at
   from traders t left join wallets w using (handle)
   where t.handle = any(${handles})`;
 

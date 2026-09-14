@@ -140,6 +140,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **10** | [Trades, both sides](#10-trades-both-sides) | valued from the money side |
 | **11** | [Batch reads](#11-batch-reads) | the whole board in a bounded number of calls |
 | **C** | [What the plugin team asked for](#appendix-c-what-the-plugin-team-asked-for) | § by §, and where each landed |
+| **A4** | [The version 8 report, and what changed](#appendix-a4-the-version-8-report-and-what-changed-2026-09-14) | freshness, `now`, and the seam |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -1720,10 +1721,46 @@ The counts on a portfolio point describe the whole trader, so showing them besid
 dollars would make the line look like it changed scope halfway along. `pricedShare` means the
 same thing on every point.
 
-**`now` is the newest reading we hold, whatever window you asked for.** Asking for one day
-used to return `now: null` on a trader carrying a month of history and a $5.1M balance — what
-someone is worth does not depend on how much of their past you requested. A null total there
-now means the newest reading was genuinely refused, and `refused` names why.
+**`now` is the most complete RECENT reading, not simply the newest**, and it is window-independent
+— what someone is worth does not depend on how much of their past you requested.
+
+```bash
+curl -s "$B/traders/unipcs/aum?window=1w" | jq .now
+```
+
+```json
+{
+  "at": "2026-09-14T04:00:00.000Z",
+  "totalUsd": 15770542.96,
+  "ageSeconds": 5485,
+  "basis": "sampled",
+  "tier": "verified",
+  "partial": true,
+  "coverage": { "pricedPositions": 322, "totalPositions": 595, "valueShare": 0.5412,
+                "chainsAnswered": 4, "chainsTotal": 5 }
+}
+```
+
+The selection rule, in order:
+
+1. only readings within **36 hours** of the freshest one compete — the same allowance the
+   sampler is judged by, so a complete but stale reading never beats a fresh one;
+2. among those, the one that answered for **the most chains** wins;
+3. at equal coverage a **measured** reading beats a rebuilt one;
+4. recency settles the rest.
+
+Taking the last row by time published a number a fifth of the right size: when the newest row was
+a rebuild covering 1 of a trader's 5 chains, `now` read $5,101,125.87 eight hours after a measured
+reading of $15,665,318.55, against a portfolio route saying $15.8M.
+
+**`now` carries its own coverage, not just the points'.** `partial` is true when
+`chainsAnswered < chainsTotal`, so a figure standing for part of a trader says so at the place it
+is read, and `ageSeconds` gives its age without parsing a date. A null total means the newest
+reading was genuinely refused, and `refused` names why.
+
+**`chainsAnswered` / `chainsTotal` are filled on sampled and rebuilt points alike.** They are
+`null` only where no chain split was stored for that reading at all — 149 readings of 872 — and
+that is a missing count, never a zero.
 
 **A short window borrows the readings just before it, marked `outsideWindow`.** History steps
 once a day, so a 24-hour window held at most one point and usually none — `window=1d` drew
@@ -2116,6 +2153,29 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 **Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
 `RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
+
+---
+
+## Appendix A4 · The version 8 report, and what changed (2026-09-14)
+
+The consumer read all 435 traders through the batch call and reported what version 8 still got
+wrong. The three ranked first are below, with the measurement that settled each one. A fourth —
+chains answered on sampled points — was closed by the same work as **A2**.
+
+| # | What they asked for | What was wrong | What changed |
+| --- | --- | --- | --- |
+| **A1** | Say how fresh an answer is, and put the same `asOf` on every route | **432 of 435** answers said `status: "ready"` while the newest balance reading anywhere was **75 hours old**, and nothing in the response said so. seven routes carried no `asOf` at all, the two batch calls among them | every route carries `asOf`, including both batch calls, which date the whole batch beside `limit` and `asked`. The balance series carries a `sampler` block — `state`, `lastSuccessAt`, `nextExpectedAt`, `ageSeconds`, `staleAfterHours` — and answers `status: "stale"` rather than `ready` once readings pass the stated 36-hour allowance. `/health` gives every feed its own allowance and a verdict, with `dataState` and `staleFeeds` naming what stopped. **§0f** |
+| **A2** | Choose `now` from the most complete recent reading, not the newest | `now` for `@unipcs` was **$5,101,125.87** from a rebuild covering **1 of his 5 chains**, taken eight hours after a measured reading of **$15,665,318.55** and against a portfolio route saying $15.8M. The figure read first was a fifth of him, presented as all of him | `now` is the widest-coverage reading inside 36 hours of the freshest, measured beating rebuilt at equal coverage and recency breaking ties. It carries `partial`, `chainsAnswered`, `chainsTotal` and `ageSeconds` at the place it is read. `chainsAnswered` / `chainsTotal` are filled on sampled points as well as rebuilt ones — **723 of 872**; the remaining 149 stored no chain split at all, so the count is `null` rather than invented. **§9** |
+| **A3** | Value both kinds the same way; failing that, mark every change of method | two neighbouring points could be valued over different sets of chains and the difference printed as a move in the balance. `@fhn_gt` read $65,367.54, then $33.26, then $52,276.29, and a card said "+155,855.5% in 7 days" | `breaks[]` marks every step whose two figures do not count the same thing, and marks **more** than was asked: of the **865 of 1,418** steps that move a line by half or more, 542 change method and **226 more keep the same method and change only the chain set** — both of `@fhn_gt`'s first two steps among them. Marking either catches **768 of 865**. Each point also carries `chains[]` and `comparableWithPrevious`. **§9** |
+
+**On A3's first preference, valuing both kinds the same way.** It was attempted and measured
+rather than declined. Per chain, a rebuilt point prices about **39%** of the positions and a
+sampled one **77–84%**, and the steps that cross between them are where the cliffs sit — 60% of
+sampled-after-rebuilt and 74% of rebuilt-after-sampled, against 14% of sampled-after-sampled.
+Valuing every point over the chains they all share removes the chain-set cliffs and leaves the
+coverage ones: **548 of 1,074** steps still move by half or more. A column named "comparable"
+that is wrong half the time is worse than none, so `comparability` states plainly that the two
+kinds are marked rather than equalised, and `breaks` is where they are marked.
 
 ---
 
