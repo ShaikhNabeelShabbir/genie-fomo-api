@@ -262,6 +262,61 @@ get("/v1/chains", async () => {
 
 // ------------------------------------------------------------- T11/T13/T14
 
+/**
+ * Each chain's own coin, and what one of them costs — so a chain's dollars can also be said
+ * the way a wallet says them, "114.09 BNB" beside "$83.6K".
+ *
+ * The price has to be a MARKET price or it is worse than nothing. Most of what we hold for a
+ * wrapped native is `fomo_reported_entry` — the price a trader reported paying, not what the
+ * coin is worth now — and some rows carry a price with no source at all, which cannot be
+ * stood behind either. Both are excluded, so three of five chains answer `null` today rather
+ * than converting a portfolio at a number nobody can defend.
+ *
+ * Five rows, cached for the process: chains do not change and the price moves slowly enough
+ * that a per-request query would be pure cost.
+ */
+type NativePrice = { symbol: string; usd: number | null; source: string | null };
+let nativeCache: { at: number; by: Map<number, NativePrice> } | null = null;
+
+async function nativePrices(): Promise<Map<number, NativePrice>> {
+  if (nativeCache && Date.now() - nativeCache.at < 5 * 60_000) return nativeCache.by;
+  const rows = await sql`
+    with native as (
+      select c.network_id, c.name, c.native_symbol,
+             (select q.token_key from quote_assets q
+               where q.network_id = c.network_id
+                 and upper(q.symbol) in ('W' || upper(c.native_symbol), upper(c.native_symbol))
+               order by (upper(q.symbol) = 'W' || upper(c.native_symbol)) desc
+               limit 1) as token_key
+      from chains c)
+    select n.network_id, n.native_symbol,
+           coalesce(tp.usd, hp.price) as usd,
+           case when tp.usd is not null then 'token_prices_daily'
+                when hp.price is not null then hp.price_source
+                else null end as source
+    from native n
+    left join lateral (
+      select usd from token_prices p
+      where p.network_id = n.network_id and p.token_key = n.token_key
+      order by day desc limit 1) tp on true
+    left join lateral (
+      select h.price, h.price_source from holdings_current h
+      where h.network_id = n.network_id and h.token_key = n.token_key
+        and h.price is not null
+        and h.price_source is not null and h.price_source <> 'fomo_reported_entry'
+      order by h.priced_at desc nulls last limit 1) hp on true`;
+  const by = new Map<number, NativePrice>();
+  for (const r of rows) {
+    by.set(Number(r.network_id), {
+      symbol: String(r.native_symbol),
+      usd: n(r.usd),
+      source: r.source ? String(r.source) : null,
+    });
+  }
+  nativeCache = { at: Date.now(), by };
+  return by;
+}
+
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
     select handle, display_handle, name from traders where handle = ${await resolveTrader(handle)}`;
@@ -333,13 +388,39 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const top = n(r.top_value);
   const cash = n(r.cash) ?? 0;
 
-  const chainCoverage = byChain.map((r) => ({
-    chain: r.chain,
-    networkId: Number(r.network_id),
-    positions: Number(r.positions),
-    priced: Number(r.priced),
-    valueUsd: Number(r.priced) ? round(n(r.value)) : null,
-  }));
+  const natives = await nativePrices();
+  const chainCoverage = byChain.map((r) => {
+    const net = Number(r.network_id);
+    const usd = Number(r.priced) ? round(n(r.value)) : null;
+    const nat = natives.get(net) ?? null;
+    return {
+      chain: r.chain,
+      networkId: net,
+      positions: Number(r.positions),
+      priced: Number(r.priced),
+      valueUsd: usd,
+      /**
+       * The same dollars said in the chain's own coin, which is how a wallet says them.
+       *
+       * `nativeAmount` is `valueUsd / nativeUsd` and nothing more, so the two always agree;
+       * `nativeUsd` and `nativePriceSource` travel with it so the division can be rechecked
+       * and so a consumer can see WHERE the rate came from.
+       *
+       * Null, never 0, when we hold no market price for that coin — see `whyNoNative`. A
+       * portfolio converted at a price nobody can stand behind is a worse answer than none.
+       */
+      nativeSymbol: nat?.symbol ?? null,
+      nativeUsd: nat?.usd ?? null,
+      nativePriceSource: nat?.source ?? null,
+      nativeAmount: nat?.usd && usd !== null
+        ? Number((usd / nat.usd).toPrecision(10))
+        : null,
+      whyNoNative: nat?.usd && usd !== null ? null
+        : usd === null ? "nothing on this chain carries a price"
+        : "no market price for this chain's own coin — the only figures we hold for it are " +
+          "traders' reported entry prices, which are not what it is worth now",
+    };
+  });
 
   const base = {
     handle: t.display_handle,
@@ -500,6 +581,32 @@ function trustBody(t: any, h: any | undefined, asOf: string | null) {
 
   return {
     handle: t.display_handle, name: t.name ?? null,
+    /**
+     * WHAT WAS CHECKED, so an absent flag cannot be read as a clean bill of health.
+     *
+     * Every flag this route raises is an internal-consistency check on figures we already
+     * hold: two numbers that cannot both be true, or too little evidence to judge. NOTHING
+     * here consults an external reputation service, a blacklist, or a known-scam list.
+     *
+     * That distinction is the whole point of publishing this block. "We checked a blacklist
+     * and this trader is not on it" and "we never looked" are opposite statements, and until
+     * now an absent blacklist flag was indistinguishable from the first while meaning the
+     * second. `blacklist.checked: false` says which one it is.
+     */
+    checks: {
+      performed: [
+        "pnl_exceeds_volume", "pnl_exceeds_holdings", "holdings_coverage_too_low",
+        "too_few_trades", "partial_pricing",
+      ],
+      basis: "internal consistency only — figures we hold, checked against each other",
+      blacklist: {
+        checked: false,
+        lists: [],
+        why: "no blacklist, sanctions list or known-scam source is consulted by this route. " +
+             "An absent blacklist flag means NOT CHECKED — never 'checked and clear'.",
+      },
+      externalReputation: { checked: false, sources: [] },
+    },
     // Every money figure carries its measurement time; these are derived from the holdings
     // snapshot, so they age with it — this trader's own, not the board's.
     asOf: h?.as_of ? new Date(String(h.as_of)).toISOString() : asOf,
@@ -795,6 +902,10 @@ get("/v1/traders", async (_p, url) => {
   const scBy = byHandle(scRows as any[]);
   // deno-lint-ignore no-explicit-any
   const wBy = byHandle(wRows as any[]);
+  /** One query for the page, not one per trader — same rule as every other include. */
+  const knownChainsBy = include.includes("wallets")
+    ? await knownChainsFor(page.map((r) => String(r.handle)))
+    : new Map<string, KnownChain[]>();
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
   /*
@@ -837,7 +948,7 @@ get("/v1/traders", async (_p, url) => {
     if (include.includes("pnl")) out.pnl = pnlBody(r, pnlBy.get(h)?.[0]);
     if (include.includes("wallets")) {
       const w = wBy.get(h)?.[0];
-      out.wallets = w ? walletsBody(w) : null;
+      out.wallets = w ? walletsBody(w, knownChainsBy.get(h) ?? []) : null;
     }
     if (include.includes("trust")) out.trust = trustBody(r, trBy.get(h)?.[0], holdingsAsOf);
     if (include.includes("scorecard")) {
@@ -2258,7 +2369,8 @@ async function scorecardBody(
     const value = a.legs === 0 ? null
       : method === "single_position" || method === "first_only" ? a.first
       : a.weight > 0 ? a.sum / a.weight : a.first;
-    return { value, method, legs: a.legs, legsWeighted: a.weighted, first: a.first };
+    return { value, method, legs: a.legs, legsWeighted: a.weighted, first: a.first,
+             sum: a.sum, weight: a.weight };
   };
   const byToken = [...byTokenMap.values()]
     .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, firstClosedMs, lastClosedMs, chainKey, ...r }) => {
@@ -2347,6 +2459,34 @@ async function scorecardBody(
         x.value !== null && r.totalSupply !== null && r.totalSupply > 0
           ? Number((x.value * r.totalSupply).toPrecision(10))
           : null,
+      /**
+       * DOLLARS IN AND DOLLARS OUT on this coin, which is what "how much a bet" and the
+       * profit bands are actually asking for. An average price cannot answer it: two traders
+       * with the same average entry can have staked a hundred dollars or a hundred thousand.
+       *
+       * Both are the quantity-weighted sums that already produced the averages above -- the
+       * price of each position times the quantity recovered for it -- so they reconcile with
+       * `avgEntryPrice` exactly, and are not a second estimate of the same thing.
+       *
+       * Null, never 0, when no position in this coin carried a recoverable quantity. A coin
+       * whose cost we cannot establish must not appear to have been free.
+       */
+      costUsd: e.legsWeighted > 0 ? round(e.sum) : null,
+      proceedsUsd: x.legsWeighted > 0 ? round(x.sum) : null,
+      /** The quantity each sum was taken over, so the division can be rechecked. */
+      costQuantity: e.legsWeighted > 0 ? e.weight : null,
+      proceedsQuantity: x.legsWeighted > 0 ? x.weight : null,
+      /** How many of this coin's positions contributed dollars, against how many had a price. */
+      costCoverage: cov(e.legsWeighted, e.legs),
+      proceedsCoverage: cov(x.legsWeighted, x.legs),
+      whyNoCostUsd: e.legsWeighted > 0 ? null
+        : (e.legs === 0
+          ? "no position in this coin carries an entry price"
+          : "entry prices are present but no position has a recoverable quantity"),
+      whyNoProceedsUsd: x.legsWeighted > 0 ? null
+        : (x.legs === 0
+          ? "nothing in this coin has been sold, or no sale carries an exit price"
+          : "exit prices are present but no position has a recoverable quantity"),
       };
     })
     .sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd ||
@@ -2429,7 +2569,43 @@ async function scorecardBody(
     // because a window with no closed trades earned nothing, which is a real 0 and not a
     // missing value.
     const total = inWindow.reduce((acc, r) => acc + (n(r.realized_pnl_usd) ?? 0), 0);
-    return { realizedUsd: round(total), closedTrades: inWindow.length };
+
+    /*
+     * VOLUME THIS WINDOW, MEASURED RATHER THAN REPORTED.
+     *
+     * The leaderboard gives one lifetime volume per trader and nothing to slice it by, so
+     * "volume in the last 7 days" had no answer at all. Every closed position here carries
+     * an entry price, an exit price and a recoverable quantity, and dollars in plus dollars
+     * out is what volume means -- both legs, because a round trip trades twice.
+     *
+     * Counted only over the positions that carry all three, with `coverage` saying how many
+     * that was. A volume summed over half a window and presented as the whole is the same
+     * failure as a partial balance total.
+     */
+    let volume = 0, volumed = 0;
+    for (const r of inWindow) {
+      const q = legQty(r), e = n(r.avg_entry_price), x = n(r.avg_exit_price);
+      if (q === null || e === null || x === null) continue;
+      volume += q * e + q * x;
+      volumed++;
+    }
+    return {
+      realizedUsd: round(total),
+      closedTrades: inWindow.length,
+      /** Both legs of each round trip. Null, never 0, when no position carried the inputs. */
+      volumeUsd: volumed > 0 ? round(volume) : null,
+      volumeCoverage: cov(volumed, inWindow.length),
+      whyNoVolume: volumed > 0 ? null
+        : (inWindow.length === 0
+          ? "no position closed in this window"
+          : "no closed position in this window carries an entry price, an exit price and a " +
+            "recoverable quantity"),
+      /**
+       * Fees are NOT deducted from `realizedUsd`, and nothing here can deduct them: no fee
+       * or gas figure is stored on any trade or transfer we hold. See `fees` on the response.
+       */
+      includesFees: false,
+    };
   };
 
   /*
@@ -2458,9 +2634,79 @@ async function scorecardBody(
     .sort((a, b) => a[0] < b[0] ? -1 : 1)
     .map(([day, v]) => ({ day, realizedUsd: round(v.realizedUsd), closedTrades: v.closedTrades }));
 
+  /*
+   * THE SAME GROUPING, BY CALENDAR MONTH, for "worst month" and the bad-days test.
+   *
+   * A balance drawdown does not answer this: money moving in or out of a wallet is not a
+   * trading loss, and the two are indistinguishable on a balance line. Realised profit summed
+   * by close date is, and the close dates have been on every row all along.
+   *
+   * Thirteen buckets: the twelve completed calendar months plus the one in progress, which
+   * carries `complete: false` so a partial month is never read as a bad one.
+   *
+   * `coverage` is the closed trades in the month that carry a realised figure against all of
+   * them, because a month whose trades mostly lack a P&L is a thin month, not a flat one.
+   *
+   * A month with no closed trade is ABSENT rather than zero, the same rule `realizedByDay`
+   * follows: a month he closed nothing is not a month he earned nothing.
+   */
+  const monthKey = (ms: number) => new Date(ms).toISOString().slice(0, 7);
+  const nowMonth = monthKey(nowMs);
+  const firstMonthDate = new Date(nowMs);
+  firstMonthDate.setUTCDate(1);
+  firstMonthDate.setUTCHours(0, 0, 0, 0);
+  firstMonthDate.setUTCMonth(firstMonthDate.getUTCMonth() - 12);
+  const since12m = firstMonthDate.getTime();
+
+  const monthBuckets = new Map<string,
+    { realizedUsd: number; closedTrades: number; withFigure: number }>();
+  for (const r of closedDated) {
+    const ms = Date.parse(String(r.closed_at));
+    if (!Number.isFinite(ms) || ms < since12m) continue;
+    const m = monthKey(ms);
+    const b = monthBuckets.get(m) ?? { realizedUsd: 0, closedTrades: 0, withFigure: 0 };
+    const pnl = n(r.realized_pnl_usd);
+    if (pnl !== null) { b.realizedUsd += pnl; b.withFigure++; }
+    b.closedTrades++;
+    monthBuckets.set(m, b);
+  }
+  const realizedByMonth = [...monthBuckets.entries()]
+    .sort((a, b) => a[0] < b[0] ? -1 : 1)
+    .map(([month, v]) => ({
+      month,
+      realizedUsd: v.withFigure === 0 ? null : round(v.realizedUsd),
+      closedTrades: v.closedTrades,
+      coverage: cov(v.withFigure, v.closedTrades),
+      /** False for the month still running, so a part-month is not compared with whole ones. */
+      complete: month !== nowMonth,
+      /**
+       * What a return percentage would need. The balance history reaches thirty days back, so
+       * eleven of these twelve months have no capital figure to divide by -- and a percentage
+       * computed against a balance we did not measure would be a guess wearing a number.
+       * Read `realizedUsd` against `/aum` for the months the history covers.
+       */
+      startingCapitalUsd: null,
+      returnPct: null,
+    }));
+
+  /*
+   * WHY THESE MONTHS DO NOT SUM TO THE LIFETIME FIGURE.
+   *
+   * A trader with a longer record has closes before this window -- one measured 20 closes
+   * worth $5,005.73 sitting before the twelve months, so his months summed to $59,422.09
+   * against an `all` of $64,427.81. Both numbers are right and the difference is not an
+   * error, but a consumer adding up a calendar and comparing it with the headline has no way
+   * to know that unless we say it. So the difference is stated rather than left to be
+   * discovered.
+   */
+  const monthsRealized = realizedByMonth
+    .reduce((a, m) => a + (m.realizedUsd ?? 0), 0);
+  const lifetimeRealized = closedDated
+    .reduce((a, r) => a + (n(r.realized_pnl_usd) ?? 0), 0);
+
   const windows = {
     basis: "realized profit only — closed trades, summed by closed_at. Unrealised movement " +
-           "is not included; see /pnl for banked versus on paper.",
+           "is not included; see /pnl for banked versus on paper. Gross of fees: see `fees`.",
     "24h": windowAgg(nowMs - 86_400_000),
     "7d":  windowAgg(nowMs - 7 * 86_400_000),
     "30d": windowAgg(nowMs - 30 * 86_400_000),
@@ -2475,13 +2721,100 @@ async function scorecardBody(
      * A day with no closed trade is absent, not zero.
      */
     realizedByDay,
+    /**
+     * Realised profit per calendar month for the last twelve completed months plus the one in
+     * progress. Same basis as `realizedByDay` and as `realized` below: closed trades summed by
+     * `closed_at`, unrealised movement excluded. A month with no closed trade is absent.
+     */
+    realizedByMonth,
+    /** What the months above cover, and what they leave out. */
+    realizedByMonthBasis: {
+      months: realizedByMonth.length,
+      from: realizedByMonth[0]?.month ?? null,
+      to: realizedByMonth[realizedByMonth.length - 1]?.month ?? null,
+      realizedUsd: round(monthsRealized),
+      /** Realised profit on closes OLDER than this window; 0 when the record fits inside it. */
+      beforeWindowUsd: round(lifetimeRealized - monthsRealized),
+      note: "the last twelve completed calendar months plus the one running. A record that " +
+            "starts earlier has closes before this window, so these months do not sum to " +
+            "windows.all.realizedUsd — `beforeWindowUsd` is exactly that difference.",
+    },
     // max(captured_at) over the same rows — identical to the query this replaces, and free.
     asOf: (() => {
       const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
         .filter((x): x is number => x !== null && Number.isFinite(x));
       return times.length ? new Date(Math.max(...times)).toISOString() : null;
     })(),
-    sample: { returned: rows.length, storedAt: rows[0]?.captured_at ?? null },
+    /**
+     * WHAT THIS SCORECARD WAS COMPUTED OVER, and whether that is the whole record.
+     *
+     * It used to say `sample`, with a count and a load date, and a consumer could not tell
+     * whether 363 was a trader's whole history or a slice of it. `complete` answers exactly
+     * that one question and no more: every position stored for this trader was used, with no
+     * cap and no sampling. Whether the STORE is behind the chain is a different question, and
+     * `storedAt` with `nextLoadAt` is what answers it -- as does the `trades` feed on
+     * /health, which states its own age and allowance.
+     *
+     * `unit` matters more than it looks. We hold POSITIONS, already averaged across the fills
+     * inside them; the leaderboard counts FILLS. 363 against 4,745 is not a coverage gap, it
+     * is two different things counted, and `reportedTrades` is carried so the difference is
+     * visible instead of alarming.
+     */
+    sample: {
+      returned: rows.length,
+      storedAt: rows[0]?.captured_at ?? null,
+      complete: true,
+      capped: false,
+      unit: "position",
+      positionsStored: rows.length,
+      reportedTrades: n(t.trade_count),
+      reportedTradesSource: "leaderboard, lifetime, counted as fills",
+      /**
+       * When the trade load behind these rows ran, and when it is next due. This is the
+       * scorecard's half of the freshness contract -- the same question `sampler` answers for
+       * the balance series, on the store that actually feeds this route.
+       */
+      loadedAt: rows[0]?.captured_at
+        ? new Date(String(rows[0].captured_at)).toISOString() : null,
+      nextLoadAt: (() => {
+        const d = new Date();
+        d.setUTCHours(6, 0, 0, 0);
+        if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
+        return d.toISOString();
+      })(),
+      note: "no cap is applied: every position stored for this trader is used. `returned` " +
+            "counts positions, `reportedTrades` counts fills, and they are not comparable.",
+    },
+    /**
+     * FEES, ANSWERED HONESTLY RATHER THAN ASSUMED EITHER WAY.
+     *
+     * The profile's headline says "made, after fees". Nothing here is after fees, and saying
+     * so is the only correct answer available: no fee or gas column exists on any trade or
+     * transfer we store, so a fee figure would have to be invented. `includesFees: false`
+     * travels on every realised window so the claim cannot be lost.
+     */
+    fees: {
+      includedInRealized: false,
+      paidUsd: null,
+      perTradeUsd: null,
+      source: null,
+      why: "no fee or gas figure is stored on any trade or transfer we hold. Realised profit " +
+           "is gross of fees, on every window and every per-coin row.",
+    },
+    /**
+     * VOLUME, both the reported lifetime figure and the measured per-window one.
+     *
+     * They are different measurements and will not agree: the first is the leaderboard's
+     * lifetime number for the trader, the second is what we can prove from the positions we
+     * hold. `windows[].volumeUsd` carries the per-window figures with their own coverage.
+     */
+    volume: {
+      reportedLifetimeUsd: n(t.volume_usd),
+      reportedSource: "leaderboard, lifetime",
+      measuredBasis: "entry leg plus exit leg of every closed position that carries an entry " +
+                     "price, an exit price and a recoverable quantity",
+      perWindow: "see windows[].volumeUsd and windows[].volumeCoverage",
+    },
     winRate, wins, losses, breakeven,
     bestTradeUsd: round(best), worstTradeUsd: round(worst),
     topTradeShare, meanToMedian,
@@ -2561,7 +2894,17 @@ async function scorecardBody(
           value: medHold === null ? null : Number((medHold / 86_400_000).toFixed(3)),
           basis: "median open-to-close duration over finished positions",
           window: "all recorded history",
-          coverage: cov(closedPriced.length, closedCount),
+          /*
+           * THE SAME COVERAGE THE FIGURE WAS ACTUALLY COMPUTED OVER.
+           *
+           * This used to report `closedPriced` -- positions carrying an entry AND an exit
+           * PRICE, which is the denominator the return figures need and has nothing to do
+           * with a duration. So one median appeared twice under two coverages, 43 of 43 here
+           * and 3 of 43 there, and a consumer had no way to tell which was true. A duration
+           * needs two timestamps, so the denominator is the positions that carry them, which
+           * is exactly `holds` -- the array this median was taken from.
+           */
+          coverage: cov(holds.length, closedCount),
           why: medHold === null
             ? "no finished position carries both an open and a close time" : null,
         },
@@ -3298,6 +3641,8 @@ function buildAum(
     chainFilter: { network_id: number; name: string } | null; to: Date;
     /** Every point's chain split, keyed "<iso at>|<basis>". Null when not fetched. */
     pointChains?: Map<string, { chain: string; usd: number | null }[]> | null;
+    /** Every chain this trader uses, window-independent. Null when not fetched. */
+    knownChains?: KnownChain[] | null;
     sampler?: { lastAt: Date | null; lastSuccess: Date | null };
   },
 ) {
@@ -3368,14 +3713,52 @@ function buildAum(
   const anchorAts = new Set(anchors.map((r) => new Date(String(r.at)).toISOString()));
 
   /*
-   * The default step is the coarsest that still leaves at least 24 points, so a week does
-   * not arrive as 168 points nobody plots and a day does not collapse to 1.
+   * THE DEFAULT STEP IS THE COARSER OF WHAT THE WINDOW AFFORDS AND WHAT THE DATA HOLDS.
+   *
+   * It used to be the first of those alone: the coarsest step leaving at least 24 points in
+   * the requested span, so a week does not arrive as 168 points nobody plots and a day does
+   * not collapse to 1. That is a sound rule about the WINDOW and says nothing about the
+   * readings, so every one of the 435 weeks declared 6h steps over readings a day apart --
+   * 566 of the gaps between neighbouring readings measured 24 hours, against 156 at 8 and
+   * 258 at 16. The answer described itself wrongly, which is its own kind of untrue figure.
+   *
+   * So the observed spacing sets a floor. A week over daily readings declares 1d, and starts
+   * declaring 6h on its own the day the readings are actually six-hourly.
    */
+  const rawGaps: number[] = [];
+  for (let i = 1; i < windowed.length; i++) {
+    const g = Date.parse(String(windowed[i].at)) - Date.parse(String(windowed[i - 1].at));
+    if (Number.isFinite(g) && g > 0) rawGaps.push(g);
+  }
+  rawGaps.sort((a, b) => a - b);
+  /** Median, not mean: one long gap after a quiet spell must not coarsen the whole series. */
+  const observedStepMs = rawGaps.length ? rawGaps[Math.floor(rawGaps.length / 2)] : 0;
+
   const chosen = stepRaw !== null
     ? AUM_STEPS.find((s) => s.name === stepRaw.trim())!
     : [...AUM_STEPS].reverse().find((s) =>
         span === null || Math.floor(span / s.ms) >= 24
       ) ?? AUM_STEPS[0];
+
+  /*
+   * WHAT IS DECLARED IS NOT WHAT IS BUCKETED, and conflating them costs real readings.
+   *
+   * `chosen` is the bucket the points are thinned into, and it must stay as fine as the
+   * window affords: coarsening it to match the data merged both of one trader's 10 September
+   * readings into one and returned five points where six exist. Thinning is for keeping a
+   * chart plottable, not for making the label true.
+   *
+   * `declared` is what the answer CALLS its step, and that has to match the readings. It is
+   * the coarsest step that covers the observed spacing, so a week over daily readings says
+   * 1d and begins saying 6h by itself the day the readings are six-hourly.
+   *
+   * A caller who names a step gets that step in both places: they asked, and the answer
+   * should not argue. `observedStepMs` still reports what the data does either way.
+   */
+  const declared = stepRaw !== null
+    ? chosen
+    : (AUM_STEPS.find((x) => x.ms >= Math.max(chosen.ms, observedStepMs))
+       ?? AUM_STEPS[AUM_STEPS.length - 1]);
 
   /*
    * Thin by keeping the LAST point in each bucket rather than the first or an average.
@@ -3717,9 +4100,17 @@ function buildAum(
      * do not: balances, trades and the directory are refreshed by different jobs.
      */
     asOf: newest ? new Date(String(newest.at)).toISOString() : null,
-    step: chosen.name,
+    step: declared.name,
     /** The step in milliseconds, so a consumer need not parse "6h". */
-    stepMs: chosen.ms,
+    stepMs: declared.ms,
+    /** The bucket the points were thinned into, which may be finer than the step declared. */
+    bucketMs: chosen.ms,
+    /**
+     * The median spacing of the readings actually held, in milliseconds. `step` is the bucket
+     * the points are thinned into; this is what the data does. They agree unless a caller
+     * asked for a step explicitly, and a consumer labelling an axis should read this one.
+     */
+    observedStepMs: observedStepMs || null,
     from: from ? from.toISOString() : (points[0]?.at ?? null),
     to: to.toISOString(),
     trackedSince,
@@ -3763,6 +4154,16 @@ function buildAum(
 
     /** Coverage of the newest point, in wallets and chains rather than positions. */
     coverage: { answeredWallets, totalWallets, answeredChains: answeredNets.size, totalChains },
+
+    /**
+     * EVERY CHAIN THIS TRADER USES, and it does not change with the window.
+     *
+     * `chains` below is the split of the newest reading; this is the trader. They answer
+     * different questions and both are needed: draw the chain switches from this one, and
+     * read `chains` for what the latest reading actually covered. `coverage` and each point's
+     * `chainsAnswered` / `chainsTotal` are untouched.
+     */
+    knownChains: opts.knownChains ?? [],
 
     /**
      * `ready` — this is what we have to offer.
@@ -3825,7 +4226,7 @@ function buildAum(
       : newest.total_usd === null
       ? `The most recent reading was refused (${newest.refused_reason}), so there is no total for it. ` +
         `A partial total would read like a real drawdown.`
-      : `${points.length} point${points.length === 1 ? "" : "s"} over ${windowKey} at ${chosen.name} steps` +
+      : `${points.length} point${points.length === 1 ? "" : "s"} over ${windowKey} at ${declared.name} steps` +
         (chainFilter ? ` on ${chainFilter.name} alone` : "") + "." +
         (trackedSince === null
           ? " Every point is a marked rebuild — sampling has not started."
@@ -3947,6 +4348,9 @@ async function aumFor(
         where a.handle = any(${present})
         order by a.handle, a.at asc`
     : [];
+  /** Window-independent chain list, one query for the whole batch. */
+  const knownBy = await knownChainsFor(present);
+
   /** handle -> "<iso at>|<basis>" -> [{ chain, usd }]. One map, built once for the batch. */
   const pointChainsBy = new Map<string, Map<string, { chain: string; usd: number | null }[]>>();
   for (const r of allChainRows) {
@@ -3985,7 +4389,8 @@ async function aumFor(
       byHandle.get(h) ?? [],
       chainsBy.get(h) ?? [],
       presBy.get(h) ?? null,
-      { ...opts, to, pointChains: pointChainsBy.get(h) ?? null, sampler: {
+      { ...opts, to, pointChains: pointChainsBy.get(h) ?? null,
+        knownChains: knownBy.get(h) ?? [], sampler: {
         lastAt: samplerRow?.last_at ? new Date(String(samplerRow.last_at)) : null,
         lastSuccess: samplerRow?.last_success ? new Date(String(samplerRow.last_success)) : null,
       } },
@@ -4634,6 +5039,86 @@ get("/v1/health", async () => {
 
 // ----------------------------------------------------------------- wallets
 
+/**
+ * EVERY CHAIN A TRADER USES, independent of any window or any single reading.
+ *
+ * `aum.chains` lists the chains in the NEWEST reading, which is a fact about that reading and
+ * not about the trader -- it showed Solana alone for a trader whose portfolio spans five. A
+ * consumer drawing chain switches from it offered 128 of 435 traders fewer switches than the
+ * service itself says they use.
+ *
+ * So the list is built from every place a chain can be evidenced, unioned:
+ *   - a chain his wallets have been SEEN trading on (wallet_chain_presence)
+ *   - a chain he currently HOLDS something on (holdings_current)
+ *   - a chain we hold BALANCE HISTORY for (aum_chain_samples)
+ *
+ * Set-based over every handle at once, so the batch routes pay one query rather than fifty:
+ * measured 116 ms for fifty traders.
+ */
+type KnownChain = {
+  chain: string; networkId: number; wallets: number;
+  hasPositions: boolean; historyState: string;
+};
+
+async function knownChainsFor(handles: string[]): Promise<Map<string, KnownChain[]>> {
+  const out = new Map<string, KnownChain[]>();
+  if (!handles.length) return out;
+
+  const rows = await sql`
+    with hs as (
+      select handle, network_id, count(*) filter (where human_amount > 0) as pos
+      from holdings_current where handle = any(${handles}) group by 1, 2),
+    ah as (
+      select handle, network_id, count(*) filter (where total_usd is not null) as pts
+      from aum_chain_samples where handle = any(${handles}) group by 1, 2),
+    pr as (
+      select handle, network_id from wallet_chain_presence where handle = any(${handles})),
+    seen as (
+      select handle, network_id from pr
+      union select handle, network_id from hs where pos > 0
+      union select handle, network_id from ah),
+    fam as (
+      select t.handle,
+             (w.sol_address is not null) as has_sol,
+             (w.evm_address is not null) as has_evm
+      from traders t left join wallets w using (handle)
+      where t.handle = any(${handles}))
+    select s.handle, c.name as chain, s.network_id,
+           coalesce(hs.pos, 0) as positions,
+           coalesce(ah.pts, 0) as history_points,
+           case when s.network_id = ${SOLANA_NET} then fam.has_sol else fam.has_evm end
+             as has_wallet
+    from seen s
+    join chains c using (network_id)
+    join fam on fam.handle = s.handle
+    left join hs on hs.handle = s.handle and hs.network_id = s.network_id
+    left join ah on ah.handle = s.handle and ah.network_id = s.network_id
+    order by s.handle, c.name`;
+
+  for (const r of rows) {
+    const h = String(r.handle);
+    let a = out.get(h); if (!a) out.set(h, a = []);
+    const pts = Number(r.history_points);
+    a.push({
+      chain: String(r.chain),
+      networkId: Number(r.network_id),
+      /*
+       * One Ethereum-style address serves four chains, so this is 1 whenever the family that
+       * reaches this chain is on record, and 0 when the chain is evidenced but the address
+       * behind it is not -- which is a real state and worth seeing rather than assuming.
+       */
+      wallets: r.has_wallet === true ? 1 : 0,
+      hasPositions: Number(r.positions) > 0,
+      /*
+       * Whether this chain can be drawn on its own, by the same two-point rule the series
+       * uses. `none` is not `warming`: one has never produced a reading, the other has.
+       */
+      historyState: pts >= 2 ? "ready" : (pts === 1 ? "warming" : "none"),
+    });
+  }
+  return out;
+}
+
 /** Wallet rows for many traders at once, for the ISSUE-8 bulk route. */
 const walletRows = (handles: string[]) => sql`
   select t.handle, t.id, t.display_handle, t.handle_changed_at,
@@ -4645,7 +5130,7 @@ const walletRows = (handles: string[]) => sql`
 
 /** Shared by the single route and the bulk route, so the two cannot diverge. */
 // deno-lint-ignore no-explicit-any
-function walletsBody(t: any) {
+function walletsBody(t: any, knownChains: KnownChain[] | null = null) {
   // Shape-checked before publishing. fomo's own evm/sol fields are empty for all 100
   // traders; these come from fomoapi's resolution and are REPORTED, not verified — see
   // PARAMETERS.md section 5. Verification writes into the *_confidence columns.
@@ -4666,6 +5151,17 @@ function walletsBody(t: any) {
     tier: (t.evm_confidence || t.sol_confidence) ? "verified" : "reported",
     confidence: { evm: t.evm_confidence ?? null, solana: t.sol_confidence ?? null },
     ...(bad ? { warning: `${bad} stored address(es) are malformed and were withheld` } : {}),
+    /**
+     * EVERY CHAIN THIS TRADER USES, window-independent and stable.
+     *
+     * `wallets[].chains` says where each ADDRESS has been seen; this says where the TRADER
+     * is, which is the list chain tags and per-chain switches are drawn from. They differ:
+     * a chain can carry positions or balance history without a trade we observed.
+     *
+     * Null rather than [] when the caller did not ask for it to be resolved, so an absent
+     * list is never read as a trader on no chains.
+     */
+    knownChains,
   };
 }
 
@@ -4747,9 +5243,11 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
   const [t] = await walletRows([h]);
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
-  const presence = await sql`
-    select chain, network_id, trades_seen, last_active_at
-    from wallet_chain_presence where handle = ${h} order by trades_seen desc`;
+  const [presence, knownBy] = await Promise.all([
+    sql`select chain, network_id, trades_seen, last_active_at
+        from wallet_chain_presence where handle = ${h} order by trades_seen desc`,
+    knownChainsFor([h]),
+  ]);
 
   const seen = presence.map((p: any) => ({
     chain: p.chain as string,
@@ -4778,7 +5276,7 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
   }
 
   return {
-    ...walletsBody(t),
+    ...walletsBody(t, knownBy.get(h) ?? []),
     /**
      * The stable key. `handle` above is a display name and may change; this does not.
      *

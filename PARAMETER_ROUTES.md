@@ -141,6 +141,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **11** | [Batch reads](#11-batch-reads) | the whole board in a bounded number of calls |
 | **C** | [What the plugin team asked for](#appendix-c-what-the-plugin-team-asked-for) | § by §, and where each landed |
 | **A4** | [The version 8 report, and what changed](#appendix-a4-the-version-8-report-and-what-changed-2026-09-14) | freshness, `now`, and the seam |
+| **A5** | [The version 8 report, the rest of the asks](#appendix-a5-the-version-8-report-the-rest-of-the-asks-2026-09-14) | ten more, measured |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -178,6 +179,22 @@ Valid values are `pnl`, `scorecard`, `wallets`, `trust`. Anything else is a **40
 valid set — a silently ignored parameter is how a consumer ends up believing they have data
 they never received. `portfolio`, `positions` and `transactions` are not bulk-able and are
 still fetched per trader.
+
+**Every trader in the directory carries its figures.** `pnl`, `volume`, `numTrades` and
+`updatedAt` are present on **442 of 442**.
+
+```bash
+curl -s "$B/traders?limit=500" | jq '[.entries[] | select(.volume == null)] | length'
+# 0
+```
+
+Two loaders write the stats behind these fields and they do not run together — one covers 100
+traders, the other 291. The directory used to publish whichever load ran most recently as
+"current" for everybody, so every trader belonging to the other loader had all four fields
+null while their figures sat in the store unchanged. The figures are now taken per trader.
+
+**`updatedAt` therefore varies between entries**, and that is the point: it is that trader's
+own freshness rather than a date borrowed from a trader you are not looking at.
 
 **Sub-resources arrive under `entries[].included`, not on the entry itself.** `entries[].pnl`
 is fomo's *reported* figure; `included.pnl` is what we compute from stored trades. They are
@@ -659,6 +676,29 @@ disappearing between pages cannot make the sequence skip or repeat one. Row iden
 `(chain, tokenAddress)` — never `symbol`, which is display metadata two different coins can
 share.
 
+### Each chain's dollars, said in that chain's own coin
+
+```bash
+curl -s "$B/traders/unipcs/portfolio" | jq '.byChain[] | {chain, valueUsd, nativeAmount, nativeSymbol, nativeUsd, nativePriceSource}'
+```
+
+| chain | `valueUsd` | `nativeAmount` | | `nativeUsd` | `nativePriceSource` |
+| --- | --- | --- | --- | --- | --- |
+| solana | $4,797,285.24 | **46,670.73879** | SOL | 102.79 | `token_prices_daily` |
+| robinhood | $11,002,305.93 | **4,439.112504** | ETH | 2,478.49 | `gmgn_token_info` |
+| bsc | $31,441.38 | `null` | BNB | `null` | — |
+| ethereum | $18,505.32 | `null` | ETH | `null` | — |
+| base | `null` | `null` | ETH | `null` | — |
+
+**`nativeAmount` is `valueUsd / nativeUsd` and nothing more**, so the two always agree. The
+rate and its source travel with it so the division can be rechecked.
+
+**Three of five chains answer `null`, and `whyNoNative` says why.** The rate has to be a
+*market* price. Most of what we hold for a wrapped native is `fomo_reported_entry` — the price
+a trader reported paying, not what the coin is worth now — and some rows carry a price with no
+source at all. Neither can be stood behind: one chain's WETH rows range $1,885 to $2,931. A
+portfolio converted at a number nobody can defend is a worse answer than no number.
+
 ### Every position says where its numbers came from
 
 `entries[]` carries the provenance of both halves of a valuation — the amount and the price:
@@ -756,7 +796,7 @@ have ingested, and says so in the response. Theirs is more complete; ours is che
 
 | # | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- | --- |
-| **T16** | "How long do they usually hold?" | `GET $B/traders/unipcs/scorecard` | `holdingTime` | **1.06 days** (25.4h), coverage 43/43 |
+| **T16** | "How long do they usually hold?" | `GET $B/traders/unipcs/scorecard` | `holdingTime`, `measurements.holdTimeDays` | **1.06 days** (25.4h), coverage **43/43 on both** |
 | **T17** | "What did they pay to get in — **as a market cap**?" | same | `byToken[].avgEntryMarketCapUsd` + `totalSupply` | `frankdegods` · Stonks **$2,398,439 MC** from supply 1,000,000,000, `entryMethod: weighted` over 2 positions |
 | **T18** | "Are they still active?" | same | `lastTradeAt` | **2026-09-07T11:22Z** |
 | **T19** | "How long have they been trading?" | same | `trackRecordDays` | **108.4 days** |
@@ -764,6 +804,111 @@ have ingested, and says so in the response. Theirs is more complete; ours is che
 
 Unlike the price fields, **timestamps are populated on 100% of trades** — which is why all
 of §3 is solid while §1 carries coverage caveats.
+
+### Dollars in and dollars out, per coin
+
+An average price cannot answer "how much a bet": two traders with the same average entry may
+have staked a hundred dollars or a hundred thousand. Each `byToken` row carries both sums.
+
+```bash
+curl -s "$B/traders/turtletaverntv/scorecard" | jq '.byToken[0] | {symbol, costUsd, proceedsUsd, costCoverage, whyNoCostUsd}'
+```
+
+| symbol | `costUsd` | `proceedsUsd` | `costCoverage.share` |
+| --- | --- | --- | --- |
+| Basecat | $13,425.88 | $43,634.94 | 1 |
+| ASTEROID | $58,125.30 | $75,836.26 | 1 |
+| SESH | $7,797.60 | $18,339.30 | 1 |
+
+**These are the same quantity-weighted sums that produced `avgEntryPrice`** — each position's
+price times the quantity recovered for it — so they reconcile with it exactly rather than
+being a second estimate of the same thing. `costQuantity` and `proceedsQuantity` carry the
+quantity each was taken over, so the division can be rechecked.
+
+**Null, never 0**, when no position in the coin carried a recoverable quantity, with
+`whyNoCostUsd` naming which of the two reasons it was.
+
+### Realised profit by month
+
+`realizedByDay` covers thirty days. `realizedByMonth` covers the twelve completed calendar
+months plus the one running, which is what a "worst month" reading needs.
+
+```bash
+curl -s "$B/traders/turtletaverntv/scorecard" | jq '.realizedByMonth[] | {month, realizedUsd, closedTrades, complete}'
+```
+
+```
+2026-02   -1,769.08   16 trades
+2026-05  -10,556.09   14 trades     <- worst month
+2026-06   16,860.89   10 trades
+2026-08   34,166.74   29 trades
+2026-09    4,602.17  124 trades     complete: false
+```
+
+**`complete: false` marks the month still running**, so a part-month is never compared with
+whole ones.
+
+**A month with no closed trade is absent, not zero** — the same rule `realizedByDay` follows.
+
+**The months do not sum to `windows.all` for a longer record, and `realizedByMonthBasis` says
+by how much.** For the trader above, the months total $59,422.09 against an `all` of
+$64,427.81; the difference is `beforeWindowUsd: 5005.73` — twenty closes that happened before
+this window. Both figures are right, and the arithmetic is stated rather than left to be
+discovered.
+
+### Fees, and volume per window
+
+**Nothing here is after fees, and the answer says so.** `includesFees: false` travels on every
+realised window, and `fees` states the reason once:
+
+```json
+{ "includedInRealized": false, "paidUsd": null, "perTradeUsd": null, "source": null,
+  "why": "no fee or gas figure is stored on any trade or transfer we hold." }
+```
+
+No fee or gas column exists on any trade or transfer in the store, so a fee figure would have
+to be invented. The profile's "made, after fees" cannot be answered from this data, and saying
+that is the only correct answer available.
+
+**Volume is now measured per window, not only reported for a lifetime.**
+
+```bash
+curl -s "$B/traders/unipcs/scorecard" | jq '.windows["30d"] | {realizedUsd, volumeUsd, volumeCoverage, includesFees}'
+```
+
+```json
+{ "realizedUsd": -131120.08, "volumeUsd": 419969.75,
+  "volumeCoverage": { "of": 3, "total": 43, "share": 0.0698 }, "includesFees": false }
+```
+
+The leaderboard gives one lifetime figure with nothing to slice it by, so "volume in the last
+7 days" had no answer at all before. This counts **both legs** of each round trip — a round
+trip trades twice — over the closed positions carrying an entry price, an exit price and a
+recoverable quantity, with `volumeCoverage` saying how many that was. `volume.reportedLifetimeUsd`
+keeps the leaderboard's number beside it; the two are different measurements and will not agree.
+
+### Is this the whole record? — `sample`
+
+```bash
+curl -s "$B/traders/unipcs/scorecard" | jq .sample
+```
+
+```json
+{ "returned": 363, "complete": true, "capped": false, "unit": "position",
+  "positionsStored": 363, "reportedTrades": 4745,
+  "reportedTradesSource": "leaderboard, lifetime, counted as fills",
+  "loadedAt": "2026-09-05T04:30:29.000Z", "nextLoadAt": "2026-09-15T06:00:00.000Z" }
+```
+
+**`complete` answers one question: was anything left out of this response.** No cap is applied
+— every stored position is used.
+
+**363 against 4,745 is not a coverage gap.** We hold **positions**, already averaged across
+the fills inside them; the leaderboard counts **fills**. `unit` and `reportedTradesSource` make
+that visible instead of alarming.
+
+**`loadedAt` and `nextLoadAt`** are the scorecard's half of the freshness contract — the same
+question `sampler` answers for the balance series, asked of the store that feeds this route.
 
 ### Average entry is a market cap, and the supply travels with it
 
@@ -986,6 +1131,28 @@ curl -s "$B/traders/ogle/trust" | jq -r '.verdict, .plain'
 # self_contradictory
 # fomo's own profit and volume figures for this trader do not reconcile with each other.
 ```
+
+**`checks` says what was looked at, so an absent flag is never a clean bill of health.**
+
+```bash
+curl -s "$B/traders/unipcs/trust" | jq .checks
+```
+
+```json
+{
+  "performed": ["pnl_exceeds_volume", "pnl_exceeds_holdings",
+                "holdings_coverage_too_low", "too_few_trades", "partial_pricing"],
+  "basis": "internal consistency only — figures we hold, checked against each other",
+  "blacklist": { "checked": false, "lists": [],
+                 "why": "no blacklist, sanctions list or known-scam source is consulted by this route." },
+  "externalReputation": { "checked": false, "sources": [] }
+}
+```
+
+**No blacklist, sanctions list or scam list is consulted here.** Every flag is an internal
+consistency check on figures we already hold. "We checked a list and this trader is not on it"
+and "we never looked" are opposite statements, and `blacklist.checked: false` says which one
+this is. An absent blacklist flag means **not checked** — never *checked and clear*.
 
 **The verdict describes the numbers, not the trader.** `self_contradictory` means two figures
 fomo published cannot both be right — profit of $5,320,901 on $398,122 of lifetime volume.
@@ -1635,15 +1802,36 @@ curl -s "$B/traders/0xAvast/aum?window=1w&step=1d" | jq '{step, count}'
 
 ```
 ?window=1d | 1w | 1m | all        how far back            default 1w
-?step=1h  | 6h | 1d               thin the series         default: the coarsest leaving >= 24 points
+?step=1h  | 6h | 1d               thin the series         default: see below
 ?chain=robinhood | solana | ...   one chain instead of the whole portfolio
 ```
 
-| `?window=` | default `step` | points |
-| --- | --- | --- |
-| `1d` | `1h` | 24 |
-| `1w` | `6h` | 28 |
-| `1m` | `1d` | 30 |
+**`step` describes the readings, not the request.** It used to be chosen from the requested
+span alone — the coarsest leaving at least 24 points — which is a sound rule about the window
+and says nothing about the data. Every week therefore declared `6h` over readings a day apart:
+of the gaps between neighbouring readings, 566 measured 24 hours against 156 at 8 and 258 at
+16. The answer described itself wrongly.
+
+The observed spacing is now a floor, so a week over daily readings declares `1d`, and will
+declare `6h` again by itself the day the readings are six-hourly.
+
+| `?window=` | `step` declared | `bucketMs` | `observedStepMs` |
+| --- | --- | --- | --- |
+| `1d` | `1d` | 1h | whatever the data does |
+| `1w` | `1d` | 6h | 86,400,000 (24h) |
+| `1m` | `1d` | 1d | 86,400,000 (24h) |
+
+**`step` and `bucketMs` are different knobs on purpose.** `bucketMs` is what the points are
+thinned into and stays as fine as the window affords — coarsening it to match the label merged
+two readings taken on the same day and returned five points where six exist. Thinning keeps a
+chart plottable; it is not how a label is made true.
+
+**`observedStepMs` is the median spacing of the readings actually held.** A consumer labelling
+an axis should read this one. Median, not mean, so one long gap after a quiet spell does not
+coarsen the whole series.
+
+**A caller who names a `step` gets it in both places.** They asked; the answer does not argue.
+`observedStepMs` still reports what the data does.
 
 ### One chain at a time — `?chain=`
 
@@ -1859,6 +2047,40 @@ chain with no row at that moment did not contribute zero dollars; it contributed
 all, and those are different facts. Wallets are counted as well as chains because one EVM
 address serves four of the five chains — so "three of four chains" can still mean either
 wallet went unread, and which one it was changes what the number is missing.
+
+### Every chain a trader uses — `knownChains[]`
+
+```bash
+curl -s "$B/traders/unipcs/aum?window=1w" | jq .knownChains
+curl -s "$B/traders/unipcs/wallets"       | jq .knownChains
+```
+
+```json
+[ { "chain": "base",      "networkId": 8453,       "wallets": 1, "hasPositions": true, "historyState": "ready" },
+  { "chain": "bsc",       "networkId": 56,         "wallets": 1, "hasPositions": true, "historyState": "ready" },
+  { "chain": "ethereum",  "networkId": 1,          "wallets": 1, "hasPositions": true, "historyState": "ready" },
+  { "chain": "robinhood", "networkId": 4663,       "wallets": 1, "hasPositions": true, "historyState": "ready" },
+  { "chain": "solana",    "networkId": 1399811149, "wallets": 1, "hasPositions": true, "historyState": "ready" } ]
+```
+
+**It does not change with the window, and it is not the newest reading's chain list.** `chains`
+below is the split of one reading — for the trader above it held four chains while he uses
+five. Draw chain tags and per-chain switches from `knownChains`; read `chains` for what the
+latest reading actually covered.
+
+**Built from every place a chain can be evidenced**, unioned: a chain his wallets have been
+seen trading on, a chain he currently holds something on, and a chain we hold balance history
+for. One query per batch — 117 ms for fifty traders.
+
+| field | means |
+| --- | --- |
+| `wallets` | 1 when the address family reaching this chain is on record. One Ethereum-style address serves four chains |
+| `hasPositions` | he holds something there right now |
+| `historyState` | `ready` (two or more valued readings, the same rule the series draws by), `warming` (one), `none` |
+
+It appears on `GET /aum`, `POST /traders/aum`, `GET /wallets` and `?include=wallets`.
+`chainsAnswered` / `chainsTotal` / `partial` on each point are untouched — they answer a
+different question.
 
 ### Two neighbouring points may not count the same thing — `breaks[]`
 
@@ -2153,6 +2375,40 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 **Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
 `RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
+
+---
+
+## Appendix A5 · The version 8 report, the rest of the asks (2026-09-14)
+
+The ten asks after A1-A3 that could be answered from data already stored. Every figure below
+was read from the live service after the change.
+
+| # | What was wrong | What changed |
+| --- | --- | --- |
+| **A13.2** | `pnl`, `volume`, `numTrades` and `updatedAt` null for a large part of the directory | two loaders write the stats and never run together, so whichever ran last defined "current" and the other's traders fell out of the view entirely. Taken **per trader** now: **442 of 442** carry all four, from 100. `updatedAt` is each trader's own. **§0** |
+| **A10 · A13.7** | every week declared `6h` over readings a day apart — 566 of the gaps measured 24 hours | the observed spacing is a floor on the declared step, so the week says `1d` and will say `6h` again on its own. `observedStepMs` reports the median spacing; `bucketMs` stays as fine as the window affords, because coarsening the thinning lost a real reading. **§9** |
+| **A13.1** | one median under two coverages, 43 of 43 and 3 of 43 | the 3-of-43 was the PRICED-position coverage, which belongs to the return figures and has nothing to do with a duration. Both now read **43 of 43**, the positions the median was actually taken over. **§3** |
+| **A6** | `realizedByDay` covered 30 days; no monthly field existed | `realizedByMonth` — twelve completed months plus the one running, each with dollars, closed-trade count, coverage and `complete`. `realizedByMonthBasis.beforeWindowUsd` states what falls outside, so a calendar that does not sum to the lifetime figure is explained rather than puzzling. **§3** |
+| **A4** | no dollars-in or dollars-out on any coin | `costUsd` and `proceedsUsd` per coin with quantities, coverage and a reason when null. They are the quantity-weighted sums that already produced `avgEntryPrice`, so they reconcile with it exactly. **§3** |
+| **A8** | `aum.chains` listed the newest reading's chains, so chain switches were drawn from one reading | `knownChains[]` on `/aum`, `POST /traders/aum`, `/wallets` and `?include=wallets`: every chain traded on, held on, or with balance history, each with `wallets`, `hasPositions` and `historyState`. Window-independent. 117 ms for fifty traders. **§9** |
+| **A13.3** | no way to say "114.09 BNB" beside "$83.6K" | `nativeAmount`, `nativeSymbol`, `nativeUsd` and `nativePriceSource` per chain on `/portfolio.byChain`. **§2** |
+| **A9** | `sample: { returned, storedAt }` left it unclear whether 363 was a whole record or a slice | `complete`, `capped`, `unit`, `positionsStored`, `reportedTrades`, `loadedAt` and `nextLoadAt`. 363 positions against 4,745 reported fills is two units counted, not a gap, and the response now says so. **§3** |
+| **A7** (what the data supports) | no realised figure stated whether fees were included; volume existed only as a lifetime total | `includesFees: false` on every realised window with the reason stated once in `fees`, and **volume measured per window** — both legs of each round trip, with coverage. **§3** |
+| **A13.4** | unclear whether `/trust.flags` included any blacklist check | a `checks` block: the five consistency checks it performs, and `blacklist.checked: false`. An absent blacklist flag means **not checked**, never *checked and clear*. **§4** |
+
+**Two of these could not be answered the way the report hoped, and say so on the response.**
+
+- **A13.3 answers `null` on three of five chains.** The rate has to be a market price, and the
+  only figures we hold for BNB and for ETH on base and ethereum are `fomo_reported_entry` —
+  what a trader said they paid — plus rows carrying a price with no source at all. One chain's
+  WETH rows range $1,885 to $2,931. `whyNoNative` names the reason rather than converting a
+  portfolio at a number nobody can defend.
+- **A4's larger half needs data that is not stored.** The report hoped the valued transaction
+  legs would fill entry cost. Those valued legs are Solana-only: 109,874 of 936,792 on solana,
+  and none at all on robinhood, bsc, base or ethereum.
+
+**A7's fee figures and the per-buy breakdown in A4 are not here**, and no field pretends
+otherwise: no fee or gas column exists on any trade or transfer in the store.
 
 ---
 
