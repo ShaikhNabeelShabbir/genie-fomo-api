@@ -238,6 +238,15 @@ jobs:
         timeout-minutes: 15
         run: node scripts/load_transaction_fees.mjs --chain=solana --swaps-only --batch=10
 
+      # A4 — individual buys on the EVM chains, from the same receipts the fees come from.
+      # Only transactions where the wallet both sent and received a token are candidates: a
+      # one-sided leg means the wallet was a counterparty inside someone else's trade.
+      - name: Resolve EVM swaps from receipts
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 25
+        run: node scripts/resolve_evm_swaps_from_receipts.mjs
+
       # Roll those into the daily buckets the scorecard reads. Must follow the loaders.
       - name: Refresh trader fees
         if: '!cancelled()'

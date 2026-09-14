@@ -144,6 +144,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **A5** | [The version 8 report, the rest of the asks](#appendix-a5-the-version-8-report-the-rest-of-the-asks-2026-09-14) | ten more, measured |
 | **A6** | [Cost basis, reasons, and paired trades](#appendix-a6-cost-basis-reasons-and-paired-trades-2026-09-14) | the last code-only three |
 | **A7** | [Fees, read from chain](#appendix-a7-fees-read-from-chain-2026-09-14) | the fee gap, closed |
+| **A8** | [The buys themselves, and version 8 closed](#appendix-a8-the-buys-themselves-and-version-8-closed-2026-09-14) | 19 of 19 |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -939,12 +940,11 @@ curl -s "$B/traders/unipcs/scorecard" | jq '.fees, (.windows["30d"] | {realizedU
 
 ```json
 { "includedInRealized": false,
-  "paidUsd": 676.9,
-  "byWindowUsd": { "24h": 0.03, "7d": 77.54, "30d": 674.35, "all": 676.9 },
-  "paidNative": [ { "symbol": "ETH", "amount": 0.271543412, "chains": 3 },
-                  { "symbol": "BNB", "amount": 0.089880785, "chains": 1 },
-                  { "symbol": "SOL", "amount": 0.037769357, "chains": 1 } ],
-  "transactions": 1156,
+  "paidUsd": 1966.112168,
+  "byWindowUsd": { "24h": 0.03, "7d": 77.54, "30d": 1960.408923, "all": 1966.112168 },
+  "paidNative": [ { "symbol": "ETH", "amount": 0.789553423698, "chains": 3 },
+                  { "symbol": "BNB", "amount": 0.0898807848313, "chains": 1 },
+                  { "symbol": "SOL", "amount": 0.089601398, "chains": 1 } ],
   "coverage": { "of": 4, "total": 5, "share": 0.8 },
   "usdBasis": "native fee valued at the current native price, not the price when it was paid" }
 ```
@@ -1001,6 +1001,62 @@ that visible instead of alarming.
 
 **`loadedAt` and `nextLoadAt`** are the scorecard's half of the freshness contract — the same
 question `sampler` answers for the balance series, asked of the store that feeds this route.
+
+### The buys themselves — `byToken[].buys[]`
+
+`avgEntryPrice` is one number per coin, and fomoapi hands it to us **already averaged** across
+the fills inside a position. An average cannot be un-averaged: five buys at five prices arrive
+as one figure. A question about buys has to count buys.
+
+```bash
+curl -s "$B/traders/unipcs/scorecard" | jq '[.byToken[] | select(.buysTotal > 0)][0] | {symbol, buysTotal, buys: .buys[0:3]}'
+```
+
+```json
+{ "symbol": "USELESS", "buysTotal": 8,
+  "buys": [
+    { "at": "2026-07-25T20:11:12Z", "txHash": "…", "amount": 63637.547083,
+      "costUsd": 3360.2, "priceUsd": 0.0528021671485, "marketCapUsd": 52753797.6 },
+    { "at": "2026-07-27T14:30:29Z", "txHash": "…", "amount": 2032.663698,
+      "costUsd": 122.23, "priceUsd": 0.060133316751, "marketCapUsd": 60078231.49 }
+  ] }
+```
+
+**`marketCapUsd` is the figure a size band is drawn from** — that buy's price times the supply
+we hold, so "how big was the coin when he bought it" is answerable per buy rather than per coin.
+Null, never 0, wherever either input is.
+
+**Read `buysCoverage` before counting anything.**
+
+```json
+{ "buys": 398, "coinsWithBuys": 25, "coinsTotal": 104, "share": 0.2404,
+  "basis": "individual buys resolved from chain swaps. Solana throughout; the four
+            Ethereum-style chains only where a transaction shows this wallet both sending and
+            receiving a token, which is what a trade the wallet made looks like" }
+```
+
+**The buys we hold are not a random sample of a trader's buying.** They are the ones on chains
+whose swaps resolve — 2,070 individual priced buys across 139 wallets, heavily Solana. A
+percentile computed over them and printed as a fact about the trader is exactly the failure this
+document exists to prevent. With coverage stated, the bands are real:
+
+| entry market cap | buys | share |
+| --- | --- | --- |
+| under $100K | 2 | 0.5% |
+| $100K – $1M | 38 | 9.5% |
+| $1M – $10M | 193 | 48.5% |
+| over $10M | 165 | 41.5% |
+
+**Capped at 100 per coin**, with `buysTotal` stating the real count, so one heavily traded coin
+cannot dominate a response. `buysTotal: 0` means we hold no individual buys for that coin — not
+that none were made — and `fieldReasons.buys` says `source_unavailable` there.
+
+**Why the EVM chains contribute little.** A wallet's own trade is a transaction where it both
+sends and receives a token. Measured on a random sample of 100 bsc transactions: 74% contain no
+swap at all, 25% contain a swap in which our wallet is **one-sided** — a counterparty inside
+someone else's trade — and 1% are the wallet's own two-sided swap. Only the last kind is
+resolved. Counting the 25% would have manufactured hundreds of fills at prices the trader never
+paid.
 
 ### A reason beside every empty field — `fieldReasons`
 
@@ -2566,6 +2622,61 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 **Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
 `RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
+
+---
+
+## Appendix A8 · The buys themselves, and version 8 closed (2026-09-14)
+
+A4's last bullet asked for entry price and entry market cap **per buy**, "so '95% of buys under
+$100K' counts buys". It was the final open item in the version 8 report.
+
+**The obstacle was never the fetching.** fomoapi gives us a POSITION carrying one
+`avg_entry_price`, already averaged across the fills inside it, and an average cannot be taken
+apart. The buys had to come from chain swaps, and only Solana had them.
+
+### What the probe found, before anything was built
+
+A random sample of 100 bsc transactions:
+
+| | Share | What it is |
+| --- | --- | --- |
+| no swap at all | 74% | transfers, approvals, bridges |
+| a swap, **wallet one-sided** | 25% | the wallet received or sent one token, not both — a counterparty inside someone else's trade |
+| the wallet's own two-sided swap | **1%** | a trade this wallet made |
+
+That 25% is the trap the `/trades` coverage note has always warned about. Treating those as the
+trader's buys would have manufactured hundreds of fills at prices the trader never paid, so the
+resolver accepts only transactions where the wallet **both sends and receives** — 1,979
+candidates across four chains, about 20 batched requests rather than 52,420.
+
+### What it yielded
+
+| chain | buys held | priced | wallets |
+| --- | --- | --- | --- |
+| solana | 2,017 | 2,017 | 122 |
+| bsc | 40 | 40 | 5 |
+| base | 14 | 12 | 10 |
+| robinhood | 1 | 1 | 2 |
+
+**2,070 individual priced buys across 139 wallets**, and `buysCoverage` says so on every answer.
+116 EVM swaps were resolved where the previous attempt found none — because a receipt carries
+every log, while the transfer rows we had ingested carry only the legs the ingest happened to
+store. Ethereum yielded nothing: all 60 of its two-sided candidates moved more than two tokens
+for the wallet, which is a route or a rebalance and not a single trade.
+
+### Version 8, closed
+
+All nineteen asks are answered, verified against the live service:
+
+| | Asks |
+| --- | --- |
+| **Answered in full** | A1, A2, A3, A5, A6, A8, A9, A10, A11, A12, A13.1, A13.2, A13.3, A13.4, A13.5, A13.6, A13.7 |
+| **Answered to the limit of the data, with coverage stated** | A4 — 2,070 buys across 139 of 442 traders; A7 — fees on four of five chains, native-only on bsc |
+
+Nothing here is a partial answer presented as a whole. Every figure that covers part of a trader
+says which part: `buysCoverage`, `fees.coverage`, `costCoverage`, `volumeCoverage`,
+`feesCoverage`, `entryPriceCoverage`, `chainsAnswered` / `chainsTotal`, and `fieldReasons` in
+four named codes beside every null.
 
 ---
 

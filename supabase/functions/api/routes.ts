@@ -1009,7 +1009,7 @@ get("/v1/traders", async (_p, url) => {
             entries: new Map((ceBy.get(h) ?? []).map((c: any) =>
               [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
             exits: (xeBy.get(h) ?? []).map((x: any) => Number(x.exit_pnl_usd)),
-          }, feesBy.get(h) ?? null)
+          }, feesBy.get(h) ?? null, null)
         : null;
     }
     return out;
@@ -2385,6 +2385,59 @@ async function feesFor(
 }
 
 /**
+ * INDIVIDUAL BUYS, so a question about buys can be counted in buys.
+ *
+ * The scorecard's `avgEntryPrice` is an average fomoapi hands us already averaged across the
+ * fills inside a position, and an average cannot be un-averaged: five buys at five prices
+ * arrive as one number. "95% of his buys were under $100K" counts buys, so it needs them
+ * individually, and the only place they exist is `wallet_swaps` -- Solana from the start, and
+ * the four EVM chains since the receipts were read.
+ *
+ * Keyed by handle then "networkId:tokenKey", so a per-coin row can carry its own buys and the
+ * batch path pays one query for the page.
+ */
+type Buy = {
+  at: string | null; txHash: string; amount: number;
+  costUsd: number | null; priceUsd: number | null;
+};
+
+async function buysFor(handles: string[]): Promise<Map<string, Map<string, Buy[]>>> {
+  const out = new Map<string, Map<string, Buy[]>>();
+  if (!handles.length) return out;
+  const rows = await sql`
+    select t.handle, ws.network_id, ws.token_key, ws.tx_hash, ws.block_time,
+           ws.token_delta, ws.quote_usd
+    from traders t
+    join wallets w using (handle)
+    join wallet_swaps ws
+      on ws.address_key = w.evm_address_key or ws.address_key = lower(w.sol_address)
+    where t.handle = any(${handles}) and ws.token_delta > 0
+    order by t.handle, ws.block_time asc`;
+
+  for (const r of rows) {
+    const h = String(r.handle);
+    let m = out.get(h); if (!m) out.set(h, m = new Map());
+    const k = `${Number(r.network_id)}:${r.token_key}`;
+    let a = m.get(k); if (!a) m.set(k, a = []);
+    const amount = n(r.token_delta) ?? 0;
+    const cost = n(r.quote_usd);
+    a.push({
+      at: r.block_time ? new Date(String(r.block_time)).toISOString() : null,
+      txHash: String(r.tx_hash),
+      amount,
+      costUsd: cost === null ? null : round(Math.abs(cost)),
+      /*
+       * What this buy paid per token -- the figure a size band is drawn from. Null, never 0,
+       * when the money leg carried no dollar value.
+       */
+      priceUsd: cost !== null && amount > 0
+        ? Number((Math.abs(cost) / amount).toPrecision(12)) : null,
+    });
+  }
+  return out;
+}
+
+/**
  * Everything the scorecard computes, over rows already fetched.
  *
  * Split out for ISSUE-8 so `/traders?include=scorecard` runs THIS function rather than a
@@ -2397,6 +2450,7 @@ async function scorecardBody(
   t: any, rows: any[], tokenLimit: number | null,
   chain?: { entries: Map<string, number>; exits: number[] },
   feeWindows?: FeeWindows | null,
+  buys?: Map<string, Buy[]> | null,
 ) {
   const chainEntry = chain?.entries ?? new Map<string, number>();
   const chainExits = chain?.exits ?? [];
@@ -2743,6 +2797,31 @@ async function scorecardBody(
        * rather than a wall of nulls-about-nulls. This explains existing fields; it does not
        * replace any null with a zero.
        */
+      /**
+       * THE BUYS THEMSELVES, where we hold them.
+       *
+       * `avgEntryPrice` above is one number for the coin; these are the fills it averages.
+       * A question about buys -- "95% of buys under $100K", the size bands, "how much a bet"
+       * -- has to count buys, and an average cannot be taken apart into them.
+       *
+       * `marketCapUsd` is that buy's price times the supply we hold, so a buy can be placed
+       * in a size band. It is null wherever either input is, never 0.
+       *
+       * Capped at 100 per coin with `buysTotal` stating the real count, so one heavily traded
+       * coin cannot dominate a response. Absent chains contribute nothing: `buysTotal` of 0
+       * means we hold no individual buys for this coin, NOT that none were made -- read
+       * `buysCoverage` on the answer before counting anything.
+       */
+      buys: (() => {
+        const list = buys?.get(chainKey) ?? [];
+        return list.slice(0, 100).map((b) => ({
+          at: b.at, txHash: b.txHash, amount: b.amount,
+          costUsd: b.costUsd, priceUsd: b.priceUsd,
+          marketCapUsd: b.priceUsd !== null && r.totalSupply !== null && r.totalSupply > 0
+            ? Number((b.priceUsd * r.totalSupply).toPrecision(10)) : null,
+        }));
+      })(),
+      buysTotal: (buys?.get(chainKey) ?? []).length,
       fieldReasons: (() => {
         const why: Record<string, string> = {};
         if (entryPx === null) why.avgEntryPrice = "historical_input_missing";
@@ -2769,6 +2848,12 @@ async function scorecardBody(
           why.tokenAgeAtEntryDays = tokenCreatedUnix === null
             ? "source_unavailable" : "historical_input_missing";
         }
+        /*
+         * No individual buys for this coin. `source_unavailable` rather than
+         * `historical_input_missing`: the fills happened, and the reason we cannot show them
+         * is that no resolver reaches this coin's chain, not that a value went unrecorded.
+         */
+        if ((buys?.get(chainKey) ?? []).length === 0) why.buys = "source_unavailable";
         if (firstClosedMs === null) why.firstClosedAt = "not_applicable";
         if (lastClosedMs === null) why.lastClosedAt = "not_applicable";
         return why;
@@ -3376,6 +3461,36 @@ async function scorecardBody(
      * end apply that rule without recomputing it, and lets it argue for a different rule
      * with the evidence in front of it.
      */
+    /**
+     * HOW MUCH OF THIS TRADER'S BUYING WE HOLD BUY BY BUY.
+     *
+     * Read this before counting anything in `byToken[].buys`. A percentile over the buys we
+     * happen to hold, printed as a fact about the trader, is the failure this API is built
+     * against -- and the buys we hold are not a random sample of his. They are the ones on
+     * chains whose swaps we could resolve.
+     *
+     * `positions` is what the scorecard is built from, and it is the honest denominator: each
+     * one folds an unknown number of fills into a single average.
+     */
+    buysCoverage: (() => {
+      const withBuys = byToken.filter((x) => x.buysTotal > 0);
+      const total = byToken.reduce((a, x) => a + x.buysTotal, 0);
+      return {
+        buys: total,
+        coinsWithBuys: withBuys.length,
+        coinsTotal: byToken.length,
+        share: byToken.length
+          ? Number((withBuys.length / byToken.length).toFixed(4)) : null,
+        basis: "individual buys resolved from chain swaps. Solana throughout; the four " +
+               "Ethereum-style chains only where a transaction shows this wallet both " +
+               "sending and receiving a token, which is what a trade the wallet made looks " +
+               "like",
+        why: total === 0
+          ? "no individual buys resolved for this trader — count from avgEntryPrice instead, " +
+            "which is one figure per coin"
+          : null,
+      };
+    })(),
     entryPriceCoverage: (() => {
       const withPrice = byToken.filter((t) => t.avgEntryPrice !== null);
       const fromChain = withPrice.filter((t) => t.entryPriceSource === "chain").length;
@@ -3406,16 +3521,17 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const h = t.handle as string;
-  const [rows, ce, xe, feeBy] = await Promise.all([
+  const [rows, ce, xe, feeBy, buyBy] = await Promise.all([
     scorecardRows([h]), chainEntryRows([h]), chainExitRows([h]),
     nativePrices().then((nat) => feesFor([h], nat)),
+    buysFor([h]),
   ]);
   if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
 
   return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
     entries: new Map(ce.map((c: any) => [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
     exits: xe.map((x: any) => Number(x.exit_pnl_usd)),
-  }, feeBy.get(h) ?? null);
+  }, feeBy.get(h) ?? null, buyBy.get(h) ?? null);
 });
 
 // ------------------------------------------------------------ K5-K8 (SQL)
