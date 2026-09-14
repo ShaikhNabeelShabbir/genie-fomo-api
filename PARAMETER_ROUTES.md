@@ -1,29 +1,39 @@
 # genie-fomo API — complete reference
 
-**Generated: 2026-09-09T09:20Z** · **Updated 2026-09-12** — the directory carries
+**Generated: 2026-09-09T09:20Z** · **Updated 2026-09-14** — the directory carries
 GMGN-sourced traders alongside fomo's (§0d); the **stable id works on every per-trader route**
 and wallets name their **chains** (§0e); balances are **read from the chain** and the asset
 list **pages** (§2); the **balance series reaches thirty days back on all five chains**, with
 the service's own `reach` and `drawing` verdict (§9); and the batch routes answer with
 **identity-safe rows carrying the complete AUM object** under `contractVersion: 2`, and a
 `chain` of their own (§11). A day is now stated from the chains that answered rather than
-refused whole, which took traders who can draw a line from 96 to **372 of 435** — see
-Appendix A3.
+refused whole, which took traders who can draw a line from 96 to 372 at the time and
+**432 of 442** today — see Appendix A3.
 
-Everything the API answers, in one document: the **35 PARAMETERS.md parameters**, the **10
-GMGN-parity features** built on top of them, and the corrections from the bug report. One row
-per thing you can ask — what it means in plain words, the exact call, and the field to read.
+**The version 8 report is answered in full — all nineteen asks (Appendices A4–A8).** Every
+route now dates itself with `asOf` and `/health` says which feed has stopped (§0f); `now` is
+the most complete recent reading rather than the newest, and `breaks[]` marks every seam a
+percentage must not cross (§9); every trader carries `knownChains[]`, a cost basis on each
+position (§2), fees read from chain per trade and per window, realised profit by month, the
+individual buys behind each coin's average, and a reason in four named codes beside every null
+(§3).
+
+Everything the API answers, in one document: the **35 PARAMETERS.md parameters**, the **12
+GMGN-parity features** built on top of them, and the corrections from the bug report and the
+version 8 report. One row per thing you can ask — what it means in plain words, the exact call,
+and the field to read.
 
 | | |
 | --- | --- |
 | Parameters (T·K·C series) | **35**, all live |
 | GMGN-parity features (G series) | **12 of 12** — G1–G12, complete |
 | Reported bugs and issues | **10 of 10 fixed** — see Appendix A |
+| Version 8 report | **19 of 19 answered** — see Appendices A4–A8 |
 | Plugin requirements (§ series) | **8 of 8 shipped** — see Appendix C |
 | Routes | **19** — 17 `GET`, 2 `POST` batch, plus bulk `?include=` |
-| Traders in the directory | **435** — 144 from fomo, **291 from GMGN** |
-| Positions | **36,506**, read from chain across **5 chains** |
-| Balance history | **35,271 rebuilt points** over 30 days · **389 of 435** traders · **372** can draw a line (2+ dated figures), on **all four windows** |
+| Traders in the directory | **442** — 151 from fomo, **291 from GMGN** |
+| Positions | **39,961**, read from chain across **5 chains**, for **379** traders |
+| Balance history | **35,271 rebuilt chain points** over 30 days · **388 of 442** traders · **432** carry two or more dated figures, on **all four windows** |
 
 **Every figure below is a dated example, not current state.** They were pulled from the live
 service at the timestamp above; the pipeline refreshes nightly and the Helius webhook ingests
@@ -101,7 +111,7 @@ Four things worth knowing before you read a GMGN trader's numbers:
 
 ```bash
 curl -s "$B/traders/feibo03/scorecard?tokens=0" | jq '{winRate, entryPriceCoverage}'
-curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
+curl -s "$B/traders?limit=500" | jq '.entries | length'   # 442
 ```
 
 ---
@@ -153,7 +163,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 
 | Route | In plain words | Live value |
 | --- | --- | --- |
-| `GET $B/health` | "What's in the database, and when was it loaded?" | **435 traders** · 29,967 holdings · 51,581 trades · ~652k transfers |
+| `GET $B/health` | "What's in the database, and when was it loaded?" | **442 traders** · 39,961 holdings · 51,581 trades · ~1.00M transfers |
 | `GET $B/traders` | "Who are the top 137?" | each entry carries a stable `id` and its own `updatedAt` |
 | `GET $B/traders/unipcs` | "Everything about one trader, and **what else I can ask**" | summary + `links` to all seven sub-routes |
 | `GET $B/traders/unipcs/transactions?limit=5` | "What have their wallets actually done on-chain?" | `?kind=swap` filters to trades; each row carries `kind` and `protocol` |
@@ -2061,8 +2071,8 @@ means you are looking at the whole portfolio.
 | solana | 5,091 | 169 | the balance each transaction recorded, from Helius |
 | base | 4,500 | 150 | asked an archive node for the balance at that block |
 
-**35,271 points across 388 of 435 traders**, and **363 traders have at least one series with
-three or more usable points** — enough for the service to call it drawable.
+**35,271 chain points across 388 of 442 traders**, and **432 traders carry at least two dated
+figures** — the threshold the service draws by. 377 carry three or more.
 
 **Nothing is written until it reproduces the wallet.** Where a balance is inferred rather than
 read — robinhood and Solana — the anchor plus every movement since it must equal what the
@@ -2471,7 +2481,7 @@ never mistaken for the end of the data.
 
 | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- |
-| "The whole board, without 435 calls" | `POST $B/traders/positions` | `traders[]` | **50 traders per call** |
+| "The whole board, without 442 calls" | `POST $B/traders/positions` | `traders[]` | **50 traders per call** |
 
 **In layman's terms.** A background pass over the directory cannot make one call per trader.
 These take a list of ids or handles and answer for all of them at once.
@@ -2700,17 +2710,17 @@ A receipt carries `gasUsed` and `effectiveGasPrice`; Solana carries `meta.fee`. 
 
 | Chain | Fees read | Traders covered | Dollars |
 | --- | --- | --- | --- |
+| robinhood | **28,943** — complete | 128 | priced |
 | bsc | **10,644** — complete | 149 | **native only** — no market price for BNB exists in our store |
 | base | **9,267** of 9,377 | 219 | priced |
 | solana | **3,629** — every transaction behind a resolved swap | 122 | priced |
-| ethereum | 2,956 of 3,456 | 131 | priced |
-| robinhood | in progress, resumable | 128 | priced |
+| ethereum | 3,390 of 3,456 | 134 | priced |
 
 **Solana is scoped on purpose.** 3,629 is every transaction behind a resolved swap — the ones a
 per-trade fee can attach to. The chain holds 636,689 transactions in total; sweeping all of them
 is ~6,367 requests and buys fees on transfers that are not trades.
 
-**ethereum's 500 shortfall is not a fee problem.** Those hashes return `result: null` — the node
+**ethereum's 66 remaining are not a fee problem.** Those hashes return `result: null` — the node
 has no receipt for them, so they are not Ethereum mainnet transactions. That is an ingest
 question about how they were attributed, and it is recorded here rather than hidden.
 
@@ -2724,8 +2734,9 @@ question about how they were attributed, and it is recorded here rather than hid
 - **base caps a JSON-RPC batch at 10** and returns HTTP 200 with the refusal in the body. The
   loader reads a non-array reply as a refusal and stops, rather than recording "these
   transactions have no fee" across a whole chain.
-- **Solana 429s at batch 100 and works at 10.** A rate limit, not exhausted credits — the same
-  key had answered a batch of 2 minutes earlier.
+- **Solana refuses a batch of 100 and accepts 10.** A batch-size limit rather than anything to
+  do with the key, which had answered a smaller batch moments earlier. Worth knowing, because
+  the two look identical from the HTTP status alone.
 
 ### What is deliberately still missing
 
