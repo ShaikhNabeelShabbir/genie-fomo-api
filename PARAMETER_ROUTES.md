@@ -142,6 +142,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 435
 | **C** | [What the plugin team asked for](#appendix-c-what-the-plugin-team-asked-for) | § by §, and where each landed |
 | **A4** | [The version 8 report, and what changed](#appendix-a4-the-version-8-report-and-what-changed-2026-09-14) | freshness, `now`, and the seam |
 | **A5** | [The version 8 report, the rest of the asks](#appendix-a5-the-version-8-report-the-rest-of-the-asks-2026-09-14) | ten more, measured |
+| **A6** | [Cost basis, reasons, and paired trades](#appendix-a6-cost-basis-reasons-and-paired-trades-2026-09-14) | the last code-only three |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -699,6 +700,43 @@ a trader reported paying, not what the coin is worth now — and some rows carry
 source at all. Neither can be stood behind: one chain's WETH rows range $1,885 to $2,931. A
 portfolio converted at a number nobody can defend is a worse answer than no number.
 
+### What he paid for what he holds — the cost basis
+
+Their §7.4 asks for acquisition cost on every position. Every field is on `entries[]` and on
+`POST /traders/positions`, from one shared function so the two cannot drift.
+
+```bash
+curl -s "$B/traders/unipcs/positions?limit=1" | jq '.entries[0] | {amount, priceUsd, costKnownAmount, avgCostPrice, costUsd, unrealizedUsd, costMethod, costCoverage, costAmountShare, costReason}'
+```
+
+```json
+{ "amount": 10957904.674690466, "priceUsd": 0.7678352,
+  "costKnownAmount": 10957904.674690466, "avgCostPrice": 0.00615984, "costUsd": 67498.92,
+  "unrealizedUsd": 8346363.51,
+  "costMethod": "weighted_open_positions",
+  "costCoverage": { "share": 1 }, "costAmountShare": 1, "costReason": null }
+```
+
+`(0.7678352 − 0.00615984) × 10,957,904.67 = 8,346,363.51`. The figures reconcile by hand.
+
+**A holding with no stored position is `null`, never `0`.** Coins arrive by transfer as well
+as by purchase, and reading a transfer in as a free acquisition turns every airdrop into
+infinite profit. Measured over one trader's 500 positions: **18 carry a cost, 482 do not, and
+none report a cost of 0.** `costReason` tells the two causes apart —
+
+| `costReason` | Count | Means |
+| --- | --- | --- |
+| *no stored position for this holding…* | 300 | it may have arrived as a transfer |
+| *…open positions carry no entry price* | 182 | he bought it; what he paid was never recorded |
+
+**`unrealizedUsd` is measured against `costKnownAmount`, not the whole holding.** Those differ
+whenever some positions carry an entry price and others do not, and multiplying a partial cost
+by a full quantity invents a number. `costAmountShare` says what fraction of the holding the
+basis covers.
+
+**`realizedUsd` is this coin's closed positions** — a different quantity from the one still
+held, and labelled as such rather than blended in.
+
 ### Every position says where its numbers came from
 
 `entries[]` carries the provenance of both halves of a valuation — the amount and the price:
@@ -909,6 +947,45 @@ that visible instead of alarming.
 
 **`loadedAt` and `nextLoadAt`** are the scorecard's half of the freshness contract — the same
 question `sampler` answers for the balance series, asked of the store that feeds this route.
+
+### A reason beside every empty field — `fieldReasons`
+
+A null says a figure is absent and nothing about why, and the causes want different responses
+from a screen. Four codes, per coin and per answer:
+
+| code | means |
+| --- | --- |
+| `not_applicable` | the question does not arise — nothing has closed yet |
+| `not_yet_calculated` | a job has not produced it; it may appear later |
+| `source_unavailable` | no source we hold carries it |
+| `historical_input_missing` | the inputs existed once and were not recorded |
+
+```bash
+curl -s "$B/traders/unipcs/scorecard" | jq '.fieldReasons, [.byToken[].fieldReasons][0]'
+```
+
+Measured across one trader's 317 coins:
+
+| field | count | reason |
+| --- | --- | --- |
+| `avgEntryPrice` | 293 | `historical_input_missing` |
+| `avgEntryMarketCapUsd` | 293 | `historical_input_missing` |
+| `avgExitPrice` | 277 | `not_applicable` — nothing in the coin has closed |
+| `proceedsUsd` | 24 | `historical_input_missing` — it closed, unpriced |
+| `tokenCreatedAt` | 86 | `source_unavailable` |
+| `totalSupply` | 17 | `source_unavailable` |
+
+**That `avgExitPrice` split is the point.** 277 coins have never been sold and 24 were sold
+without a recorded price. Both were one null before, and only the second is a gap in our data.
+
+**Only keys that ARE null appear.** A fully populated coin carries `{}`, not a wall of
+nulls-about-nulls. Three of the 317 have nothing missing at all.
+
+**The answer-level `fieldReasons` covers the trader-wide figures** — `winRate`, `holdingTime`,
+`moneyIn`, `moneyOut`, `returnPct`, `typicalBetUsd`, `trackRecordDays`, `feesUsd`,
+`startCapitalUsd` — by the same rule.
+
+This explains existing fields. It never replaces a null with a zero.
 
 ### Average entry is a market cap, and the supply travels with it
 
@@ -2200,6 +2277,66 @@ curl -s "$B/traders/frankdegods/trades" | jq '.coverage'
 }
 ```
 
+### Reading the whole record — `?cursor=`, and the filters
+
+```
+?limit=1..500                page size
+?cursor=<nextCursor>         keyset paging on (block_time desc, tx_hash)
+?chain= ?since= ?until=      narrow the set
+?status=open | closed        by the pairing below, not by a stored column
+```
+
+**Paging is keyset, not offset**, so new swaps arriving at the head cannot shift a page under
+a caller. Walked four pages of 50 on the busiest wallet: **200 rows, 200 unique, no overlap**.
+Follow `nextCursor` until it is `null`; `complete` is true on the last page.
+
+**`?status=` filters after paging, and says so.** Whether a swap is still open is a fact about
+what happened afterwards, not a stored column, so the database cannot filter it. A filtered
+page carries `scanned` — the rows it held before filtering — and **`count` can be 0 while
+`nextCursor` is non-null**. That is a sparse page, not the end: keep following the cursor.
+
+### Each sell paired to the buy it closed
+
+FIFO over the trader's **entire** swap record, not the page — a sell's buy may be nine pages
+away.
+
+```bash
+curl -s "$B/traders/pointfarmcap/trades?limit=100&status=closed" | jq '.trades[] | {side, at, positionId, status, openedAt, closedAt, holdSeconds}'
+```
+
+| field | means |
+| --- | --- |
+| `positionId` | the transaction that OPENED the lot — stable, and lookupable on an explorer |
+| `status` | `open` until a later sell finishes consuming the buy; `closed` after |
+| `openedAt` | on a sell, when the quantity it sold was bought |
+| `holdSeconds` | `closedAt − openedAt`; this is what "in and out under five seconds" measures |
+
+FIFO because it is the convention a reader assumes, and the only one defensible without
+knowing the trader's own accounting.
+
+**A sell with no matching buy gets `positionId: null` and `whyNoPosition`**, never an invented
+pairing. On one wallet's closed page that was 24 of 33 rows — the wallet's earlier buys predate
+our record of it. Nine carried a full pairing, with hold times from 19,436 to 248,484 seconds.
+
+### Which chains were actually read — `coverage.byChain[]`
+
+```json
+[ { "chain": "base",      "state": "unresolved", "swaps": 0,   "from": null, "to": null },
+  { "chain": "bsc",       "state": "unresolved", "swaps": 0,   "from": null, "to": null },
+  { "chain": "robinhood", "state": "unresolved", "swaps": 0,   "from": null, "to": null },
+  { "chain": "solana",    "state": "complete",   "swaps": 525,
+    "from": "2026-09-06T…", "to": "2026-09-09T…" } ]
+```
+
+**`unresolved` and "no trades" stop looking identical.** `unresolved` means the trader is known
+to trade there and we hold no resolved swaps for it — the honest state of the four EVM chains.
+`complete` carries `from`/`to`, so a caller asking for last week can tell whether last week was
+even read.
+
+**`feeUsd` is `null` on every row and will stay null** until fees are stored. Zero would claim
+the trade cost nothing to make, which is never true on any chain. `source` and `confidence`
+travel per row rather than per answer.
+
 ### What to know before you use it
 
 **`valueUsd` comes from the money side, not from a price.** `valueSource: "money_side"` says
@@ -2375,6 +2512,33 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 **Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
 `RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
+
+---
+
+## Appendix A6 · Cost basis, reasons, and paired trades (2026-09-14)
+
+The last three version 8 asks answerable from data already stored. Every figure was read from
+the live service after the change.
+
+| # | What was wrong | What changed |
+| --- | --- | --- |
+| **A12** | `/positions` gave quantity, price and value with no acquisition cost, so "up 3x on this coin" could not be said | the nine fields §7.4 names, on the single and batch routes from one function. A holding with no stored position is `null`, never `0`: of one trader's 500 positions, 18 carry a cost, 482 do not, **none report 0**, and `costReason` separates the 300 that may have arrived as transfers from the 182 he bought without a recorded price. `unrealizedUsd` is measured against the quantity whose cost we know, with `costAmountShare` stating what fraction that is. **§2** |
+| **A11** | `tokenAgeAtEntryDays`, `avgExitPrice` and `totalSupply` could be null on a coin with nothing to say why | `fieldReasons` per coin and per answer, in the four codes asked for. Across 317 coins: `avgEntryPrice` 293 `historical_input_missing`, `avgExitPrice` **277 `not_applicable`** against **24 `historical_input_missing`** — never sold versus sold unpriced, which were one null before. Only keys that are null appear; three coins carry `{}`. **§3** |
+| **A5** (what the stored data supports) | the first 100 trades, no way to read the rest, and no pairing | keyset `?cursor=` paging — four pages of 50 walked **200 rows, 200 unique, no overlap**; `?until=` and `?status=` filters; FIFO round-trip pairing over the trader's entire swap record giving `positionId`, `status`, `openedAt`, `closedAt` and `holdSeconds`; and `coverage.byChain[]` separating a chain with no trades from one never read. **§10** |
+
+**Three deliberate refusals, each visible on the response.**
+
+- **A sell with no matching buy is not paired.** 24 of 33 closed rows on one wallet carry
+  `positionId: null` and `whyNoPosition` — the wallet's earlier buys predate our record. An
+  invented pairing would produce a confident, wrong holding time.
+- **A transfer in is not a purchase at zero.** That rule is the reason 482 of 500 positions
+  answer `null` rather than showing a cost basis that would read as pure profit.
+- **`feeUsd` is null on every trade row and stays null.** Nothing stores fees; zero would claim
+  the trade cost nothing to make.
+
+**`?status=` filters after paging**, because the pairing that decides open-versus-closed is not
+a stored column. A filtered page reports `scanned`, and `count` can be 0 while `nextCursor` is
+non-null — a sparse page, not the end.
 
 ---
 

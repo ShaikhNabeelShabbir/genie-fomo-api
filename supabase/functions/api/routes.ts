@@ -503,6 +503,22 @@ const trustHoldings = (handles: string[]) => sql`
  * row is treated as zeros.
  */
 /**
+ * WHAT A BLACKLIST ANSWER LOOKS LIKE WHEN NOTHING WAS CHECKED.
+ *
+ * `listed` is null, not false. False would mean we looked and he was not on a list; null with
+ * `checked: false` means we never looked, and those are opposite statements. `checkedAt` is
+ * null for the same reason -- there was no check to time.
+ */
+const BLACKLIST_CHECK = {
+  checked: false,
+  lists: [] as string[],
+  listed: null as boolean | null,
+  checkedAt: null as string | null,
+  why: "no blacklist, sanctions list or known-scam source is consulted by this route. " +
+       "An absent blacklist flag means NOT CHECKED — never 'checked and clear'.",
+};
+
+/**
  * `asOf` is the board-wide fallback, used only for a trader with no holdings row at all —
  * `trustHoldings` carries each trader's own `as_of` and that is what wins.
  *
@@ -599,14 +615,14 @@ function trustBody(t: any, h: any | undefined, asOf: string | null) {
         "too_few_trades", "partial_pricing",
       ],
       basis: "internal consistency only — figures we hold, checked against each other",
-      blacklist: {
-        checked: false,
-        lists: [],
-        why: "no blacklist, sanctions list or known-scam source is consulted by this route. " +
-             "An absent blacklist flag means NOT CHECKED — never 'checked and clear'.",
-      },
+      blacklist: BLACKLIST_CHECK,
       externalReputation: { checked: false, sources: [] },
     },
+    /**
+     * The contract names `trust.blacklist`, so it is here as well as inside `checks`. Same
+     * object, one source, so the two can never disagree.
+     */
+    blacklist: BLACKLIST_CHECK,
     // Every money figure carries its measurement time; these are derived from the holdings
     // snapshot, so they age with it — this trader's own, not the board's.
     asOf: h?.as_of ? new Date(String(h.as_of)).toISOString() : asOf,
@@ -1255,6 +1271,101 @@ const walletActivity = (addrs: string[]) => sql`
   from transactions
   where address_key = any(${addrs})`;
 
+/**
+ * WHAT A TRADER PAID FOR WHAT HE STILL HOLDS.
+ *
+ * `/positions` gave quantity, price and value with no acquisition cost, so "up 3x on this
+ * coin" could not be said at all. Every open position we store carries an entry price and an
+ * amount, and that is a cost basis.
+ *
+ * Two rules shape this:
+ *
+ *   A holding with no stored position gets `null`, never `0`. Coins arrive by transfer as
+ *   well as by purchase, and a transfer in is not a free acquisition -- reading it as one
+ *   would turn every airdrop into infinite profit. `costReason` names which case it is.
+ *
+ *   `unrealizedUsd` is measured against the quantity whose cost we know, not against the
+ *   whole holding. Those differ whenever some positions carry an entry price and others do
+ *   not, and multiplying a partial cost by a full quantity invents a number.
+ *
+ * Keyed by handle then "networkId:tokenKey". One query for the batch: 0.6 ms for a trader
+ * through trades_handle_idx.
+ */
+type CostBasis = {
+  costKnownAmount: number | null; costUsd: number | null; avgCostPrice: number | null;
+  realizedUsd: number | null; openPositions: number; openPriced: number;
+};
+
+async function costBasisFor(handles: string[]): Promise<Map<string, Map<string, CostBasis>>> {
+  const out = new Map<string, Map<string, CostBasis>>();
+  if (!handles.length) return out;
+  const rows = await sql`
+    select handle, network_id, token_key,
+           sum(amount) filter (
+             where status = 'open' and avg_entry_price is not null and amount > 0) as cost_qty,
+           sum(avg_entry_price * amount) filter (
+             where status = 'open' and avg_entry_price is not null and amount > 0) as cost_usd,
+           count(*) filter (where status = 'open')::int as open_positions,
+           count(*) filter (
+             where status = 'open' and avg_entry_price is not null and amount > 0)::int
+             as open_priced,
+           sum(realized_pnl_usd) filter (where status = 'closed') as realized_usd
+    from trades
+    where handle = any(${handles})
+    group by handle, network_id, token_key`;
+  for (const r of rows) {
+    const h = String(r.handle);
+    let m = out.get(h); if (!m) out.set(h, m = new Map());
+    const qty = n(r.cost_qty), usd = n(r.cost_usd);
+    m.set(`${Number(r.network_id)}:${r.token_key}`, {
+      costKnownAmount: qty,
+      costUsd: usd === null ? null : round(usd),
+      avgCostPrice: qty !== null && qty > 0 && usd !== null
+        ? Number((usd / qty).toPrecision(12)) : null,
+      realizedUsd: n(r.realized_usd) === null ? null : round(n(r.realized_usd)),
+      openPositions: Number(r.open_positions),
+      openPriced: Number(r.open_priced),
+    });
+  }
+  return out;
+}
+
+/** The A12 block for one holding, shared by the single and batch routes. */
+function costBlock(cb: CostBasis | undefined, amount: number | null, priceUsd: number | null) {
+  if (!cb || cb.openPositions === 0) {
+    return {
+      costKnownAmount: null, avgCostPrice: null, costUsd: null,
+      realizedUsd: cb?.realizedUsd ?? null, unrealizedUsd: null,
+      costMethod: null, costSource: null,
+      costCoverage: cov(0, 0),
+      costReason: "no stored position for this holding — it may have arrived as a transfer, " +
+                  "and a transfer in is not a purchase at zero",
+    };
+  }
+  const known = cb.costKnownAmount;
+  const unrealized = known !== null && known > 0 && cb.avgCostPrice !== null && priceUsd !== null
+    ? round((priceUsd - cb.avgCostPrice) * known) : null;
+  return {
+    costKnownAmount: known,
+    avgCostPrice: cb.avgCostPrice,
+    costUsd: cb.costUsd,
+    /** Realised on this coin's CLOSED positions — a different quantity, and said so here. */
+    realizedUsd: cb.realizedUsd,
+    /** Against `costKnownAmount` only, never against the whole holding. */
+    unrealizedUsd: unrealized,
+    costMethod: cb.openPriced === 0 ? null
+      : (cb.openPriced === cb.openPositions ? "weighted_open_positions"
+                                            : "weighted_open_positions_partial"),
+    costSource: cb.openPriced === 0 ? null : "stored trades: avg_entry_price x amount",
+    costCoverage: cov(cb.openPriced, cb.openPositions),
+    costReason: cb.openPriced > 0 ? null
+      : "this coin's open positions carry no entry price, so what was paid is unknown",
+    /** The share of the holding the cost covers, so a partial basis is never read as whole. */
+    costAmountShare: known !== null && amount !== null && amount > 0
+      ? Number(Math.min(1, known / amount).toFixed(4)) : null,
+  };
+}
+
 get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const [t] = await sql`
     select t.handle, t.display_handle, t.name, w.evm_address, w.sol_address
@@ -1283,7 +1394,11 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     order by (case when h.value > 0 then h.value else null end) desc nulls last,
              lower(tk.address)`;
 
-  const timing = addrs.length ? await positionTiming(addrs) : [];
+  const [timing, costBy] = await Promise.all([
+    addrs.length ? positionTiming(addrs) : Promise.resolve([]),
+    costBasisFor([t.handle as string]),
+  ]);
+  const costs = costBy.get(t.handle as string) ?? new Map<string, CostBasis>();
 
   /**
    * The floor under every timestamp on this page, derived in memory from `timing`.
@@ -1331,6 +1446,15 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       whyNoPrice: v === null ? "no price for this token in any source we hold" : null,
       share: v !== null && total > 0 ? Number((v / total).toFixed(4)) : null,
       isQuoteAsset: !!r.is_quote,
+      /**
+       * WHAT HE PAID FOR THIS, and the profit measured against it.
+       *
+       * `costUsd` is null rather than 0 when nothing we store says he bought it: coins arrive
+       * by transfer too, and reading a transfer in as a free acquisition turns every airdrop
+       * into infinite profit. `costReason` names which case a null is.
+       */
+      ...costBlock(costs.get(`${Number(r.network_id)}:${r.token_key}`),
+                   n(r.human_amount), n(r.price)),
       /**
        * T1.1. First time we saw this token arrive, last time we saw any leave, and the last
        * movement of either kind. `null` means no on-chain record — which for a position
@@ -2487,6 +2611,48 @@ async function scorecardBody(
         : (x.legs === 0
           ? "nothing in this coin has been sold, or no sale carries an exit price"
           : "exit prices are present but no position has a recoverable quantity"),
+      /**
+       * A REASON BESIDE EVERY NULL ON THIS ROW, from a fixed vocabulary.
+       *
+       * A null says a figure is absent and nothing about why, and the four causes want
+       * different responses from a screen: `not_applicable` should not be shown at all,
+       * `not_yet_calculated` is worth returning for, `source_unavailable` and
+       * `historical_input_missing` are permanent for this coin and should be labelled.
+       *
+       * Only keys that ARE null appear, so a fully populated row carries an empty object
+       * rather than a wall of nulls-about-nulls. This explains existing fields; it does not
+       * replace any null with a zero.
+       */
+      fieldReasons: (() => {
+        const why: Record<string, string> = {};
+        if (entryPx === null) why.avgEntryPrice = "historical_input_missing";
+        if (e.legsWeighted === 0) why.costUsd = "historical_input_missing";
+        if (x.value === null) {
+          // Nothing sold is a different statement from sold-but-unpriced.
+          why.avgExitPrice = r.closed === 0 ? "not_applicable" : "historical_input_missing";
+        }
+        if (x.legsWeighted === 0) {
+          why.proceedsUsd = r.closed === 0 ? "not_applicable" : "historical_input_missing";
+        }
+        if (r.totalSupply === null) why.totalSupply = "source_unavailable";
+        if (entryPx === null || r.totalSupply === null || !(r.totalSupply > 0)) {
+          why.avgEntryMarketCapUsd = entryPx === null
+            ? "historical_input_missing" : "source_unavailable";
+        }
+        if (x.value === null || r.totalSupply === null || !(r.totalSupply > 0)) {
+          why.avgExitMarketCapUsd = x.value === null
+            ? (r.closed === 0 ? "not_applicable" : "historical_input_missing")
+            : "source_unavailable";
+        }
+        if (tokenCreatedUnix === null) why.tokenCreatedAt = "source_unavailable";
+        if (tokenCreatedUnix === null || firstOpenedMs === null) {
+          why.tokenAgeAtEntryDays = tokenCreatedUnix === null
+            ? "source_unavailable" : "historical_input_missing";
+        }
+        if (firstClosedMs === null) why.firstClosedAt = "not_applicable";
+        if (lastClosedMs === null) why.lastClosedAt = "not_applicable";
+        return why;
+      })(),
       };
     })
     .sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd ||
@@ -2603,8 +2769,13 @@ async function scorecardBody(
       /**
        * Fees are NOT deducted from `realizedUsd`, and nothing here can deduct them: no fee
        * or gas figure is stored on any trade or transfer we hold. See `fees` on the response.
+       *
+       * `feesUsd` is null rather than 0 and always will be until fees are stored: zero would
+       * claim this window cost nothing to trade, which is certainly false.
        */
       includesFees: false,
+      feesUsd: null,
+      feesCoverage: cov(0, inWindow.length),
     };
   };
 
@@ -2686,6 +2857,8 @@ async function scorecardBody(
        * Read `realizedUsd` against `/aum` for the months the history covers.
        */
       startingCapitalUsd: null,
+      /** The contract's spelling of the same field. One value, two names, never two answers. */
+      startCapitalUsd: null,
       returnPct: null,
     }));
 
@@ -2785,6 +2958,24 @@ async function scorecardBody(
       note: "no cap is applied: every position stored for this trader is used. `returned` " +
             "counts positions, `reportedTrades` counts fills, and they are not comparable.",
     },
+    /*
+     * THE SAME FIVE FACTS AT THE LEVEL THE CONTRACT NAMES THEM.
+     *
+     * Section 7.5 asks for `complete`, `tradesKnown`, `tradesUsed`, `loadedAt` and
+     * `nextLoadAt` on the scorecard itself. They are computed once above and read from the
+     * same place here, so the two spellings cannot drift apart.
+     */
+    complete: true,
+    tradesKnown: rows.length,
+    tradesUsed: rows.length,
+    loadedAt: rows[0]?.captured_at
+      ? new Date(String(rows[0].captured_at)).toISOString() : null,
+    nextLoadAt: (() => {
+      const d = new Date();
+      d.setUTCHours(6, 0, 0, 0);
+      if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
+      return d.toISOString();
+    })(),
     /**
      * FEES, ANSWERED HONESTLY RATHER THAN ASSUMED EITHER WAY.
      *
@@ -2865,6 +3056,38 @@ async function scorecardBody(
     returnPct: { value: basis > 0 ? Number(((closedPnl / basis) * 100).toFixed(2)) : null,
                  coverage: cov(closedPriced.length, closed.length) },
     typicalBetUsd: bet,
+    /**
+     * THE SAME VOCABULARY, SUMMARISED FOR THE WHOLE ANSWER.
+     *
+     * `byToken[].fieldReasons` explains a null on one coin; this explains a null on a figure
+     * that stands for the trader. Only keys that are actually null appear.
+     *
+     *   not_applicable            the question does not arise — nothing has closed yet
+     *   not_yet_calculated        a job has not produced it; it may appear later
+     *   source_unavailable        no source we hold carries it
+     *   historical_input_missing  the inputs existed once and were not recorded
+     */
+    fieldReasons: (() => {
+      const why: Record<string, string> = {};
+      const noClosed = closed.length === 0;
+      if (winRate === null) why.winRate = noClosed ? "not_applicable" : "historical_input_missing";
+      if (medHold === null) {
+        why.holdingTime = noClosed ? "not_applicable" : "historical_input_missing";
+      }
+      if (!entryRows.length) why.moneyIn = "historical_input_missing";
+      if (!exitRows.length) {
+        why.moneyOut = noClosed ? "not_applicable" : "historical_input_missing";
+      }
+      if (!(basis > 0)) {
+        why.returnPct = noClosed ? "not_applicable" : "historical_input_missing";
+      }
+      if (bet.value === null) why.typicalBetUsd = "historical_input_missing";
+      if (spanDays === null) why.trackRecordDays = "historical_input_missing";
+      /* Fees are a permanent absence, not a pending one: nothing stores them. */
+      why.feesUsd = "source_unavailable";
+      why.startCapitalUsd = "historical_input_missing";
+      return why;
+    })(),
     /**
      * PRD §5 — rhythm, on ONE definition, for every trader whatever source they came from.
      *
@@ -3643,6 +3866,8 @@ function buildAum(
     pointChains?: Map<string, { chain: string; usd: number | null }[]> | null;
     /** Every chain this trader uses, window-independent. Null when not fetched. */
     knownChains?: KnownChain[] | null;
+    /** Each chain's own coin and what one costs, for the native amounts on `chains[]`. */
+    natives?: Map<number, NativePrice> | null;
     sampler?: { lastAt: Date | null; lastSuccess: Date | null };
   },
 ) {
@@ -4125,6 +4350,16 @@ function buildAum(
         tier: newest.tier as string,
         /** True when this figure covers only part of the trader. See `coverage` below. */
         partial: cover(newest) >= 0 && wanted(newest) >= 0 ? cover(newest) < wanted(newest) : null,
+        /*
+         * ON `now` ITSELF, not only inside `coverage`.
+         *
+         * The contract names `now.chainsAnswered` and `now.chainsTotal`, and a consumer
+         * reading the balance reads `now` -- asking it to descend into `coverage` to find out
+         * whether the figure it just printed covers the whole trader is how a partial total
+         * gets published as a whole one. Both spellings carry the same value.
+         */
+        chainsAnswered: newest.chains_answered === null ? null : Number(newest.chains_answered),
+        chainsTotal: newest.chains_expected === null ? null : Number(newest.chains_expected),
         coverage: {
           pricedPositions: newest.priced_positions === null ? null : Number(newest.priced_positions),
           totalPositions: newest.total_positions === null ? null : Number(newest.total_positions),
@@ -4212,13 +4447,32 @@ function buildAum(
      */
     breaks,
     points: pointsOut,
-    chains: chainRows.map((r) => ({
-      chain: r.chain as string,
-      networkId: Number(r.network_id),
-      totalUsd: round(n(r.total_usd)),
-      pricedShare: n(r.priced_share),
-      ...(r.reason ? { reason: r.reason as string } : {}),
-    })),
+    chains: chainRows.map((r) => {
+      const usd = round(n(r.total_usd));
+      const nat = opts.natives?.get(Number(r.network_id)) ?? null;
+      return {
+        chain: r.chain as string,
+        networkId: Number(r.network_id),
+        totalUsd: usd,
+        pricedShare: n(r.priced_share),
+        /**
+         * The same dollars in the chain's own coin. `nativeAmount` is `totalUsd / nativeUsd`
+         * and nothing more, and the rate travels with it so the division can be rechecked.
+         * Null, never 0, when we hold no market price for that coin -- see `whyNoNative`.
+         */
+        nativeSymbol: nat?.symbol ?? null,
+        nativeUsd: nat?.usd ?? null,
+        nativePriceSource: nat?.source ?? null,
+        nativeAmount: nat?.usd && usd !== null
+          ? Number((usd / nat.usd).toPrecision(10))
+          : null,
+        whyNoNative: nat?.usd && usd !== null ? null
+          : usd === null ? "this chain carries no total at this reading"
+          : "no market price for this chain's own coin — the only figures we hold for it are " +
+            "traders' reported entry prices, which are not what it is worth now",
+        ...(r.reason ? { reason: r.reason as string } : {}),
+      };
+    }),
     /** Non-null only when the NEWEST sample was refused; the reason names which wall we hit. */
     refused: newest?.refused_reason ?? null,
     plain: !newest
@@ -4350,6 +4604,8 @@ async function aumFor(
     : [];
   /** Window-independent chain list, one query for the whole batch. */
   const knownBy = await knownChainsFor(present);
+  /** Cached for the process; five rows that barely move. */
+  const natives = await nativePrices();
 
   /** handle -> "<iso at>|<basis>" -> [{ chain, usd }]. One map, built once for the batch. */
   const pointChainsBy = new Map<string, Map<string, { chain: string; usd: number | null }[]>>();
@@ -4390,7 +4646,7 @@ async function aumFor(
       chainsBy.get(h) ?? [],
       presBy.get(h) ?? null,
       { ...opts, to, pointChains: pointChainsBy.get(h) ?? null,
-        knownChains: knownBy.get(h) ?? [], sampler: {
+        knownChains: knownBy.get(h) ?? [], natives, sampler: {
         lastAt: samplerRow?.last_at ? new Date(String(samplerRow.last_at)) : null,
         lastSuccess: samplerRow?.last_success ? new Date(String(samplerRow.last_success)) : null,
       } },
@@ -4439,14 +4695,42 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
   const limit = intParam(url, "limit", { min: 1, max: 500, fallback: 100 })!;
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
   const since = url.searchParams.get("since");
+  const until = url.searchParams.get("until");
+  /*
+   * `status` filters on the PAIRING below, not on a stored column: a swap is a swap, and
+   * whether it is still open is a fact about what happened afterwards.
+   */
+  const statusQ = (url.searchParams.get("status") ?? "").trim().toLowerCase() || null;
+  if (statusQ !== null && statusQ !== "open" && statusQ !== "closed") {
+    throw badRequest("'status' must be 'open' or 'closed'", { parameter: "status" });
+  }
 
-  const rows = addrs.length
-    ? await sql`
+  /*
+   * KEYSET PAGING, so a whole record can be read rather than its first 100 rows.
+   *
+   * The sort key is (block_time desc, tx_hash), and the cursor carries exactly that pair.
+   * An offset would drift as new swaps arrive at the head; a keyset cannot.
+   */
+  const cursorRaw = url.searchParams.get("cursor");
+  const cur = cursorRaw ? decodeCursor(cursorRaw) : null;
+  const curAt = cur ? String(cur[0]) : null;
+  const curHash = cur ? String(cur[1]) : null;
+
+  /*
+   * EVERY SWAP THIS TRADER MADE, for the pairing -- not just the page.
+   *
+   * A sell cannot be matched to its buy from one page: the buy may be a year and nine pages
+   * away. The whole set is small enough to walk in memory (3,629 rows across 122 wallets,
+   * 29.7 per wallet on average and 525 at the worst), so it is fetched once and paired once.
+   */
+  const [rows, allSwaps] = addrs.length
+    ? await Promise.all([
+      sql`
       select ws.tx_hash, ws.block_time, ws.network_id, c.name as chain,
              ws.token_key, tk.address as token_address,
              coalesce(ti.symbol, tk.symbol) as token_symbol,
              ws.token_delta, ws.quote_key, ws.quote_delta, ws.quote_usd,
-             qa.symbol as quote_symbol
+             qa.symbol as quote_symbol, ws.address_key, ws.resolved_at
       from wallet_swaps ws
       join chains c using (network_id)
       left join tokens tk on tk.network_id = ws.network_id and tk.token_key = ws.token_key
@@ -4455,12 +4739,96 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
       where ws.address_key = any(${addrs})
         and (${chainQ}::text is null or c.name = ${chainQ})
         and (${since}::timestamptz is null or ws.block_time >= ${since}::timestamptz)
+        and (${until}::timestamptz is null or ws.block_time <= ${until}::timestamptz)
+        and (${curAt}::timestamptz is null
+             or ws.block_time < ${curAt}::timestamptz
+             or (ws.block_time = ${curAt}::timestamptz and ws.tx_hash > ${curHash}))
       order by ws.block_time desc nulls last, ws.tx_hash
-      limit ${limit + 1}`
-    : [];
+      limit ${limit + 1}`,
+      sql`
+      select ws.tx_hash, ws.block_time, ws.network_id, ws.address_key,
+             ws.token_key, ws.token_delta, c.name as chain
+      from wallet_swaps ws
+      join chains c using (network_id)
+      where ws.address_key = any(${addrs})
+      order by ws.block_time asc, ws.tx_hash`,
+    ])
+    : [[], []];
+
+  /*
+   * FIFO PAIRING: each sell consumes the oldest buy still holding quantity.
+   *
+   * This is what turns a list of swaps into round trips -- "in and out under five seconds",
+   * "still open when our copy landed", and a holding time per trade rather than per coin.
+   * FIFO because it is the convention a reader assumes and the only one we can defend
+   * without knowing the trader's own accounting.
+   *
+   * A lot is identified by the tx that opened it, so a round-trip id is stable and points at
+   * something a consumer can look up on a block explorer.
+   */
+  /** `key` is the pairing entry this lot's own buy wrote, so closing it is O(1). */
+  type Lot = { id: string; key: string; at: number; left: number };
+  const openLots = new Map<string, Lot[]>();
+  /** tx_hash + token_key -> what the pairing found for that swap. */
+  const pairing = new Map<string, {
+    positionId: string | null; status: string;
+    openedAt: number | null; closedAt: number | null;
+  }>();
+  const keyOfSwap = (r: Record<string, unknown>) =>
+    `${r.tx_hash}|${r.network_id}|${r.token_key}`;
+
+  for (const r of allSwaps as Record<string, unknown>[]) {
+    const lotKey = `${r.address_key}|${r.network_id}|${r.token_key}`;
+    const at = r.block_time ? Date.parse(String(r.block_time)) : NaN;
+    const delta = n(r.token_delta) ?? 0;
+    if (!Number.isFinite(at) || delta === 0) continue;
+    let q = openLots.get(lotKey); if (!q) openLots.set(lotKey, q = []);
+
+    if (delta > 0) {
+      const id = String(r.tx_hash);
+      const key = keyOfSwap(r);
+      q.push({ id, key, at, left: delta });
+      pairing.set(key, { positionId: id, status: "open", openedAt: at, closedAt: null });
+    } else {
+      let need = -delta;
+      let firstOpenedAt: number | null = null;
+      let firstId: string | null = null;
+      while (need > 0 && q.length) {
+        const lot = q[0];
+        if (firstOpenedAt === null) { firstOpenedAt = lot.at; firstId = lot.id; }
+        const take = Math.min(lot.left, need);
+        lot.left -= take; need -= take;
+        if (lot.left <= 1e-12) {
+          // That buy is now fully sold, and this is the sell that finished it.
+          const done = q.shift()!;
+          const b = pairing.get(done.key);
+          if (b) pairing.set(done.key, { ...b, status: "closed", closedAt: at });
+        }
+      }
+      pairing.set(keyOfSwap(r), {
+        positionId: firstId,
+        status: "closed",
+        openedAt: firstOpenedAt,
+        closedAt: at,
+      });
+    }
+  }
 
   const capped = rows.length > limit;
-  const page = capped ? rows.slice(0, limit) : rows;
+  /*
+   * `pageRaw` is the page as the database returned it; `page` is what survives `?status=`.
+   *
+   * The cursor is taken from `pageRaw` and never from `page`. Filtering happens after paging
+   * -- the pairing that decides open-versus-closed is not a stored column, so the database
+   * cannot do it -- and a page whose rows are all filtered out would otherwise produce a null
+   * cursor and stop the caller dead while rows remained. A sparse page is fine; a lost tail
+   * is not.
+   */
+  const pageRaw = capped ? rows.slice(0, limit) : rows;
+  const page = statusQ === null
+    ? pageRaw
+    : pageRaw.filter((r: Record<string, unknown>) =>
+      (pairing.get(keyOfSwap(r))?.status ?? null) === statusQ);
 
   /** Chains this trader has traded on at all, so the gap is visible rather than implied. */
   const presence = await sql`
@@ -4499,8 +4867,61 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
         priceUsd: usd !== null && td !== null && td !== 0
           ? Number((Math.abs(usd) / Math.abs(td)).toPrecision(12)) : null,
         tier: "verified",
+        /**
+         * THE ROUND TRIP THIS SWAP BELONGS TO, from FIFO over the trader's whole record.
+         *
+         * `positionId` is the transaction that OPENED the lot, so it is stable and points at
+         * something a consumer can look up. On a buy, `status` is `open` until a later sell
+         * finishes consuming it. On a sell, `openedAt` is when the quantity it sold was
+         * bought, which is what "in and out under five seconds" measures.
+         *
+         * Null on a sell with nothing left to match -- a wallet whose earlier buys predate
+         * what we hold. That is a gap in our record, not a trade from nowhere.
+         */
+        ...(() => {
+          const pr = pairing.get(`${r.tx_hash}|${r.network_id}|${r.token_key}`) ?? null;
+          const openedAt = pr?.openedAt ?? null;
+          const closedAt = pr?.closedAt ?? null;
+          return {
+            positionId: pr?.positionId ?? null,
+            status: pr?.status ?? null,
+            openedAt: openedAt === null ? null : new Date(openedAt).toISOString(),
+            closedAt: closedAt === null ? null : new Date(closedAt).toISOString(),
+            holdSeconds: openedAt !== null && closedAt !== null
+              ? Math.max(0, Math.round((closedAt - openedAt) / 1000)) : null,
+            whyNoPosition: pr?.positionId ? null
+              : "no buy we hold matches this sell — the wallet's earlier buys predate our " +
+                "record of it",
+          };
+        })(),
+        /** Where the row came from and how far to trust it, per row rather than per answer. */
+        source: "helius rpc pre/post balances",
+        confidence: usd !== null ? "high" : "medium",
+        /**
+         * Null and staying null until fees are stored. Zero would claim this trade cost
+         * nothing to make, which is never true on any chain.
+         */
+        feeUsd: null,
       };
     }),
+    /**
+     * `null` on the last page. A full page only HINTS that more exist — if exactly `limit`
+     * rows remain, the next call returns empty, which is correct and costs one cheap query
+     * rather than a count on every request.
+     */
+    nextCursor: capped && pageRaw.length
+      ? encodeCursor([
+        new Date(String(pageRaw[pageRaw.length - 1].block_time)).toISOString(),
+        String(pageRaw[pageRaw.length - 1].tx_hash),
+      ])
+      : null,
+    complete: !capped,
+    /**
+     * How many rows the page held before `?status=` was applied. With a status filter, `count`
+     * can be 0 while `nextCursor` is non-null -- that is a sparse page, not the end. Keep
+     * following the cursor until it is null.
+     */
+    ...(statusQ !== null ? { scanned: pageRaw.length, status: statusQ } : {}),
     /**
      * What is NOT here. §4 asks for every chain; we resolve Solana. Saying which chains a
      * trader trades on but we cannot serve is the difference between a gap and a lie.
@@ -4510,6 +4931,44 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
       chainsTradedButUnresolved: presence
         .map((p: any) => p.chain as string)
         .filter((c: string) => !resolvedChains.has(c)),
+      /**
+       * PER CHAIN, so "he made no trades there" and "we have not read that chain" stop
+       * looking identical.
+       *
+       * `unresolved` means we hold no swaps for that chain at all though the trader is known
+       * to trade on it -- the honest state for the four EVM chains today. `complete` means we
+       * hold swaps and `from`/`to` say which span they cover, so a caller asking for last
+       * week can tell whether last week was even read.
+       */
+      byChain: (() => {
+        const span = new Map<string, { from: number; to: number; rows: number }>();
+        for (const r of allSwaps as Record<string, unknown>[]) {
+          const netName = r.chain ? String(r.chain) : null;
+          if (!netName) continue;
+          const at = r.block_time ? Date.parse(String(r.block_time)) : NaN;
+          if (!Number.isFinite(at)) continue;
+          const cur = span.get(netName);
+          if (!cur) span.set(netName, { from: at, to: at, rows: 1 });
+          else { cur.from = Math.min(cur.from, at); cur.to = Math.max(cur.to, at); cur.rows++; }
+        }
+        const named = new Set<string>([
+          ...span.keys(),
+          ...presence.map((p: any) => String(p.chain)),
+        ]);
+        return [...named].sort().map((chain) => {
+          const sp = span.get(chain) ?? null;
+          return {
+            chain,
+            state: sp === null ? "unresolved" : "complete",
+            from: sp ? new Date(sp.from).toISOString() : null,
+            to: sp ? new Date(sp.to).toISOString() : null,
+            swaps: sp?.rows ?? 0,
+            why: sp === null
+              ? "this trader trades here but we hold no resolved swaps for this chain"
+              : null,
+          };
+        });
+      })(),
       why: "swaps are resolved from chain for Solana only — a complete scan of the EVM " +
            "chains found no two-sided swaps to resolve, so those trades are visible as " +
            "positions on /positions but not as individual swaps here",
@@ -4662,7 +5121,8 @@ post("/v1/traders/positions", async (_p, _url, body) => {
   const v2 = Number((body as { contractVersion?: number })?.contractVersion) === 2;
 
   const rows = await sql`
-    select h.handle, ch.name as chain, h.network_id, tk.address as token_address,
+    select h.handle, ch.name as chain, h.network_id, h.token_key,
+           tk.address as token_address,
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
            h.price_source, h.priced_at
@@ -4689,10 +5149,16 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     return best === null || at > best ? at : best;
   }, null);
 
+  /** Same cost basis the individual route serves, from the same function. */
+  const costByHandle = await costBasisFor(handles);
+
   const position = (r: Record<string, unknown>) => ({
     chain: r.chain, networkId: Number(r.network_id),
     tokenAddress: r.token_address, symbol: r.symbol,
     amount: n(r.human_amount),
+    ...costBlock(
+      costByHandle.get(String(r.handle))?.get(`${Number(r.network_id)}:${r.token_key}`),
+      n(r.human_amount), n(r.price)),
     /** §3: the moment the balance was read, not the moment you asked. */
     balanceAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
     priceUsd: n(r.price),
