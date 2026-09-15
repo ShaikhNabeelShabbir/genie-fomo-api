@@ -2875,7 +2875,15 @@ cannot serve — it answers `{"available": false}` for anyone outside its own le
 every pass, which at 250 credits a call and 8 passes is 2,328 calls against a budget under a
 thousand.
 
-**Scorecards past 72 hours: 368 of 448 → 175**, still falling as the second loader runs.
+**Scorecards past 72 hours: 368 of 448 → 30.**
+
+| source | traders | scorecard fresh (<72h) | fees | resolved swaps |
+| --- | --- | --- | --- | --- |
+| fomoapi.io | 157 | 138 | 146 | 121 |
+| gmgn | 291 | **278** | **216** | **205** |
+
+The GMGN side went from an empty trades route to 205 of 291 traders with resolved swaps, and
+from 93 to 216 with fees.
 
 ---
 
