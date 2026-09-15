@@ -2553,6 +2553,22 @@ async function scorecardBody(
   const chainExits = chain?.exits ?? [];
   const fw = feeWindows ?? null;
 
+  /*
+   * WHEN THIS TRADER'S RECORD WAS LAST LOADED — the NEWEST row, not the first one.
+   *
+   * `rows[0].captured_at` is whatever row the query happened to return first, and a trader
+   * whose record is refreshed keeps his older rows: unipcs spans 4 September to 15 September,
+   * so the scorecard reported a load stamp ten days old on a record refreshed that morning.
+   * That is the exact shape of the staleness complaint this field exists to answer, produced
+   * by the field itself. `asOf` next to it was already taking the maximum and disagreeing.
+   */
+  const loadedAtIso = (() => {
+    const times = rows
+      .map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
+      .filter((x): x is number => x !== null && Number.isFinite(x));
+    return times.length ? new Date(Math.max(...times)).toISOString() : null;
+  })();
+
   const closed = rows.filter((r) => r.status === "closed");
   const realized = closed.map((r) => n(r.realized_pnl_usd)).filter((x): x is number => x !== null);
 
@@ -3196,7 +3212,19 @@ async function scorecardBody(
 
   return {
     handle: t.display_handle, name: t.name ?? null,
-    source: "postgres · trades (loaded from fomoapi)",
+    /**
+     * WHERE THESE ROWS CAME FROM — and it is not the same answer for every trader.
+     *
+     * This said "loaded from fomoapi" for everyone, including the 291 traders whose trades
+     * are built from GMGN's activity feed. A consumer reading it to decide how far to trust a
+     * figure was being told the wrong provider for two thirds of the directory, and the two
+     * behave differently: entry prices are thin on one side and rich on the other.
+     */
+    source: t.source === "gmgn"
+      ? "postgres · trades (folded from GMGN wallet activity)"
+      : "postgres · trades (loaded from fomoapi)",
+    /** The directory this trader came from, the same value `GET /v1/traders` reports. */
+    traderSource: t.source ?? null,
     /**
      * Realised profit per day for the last thirty days, same basis as `realized` below.
      * A day with no closed trade is absent, not zero.
@@ -3243,7 +3271,7 @@ async function scorecardBody(
      */
     sample: {
       returned: rows.length,
-      storedAt: rows[0]?.captured_at ?? null,
+      storedAt: loadedAtIso,
       complete: true,
       capped: false,
       unit: "position",
@@ -3255,8 +3283,7 @@ async function scorecardBody(
        * scorecard's half of the freshness contract -- the same question `sampler` answers for
        * the balance series, on the store that actually feeds this route.
        */
-      loadedAt: rows[0]?.captured_at
-        ? new Date(String(rows[0].captured_at)).toISOString() : null,
+      loadedAt: loadedAtIso,
       nextLoadAt: (() => {
         const d = new Date();
         d.setUTCHours(6, 0, 0, 0);
@@ -3276,8 +3303,7 @@ async function scorecardBody(
     complete: true,
     tradesKnown: rows.length,
     tradesUsed: rows.length,
-    loadedAt: rows[0]?.captured_at
-      ? new Date(String(rows[0].captured_at)).toISOString() : null,
+    loadedAt: loadedAtIso,
     nextLoadAt: (() => {
       const d = new Date();
       d.setUTCHours(6, 0, 0, 0);
@@ -3612,7 +3638,7 @@ async function scorecardBody(
 
 get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   const [t] = await sql`
-    select t.handle, t.display_handle, t.name, s.volume_usd, s.trade_count
+    select t.handle, t.display_handle, t.name, t.source, s.volume_usd, s.trade_count
     from traders t left join trader_stats_current s using (handle)
     where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);

@@ -56,6 +56,8 @@ const LIMIT = Number(opt("limit", "0")) || 0;
  * refusal instead of as missing data.
  */
 const BATCH = Number(opt("batch", "100")) || 100;
+/** Narrow to one directory's traders, e.g. `--source=gmgn`. Omitted means every transaction. */
+const SOURCE = opt("source");
 
 const db = new pg.Client({ connectionString: DB, ssl: { rejectUnauthorized: false } });
 await db.connect();
@@ -79,16 +81,47 @@ if (!chains.length) { console.error("no chain matched"); process.exit(1); }
  */
 async function pending(net, limit) {
   const swapsOnly = SWAPS_ONLY;
+  /*
+   * `--source` narrows the sweep to one directory's traders.
+   *
+   * Solana holds 654,582 transactions with no fee read yet, and reading all of them is hours
+   * of calls. The ones that actually close a gap are the 36,032 belonging to GMGN traders --
+   * the traders whose scorecards still answer `not_yet_calculated`. Naming the source turns a
+   * multi-hour sweep into a twenty-minute one that finishes the job it was started for.
+   */
+  /*
+   * The address list is resolved FIRST and passed in as an array.
+   *
+   * Expressed as a correlated EXISTS against traders/wallets, this query timed out on Solana:
+   * the planner had to test 936,792 transaction rows one at a time. Resolving the handful of
+   * addresses up front turns it into an index scan on (address_key, block_time), which is the
+   * index that already exists.
+   */
+  let addrs = null;
+  if (SOURCE) {
+    const { rows: a } = await db.query(
+      `select lower(x.addr) as addr
+       from traders t join wallets w on w.handle = t.handle,
+       lateral (values (w.evm_address_key), (lower(w.sol_address))) x(addr)
+       where t.source = $1 and x.addr is not null`, [SOURCE]);
+    addrs = [...new Set(a.map((r) => r.addr))];
+    if (!addrs.length) return [];
+  }
+
   const { rows } = await db.query(
-    `select tx_hash from (
-        select tx_hash from wallet_swaps where network_id = $1
+    `select t.tx_hash from (
+        select tx_hash, address_key from wallet_swaps
+         where network_id = $1 and ($3::text[] is null or address_key = any($3))
         union
-        select tx_hash from transactions where network_id = $1 and $2::bool is false
+        select tx_hash, address_key from transactions
+         where network_id = $1 and $2::bool is false
+           and ($3::text[] is null or address_key = any($3))
      ) t
      where not exists (
        select 1 from transaction_fees f where f.network_id = $1 and f.tx_hash = t.tx_hash)
+     group by t.tx_hash
      ${limit ? "limit " + Number(limit) : ""}`,
-    [net, swapsOnly],
+    [net, swapsOnly, addrs],
   );
   return rows.map((r) => r.tx_hash);
 }

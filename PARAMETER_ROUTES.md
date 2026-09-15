@@ -1063,6 +1063,48 @@ that visible instead of alarming.
 **`loadedAt` and `nextLoadAt`** are the scorecard's half of the freshness contract — the same
 question `sampler` answers for the balance series, asked of the store that feeds this route.
 
+**`loadedAt` is the NEWEST row's capture, not the first one's.** A refreshed record keeps its
+older rows, so taking whichever row came back first reported a load stamp ten days old on a
+record refreshed that morning — one trader's rows span 4 September to 15 September. The field
+that exists to report staleness was manufacturing it, while `asOf` beside it took the maximum
+and disagreed. Both now take the maximum.
+
+**`source` says which provider these rows came from, per trader.**
+
+| `traderSource` | `source` |
+| --- | --- |
+| `fomoapi.io` | `postgres · trades (loaded from fomoapi)` |
+| `gmgn` | `postgres · trades (folded from GMGN wallet activity)` |
+
+It used to say fomoapi for everybody, including the 291 traders whose trades are folded from
+GMGN's activity feed. A consumer reading it to judge how far to trust a figure was told the
+wrong provider for two thirds of the directory — and the two behave differently, which is the
+whole reason to ask.
+
+### Where an entry price comes from — `entryPriceSource`
+
+A per-coin entry price has two possible origins, and the row says which it used:
+
+| `entryPriceSource` | means |
+| --- | --- |
+| `reported` | the directory supplied it |
+| `chain` | derived from this wallet's own resolved buys, because the directory supplied none |
+| `null` | neither had it — `fieldReasons.avgEntryPrice` says `historical_input_missing` |
+
+**The fallback only fires where a resolved buy exists for that coin**, and it must be a buy whose
+money leg carries a dollar value — a swap paid for in a coin we cannot price resolves fine and
+still yields no entry price.
+
+That is why the second row can read zero on a trader with hundreds of resolved buys: his buys and
+his unpriced coins are different coins. One trader measured 262 coins, 71 priced by the
+directory, 191 not — and exactly **1** of those 191 had a valued chain buy. The fallback was
+built and had nothing to work with.
+
+**It fills as swaps resolve.** Of that same trader's 191 unpriced coins, **155 appear in
+transactions we hold and have not yet resolved**; for another, 190 of 424. Those are reachable.
+The rest are not, and no amount of resolving reaches them — `fieldReasons` says so rather than
+implying a pending job.
+
 ### The buys themselves — `byToken[].buys[]`
 
 `avgEntryPrice` is one number per coin, and fomoapi hands it to us **already averaged** across
@@ -2875,7 +2917,8 @@ cannot serve — it answers `{"available": false}` for anyone outside its own le
 every pass, which at 250 credits a call and 8 passes is 2,328 calls against a budget under a
 thousand.
 
-**Scorecards past 72 hours: 368 of 448 → 30.**
+**Scorecards past 72 hours: 368 of 448 → 16.** The GMGN loader finished at **291 of 291
+traders, 39,591 positions, 0 skipped.**
 
 | source | traders | scorecard fresh (<72h) | fees | resolved swaps |
 | --- | --- | --- | --- | --- |
@@ -2884,6 +2927,51 @@ thousand.
 
 The GMGN side went from an empty trades route to 205 of 291 traders with resolved swaps, and
 from 93 to 216 with fees.
+
+### What a resolver run is, and what it is not
+
+Three gaps that look like three jobs are two, and both are the same kind of work.
+
+**Fees were never collected.** `transaction_fees` did not exist before 14 September; no fee or
+gas figure was stored anywhere, and `transactions.raw` is empty on all 1,025,559 rows. This is
+a first collection, not a recovery.
+
+**Swaps were collected and never processed.** `transactions` holds one row per transfer leg —
+hash, address, token, amount. Whether a transaction was *this wallet's own swap* needs its
+pre/post balances, which only the chain has. One trader has **64,975 Solana transactions stored
+and 49 resolved**. The rows were never lost; the pass over them had not been run.
+
+So resolving is not a database operation. It is one `getTransaction` per signature:
+
+| | calls | endpoint |
+| --- | --- | --- |
+| fees | 34,772 | Helius `getTransaction` |
+| swaps | 223,726 | Helius `getTransaction` |
+
+Same key, no credit meter, rate-limited at about 3.6 per second — which is the whole cost, in
+wall clock rather than money.
+
+**Nothing was lost to make this necessary.** Integrity across the store: no orphaned trades, no
+orphaned swaps, no invalid statuses, no negative prices, no negative balances, no empty handles.
+Every table has grown.
+
+### Two fields that were quietly wrong, found by a consumer re-test
+
+Neither was a missing feature — both were fields that answered confidently and incorrectly.
+
+**`loadedAt` reported the first row it happened to see.** On a refreshed record that is an old
+row, so the scorecard claimed a ten-day-old load on a record refreshed that morning. `asOf` next
+to it was already taking the maximum, so the response disagreed with itself.
+
+**The scorecard named the wrong provider for 291 of 448 traders.** `source` was the fixed string
+`postgres · trades (loaded from fomoapi)` for everyone, including every trader whose trades are
+folded from GMGN's activity feed. It now names the provider that actually produced the rows, and
+`traderSource` carries the directory the trader came from.
+
+Also confirmed in the same re-test, against a consumer report written before the last deploy:
+`window=30d` answers 200 rather than 400, and the `all` window that carried **18 undeclared
+breaks now carries 1** — the thin points behind the other seventeen are refused rather than
+drawn.
 
 ---
 
