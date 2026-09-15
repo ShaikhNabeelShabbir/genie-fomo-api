@@ -8,7 +8,7 @@ the service's own `reach` and `drawing` verdict (§9); and the batch routes answ
 **identity-safe rows carrying the complete AUM object** under `contractVersion: 2`, and a
 `chain` of their own (§11). A day is now stated from the chains that answered rather than
 refused whole, which took traders who can draw a line from 96 to 372 at the time and
-**432 of 442** today — see Appendix A3.
+**408 of 448** today — see Appendix A3.
 
 **The version 8 report is answered in full — all nineteen asks (Appendices A4–A8).** Every
 route now dates itself with `asOf` and `/health` says which feed has stopped (§0f); `now` is
@@ -31,9 +31,9 @@ and the field to read.
 | Version 8 report | **19 of 19 answered** — see Appendices A4–A8 |
 | Plugin requirements (§ series) | **8 of 8 shipped** — see Appendix C |
 | Routes | **19** — 17 `GET`, 2 `POST` batch, plus bulk `?include=` |
-| Traders in the directory | **442** — 151 from fomo, **291 from GMGN** |
+| Traders in the directory | **448** — 157 from fomo, **291 from GMGN** |
 | Positions | **39,961**, read from chain across **5 chains**, for **379** traders |
-| Balance history | **35,271 rebuilt chain points** over 30 days · **388 of 442** traders · **432** carry two or more dated figures, on **all four windows** |
+| Balance history | **35,271 rebuilt chain points** over 30 days · **388 of 448** traders · **408** carry two or more dated figures that price enough of the wallet to draw |
 
 **Every figure below is a dated example, not current state.** They were pulled from the live
 service at the timestamp above; the pipeline refreshes nightly and the Helius webhook ingests
@@ -111,7 +111,7 @@ Four things worth knowing before you read a GMGN trader's numbers:
 
 ```bash
 curl -s "$B/traders/feibo03/scorecard?tokens=0" | jq '{winRate, entryPriceCoverage}'
-curl -s "$B/traders?limit=500" | jq '.entries | length'   # 442
+curl -s "$B/traders?limit=500" | jq '.entries | length'   # 448
 ```
 
 ---
@@ -155,6 +155,8 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 442
 | **A6** | [Cost basis, reasons, and paired trades](#appendix-a6-cost-basis-reasons-and-paired-trades-2026-09-14) | the last code-only three |
 | **A7** | [Fees, read from chain](#appendix-a7-fees-read-from-chain-2026-09-14) | the fee gap, closed |
 | **A8** | [The buys themselves, and version 8 closed](#appendix-a8-the-buys-themselves-and-version-8-closed-2026-09-14) | 19 of 19 |
+| **A9** | [The version 9 report — A1, A2, A3 re-tested](#appendix-a9-the-version-9-report-a1-a2-a3-re-tested-2026-09-15) | measured on all 448 |
+| **A10** | [Trades on four chains, and a directory that refreshes](#appendix-a10-trades-on-four-chains-and-a-directory-that-refreshes-2026-09-15) | two selectors, one decoder |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -163,7 +165,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 442
 
 | Route | In plain words | Live value |
 | --- | --- | --- |
-| `GET $B/health` | "What's in the database, and when was it loaded?" | **442 traders** · 39,961 holdings · 51,581 trades · ~1.00M transfers |
+| `GET $B/health` | "What's in the database, and when was it loaded?" | **448 traders** · 39,961 holdings · 51,581 trades · ~1.00M transfers |
 | `GET $B/traders` | "Who are the top 137?" | each entry carries a stable `id` and its own `updatedAt` |
 | `GET $B/traders/unipcs` | "Everything about one trader, and **what else I can ask**" | summary + `links` to all seven sub-routes |
 | `GET $B/traders/unipcs/transactions?limit=5` | "What have their wallets actually done on-chain?" | `?kind=swap` filters to trades; each row carries `kind` and `protocol` |
@@ -193,8 +195,27 @@ valid set — a silently ignored parameter is how a consumer ends up believing t
 they never received. `portfolio`, `positions` and `transactions` are not bulk-able and are
 still fetched per trader.
 
+**Every entry says which directory it came from.**
+
+```bash
+curl -s "$B/traders?limit=500" | jq '[.entries[].source] | group_by(.) | map({(.[0]): length}) | add'
+# { "fomoapi.io": 157, "gmgn": 291 }
+```
+
+`source` is on the directory, on `GET /traders/:id` and on `/wallets`. It matters because the
+two sources fail in **opposite directions**, and a profile built to one contract looks rich on
+some traders and threadbare on others with nothing in the answer to explain why:
+
+| source | traders | mostly | entry prices | resolved trades | fees |
+| --- | --- | --- | --- | --- | --- |
+| `fomoapi.io` | 157 | **Solana** (142 of 157) | thin | 121 of 157 | 146 of 157 |
+| `gmgn` | 291 | **EVM** (255 of 291) | rich | **50 of 291** | 216 of 291 |
+
+Until now the only tell was that `rank` and `followers` came back null — an inference, not a
+field.
+
 **Every trader in the directory carries its figures.** `pnl`, `volume`, `numTrades` and
-`updatedAt` are present on **442 of 442**.
+`updatedAt` are present on **448 of 448**.
 
 ```bash
 curl -s "$B/traders?limit=500" | jq '[.entries[] | select(.volume == null)] | length'
@@ -572,9 +593,24 @@ curl -s "$B/traders/unipcs/aum?window=1w" | jq '{status, asOf, now: .now.ageSeco
 
 | `sampler.state` | What it means |
 | --- | --- |
-| `current` | a reading was written inside `staleAfterHours` — the series is keeping up |
+| `current` | **this trader's own** newest reading is inside `staleAfterHours` |
 | `stale` | past that allowance. The points are still true, they are simply old, and `reason` says how old |
 | `warming` | no measured reading yet for this trader |
+
+**The state is the trader's, not the pipeline's.** It used to be computed from the newest
+successful run anywhere in the table — so on a night the sampler ran for most of the directory,
+a trader whose own newest reading was 6.8 days old still answered `current`, and `status` still
+said `ready`. Fourteen traders were measured in exactly that state.
+
+**Both clocks are reported, because they answer different questions:**
+
+| field | question |
+| --- | --- |
+| `lastSuccessAt`, `ageSeconds`, `state` | how old is **this trader's** reading — what `status` is judged on |
+| `pipelineLastSuccessAt`, `pipelineAgeSeconds` | when did the **job** last write anything |
+
+A fresh `pipelineLastSuccessAt` beside a `stale` state means the sampler ran and did not reach
+this trader — a different problem from the sampler having stopped, and a different fix.
 
 **The allowance is 36 hours and it is on the response**, not buried in a doc: the sampler runs
 daily, so one run plus a fully missed one is still on schedule, and anything past that is not.
@@ -616,6 +652,21 @@ answers "has anything stopped arriving" without subtracting seven dates from the
 never run has a different cause and a different fix.
 
 **`staleFeeds` names them**, and `dataState` is `current` or `degraded`.
+
+**`staleTraders` counts the traders themselves, which no feed clock can express.**
+
+```json
+{ "readingStale": 14, "readingStaleAfterHours": 36, "noReading": 14,
+  "oldestReadingHours": 177,
+  "scorecardStale": 175, "scorecardStaleAfterHours": 72, "oldestScorecardHours": 189,
+  "of": 448 }
+```
+
+A feed reports when its job last wrote *anything*. A trader the job did not reach keeps his old
+figures and moves no feed — so `feeds` can read `current` across the board, `dataState` can say
+`current`, and 368 traders can still be carrying week-old scorecards. That is exactly the state
+above, and it is why these counts are published: they are what either team would watch to notice
+a reload has stopped landing, without hand-checking traders one at a time.
 
 **`status` stays `ok` while the service answers.** It has always meant liveness and consumers
 check it for that. Whether the *data* is still arriving is the separate question `dataState`
@@ -1449,8 +1500,9 @@ An earlier attempt that matched raw transfers instead of net balances scored 66%
 close enough to look plausible, far enough to be worthless. The agreement is what makes
 `tier: "verified"` defensible.
 
-**Solana only.** The resolution reads Solana pre/post balances; EVM chains carry no
-`chainDerived` block.
+**Solana only.** This particular cross-check reads Solana pre/post balances, which is what
+makes its `tier: "verified"` defensible. The EVM chains resolve trades by a different route —
+see §10 — and carry no `chainDerived` block.
 
 **Versus GMGN.** They have no equivalent, and structurally cannot: they publish one P&L and
 have no independent second source to check it against. This exists precisely because we do.
@@ -2003,6 +2055,21 @@ curl -s "$B/traders/0xAvast/aum?window=1w&step=1d" | jq '{step, count}'
 ?chain=robinhood | solana | ...   one chain instead of the whole portfolio
 ```
 
+**Window names are forgiving.** The canonical four are `1d`, `1w`, `1m`, `all`, and those are
+what `window` echoes back — but the spellings people actually type resolve too, in any case:
+
+| you send | you get |
+| --- | --- |
+| `30d` · `30D` · `1M` · `30day` · `1mo` | `1m` |
+| `7d` · `7D` · `1week` | `1w` |
+| `24h` · `1day` | `1d` |
+| `ALL` · `lifetime` · `everything` · `max` | `all` |
+
+A consumer whose chart buttons read 1D / 7D / 30D / All used to get a chart on three of them
+and a 400 on the fourth, which reads as the service being down rather than as a spelling
+disagreement. Anything genuinely unknown is still a 400, and the message now lists the
+accepted aliases. `?step=` takes the same courtesy: `1H` is `1h`.
+
 **`step` describes the readings, not the request.** It used to be chosen from the requested
 span alone — the coarsest leaving at least 24 points — which is a sound rule about the window
 and says nothing about the data. Every week therefore declared `6h` over readings a day apart:
@@ -2029,6 +2096,16 @@ coarsen the whole series.
 
 **A caller who names a `step` gets it in both places.** They asked; the answer does not argue.
 `observedStepMs` still reports what the data does.
+
+**`stepUnderstated` is true when the label cannot tell the truth.** `step` is an enum — `1h`,
+`6h`, `1d` — so a consumer can switch on it. A one-day window over readings three and a half
+days apart has no honest value in that set: `1d` is the coarsest name available and it still
+overstates how close the points are. Rather than quietly return the wrong one, the answer says
+the label is a floor and `observedStepMs` carries the truth.
+
+```json
+{ "step": "1d", "bucketMs": 3600000, "observedStepMs": 302400000, "stepUnderstated": true }
+```
 
 ### One chain at a time — `?chain=`
 
@@ -2071,8 +2148,8 @@ means you are looking at the whole portfolio.
 | solana | 5,091 | 169 | the balance each transaction recorded, from Helius |
 | base | 4,500 | 150 | asked an archive node for the balance at that block |
 
-**35,271 chain points across 388 of 442 traders**, and **432 traders carry at least two dated
-figures** — the threshold the service draws by. 377 carry three or more.
+**35,271 chain points across 388 of 448 traders**, and **408 traders carry at least two dated
+figures that price enough of the wallet to be a balance** — see the priced floor in §9.
 
 **Nothing is written until it reproduces the wallet.** Where a balance is inferred rather than
 read — robinhood and Solana — the anchor plus every movement since it must equal what the
@@ -2138,10 +2215,27 @@ Taking the last row by time published a number a fifth of the right size: when t
 a rebuild covering 1 of a trader's 5 chains, `now` read $5,101,125.87 eight hours after a measured
 reading of $15,665,318.55, against a portfolio route saying $15.8M.
 
-**`now` carries its own coverage, not just the points'.** `partial` is true when
-`chainsAnswered < chainsTotal`, so a figure standing for part of a trader says so at the place it
-is read, and `ageSeconds` gives its age without parsing a date. A null total means the newest
-reading was genuinely refused, and `refused` names why.
+**`now` carries its own coverage, not just the points'.** `ageSeconds` gives its age without
+parsing a date. A null total means the newest reading was genuinely refused, and `refused` names
+why.
+
+**`partial` means the figure is incomplete, by either route.** It used to mean only "a chain is
+missing", so 106 readings priced less than all of their value and still said `partial: false`. A
+total built from 63% of a wallet is partial whether the missing 37% is a whole chain or a
+thousand unpriced coins. `partialReason` names which:
+
+| `partialReason` | |
+| --- | --- |
+| `chains_missing` | a chain this trader uses did not answer |
+| `unpriced_positions` | every chain answered, but not every position could be priced |
+| `chains_missing_and_unpriced_positions` | both |
+
+**A zero that nothing answered for is not a zero.** A trader whose wallets all answered and held
+nothing reads `0`, and that zero is a measurement. A reading of `$0` with **no chain answered and
+no position examined** is an empty read, not a balance — 72 traders were being returned that way,
+71 of them marked drawable, so a consumer drew a flat $0 line for traders holding real coins.
+Those now answer `status: "no_reading"` and `drawable: false`, with `nothing_answered` as the
+reason. The same applies when every reading a trader has is refused.
 
 **`chainsAnswered` / `chainsTotal` are filled on sampled and rebuilt points alike.** They are
 `null` only where no chain split was stored for that reading at all — 149 readings of 872 — and
@@ -2205,9 +2299,17 @@ curl -s "$B/traders/pointfarmcap/aum?window=1m&chain=robinhood" | jq '{reach, dr
 }
 ```
 
-**`status` separates "this is all there is" from "this is all there is SO FAR".** A `ready`
-series is the finished answer; a `warming` one will be longer if the same request is made
-later, and carries a `progress` block saying how much longer and when:
+**`status` has four values, and only one of them means "plot this".**
+
+| `status` | |
+| --- | --- |
+| `ready` | this is what we have to offer |
+| `warming` | it will be longer if you ask again later; `progress` says how much and when |
+| `stale` | **this trader's** newest reading is past the 36-hour allowance. True, but old |
+| `no_reading` | nothing answered — no chain, no position, or every reading refused. Not a zero |
+
+A `ready` series is the finished answer; a `warming` one will be longer if the same request is
+made later, and carries a `progress` block saying how much longer and when:
 
 ```json
 {
@@ -2230,9 +2332,11 @@ or from missing data, so it makes the call rather than leaving each consumer to 
 | `drawing.reason` | What it means |
 | --- | --- |
 | `null` | drawable — plot it |
+| `nothing_answered` | the newest reading answered for no chain and examined no position. Not a balance of zero — an empty read |
 | `warming` | backfill or first sampling still running; temporary |
-| `too_few_points` | fewer than three comparable numeric points |
+| `too_few_points` | fewer than two comparable numeric points |
 | `short_coverage` | enough points, but not across the requested window |
+| `too_little_priced` | the newest point priced too small a share of the wallet to be a balance — see below |
 | `wallet_unreadable` · `service_timeout` · `no_prices` · `price_rejected` | the newest point's own refusal |
 
 **`gaps[]` lists every bucket with no number, and its reason.** Nothing is interpolated — a
@@ -2279,6 +2383,53 @@ It appears on `GET /aum`, `POST /traders/aum`, `GET /wallets` and `?include=wall
 `chainsAnswered` / `chainsTotal` / `partial` on each point are untouched — they answer a
 different question.
 
+### A figure built from almost none of a wallet is not a balance
+
+This section has always said `totalUsd` is `null`, never a smaller number, when a wallet could
+not be read. That rule was applied to outright refusals and not to the case that actually
+bites: a point that *did* answer, for 1.7% of the wallet.
+
+| basis | points | median share of value priced | under 10% |
+| --- | --- | --- | --- |
+| **rebuilt** | 7,815 | **1.7%** | 6,133 |
+| sampled | 703 | **66.7%** | 13 |
+
+The rebuilt history is thinly priced by construction, and drawing it as a balance line produces
+figures that are wrong in a way no consumer can detect — one trader's line ran **$40 →
+$389,797** between neighbouring points with no method change and no chain change to explain it.
+Of 3,033 jumps of half or more on the month window, **1,226 had no declared cause**, and on
+those the lower side priced a median 1.2%.
+
+**No break marker fixes that**, because both sides are thin: the ratio between 1.2% and 1.5% is
+nothing while the dollar figures differ a thousandfold.
+
+**So a point that prices less than a fifth of its wallet is refused.** `totalUsd` is `null`,
+`refused` reads `too_little_priced`, the point appears in `gaps[]`, and a chart breaks its line
+there instead of drawing through it.
+
+```bash
+curl -s "$B/traders/unipcs/aum?window=1m" | jq '[.points[] | select(.refused == "too_little_priced")] | length'
+```
+
+| after the floor | |
+| --- | --- |
+| month-window jumps | 2,768 → **302** |
+| undeclared jumps | **1,261 → 134** |
+| traders affected | 316 → **67** |
+| traders who can still draw a line | 432 → **408** |
+
+Of the 134 that remain, about half have **both** sides pricing over 50% of the wallet — those
+are most likely real moves, and marking them would be a false alarm rather than a fix.
+
+**The threshold is one constant**, chosen against the measured trade:
+
+| floor | traders who can draw | undeclared jumps |
+| --- | --- | --- |
+| none | 432 | 1,226 |
+| 0.10 | 416 | 254 |
+| **0.20** (shipped) | **408** | **134** |
+| 0.30 | 393 | 122 |
+
 ### Two neighbouring points may not count the same thing — `breaks[]`
 
 A gap is a bucket with no number. A **break** is two numbers that cannot be subtracted.
@@ -2308,7 +2459,11 @@ sees the same thing, and `chains[]` naming which chains that point answered for.
 | --- | --- |
 | `method_changed` | one is a measured reading, the other a rebuild |
 | `chains_changed` | the same method answered for a different set of chains |
-| `method_and_chains_changed` | both |
+| `priced_share_changed` | the same method and chains, but one point could price twice as much of the wallet as the other |
+| combinations | joined with `_and_`, e.g. `method_and_chains_changed` |
+
+`pricedShareBefore` and `pricedShareAfter` travel on every break, so the size of the change is
+visible rather than implied.
 
 **`chains_changed` is the one that catches what a method marker misses.** `fhn_gt` read
 $65,367.54, then $33.26, then $52,276.29 in three days, and a consumer's card printed
@@ -2448,10 +2603,28 @@ our record of it. Nine carried a full pairing, with hold times from 19,436 to 24
     "from": "2026-09-06T…", "to": "2026-09-09T…" } ]
 ```
 
-**`unresolved` and "no trades" stop looking identical.** `unresolved` means the trader is known
-to trade there and we hold no resolved swaps for it — the honest state of the four EVM chains.
-`complete` carries `from`/`to`, so a caller asking for last week can tell whether last week was
-even read.
+**`unresolved` and "no trades" stop looking identical.** `unresolved` means we resolved none of
+this wallet's own trades on that chain — not that it made none. `complete` carries `from`/`to`,
+so a caller asking for last week can tell whether last week was even read.
+
+**Trades now resolve on four chains, not one.** The resolver originally accepted only
+token-for-token swaps, and on the Ethereum-style chains that is the *uncommon* shape: buying a
+token with BNB or ETH moves the coin as a value transfer, which emits no `Transfer` event and
+so is invisible in a receipt's logs. Reading the transaction body alongside the receipt — `from`
+and `value`, plus the `Withdrawal` a router fires when it unwraps — makes those trades readable.
+
+| chain | swaps | wallets |
+| --- | --- | --- |
+| solana | 18,893 | 160 |
+| bsc | 4,234 | 150 |
+| base | 2,164 | 104 |
+| ethereum | 206 | 13 |
+
+**A wallet appears in far more transactions than it trades in.** Measured on a random sample,
+**5 in 6** are the wallet receiving tokens inside someone else's trade — an airdrop, a router
+hop, a distribution. Only a transaction the wallet signed, with one token in and one out (or a
+native leg on one side), is written here. That is why a chain can hold thousands of a wallet's
+transactions and a handful of its trades.
 
 **`feeUsd` is `null` on every row and will stay null** until fees are stored. Zero would claim
 the trade cost nothing to make, which is never true on any chain. `source` and `confidence`
@@ -2481,7 +2654,7 @@ never mistaken for the end of the data.
 
 | In plain words | Call | Read | Live value |
 | --- | --- | --- | --- |
-| "The whole board, without 442 calls" | `POST $B/traders/positions` | `traders[]` | **50 traders per call** |
+| "The whole board, without 448 calls" | `POST $B/traders/positions` | `traders[]` | **50 traders per call** |
 
 **In layman's terms.** A background pass over the directory cannot make one call per trader.
 These take a list of ids or handles and answer for all of them at once.
@@ -2635,6 +2808,157 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 ---
 
+## Appendix A10 · Trades on four chains, and a directory that refreshes (2026-09-15)
+
+Three faults, each one a piece of code that could only ever do half its job while reporting
+success.
+
+### The decoder could not see a native leg
+
+The EVM swap resolver accepted **token for token** and nothing else. On the Ethereum-style
+chains that is the uncommon shape: paying with BNB or ETH moves the coin as a value transfer,
+which emits no `Transfer` event, so a receipt shows the wallet receiving a token and sending
+nothing — indistinguishable, from logs alone, from an airdrop.
+
+Measured on 60 random bsc transactions before changing anything:
+
+| | count |
+| --- | --- |
+| token ↔ token — the only kind it resolved | **1** |
+| **native → token** | **2** |
+| **token → native** | **3** |
+| wallet is a counterparty in someone else's trade | 50 |
+
+It was finding one trade in six and discarding five. Reading the transaction body beside the
+receipt — `from`, `value`, and the `Withdrawal` a router fires on unwrap — fixed it:
+
+| chain | swaps before | after | wallets |
+| --- | --- | --- | --- |
+| bsc | 76 | **4,234** | 5 → **150** |
+| base | 37 | **2,164** | 10 → **104** |
+| ethereum | 0 | **206** | 0 → 13 |
+
+Two traders the consumer named as returning zero rows now answer:
+
+```
+0xcaishen_1   rows 0 → 80   28 sells, 20 paired to their buys
+0xKaroshi     rows 0 →  6    1 sell,   1 paired
+```
+
+**robinhood stays at 3, and that is the right answer.** Sampling its transactions, the wallet
+receives a token and is not the sender in every one — several inside 200-to-500-log batch
+transactions. What we ingested there are inbound transfers, so there are no wallet-signed trades
+in them to resolve.
+
+### One resolver was throwing away most of its own work
+
+The Solana resolver made exactly one attempt per transaction and counted anything else a
+failure. Smoke runs read a 30% hit rate. With backoff added, the same 200 events read **92%**,
+and a full run over 15,738 events resolved **94.9% with zero failures**. The earlier number was
+never the data — it was rate limits being counted as refusals, and each one still cost a call.
+
+### Two loaders that could fill a table but never refresh it
+
+Both trade loaders selected traders **with no rows at all**:
+
+```sql
+and not exists (select 1 from trades tr where tr.handle = t.handle)
+```
+
+Correct for a first fill, useless afterwards — and silent about it. All 291 GMGN traders already
+had rows, so that loader selected **nobody** and reported success. Both now take a staleness
+selector, which is self-converging: a trader that loads successfully moves his own `ingested_at`
+and drops out of the next pass.
+
+The fomo loader also gained `--source`. Without it a converge loop retries traders that API
+cannot serve — it answers `{"available": false}` for anyone outside its own leaderboard — on
+every pass, which at 250 credits a call and 8 passes is 2,328 calls against a budget under a
+thousand.
+
+**Scorecards past 72 hours: 368 of 448 → 175**, still falling as the second loader runs.
+
+---
+
+## Appendix A9 · The version 9 report — A1, A2, A3 re-tested (2026-09-15)
+
+The consumer re-tested the three asks that mattered most, this time across **all 448 traders**
+rather than a sample, and found all three still failing. They were right on every count, and all
+three were faults in what we shipped rather than missing data.
+
+| | measured by them | now |
+| --- | --- | --- |
+| **A1** readings past the 36h bar still answering `ready` | **14** | **0** |
+| **A2** `$0` readings with no coverage, still `ready` | **72** | **0** |
+| **A2** …of those, still `drawable` | **71** | **0** |
+| **A2** points pricing under 100% yet `partial: false` | **106** | **0** |
+| **A3** month-window jumps of half or more | 2,768 | 302 |
+| **A3** …with no declared cause | **1,261** | **134** |
+| **A3** traders affected | 316 | **67** |
+
+### What each fault actually was
+
+**A1 — the state was the pipeline's, not the trader's.** `sampler.state` was computed from the
+newest successful run anywhere in the table. On a night the sampler reached most of the
+directory, a trader whose own newest reading was 6.8 days old still answered `current`. Both
+clocks are now reported and they answer different questions — see **§0f**.
+
+**A2 — a zero nobody answered for.** The rule "a trader whose wallets all answered and held
+nothing reads `0`" was right; the check that a wallet *had* answered was missing. Live testing
+after the fix found a second shape of the same fault: a trader whose readings are **all refused**
+(`totalUsd` null rather than `0`) still answered `ready`, because the fallback picked the newest
+row and aged a figure that does not exist. Both now answer `no_reading`.
+
+**A3 — the marker was never going to be enough.** Their first suggestion was a break wherever
+the priced share moves. It was implemented and measured: undeclared jumps went 1,226 → 1,025.
+Barely moved, because on those jumps *both* sides are thin — the ratio between 1.2% and 1.5% is
+nothing while the dollar figures differ a thousandfold. Their second suggestion was the right
+one, and it is the rule this document already states everywhere else: refuse the number. A point
+pricing under a fifth of its wallet now answers `too_little_priced`. See **§9**.
+
+### What it cost, stated plainly
+
+The floor removes 77% of rebuilt points and takes traders who can draw a line from 432 to
+**408**. Those points were never balances — the median rebuilt point priced **1.7%** of its
+trader's wallet — but 24 traders lost a line they previously had, and that is a real loss to
+set against a chart that was wrong undetectably.
+
+### The rest of the version 9 list
+
+| ask | what changed |
+| --- | --- |
+| **N1** `window=30d` was a 400 | `30d`, `7d`, `24h`, `1mo`, `lifetime` and case variants all resolve, on the individual and batch routes from one table. **§9** |
+| **N2** nothing named the source | `source` on the directory, the profile and `/wallets`, with the two sources' opposite failure modes stated. **§0** |
+| **A13.7** the 1d window declared `1d` over 3.5-day spacing | `stepUnderstated` says the enum label is a floor; `observedStepMs` carries the truth. **§9** |
+| **stale-trader count** on `/health` | `staleTraders` — 14 readings and 368 scorecards past their own bars, of 448. **§0f** |
+
+### What the A2 fix cost, stated plainly
+
+Traders drawable on the month window went from **428 to 331**. Almost all of that is the fix
+working rather than a loss:
+
+| `drawing.reason` | traders |
+| --- | --- |
+| `nothing_answered` | **106** |
+| `too_few_points` | 8 |
+| `warming` | 2 |
+| `short_coverage` | 1 |
+
+The 106 are the empty reads — 72 returning `$0` with nothing behind it, plus 34 whose every
+reading is refused. They were being drawn as flat `$0` lines for traders holding real coins.
+The priced floor accounts for only 8 of the 117.
+
+`status` across the directory now reads: **326 ready, 106 no_reading, 13 stale, 3 warming.**
+
+### One regression this round, found by testing
+
+Making `/health` concurrent — four queries in one `Promise.all` instead of four sequential
+awaits — stopped it answering entirely, 90 seconds to the route timeout, while every underlying
+query still returned in 150 ms by hand. Every other route kept working. It is sequential again,
+and the note above it says to test `/health` specifically if anyone tries that optimisation
+again, because a smoke test that skips it passes.
+
+---
+
 ## Appendix A8 · The buys themselves, and version 8 closed (2026-09-14)
 
 A4's last bullet asked for entry price and entry market cap **per buy**, "so '95% of buys under
@@ -2681,7 +3005,7 @@ All nineteen asks are answered, verified against the live service:
 | | Asks |
 | --- | --- |
 | **Answered in full** | A1, A2, A3, A5, A6, A8, A9, A10, A11, A12, A13.1, A13.2, A13.3, A13.4, A13.5, A13.6, A13.7 |
-| **Answered to the limit of the data, with coverage stated** | A4 — 2,070 buys across 139 of 442 traders; A7 — fees on four of five chains, native-only on bsc |
+| **Answered to the limit of the data, with coverage stated** | A4 — 2,070 buys across 139 of 448 traders; A7 — fees on four of five chains, native-only on bsc |
 
 Nothing here is a partial answer presented as a whole. Every figure that covers part of a trader
 says which part: `buysCoverage`, `fees.coverage`, `costCoverage`, `volumeCoverage`,

@@ -38,22 +38,49 @@ const arg = (n, d = null) => {
 const LIMIT = Number(arg("limit", "0")) || null;
 /** 16 measured at 49 req/s with zero errors. Higher risks 429s for no real gain. */
 const FANOUT = Number(arg("fanout", "16"));
+/** `gmgn` or `fomoapi.io`; omitted means every trader, as before. */
+const SOURCE = arg("source", null);
 
 const pool = new pg.Pool({ connectionString: DB, ssl: { rejectUnauthorized: false }, max: 4 });
 
-async function getTx(sig) {
+const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * One transaction, with backoff.
+ *
+ * This used to make exactly one attempt and count anything else as a failure. Measured on a
+ * 200-event smoke run that lost 119 of 200 -- the node was rate-limiting, every refusal was
+ * final, and each one still cost a call. Retrying the refusals costs nothing extra when they
+ * succeed and stops us paying for work we then throw away.
+ *
+ * A 429 is the node asking for a pause, so its own Retry-After is honoured when it sends one.
+ */
+async function getTx(sig, tries = 4) {
   const body = JSON.stringify({
     jsonrpc: "2.0", id: 1, method: "getTransaction",
     params: [sig, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }],
   });
-  const r = await fetch(RPC, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body,
-    signal: AbortSignal.timeout(45_000),
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const j = await r.json();
-  if (j.error) throw new Error(String(j.error?.message ?? "rpc error").slice(0, 60));
-  return j.result ?? null;
+  for (let i = 1; ; i++) {
+    try {
+      const r = await fetch(RPC, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body,
+        signal: AbortSignal.timeout(45_000),
+      });
+      if (r.status === 429 || r.status >= 500) {
+        const ra = Number(r.headers.get("retry-after"));
+        const e = new Error(`HTTP ${r.status}`);
+        e.waitMs = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 20_000) : null;
+        throw e;
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      if (j.error) throw new Error(String(j.error?.message ?? "rpc error").slice(0, 60));
+      return j.result ?? null;
+    } catch (e) {
+      if (i >= tries) throw e;
+      await nap(e.waitMs ?? Math.min(500 * 2 ** (i - 1), 8_000));
+    }
+  }
 }
 
 /**
@@ -97,19 +124,29 @@ async function main() {
     );
     const quoteSet = new Map(quotes.map((q) => [q.token_key, q.pegged_usd]));
 
+    /*
+     * SCOPED BY SOURCE, because the two directories need this at different times.
+     *
+     * 238,990 swap events sit unresolved across every trader, and resolving all of them is a
+     * long run against a metered key. The GMGN traders are the ones whose trades route is
+     * empty today, so they are the ones worth spending on first. `--source gmgn` asks for
+     * exactly those; no flag keeps the old behaviour of everything unresolved.
+     */
     const { rows: work } = await c.query(
       `select t.tx_hash, w.sol_address as owner, lower(w.sol_address) as address_key,
               min(t.block_time) as block_time
          from transactions t
          join wallets w on lower(w.sol_address) = t.address_key
+         join traders tr on tr.handle = w.handle
          left join wallet_swaps s
            on s.network_id = t.network_id and s.tx_hash = t.tx_hash
           and s.address_key = t.address_key
         where t.network_id = $1 and t.tx_type = 'SWAP' and s.tx_hash is null
+          and ($2::text is null or tr.source = $2)
         group by t.tx_hash, w.sol_address
         order by min(t.block_time) desc
         ${LIMIT ? `limit ${LIMIT}` : ""}`,
-      [SOLANA],
+      [SOLANA, SOURCE],
     );
     if (!work.length) { console.log("nothing to resolve"); return; }
     console.log(`resolving ${work.length} swap event(s) · fanout ${FANOUT} · ~${Math.ceil(work.length / 49 / 60)} min`);

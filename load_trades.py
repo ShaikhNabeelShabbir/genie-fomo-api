@@ -148,6 +148,12 @@ def select_targets(cur, args) -> list[tuple]:
     Correct when filling an empty table, useless for a refresh where all 100 already have
     some, which is the trap: the loop would stall on pass one and report success.
     """
+    # `--source` keeps a converge loop off traders this API cannot serve. fomoapi answers
+    # {"available": false} for anyone outside its own leaderboard -- 291 of our 448 -- and an
+    # unavailable trader never gets a fresh `ingested_at`, so `--converge` reselects them on
+    # every pass. At 250 credits a call and 8 passes that is 2,328 calls spent learning the
+    # same thing eight times, against a budget of under a thousand.
+    src = getattr(args, "source", None)
     if args.all and args.stale_hours is not None:
         cur.execute("""
             select t.handle, t.display_handle from traders t
@@ -156,10 +162,12 @@ def select_targets(cur, args) -> list[tuple]:
                            -- sends a float, so multiply an interval instead. This also
                            -- keeps fractional hours working.
                            'epoch'::timestamptz) < now() - (%s * interval '1 hour')
+              and (%s::text is null or t.source = %s)
             order by t.handle
-        """, (args.stale_hours,))
+        """, (args.stale_hours, src, src))
     elif args.all:
-        cur.execute("select handle, display_handle from traders order by handle")
+        cur.execute("""select handle, display_handle from traders
+                       where (%s::text is null or source = %s) order by handle""", (src, src))
     else:
         cur.execute("""
             select t.handle, t.display_handle from traders t
@@ -183,6 +191,7 @@ def _build_parser():
                          "load over a time window, so one pass never covers the board.")
     ap.add_argument("--max-passes", type=int, default=8)
     ap.add_argument("--fanout", type=int, help="override concurrency")
+    ap.add_argument("--source", help="only traders from this directory, e.g. fomoapi.io")
     return ap
 
 

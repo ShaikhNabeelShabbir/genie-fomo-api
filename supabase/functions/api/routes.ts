@@ -823,7 +823,7 @@ get("/v1/traders", async (_p, url) => {
     : sql`s.captured_at`;
 
   const rows = await sql`
-    select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at,
+    select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at, t.source,
            s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
            case
              when ${q} = '' then 0
@@ -911,18 +911,17 @@ get("/v1/traders", async (_p, url) => {
    */
   const handles = page.map((r) => r.handle as string);
   const wantsScorecard = include.includes("scorecard");
-  const [pnlRows, scRows, wRows, trRows, ceRows, xeRows] = handles.length
+  const [pnlRows, scRows, wRows, trRows, swapBy] = handles.length
     ? await Promise.all([
       include.includes("pnl") ? pnlAgg(handles) : Promise.resolve([]),
       wantsScorecard ? scorecardRows(handles) : Promise.resolve([]),
       include.includes("wallets") ? walletRows(handles) : Promise.resolve([]),
       include.includes("trust") ? trustHoldings(handles) : Promise.resolve([]),
-      // Axes 5 and 2. Set-based like every other include, so the bulk route stays one
-      // statement per resource rather than a loop wearing one's coat.
-      wantsScorecard ? chainEntryRows(handles) : Promise.resolve([]),
-      wantsScorecard ? chainExitRows(handles) : Promise.resolve([]),
+      // Axes 5 and 2. One query for every swap on the page, from which the entry price, the
+      // exit P&L and the individual buys are all derived -- see `swapsFor`.
+      wantsScorecard ? swapsFor(handles) : Promise.resolve(new Map<string, Swap[]>()),
     ])
-    : [[], [], [], [], [], []];
+    : [[], [], [], [], new Map<string, Swap[]>()];
 
   // One global value shared by every trader's trust block, fetched once.
   const holdingsAsOf = include.includes("trust") ? await asOfHoldings() : null;
@@ -972,10 +971,6 @@ get("/v1/traders", async (_p, url) => {
     if (empty.length) throw includeUnavailable(empty);
   }
 
-  // deno-lint-ignore no-explicit-any
-  const ceBy = byHandle(ceRows as any[]);
-  // deno-lint-ignore no-explicit-any
-  const xeBy = byHandle(xeRows as any[]);
 
   /**
    * Sub-resources are nested under `included`, NOT spread onto the entry.
@@ -1006,9 +1001,9 @@ get("/v1/traders", async (_p, url) => {
        */
       out.scorecard = rows.length
         ? await scorecardBody(r, rows, 0, {
-            entries: new Map((ceBy.get(h) ?? []).map((c: any) =>
-              [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
-            exits: (xeBy.get(h) ?? []).map((x: any) => Number(x.exit_pnl_usd)),
+            entries: chainEntriesFrom(swapBy.get(h) ?? []),
+            exits: chainExitsFrom(swapBy.get(h) ?? [],
+                                  chainEntriesFrom(swapBy.get(h) ?? [])),
           }, feesBy.get(h) ?? null, null)
         : null;
     }
@@ -1082,6 +1077,17 @@ get("/v1/traders", async (_p, url) => {
       // Empty string is not a URL. The column stores '' where fomo gave nothing, and the
       // Node route passes it through `nonEmpty`, so this has to as well.
       avatarUrl: nonEmpty(r.avatar as string | null),
+      /**
+       * WHERE THIS TRADER CAME FROM.
+       *
+       * The two sources fail in opposite directions and always have: entry prices are thin on
+       * the fomo side and rich on the GMGN side, resolved trades exist on the fomo side and
+       * barely at all on the GMGN side. A profile built to one contract therefore looks rich
+       * on some traders and threadbare on others, and until now nothing in the answer
+       * explained why -- the only tell was that `rank` and `followers` came back null, which
+       * is an inference, not a field.
+       */
+      source: r.source ?? null,
       pnl: n(r.pnl_usd),
       volume: n(r.volume_usd),
       followers: r.followers ?? null,
@@ -1105,7 +1111,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
   const h = await resolveTrader(handle);
   const [t] = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified,
-           t.last_seen_at, s.captured_at,
+           t.last_seen_at, t.source, s.captured_at,
            s.rank, s.pnl_usd, s.volume_usd, s.trade_count, s.followers,
            w.evm_address, w.sol_address
     from traders t
@@ -1134,6 +1140,8 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     name: t.name ?? null,
     rank: t.rank ?? null,
     verified: !!t.verified,
+    /** Which directory this trader came from. See the note on `source` in `GET /v1/traders`. */
+    source: t.source ?? null,
     updatedAt: t.captured_at ? new Date(String(t.captured_at)).toISOString() : null,
     /**
      * The same value as `updatedAt`, under the name every other route uses for it. Both are
@@ -2254,6 +2262,7 @@ const scorecardRows = (handles: string[]) => sql`
  * This is a fallback, never an override. fomo's figure wins when it exists, so turning this
  * on cannot move a number that already had a source.
  */
+/** SUPERSEDED by swapsFor() + chainEntriesFrom(). Kept only for reference; no caller. */
 const chainEntryRows = (handles: string[]) => sql`
   select w.handle, ws.network_id, ws.token_key,
          sum(abs(ws.quote_usd)) / nullif(sum(ws.token_delta), 0) as chain_entry_price,
@@ -2279,6 +2288,7 @@ const chainEntryRows = (handles: string[]) => sql`
  * Only a position with BOTH sides resolved qualifies. Selling something we never saw bought
  * has no cost basis, and inventing one would be the whole problem in miniature.
  */
+/** SUPERSEDED by swapsFor() + chainExitsFrom(). Kept only for reference; no caller. */
 const chainExitRows = (handles: string[]) => sql`
   with buys as (
     select w.handle, ws.network_id, ws.token_key,
@@ -2401,6 +2411,7 @@ type Buy = {
   costUsd: number | null; priceUsd: number | null;
 };
 
+/** SUPERSEDED by swapsFor() + buysFrom(). Kept only for reference; no caller. */
 async function buysFor(handles: string[]): Promise<Map<string, Map<string, Buy[]>>> {
   const out = new Map<string, Map<string, Buy[]>>();
   if (!handles.length) return out;
@@ -2432,6 +2443,92 @@ async function buysFor(handles: string[]): Promise<Map<string, Map<string, Buy[]
        */
       priceUsd: cost !== null && amount > 0
         ? Number((Math.abs(cost) / amount).toPrecision(12)) : null,
+    });
+  }
+  return out;
+}
+
+/**
+ * EVERY RESOLVED SWAP FOR THESE TRADERS, IN ONE QUERY.
+ *
+ * Three separate queries used to scan `wallet_swaps` over the same join for the same trader:
+ * the chain entry price, the chain exit P&L, and the individual buys. Each one measures about
+ * 160 ms, which sounds harmless -- but each also holds its own connection, and a pool exhausts
+ * on connections held, not on milliseconds burned. That is what took the service down under a
+ * 448-trader sweep.
+ *
+ * So the rows are fetched once and the three answers are derived from them in memory. Same
+ * numbers, one third of the connections.
+ */
+type Swap = {
+  handle: string; net: number; tokenKey: string; txHash: string;
+  at: string | null; tokenDelta: number; quoteUsd: number | null;
+};
+
+async function swapsFor(handles: string[]): Promise<Map<string, Swap[]>> {
+  const out = new Map<string, Swap[]>();
+  if (!handles.length) return out;
+  const rows = await sql`
+    select w.handle, ws.network_id, ws.token_key, ws.tx_hash, ws.block_time,
+           ws.token_delta, ws.quote_usd
+    from wallet_swaps ws
+    join wallets w
+      on lower(w.sol_address) = ws.address_key or w.evm_address_key = ws.address_key
+    where w.handle = any(${handles})
+    order by w.handle, ws.block_time asc`;
+  for (const r of rows) {
+    const h = String(r.handle);
+    let a = out.get(h); if (!a) out.set(h, a = []);
+    a.push({
+      handle: h, net: Number(r.network_id), tokenKey: String(r.token_key),
+      txHash: String(r.tx_hash),
+      at: r.block_time ? new Date(String(r.block_time)).toISOString() : null,
+      tokenDelta: n(r.token_delta) ?? 0, quoteUsd: n(r.quote_usd),
+    });
+  }
+  return out;
+}
+
+/** The quantity-weighted entry price per "net:token", from the buys in one swap list. */
+function chainEntriesFrom(swaps: Swap[]): Map<string, number> {
+  const acc = new Map<string, { usd: number; qty: number }>();
+  for (const s of swaps) {
+    if (s.tokenDelta <= 0 || s.quoteUsd === null) continue;
+    const k = `${s.net}:${s.tokenKey}`;
+    const a = acc.get(k) ?? { usd: 0, qty: 0 };
+    a.usd += Math.abs(s.quoteUsd); a.qty += s.tokenDelta;
+    acc.set(k, a);
+  }
+  const out = new Map<string, number>();
+  for (const [k, a] of acc) if (a.qty > 0) out.set(k, a.usd / a.qty);
+  return out;
+}
+
+/** Realised P&L per closing swap, valued against that token's entry price. */
+function chainExitsFrom(swaps: Swap[], entries: Map<string, number>): number[] {
+  const out: number[] = [];
+  for (const s of swaps) {
+    if (s.tokenDelta >= 0 || s.quoteUsd === null) continue;
+    const px = entries.get(`${s.net}:${s.tokenKey}`);
+    if (px === undefined) continue;
+    out.push(s.quoteUsd + s.tokenDelta * px);
+  }
+  return out;
+}
+
+/** The individual buys, grouped by "net:token", from the same rows. */
+function buysFrom(swaps: Swap[]): Map<string, Buy[]> {
+  const out = new Map<string, Buy[]>();
+  for (const s of swaps) {
+    if (s.tokenDelta <= 0) continue;
+    const k = `${s.net}:${s.tokenKey}`;
+    let a = out.get(k); if (!a) out.set(k, a = []);
+    const cost = s.quoteUsd === null ? null : Math.abs(s.quoteUsd);
+    a.push({
+      at: s.at, txHash: s.txHash, amount: s.tokenDelta,
+      costUsd: cost === null ? null : round(cost),
+      priceUsd: cost !== null && s.tokenDelta > 0
+        ? Number((cost / s.tokenDelta).toPrecision(12)) : null,
     });
   }
   return out;
@@ -3521,17 +3618,23 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const h = t.handle as string;
-  const [rows, ce, xe, feeBy, buyBy] = await Promise.all([
-    scorecardRows([h]), chainEntryRows([h]), chainExitRows([h]),
+  /*
+   * Three queries became one. The entry price, the exit P&L and the individual buys are all
+   * derived from the same swap rows, so they are fetched once -- see `swapsFor`.
+   */
+  const [rows, swapBy, feeBy] = await Promise.all([
+    scorecardRows([h]),
+    swapsFor([h]),
     nativePrices().then((nat) => feesFor([h], nat)),
-    buysFor([h]),
   ]);
   if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
 
+  const swaps = swapBy.get(h) ?? [];
+  const entries = chainEntriesFrom(swaps);
   return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
-    entries: new Map(ce.map((c: any) => [`${c.network_id}:${c.token_key}`, Number(c.chain_entry_price)])),
-    exits: xe.map((x: any) => Number(x.exit_pnl_usd)),
-  }, feeBy.get(h) ?? null, buyBy.get(h) ?? null);
+    entries,
+    exits: chainExitsFrom(swaps, entries),
+  }, feeBy.get(h) ?? null, buysFrom(swaps));
 });
 
 // ------------------------------------------------------------ K5-K8 (SQL)
@@ -4064,6 +4167,32 @@ const AUM_WINDOWS: Record<string, number | null> = {
   "1m": 30 * 86_400_000,
   all: null,
 };
+/**
+ * THE SAME WINDOW, SPELLED THE WAY PEOPLE SPELL IT.
+ *
+ * The four windows are `1d`, `1w`, `1m`, `all`, and everything else was a 400 -- including
+ * `30d`, which is the natural request from a document that keeps saying "thirty days", and
+ * `1D` / `30D` / `1M`, which is how chart buttons are usually labelled. A consumer whose pills
+ * read 1D / 7D / 30D / All got a chart on three of them and an error on the fourth, which
+ * reads as the service being down rather than as a spelling disagreement.
+ *
+ * The canonical names are unchanged and are what `window` echoes back, so nothing that already
+ * works changes its answer. These are only ways IN.
+ */
+const WINDOW_ALIASES: Record<string, string> = {
+  "24h": "1d", "1day": "1d",
+  "7d": "1w", "1week": "1w", "7day": "1w",
+  "30d": "1m", "1month": "1m", "30day": "1m", "1mo": "1m",
+  everything: "all", lifetime: "all", max: "all",
+};
+
+/** Canonical window for a requested one, or null when it is not a window we serve. */
+function resolveWindow(raw: string): string | null {
+  const k = raw.trim().toLowerCase();
+  if (k in AUM_WINDOWS) return k;
+  return WINDOW_ALIASES[k] ?? null;
+}
+
 /** Step sizes, coarsest last. The default picks the coarsest that still leaves >= 24 points. */
 const AUM_STEPS: { name: string; ms: number }[] = [
   { name: "1h", ms: 3_600_000 },
@@ -4090,15 +4219,19 @@ const AUM_STEPS: { name: string; ms: number }[] = [
  * and the cheapest way to guarantee that is to have one of them.
  */
 function aumOptions(url: URL): { windowKey: string; stepRaw: string | null; chainKey: string } {
-  const windowKey = (url.searchParams.get("window") ?? "1w").trim();
-  if (!(windowKey in AUM_WINDOWS)) {
+  const asked = (url.searchParams.get("window") ?? "1w").trim();
+  const windowKey = resolveWindow(asked);
+  if (windowKey === null) {
     throw badRequest(
-      `'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")} — got '${windowKey}'`,
+      `'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")} — got '${asked}'. ` +
+      `Also accepted: ${Object.keys(WINDOW_ALIASES).join(", ")}, in any case.`,
       { parameter: "window" },
     );
   }
   const stepRaw = url.searchParams.get("step");
-  if (stepRaw !== null && !AUM_STEPS.some((s) => s.name === stepRaw.trim())) {
+  /* Steps take the same courtesy: `1H` and `6H` are the same request as `1h` and `6h`. */
+  if (stepRaw !== null &&
+      !AUM_STEPS.some((s) => s.name === stepRaw.trim().toLowerCase())) {
     throw badRequest(
       `'step' must be one of ${AUM_STEPS.map((s) => s.name).join(", ")} — got '${stepRaw}'`,
       { parameter: "step" },
@@ -4150,6 +4283,47 @@ function buildAum(
   const { windowKey, stepRaw, chainFilter, to } = opts;
   const span = AUM_WINDOWS[windowKey];
   const from = span === null ? null : new Date(to.getTime() - span);
+
+  /*
+   * A FIGURE BUILT FROM ALMOST NONE OF A WALLET IS NOT A BALANCE.
+   *
+   * Section 9 has always said `totalUsd` is null, never a smaller number, when a wallet could
+   * not be read. That rule was applied to outright refusals and not to the case that actually
+   * bites: a point that DID answer, for 1.7% of the wallet.
+   *
+   * Measured over thirty days: the median REBUILT point prices 1.7% of its trader's value,
+   * and 6,133 of 7,815 price under a tenth. The median SAMPLED point prices 66.7%. So the
+   * rebuilt history is thinly priced by construction -- and drawing it as a balance line
+   * produces exactly what the consumer reported: $40 to $389,797 between two neighbouring
+   * points, with no method change and no chain change to explain it. 1,226 of 3,033 jumps of
+   * half or more had no declared cause, and on those the lower side priced a median 1.2%.
+   *
+   * No break marker fixes that, because both sides are thin: the ratio between 1.2% and 1.5%
+   * is nothing, while the dollar figures differ by a thousandfold. The honest answer is the
+   * one this document already gives everywhere else -- refuse the number and say why. The
+   * point still exists, `gaps[]` still lists it, and a chart breaks its line there instead of
+   * drawing through a figure that is wrong in a way no consumer could detect.
+   *
+   * PRICED_FLOOR is the one number that decides this. It is deliberately a single constant,
+   * and the trade at each setting was measured against the consumer's own metric -- jumps of
+   * half or more on the month window that carry no declared cause:
+   *
+   *     floor   traders who can draw     undeclared jumps
+   *     none            432                    1,226
+   *     0.10            416                      254
+   *     0.20            408                      158   <- here
+   *     0.30            393                      122
+   *
+   * 0.20 halves the residual for the cost of eight traders. Of the 158 that remain, 66 have
+   * both sides pricing over half the wallet -- those are most likely real moves, and marking
+   * them would be a false alarm rather than a fix.
+   */
+  const PRICED_FLOOR = 0.20;
+  rows = rows.map((r) => {
+    const share = n(r.value_share);
+    if (n(r.total_usd) === null || share === null || share >= PRICED_FLOOR) return r;
+    return { ...r, total_usd: null, refused_reason: "too_little_priced" };
+  });
 
   /*
    * THE READING JUST BEFORE THE WINDOW IS KEPT, as an anchor.
@@ -4236,7 +4410,7 @@ function buildAum(
   const observedStepMs = rawGaps.length ? rawGaps[Math.floor(rawGaps.length / 2)] : 0;
 
   const chosen = stepRaw !== null
-    ? AUM_STEPS.find((s) => s.name === stepRaw.trim())!
+    ? AUM_STEPS.find((s) => s.name === stepRaw.trim().toLowerCase())!
     : [...AUM_STEPS].reverse().find((s) =>
         span === null || Math.floor(span / s.ms) >= 24
       ) ?? AUM_STEPS[0];
@@ -4293,9 +4467,33 @@ function buildAum(
        */
       chainsAnswered: r.chains_answered === null ? null : Number(r.chains_answered),
       chainsTotal: r.chains_expected === null ? null : Number(r.chains_expected),
-      partial: r.chains_answered === null || r.chains_expected === null
-        ? null
-        : Number(r.chains_answered) < Number(r.chains_expected),
+      /*
+       * PARTIAL MEANS THE FIGURE IS INCOMPLETE, by whichever route it got that way.
+       *
+       * It used to mean only "a chain is missing", so 106 readings priced less than all of
+       * their value and still said `partial: false`. A total built from 63% of a wallet is
+       * partial whether the missing 37% is a whole chain or a thousand unpriced coins.
+       */
+      partial: (() => {
+        const chainsShort = r.chains_answered !== null && r.chains_expected !== null &&
+          Number(r.chains_answered) < Number(r.chains_expected);
+        const share = n(r.value_share);
+        const priceShort = share !== null && share < 1;
+        return (r.chains_answered === null || r.chains_expected === null) && share === null
+          ? null
+          : (chainsShort || priceShort);
+      })(),
+      /** Which of the two made it partial, so a consumer can tell them apart. */
+      partialReason: (() => {
+        const chainsShort = r.chains_answered !== null && r.chains_expected !== null &&
+          Number(r.chains_answered) < Number(r.chains_expected);
+        const share = n(r.value_share);
+        const priceShort = share !== null && share < 1;
+        if (chainsShort && priceShort) return "chains_missing_and_unpriced_positions";
+        if (chainsShort) return "chains_missing";
+        if (priceShort) return "unpriced_positions";
+        return null;
+      })(),
     },
     ...(r.refused_reason ? { refused: r.refused_reason as string } : {}),
     /** True for a real dated reading borrowed from just before the requested window. */
@@ -4360,7 +4558,37 @@ function buildAum(
   const breaks: {
     at: string; previousAt: string; reason: string;
     chainsAdded: string[]; chainsRemoved: string[];
+    pricedShareBefore: number | null; pricedShareAfter: number | null;
   }[] = [];
+  /** The source row behind each returned point, for the priced share the point does not carry. */
+  const valuedRowByKey = new Map<string, Record<string, unknown>>();
+  for (const r of rows) {
+    valuedRowByKey.set(
+      `${new Date(String(r.at)).toISOString()}|${r.basis}`, r);
+  }
+  /*
+   * A THIRD REASON, AND IT IS THE COMMONEST ONE.
+   *
+   * Method and chain set were the two I marked, and I tested a priced-share rule once, on the
+   * WEEK window at a ten-point threshold, found it bought 21 catches for 25 extra marks, and
+   * dropped it. That was the wrong window and the wrong threshold. On the MONTH window 1,261
+   * of 2,768 jumps of half or more carry no break at all -- 46% -- and on those jumps the
+   * lower point prices a median 1.5% of the trader's value. One measured example: a line went
+   * $358,325 -> $1,132,934 drawn from 3 of 2,477 priced holdings, same chains, same method.
+   *
+   * That is not a move in the balance, it is a move in how much of the wallet we could see.
+   * So a material change in priced share is a break, on the same footing as the other two.
+   *
+   * The threshold is a RATIO, not a difference in points: 63% against 60% is the same picture
+   * twice, while 1.5% against 60% is two different pictures. A doubling either way is the
+   * line at which the smaller reading is no longer measuring the same trader.
+   */
+  const SHARE_RATIO = 2;
+  const shareAt = (p: { at: string; basis: string }): number | null => {
+    const row = valuedRowByKey.get(`${p.at}|${p.basis}`);
+    return row ? n(row.value_share) : null;
+  };
+
   for (let i = 1; i < valued.length; i++) {
     const prev = valued[i - 1], cur = valued[i];
     const a = chainsAt(prev.at, prev.basis), b = chainsAt(cur.at, cur.basis);
@@ -4368,15 +4596,25 @@ function buildAum(
     const removed = a.filter((c) => !b.includes(c));
     const methodChanged = prev.basis !== cur.basis;
     const chainsChanged = added.length > 0 || removed.length > 0;
-    if (!methodChanged && !chainsChanged) continue;
+
+    const ps = shareAt(prev), cs = shareAt(cur);
+    const shareChanged = ps !== null && cs !== null && ps > 0 && cs > 0 &&
+      Math.max(ps / cs, cs / ps) >= SHARE_RATIO;
+
+    if (!methodChanged && !chainsChanged && !shareChanged) continue;
+    const why: string[] = [];
+    if (methodChanged) why.push("method");
+    if (chainsChanged) why.push("chains");
+    if (shareChanged) why.push("priced_share");
     breaks.push({
       at: cur.at,
       previousAt: prev.at,
-      reason: methodChanged && chainsChanged
-        ? "method_and_chains_changed"
-        : (methodChanged ? "method_changed" : "chains_changed"),
+      reason: why.join("_and_") + "_changed",
       chainsAdded: added,
       chainsRemoved: removed,
+      /** The share of value each side priced, so the size of the change is visible. */
+      pricedShareBefore: ps,
+      pricedShareAfter: cs,
     });
   }
   const breakAt = new Set(breaks.map((b) => b.at));
@@ -4517,11 +4755,51 @@ function buildAum(
    * owner's rule (one point is never a line)". Holding out for a third made a real two-point
    * series undrawable and put our flag out of step with the figures we report.
    */
+  /*
+   * A ZERO THAT NOTHING ANSWERED FOR IS NOT A ZERO.
+   *
+   * Section 9 says a trader whose wallets all answered and held nothing reads `0`, and that
+   * zero is a measurement. The rule was right and the CHECK was missing: nothing verified
+   * that a wallet had answered. 72 of 432 ready traders returned exactly $0 with no chain
+   * count, no priced share and no positions, and 71 of them were still marked drawable -- so
+   * a consumer following the flag drew a flat $0 line for a trader whose wallets are on known
+   * chains and hold real coins.
+   *
+   * An empty read is a refusal. It is told apart from a real zero by the coverage beside it:
+   * a measured zero answered for at least one chain or looked at at least one position.
+   */
+  const emptyRead = (r: Record<string, unknown> | null): boolean => {
+    if (!r) return false;
+    if (n(r.total_usd) !== 0) return false;
+    const chains = r.chains_answered === null || r.chains_answered === undefined
+      ? 0 : Number(r.chains_answered);
+    const looked = r.total_positions === null || r.total_positions === undefined
+      ? 0 : Number(r.total_positions);
+    return chains === 0 && looked === 0;
+  };
+  /*
+   * TWO WAYS TO HAVE NOTHING, and both must stop `ready`.
+   *
+   *   a zero nothing answered for  -- total 0, no chains, no positions   (72 traders)
+   *   no figure at all             -- every reading refused               (seen live)
+   *
+   * The second was reported as `ready` even after the first was fixed, because a refused row
+   * is still a row and the fallback picked it up.
+   */
+  const newestIsEmpty = emptyRead(newest) || withFigure.length === 0;
+
   const MIN_DRAWABLE_POINTS = 2;
   const usable = points.filter((p) => p.totalUsd !== null);
   let drawable = true;
   let reason: string | null = null;
-  if (usable.length < MIN_DRAWABLE_POINTS) {
+  if (newestIsEmpty) {
+    /*
+     * Nothing answered for this trader at the newest reading. Not drawable, and not `ready`
+     * below -- the series would otherwise be a flat line at zero drawn from nothing.
+     */
+    drawable = false;
+    reason = "nothing_answered";
+  } else if (usable.length < MIN_DRAWABLE_POINTS) {
     /*
      * Fewer than three numbers. Which of these it is matters: a backfill that has not
      * finished is temporary and worth waiting for, a refusal is not.
@@ -4572,22 +4850,58 @@ function buildAum(
    */
   const STALE_AFTER_H = 36;
   const lastSuccess = opts.sampler?.lastSuccess ?? null;
+
+  /*
+   * THE STATE IS THIS TRADER'S, NOT THE PIPELINE'S.
+   *
+   * This was computed from the newest successful run anywhere in the table -- so on a night
+   * the sampler ran for most of the directory, a trader whose OWN newest reading was 6.8 days
+   * old still answered `current`, and `status` still said `ready`. Fourteen traders were
+   * measured in exactly that state, and a consumer trusting `status` drew a week-old figure
+   * as today's.
+   *
+   * A trader is asking about himself. The age that matters is the age of the reading he is
+   * about to be shown, so that is what decides the verdict. The pipeline's own last run is
+   * still reported, under a name that says what it is, because "my reading is old" and "the
+   * job has stopped" are different problems with different fixes.
+   */
+  /*
+   * The age of the FIGURE, not of the newest row.
+   *
+   * When every reading a trader has is refused, `newest` falls back to the newest row so its
+   * reason can be reported -- but that row carries no number. Ageing it said "this trader's
+   * reading is 25 hours old" about a reading that does not exist, and `status` answered
+   * `ready`. A reading with no figure has no age.
+   */
+  const ownAgeH = newest?.at && n(newest.total_usd) !== null
+    ? (to.getTime() - Date.parse(String(newest.at))) / 3_600_000
+    : null;
   const sinceSuccessH = lastSuccess === null
     ? null
     : (to.getTime() - lastSuccess.getTime()) / 3_600_000;
-  const samplerState = lastSuccess === null
+
+  const samplerState = ownAgeH === null
     ? "warming"
-    : (sinceSuccessH! > STALE_AFTER_H ? "stale" : "current");
+    : (ownAgeH > STALE_AFTER_H ? "stale" : "current");
+
   const samplerBlock = {
     state: samplerState,
     lastAttemptAt: null,
-    lastSuccessAt: lastSuccess ? lastSuccess.toISOString() : null,
+    /** When THIS trader was last measured. The figure `state` is judged on. */
+    lastSuccessAt: newest?.at ? new Date(String(newest.at)).toISOString() : null,
+    ageSeconds: ownAgeH === null ? null : Math.round(ownAgeH * 3600),
     nextExpectedAt: nextRun.toISOString(),
-    ageSeconds: sinceSuccessH === null ? null : Math.round(sinceSuccessH * 3600),
     staleAfterHours: STALE_AFTER_H,
     reason: samplerState === "stale"
-      ? `no measured reading for ${sinceSuccessH!.toFixed(1)}h — readings are true but old`
+      ? `this trader's newest reading is ${ownAgeH!.toFixed(1)}h old — it is true, but old`
       : null,
+    /**
+     * The pipeline's own clock, for telling "my reading is old" from "the job has stopped".
+     * A fresh `pipelineLastSuccessAt` beside a stale `state` means the sampler ran and did
+     * not reach this trader.
+     */
+    pipelineLastSuccessAt: lastSuccess ? lastSuccess.toISOString() : null,
+    pipelineAgeSeconds: sinceSuccessH === null ? null : Math.round(sinceSuccessH * 3600),
   };
 
   return {
@@ -4612,6 +4926,16 @@ function buildAum(
      * asked for a step explicitly, and a consumer labelling an axis should read this one.
      */
     observedStepMs: observedStepMs || null,
+    /**
+     * TRUE WHEN `step` UNDERSTATES THE REAL SPACING, AND IT CANNOT SAY SO ANY OTHER WAY.
+     *
+     * `step` is an enum of `1h`, `6h`, `1d` — a consumer switches on it, so it stays an enum.
+     * But a one-day window over readings three and a half days apart has no honest value in
+     * that set: `1d` is the coarsest name available and it still overstates how close the
+     * points are. Rather than quietly return the wrong one, the answer says the label is a
+     * floor and `observedStepMs` carries the truth.
+     */
+    stepUnderstated: observedStepMs > declared.ms,
     from: from ? from.toISOString() : (points[0]?.at ?? null),
     to: to.toISOString(),
     trackedSince,
@@ -4624,8 +4948,27 @@ function buildAum(
         /** `sampled` was read from the chain at the time; `rebuilt` was inferred afterwards. */
         basis: newest.basis as string,
         tier: newest.tier as string,
-        /** True when this figure covers only part of the trader. See `coverage` below. */
-        partial: cover(newest) >= 0 && wanted(newest) >= 0 ? cover(newest) < wanted(newest) : null,
+        /**
+         * True when this figure covers only part of the trader — a missing chain, unpriced
+         * positions, or both. `partialReason` names which.
+         */
+        partial: (() => {
+          const chainsShort = cover(newest) >= 0 && wanted(newest) >= 0 &&
+            cover(newest) < wanted(newest);
+          const share = n(newest.value_share);
+          const priceShort = share !== null && share < 1;
+          return cover(newest) < 0 && share === null ? null : (chainsShort || priceShort);
+        })(),
+        partialReason: (() => {
+          const chainsShort = cover(newest) >= 0 && wanted(newest) >= 0 &&
+            cover(newest) < wanted(newest);
+          const share = n(newest.value_share);
+          const priceShort = share !== null && share < 1;
+          if (chainsShort && priceShort) return "chains_missing_and_unpriced_positions";
+          if (chainsShort) return "chains_missing";
+          if (priceShort) return "unpriced_positions";
+          return null;
+        })(),
         /*
          * ON `now` ITSELF, not only inside `coverage`.
          *
@@ -4683,7 +5026,9 @@ function buildAum(
      *   `sampler`. This never used to be said, and 432 of 435 answers claimed `ready` over
      *   figures three days old.
      */
-    status: warming ? "warming" : (samplerState === "stale" ? "stale" : "ready"),
+    status: newestIsEmpty
+      ? "no_reading"
+      : (warming ? "warming" : (samplerState === "stale" ? "stale" : "ready")),
 
     /** When measurement last succeeded, and when it is next due. */
     sampler: samplerBlock,
@@ -5286,9 +5631,11 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
           };
         });
       })(),
-      why: "swaps are resolved from chain for Solana only — a complete scan of the EVM " +
-           "chains found no two-sided swaps to resolve, so those trades are visible as " +
-           "positions on /positions but not as individual swaps here",
+      why: "swaps are resolved from chain on Solana and on bsc, base and ethereum. A wallet " +
+           "appears in far more transactions than it trades in — measured on a random " +
+           "sample, 5 in 6 are the wallet receiving tokens inside someone else's trade — so " +
+           "a chain with no rows here is one where we resolved none of this wallet's own " +
+           "trades, not one where it made none",
     },
     source: "postgres · wallet_swaps (helius rpc pre/post balances)",
   };
@@ -5576,13 +5923,18 @@ post("/v1/traders/positions", async (_p, _url, body) => {
 post("/v1/traders/aum", async (_p, _url, body) => {
   const { requested, handles, asked, capped } = await batchIds(body);
   const b = body as { window?: string; step?: string; contractVersion?: number; chain?: string };
-  const windowKey = (b?.window ?? "1w").trim();
-  if (!(windowKey in AUM_WINDOWS)) {
-    throw badRequest(`'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")}`,
-                     { parameter: "window" });
+  /* Same aliases as the individual route, from the same table, so the two cannot disagree. */
+  const askedWindow = (b?.window ?? "1w").trim();
+  const windowKey = resolveWindow(askedWindow);
+  if (windowKey === null) {
+    throw badRequest(
+      `'window' must be one of ${Object.keys(AUM_WINDOWS).join(", ")} — got '${askedWindow}'. ` +
+      `Also accepted: ${Object.keys(WINDOW_ALIASES).join(", ")}, in any case.`,
+      { parameter: "window" });
   }
   const stepRaw = typeof b?.step === "string" ? b.step : null;
-  if (stepRaw !== null && !AUM_STEPS.some((s) => s.name === stepRaw.trim())) {
+  if (stepRaw !== null &&
+      !AUM_STEPS.some((s) => s.name === stepRaw.trim().toLowerCase())) {
     throw badRequest(`'step' must be one of ${AUM_STEPS.map((s) => s.name).join(", ")}`,
                      { parameter: "step" });
   }
@@ -5687,6 +6039,18 @@ get("/v1/health", async () => {
    * admits it is approximate is honest; one that does not is the failure this API is
    * organised against.
    */
+  /*
+   * FOUR SEQUENTIAL AWAITS, DELIBERATELY.
+   *
+   * Each is a round trip and the queries themselves measure about 150 ms, so running them
+   * together looked like free latency. It was not: batched into one Promise.all against a
+   * pool of 2, this endpoint stopped answering entirely -- 90 seconds, the route timeout,
+   * with every underlying query still returning in 150 ms when run by hand.
+   *
+   * The cause was not worth chasing on a liveness endpoint. Sequential is 2.4 seconds and
+   * works. If this is made concurrent again, test /health specifically after deploying:
+   * every other route kept working while this one hung, so a smoke test that skips it passes.
+   */
   const [c] = await sql`
     select (select count(*) from traders)                        as traders,
            (select count(*) from holdings_current)               as holdings,
@@ -5718,6 +6082,40 @@ get("/v1/health", async () => {
            (select max(last_seen_at) from wallets)                       as wallets_at,
            (select count(*) from aum_samples)::int                       as aum_rows,
            (select count(distinct handle) from aum_samples)::int         as aum_traders`;
+  /*
+   * HOW MANY TRADERS ARE THEMSELVES STALE.
+   *
+   * Every feed above can read `current` while individual traders carry week-old figures: a
+   * feed's clock is the job's last write, and a job that runs without reaching a trader
+   * leaves that trader behind without moving any feed. Fourteen traders were sitting on
+   * readings four to seven days old while every feed said `current`, and the only way to find
+   * them was to check traders one at a time.
+   *
+   * So the count is published. It is the number either team would look at to notice the
+   * reload has stopped landing, and it measures 168 ms.
+   */
+  const [st] = await sql`
+    with newest as (
+      select handle, max(at) filter (where total_usd is not null) as reading_at
+      from aum_samples group by handle
+    ), loads as (
+      select handle, max(captured_at) as scorecard_at from trades group by handle
+    )
+    select
+      count(*) filter (where n.reading_at is null)::int                       as no_reading,
+      count(*) filter (where n.reading_at < now() - interval '36 hours')::int as reading_stale,
+      count(*) filter (where l.scorecard_at < now() - interval '72 hours')::int
+                                                                             as scorecard_stale,
+      max(extract(epoch from (now() - n.reading_at)) / 3600.0)::int           as oldest_reading_h,
+      max(extract(epoch from (now() - l.scorecard_at)) / 3600.0)::int         as oldest_scorecard_h
+    from newest n full join loads l using (handle)`;
+
+  /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
+  const [m] = await sql`
+    select count(*)::int as traders,
+           (select count(distinct handle) from trades where status = 'closed')::int
+             as measurable
+    from traders`;
 
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
 
@@ -5767,18 +6165,12 @@ get("/v1/health", async () => {
   const staleFeeds = Object.entries(feeds)
     .filter(([, v]) => v.state !== "current").map(([k]) => k).sort();
 
-  /**
-   * The share of traders carrying a usable rhythm figure (§5).
-   *
-   * Reported here rather than left for a consumer to discover by sampling scorecards, which
-   * is how they found out it was zero last time.
+  /*
+   * The share of traders carrying a usable rhythm figure (§5) is fetched above, with the
+   * rest. It used to run a correlated EXISTS over `trades` once per trader; counting the
+   * distinct handles that have a closed trade answers the same question without the
+   * per-row subquery.
    */
-  const [m] = await sql`
-    select count(*)::int as traders,
-           count(*) filter (where exists (
-             select 1 from trades tr where tr.handle = t.handle and tr.status = 'closed'
-           ))::int as measurable
-    from traders t`;
 
   return {
     status: "ok",
@@ -5806,6 +6198,25 @@ get("/v1/health", async () => {
      */
     dataState: staleFeeds.length ? "degraded" : "current",
     staleFeeds,
+    /**
+     * PER-TRADER STALENESS, which no feed clock can express.
+     *
+     * A feed reports when its job last wrote anything. A trader the job did not reach keeps
+     * his old figures and moves no feed, so `feeds` can read `current` across the board while
+     * traders carry week-old readings. These counts are the ones to watch.
+     */
+    staleTraders: {
+      readingStale: Number(st?.reading_stale ?? 0),
+      readingStaleAfterHours: 36,
+      noReading: Number(st?.no_reading ?? 0),
+      oldestReadingHours: st?.oldest_reading_h === null || st?.oldest_reading_h === undefined
+        ? null : Number(st.oldest_reading_h),
+      scorecardStale: Number(st?.scorecard_stale ?? 0),
+      scorecardStaleAfterHours: 72,
+      oldestScorecardHours: st?.oldest_scorecard_h === null || st?.oldest_scorecard_h === undefined
+        ? null : Number(st.oldest_scorecard_h),
+      of: Number(c.traders),
+    },
     measurements: {
       traders: Number(m.traders),
       withClosedTrades: Number(m.measurable),
@@ -5904,7 +6315,7 @@ async function knownChainsFor(handles: string[]): Promise<Map<string, KnownChain
 
 /** Wallet rows for many traders at once, for the ISSUE-8 bulk route. */
 const walletRows = (handles: string[]) => sql`
-  select t.handle, t.id, t.display_handle, t.handle_changed_at,
+  select t.handle, t.id, t.display_handle, t.handle_changed_at, t.source,
          t.name, t.bio, t.avatar, t.twitter,
          w.evm_address, w.sol_address, w.evm_source, w.sol_source,
          w.evm_confidence, w.sol_confidence, w.last_seen_at
@@ -6070,6 +6481,8 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
      * Both spellings are still ACCEPTED as input, forever; only the output is now consistent.
      */
     id: t.id ?? null,
+    /** Which directory this trader came from. See `GET /v1/traders`. */
+    source: t.source ?? null,
     /** When this wallet record was last confirmed. See the note on `asOf` in the aum route. */
     asOf: t.last_seen_at ? new Date(String(t.last_seen_at)).toISOString() : null,
     /** When the display handle last changed; a consumer can notice a rename. */

@@ -37,6 +37,8 @@ const arg = (n,d=null)=>{const i=process.argv.indexOf(`--${n}`);return i>-1&&pro
 const DRY   = process.argv.includes("--dry-run");
 const LIMIT = Number(arg("limit","0")) || null;
 const PAGES = Number(arg("pages","12"));
+/** Refresh selector. Omitted keeps the original backfill behaviour. */
+const STALE_HOURS = arg("stale-hours", null) === null ? null : Number(arg("stale-hours"));
 
 const pool = new pg.Pool({ connectionString: DB, ssl:{rejectUnauthorized:false}, max: 4 });
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
@@ -119,13 +121,33 @@ function fold(acts, networkId) {
 async function main() {
   const c = await pool.connect();
   try {
-    const { rows: targets } = await c.query(`
-      select t.handle, w.sol_address, w.evm_address
-      from traders t join wallets w on w.handle = t.handle
-      where t.source = 'gmgn'
-        and not exists (select 1 from trades tr where tr.handle = t.handle)
-      order by t.handle ${LIMIT ? `limit ${LIMIT}` : ""}`);
-    console.log(`${targets.length} GMGN trader(s) with no trades yet${DRY?"  [DRY RUN]":""}`);
+    /*
+     * TWO SELECTORS: BACKFILL, AND REFRESH.
+     *
+     * The original asked for GMGN traders with no trades AT ALL. That is right for filling an
+     * empty table and useless once it is full -- all 291 now have rows, so it selects nobody
+     * and reports success having done nothing. It is the same trap load_trades.py documents
+     * on the fomo side, and the same fix: a staleness selector.
+     *
+     * `--stale-hours N` takes the traders whose newest trade row is older than N hours, which
+     * is self-converging -- a trader that loads successfully moves his own ingested_at and
+     * drops out of the next run.
+     */
+    const { rows: targets } = STALE_HOURS === null
+      ? await c.query(`
+        select t.handle, w.sol_address, w.evm_address
+        from traders t join wallets w on w.handle = t.handle
+        where t.source = 'gmgn'
+          and not exists (select 1 from trades tr where tr.handle = t.handle)
+        order by t.handle ${LIMIT ? `limit ${LIMIT}` : ""}`)
+      : await c.query(`
+        select t.handle, w.sol_address, w.evm_address
+        from traders t join wallets w on w.handle = t.handle
+        where t.source = 'gmgn'
+          and coalesce((select max(tr.ingested_at) from trades tr where tr.handle = t.handle),
+                       'epoch'::timestamptz) < now() - ($1 * interval '1 hour')
+        order by t.handle ${LIMIT ? `limit ${LIMIT}` : ""}`, [STALE_HOURS]);
+    console.log(`${targets.length} GMGN trader(s) ${STALE_HOURS === null ? "with no trades yet" : `stale over ${STALE_HOURS}h`}${DRY?"  [DRY RUN]":""}`);
     if (!targets.length) return;
 
     const capturedAt = new Date();
