@@ -7,6 +7,7 @@ import { cov, money } from "../shared/format.ts";
 import { chainWhere } from "../shared/chains.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { ledgerBody } from "../shared/creators-core.ts";
+import { exitTimingScoreFrom } from "../shared/scorecard-core.ts";
 
 // ------------------------------------------------------- K1/K3/K4/K9 board
 
@@ -660,6 +661,30 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     group by handle
     order by realized desc, handle`;
 
+  /** C5. Each seller's exit-timing score over ALL his closed coins, same rule as the scorecard. */
+  const timing = new Map<string, { exitPrice: number | null; currentPrice: number | null }[]>();
+  for (const r of await sql`
+    with legs as (
+      select t.display_handle as handle, tr.network_id, tr.token_key,
+             tr.avg_exit_price, tr.opened_at, tr.trade_id,
+             trade_qty(tr.status, tr.amount, tr.realized_pnl_usd,
+                       tr.avg_entry_price, tr.avg_exit_price) as qty
+      from trades tr join traders t on t.handle = tr.handle
+      where t.display_handle = any(${per.map((r) => String(r.handle))}) and tr.status = 'closed')
+    select l.handle, ti.price_usd as current,
+           coalesce(
+             sum(avg_exit_price * qty) filter (where avg_exit_price > 0 and qty is not null)
+               / nullif(sum(qty) filter (where avg_exit_price > 0 and qty is not null), 0),
+             (array_agg(avg_exit_price order by opened_at nulls last, trade_id)
+                filter (where avg_exit_price > 0))[1]
+           ) as exit
+    from legs l
+    left join token_info ti on ti.network_id = l.network_id and ti.token_key = l.token_key
+    group by l.handle, l.network_id, l.token_key, ti.price_usd`) {
+    const h = String(r.handle);
+    timing.set(h, [...(timing.get(h) ?? []), { exitPrice: n(r.exit), currentPrice: n(r.current) }]);
+  }
+
   const withClosed = per.filter((r) => Number(r.closed) > 0);
   const winners = withClosed.filter((r) => (n(r.realized) ?? 0) > 0).length;
   const losers = withClosed.filter((r) => (n(r.realized) ?? 0) < 0).length;
@@ -737,6 +762,8 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
       entryPositions: Number(r.entry_positions),
       entryPositionsWeighted: Number(r.entry_positions_weighted),
       firstBuyAt: r.first_buy ?? null, lastSellAt: r.last_sell ?? null,
+      /** C5: this trader's exit-timing score across every coin he has closed, not this coin alone. */
+      exitTimingScore: exitTimingScoreFrom(timing.get(String(r.handle)) ?? []),
     })),
     plain: !per.length
       ? "None of the holders have a trade record for this token, so we cannot say what they have done with it."

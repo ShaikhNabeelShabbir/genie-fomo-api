@@ -53,7 +53,9 @@ export const scorecardRows = (handles: string[]) => sql`
          -- C3. Latest honeypot read, when it first flipped, and how many OTHER tracked
          -- traders have a trade in the coin (self is always one of holders).
          ti.is_honeypot, ti.can_not_sell, ti.honeypot_since,
-         co.holders - 1 as co_holders
+         co.holders - 1 as co_holders,
+         -- C1/C5 (composite badges): the coin now, and its high since we began sampling it.
+         tk.created_at as token_created_at, ti.market_cap_usd, ti.price_usd, ps.ath_usd, ps.ath_at
   from trades tr
   left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
   left join token_info ti on ti.network_id = tr.network_id and ti.token_key = tr.token_key
@@ -63,6 +65,7 @@ export const scorecardRows = (handles: string[]) => sql`
     where (network_id, token_key) in (select network_id, token_key from trades where handle = any(${handles}))
     group by 1, 2
   ) co on co.network_id = tr.network_id and co.token_key = tr.token_key
+  left join token_price_stats ps on ps.network_id = tr.network_id and ps.token_key = tr.token_key
   where tr.handle = any(${handles})`;
 
 
@@ -151,23 +154,33 @@ export type Swap = {
 export async function swapsFor(handles: string[]): Promise<Map<string, Swap[]>> {
   const out = new Map<string, Swap[]>();
   if (!handles.length) return out;
+  // Address keys resolved here, then `any(...)` on the indexed column: the OR-join over two
+  // wallet columns forced a BitmapOr and a heap filter per swap row.
+  const handleByAddr = new Map<string, string[]>();
+  for (const w of await sql`
+    select handle, lower(sol_address) as sol, evm_address_key as evm
+    from wallets where handle = any(${handles})`) {
+    for (const a of [w.sol, w.evm]) {
+      if (!a) continue;
+      const k = String(a);
+      handleByAddr.set(k, [...(handleByAddr.get(k) ?? []), String(w.handle)]);
+    }
+  }
+  if (!handleByAddr.size) return out;
   const rows = await sql`
-    select w.handle, ws.network_id, ws.token_key, ws.tx_hash, ws.block_time,
-           ws.token_delta, ws.quote_usd
-    from wallet_swaps ws
-    join wallets w
-      on lower(w.sol_address) = ws.address_key or w.evm_address_key = ws.address_key
-    where w.handle = any(${handles})
-    order by w.handle, ws.block_time asc`;
+    select address_key, network_id, token_key, tx_hash, block_time, token_delta, quote_usd
+    from wallet_swaps where address_key = any(${[...handleByAddr.keys()]})
+    order by block_time asc`;
   for (const r of rows) {
-    const h = String(r.handle);
-    let a = out.get(h); if (!a) out.set(h, a = []);
-    a.push({
-      handle: h, net: Number(r.network_id), tokenKey: String(r.token_key),
-      txHash: String(r.tx_hash),
-      at: r.block_time ? new Date(String(r.block_time)).toISOString() : null,
-      tokenDelta: n(r.token_delta) ?? 0, quoteUsd: n(r.quote_usd),
-    });
+    for (const h of handleByAddr.get(String(r.address_key)) ?? []) {
+      let a = out.get(h); if (!a) out.set(h, a = []);
+      a.push({
+        handle: h, net: Number(r.network_id), tokenKey: String(r.token_key),
+        txHash: String(r.tx_hash),
+        at: r.block_time ? new Date(String(r.block_time)).toISOString() : null,
+        tokenDelta: n(r.token_delta) ?? 0, quoteUsd: n(r.quote_usd),
+      });
+    }
   }
   return out;
 }
@@ -205,8 +218,8 @@ export function chainExitsFrom(swaps: Swap[], entries: Map<string, number>): num
  * is a real count and may be 0. `swapsSeen` is the swap-shaped groups in `transactions`.
  */
 export type OnChainBlock = ReturnType<typeof onChainFrom>;
-export function onChainFrom(swaps: Swap[], swapsSeen: number) {
-  const exits = chainExitsFrom(swaps, chainEntriesFrom(swaps));
+/** `exits` is `chainExitsFrom(swaps, chainEntriesFrom(swaps))`, which the caller already built. */
+export function onChainFrom(swaps: Swap[], swapsSeen: number, exits: number[]) {
   const valued = swaps.map((s) => s.quoteUsd).filter((x): x is number => x !== null);
   const wins = exits.filter((v) => v > 0).length;
   const times = swaps.map((s) => s.at).filter((x): x is string => x !== null);
@@ -242,6 +255,127 @@ export function buysFrom(swaps: Swap[]): Map<string, Buy[]> {
     });
   }
   return out;
+}
+
+/**
+ * C1 (composite badges). Per-coin multiples against the weighted entry, and how much of the
+ * entry quantity has been sold. Null, never 0, whenever a leg is missing; the peak counts only
+ * when the sampled high post-dates the first open, otherwise it is someone else's run.
+ */
+export type CoinLegs = {
+  entryPx: number | null; exitPx: number | null; currentPx: number | null;
+  athPx: number | null; athAtMs: number | null; firstOpenedMs: number | null;
+  entryQty: number | null; exitQty: number | null;
+};
+export function coinMultiples(c: CoinLegs) {
+  const over = (px: number | null) =>
+    px !== null && c.entryPx !== null && c.entryPx > 0 ? Number((px / c.entryPx).toFixed(4)) : null;
+  const peakSeen = c.athAtMs !== null && c.firstOpenedMs !== null && c.athAtMs >= c.firstOpenedMs;
+  return {
+    multipleRealized: over(c.exitPx),
+    multipleCurrent: over(c.currentPx),
+    multiplePeak: peakSeen ? over(c.athPx) : null,
+    realizedShare: c.entryQty !== null && c.entryQty > 0
+      ? Number(Math.min(1, Math.max(0, (c.exitQty ?? 0) / c.entryQty)).toFixed(4)) : null,
+  };
+}
+
+/**
+ * C2 (composite badges). Recency windows against the career, from the closes and the per-coin
+ * rows the scorecard already built. `recent` is the 20 most recent closes; `closes4w` and
+ * `green4w` are the last 28 days. Every figure is null, never 0, when its inputs are missing.
+ */
+export type CloseRow = {
+  closedMs: number; openedMs: number | null; realizedUsd: number | null; entryMcapUsd: number | null;
+};
+export type CoinRow = {
+  betUsd: number | null; multipleRealized: number | null; closedMonth: string | null;
+  lastClosedMs: number | null;
+};
+export const BLEEDING_RED_SHARE_FLOOR = 0.6;
+export function compositeWindows(closes: CloseRow[], coins: CoinRow[], nowMs: number) {
+  const isNum = (x: number | null): x is number => x !== null;
+  const dated = closes.filter((c) => Number.isFinite(c.closedMs)).sort((a, b) => a.closedMs - b.closedMs);
+  const realized = dated.map((c) => c.realizedUsd).filter(isNum);
+  const typicalBetPerCoinUsd = round(median(coins.map((c) => c.betUsd).filter(isNum)));
+  const multiples = coins.filter((c) => c.multipleRealized !== null);
+  const bigWinAt = multiples.filter((c) => c.multipleRealized! >= 5 && c.lastClosedMs !== null)
+    .map((c) => c.lastClosedMs!);
+  const closes4w = dated.filter((c) => c.closedMs > nowMs - 28 * 86_400_000);
+
+  const stats = (xs: CloseRow[]) => {
+    const rz = xs.map((c) => c.realizedUsd).filter(isNum);
+    const holds = xs.filter((c) => c.openedMs !== null && c.closedMs >= c.openedMs!)
+      .map((c) => c.closedMs - c.openedMs!);
+    const medHold = median(holds);
+    const spanDays = xs.length ? (xs[xs.length - 1].closedMs - xs[0].closedMs) / 86_400_000 : null;
+    return {
+      avgRealizedUsd: rz.length ? round(rz.reduce((a, b) => a + b, 0) / rz.length) : null,
+      redShare: rz.length ? Number((rz.filter((v) => v < 0).length / rz.length).toFixed(4)) : null,
+      entryMcapMedianUsd: round(median(xs.map((c) => c.entryMcapUsd).filter(isNum))),
+      holdHoursMedian: medHold === null ? null : Number((medHold / 3_600_000).toFixed(2)),
+      // Closes per day over the window's own span, floored at one day so a burst is not infinite.
+      tradesPerDay: spanDays === null ? null : Number((xs.length / Math.max(spanDays, 1)).toFixed(2)),
+    };
+  };
+  const career = stats(dated);
+  const last = stats(dated.slice(-20));
+  const floor = typicalBetPerCoinUsd;
+  // The team's floor: fires only when the recent average trails the career average by more
+  // than a typical bet, or when 60 % or more of the last 20 closes are red.
+  const bleeding = last.redShare === null ? null
+    : (career.avgRealizedUsd !== null && floor !== null &&
+       career.avgRealizedUsd - last.avgRealizedUsd! > floor) ||
+      last.redShare >= BLEEDING_RED_SHARE_FLOOR;
+  return {
+    typicalBetPerCoinUsd,
+    medianWinUsd: round(median(realized.filter((v) => v > 0))),
+    medianLossUsd: round(median(realized.filter((v) => v < 0))),
+    bigWinMonths: multiples.length
+      ? new Set(multiples.filter((c) => c.multipleRealized! >= 10 && c.closedMonth !== null)
+          .map((c) => c.closedMonth)).size
+      : null,
+    recent: {
+      lastBigWinAt: bigWinAt.length ? new Date(Math.max(...bigWinAt)).toISOString() : null,
+      closes4w: closes4w.length,
+      green4w: closes4w.filter((c) => (c.realizedUsd ?? 0) > 0).length,
+      last20: { avgRealizedUsd: last.avgRealizedUsd, redShare: last.redShare },
+      entryMcapMedianUsd: last.entryMcapMedianUsd,
+      holdHoursMedian: last.holdHoursMedian,
+      tradesPerDay: last.tradesPerDay,
+      basis: "last20, entryMcapMedianUsd, holdHoursMedian and tradesPerDay: the 20 most recent " +
+             "closes; closes4w and green4w: closes in the last 28 days",
+    },
+    career: {
+      avgRealizedUsd: career.avgRealizedUsd,
+      entryMcapMedianUsd: career.entryMcapMedianUsd,
+      holdHoursMedian: career.holdHoursMedian,
+      tradesPerDay: career.tradesPerDay,
+      basis: "every closed position with a close time",
+    },
+    bleeding,
+    bleedingBasis: {
+      floorUsd: floor,
+      redShareFloor: BLEEDING_RED_SHARE_FLOOR,
+      plain: "true only when career.avgRealizedUsd minus recent.last20.avgRealizedUsd exceeds " +
+             "typicalBetUsd.perCoinUsd (the floor), or recent.last20.redShare is 0.6 or more; " +
+             "false otherwise; null with no dated close",
+    },
+  };
+}
+
+/**
+ * C5 (composite badges). Share of closed coins whose price today sits below the trader's
+ * weighted exit: 1 means every coin he sold went on to fall. Null under five coins carrying
+ * both prices, so the figure never rests on a coin or two. Reused by /tokens/:address/activity.
+ */
+export const EXIT_TIMING_MIN_COINS = 5;
+export function exitTimingScoreFrom(
+  rows: { exitPrice: number | null; currentPrice: number | null }[],
+): number | null {
+  const priced = rows.filter((r) => r.exitPrice !== null && r.exitPrice > 0 && r.currentPrice !== null);
+  if (priced.length < EXIT_TIMING_MIN_COINS) return null;
+  return Number((priced.filter((r) => r.currentPrice! < r.exitPrice!).length / priced.length).toFixed(4));
 }
 
 /** Everything the scorecard computes, over rows already fetched. See docs/DECISIONS.md#d142 */
@@ -413,6 +547,11 @@ export async function scorecardBody(
     tokenCreatedUnix: number | null; firstOpenedMs: number | null;
     /* When this coin was first and last closed, so a per-coin row carries its own dates. */
     firstClosedMs: number | null; lastClosedMs: number | null;
+    /* C1: the coin now (token_info) and its sampled high (token_price_stats). */
+    currentPriceUsd: number | null; currentMcapUsd: number | null;
+    athUsd: number | null; athAtMs: number | null;
+    /* Launch time: tokens.created_at (read on chain) first, GMGN's creation_timestamp after. */
+    launchMs: number | null;
     chainKey: string;
     isHoneypotNow: boolean | null; honeypotSince: string | null; coHolders: number | null;
   }>();
@@ -428,6 +567,9 @@ export async function scorecardBody(
       // Earliest position opened in this token, so age-at-entry can be derived per token.
       firstOpenedMs: null as number | null,
       firstClosedMs: null as number | null, lastClosedMs: null as number | null,
+      currentPriceUsd: n(r.price_usd), currentMcapUsd: n(r.market_cap_usd),
+      athUsd: n(r.ath_usd), athAtMs: ms(r.ath_at),
+      launchMs: ms(r.token_created_at) ?? (n(r.token_created_unix) !== null ? n(r.token_created_unix)! * 1000 : null),
       // Chain AND token, because one token_key can exist on two chains and their prices
       // have nothing to do with each other.
       chainKey: `${r.network_id}:${r.token_key}`,
@@ -489,7 +631,8 @@ export async function scorecardBody(
              sum: a.sum, weight: a.weight };
   };
   const byToken = [...byTokenMap.values()]
-    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, firstClosedMs, lastClosedMs, chainKey, ...r }) => {
+    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, firstClosedMs, lastClosedMs, chainKey,
+            athUsd, athAtMs, launchMs, ...r }) => {
       const e = resolve(entry), x = resolve(exit);
       /** Axis 5. See docs/DECISIONS.md#d148 */
       const chainPx = e.value === null ? (chainEntry.get(chainKey) ?? null) : null;
@@ -537,6 +680,21 @@ export async function scorecardBody(
       /** DOLLARS IN AND DOLLARS OUT on this coin, which is what "how much a bet" and the profit ban… See docs/DECISIONS.md#d153 */
       costUsd: e.legsWeighted > 0 ? round(e.sum) : null,
       proceedsUsd: x.legsWeighted > 0 ? round(x.sum) : null,
+      /** C1 (composite badges). `exitMcapUsd` and `betUsd` are `avgExitMarketCapUsd` and `costUsd` under the names the badge note uses: one value, two names. */
+      exitMcapUsd: x.value !== null && r.totalSupply !== null && r.totalSupply > 0
+        ? Number((x.value * r.totalSupply).toPrecision(10)) : null,
+      /** The sampled high since this trader first opened the coin, as a market cap. Null before hourly sampling reached it or when the high pre-dates his entry. */
+      peakMcapSinceEntryUsd: athUsd !== null && athAtMs !== null && firstOpenedMs !== null &&
+          athAtMs >= firstOpenedMs && r.totalSupply !== null && r.totalSupply > 0
+        ? Number((athUsd * r.totalSupply).toPrecision(10)) : null,
+      ...coinMultiples({
+        entryPx, exitPx: x.value, currentPx: r.currentPriceUsd, athPx: athUsd, athAtMs, firstOpenedMs,
+        entryQty: e.legsWeighted > 0 ? e.weight : null, exitQty: x.legsWeighted > 0 ? x.weight : null,
+      }),
+      betUsd: e.legsWeighted > 0 ? round(e.sum) : null,
+      closedMonth: lastClosedMs !== null ? new Date(lastClosedMs).toISOString().slice(0, 7) : null,
+      entryHoursAfterLaunch: launchMs !== null && firstOpenedMs !== null
+        ? Number(((firstOpenedMs - launchMs) / 3_600_000).toFixed(2)) : null,
       /** The quantity each sum was taken over, so the division can be rechecked. */
       costQuantity: e.legsWeighted > 0 ? e.weight : null,
       proceedsQuantity: x.legsWeighted > 0 ? x.weight : null,
@@ -641,12 +799,14 @@ export async function scorecardBody(
   /** T4 — profit by window. See docs/DECISIONS.md#d157 */
   /** Computed from `rows`, not from a second query. See docs/DECISIONS.md#d158 */
   const nowMs = Date.now();
-  const closedDated = rows.filter((r) =>
-    r.status === "closed" && r.closed_at !== null && r.closed_at !== undefined);
+  // `closed_at` parsed once per row; every window, day and month bucket below reads `closedMs`.
+  const closedDated = rows
+    .filter((r) => r.status === "closed" && r.closed_at !== null && r.closed_at !== undefined)
+    .map((r) => ({ ...r, closedMs: Date.parse(String(r.closed_at)) }));
   const windowAgg = (sinceMs: number | null, windowKey: string) => {
     const inWindow = sinceMs === null
       ? closedDated
-      : closedDated.filter((r) => Date.parse(String(r.closed_at)) > sinceMs);
+      : closedDated.filter((r) => r.closedMs > sinceMs);
     // `sum()` skips NULLs and `coalesce(..., 0)` makes an empty window zero — matched here,
     // because a window with no closed trades earned nothing, which is a real 0 and not a
     // missing value.
@@ -694,7 +854,7 @@ export async function scorecardBody(
   const dayBuckets = new Map<string, { realizedUsd: number; closedTrades: number }>();
   const since30 = nowMs - 30 * 86_400_000;
   for (const r of closedDated) {
-    const ms = Date.parse(String(r.closed_at));
+    const ms = r.closedMs;
     if (!Number.isFinite(ms) || ms <= since30) continue;
     const day = new Date(ms).toISOString().slice(0, 10);
     const b = dayBuckets.get(day) ?? { realizedUsd: 0, closedTrades: 0 };
@@ -718,7 +878,7 @@ export async function scorecardBody(
   const monthBuckets = new Map<string,
     { realizedUsd: number; closedTrades: number; withFigure: number }>();
   for (const r of closedDated) {
-    const ms = Date.parse(String(r.closed_at));
+    const ms = r.closedMs;
     if (!Number.isFinite(ms) || ms < since12m) continue;
     const m = monthKey(ms);
     const b = monthBuckets.get(m) ?? { realizedUsd: 0, closedTrades: 0, withFigure: 0 };
@@ -758,6 +918,22 @@ export async function scorecardBody(
     .reduce((a, m) => a + (m.realizedUsd ?? 0), 0);
   const lifetimeRealized = closedDated
     .reduce((a, r) => a + (n(r.realized_pnl_usd) ?? 0), 0);
+
+  /** C2. Over the closes and coins already built above; `nowMs` is the same clock `windows` uses. */
+  const composite = compositeWindows(
+    closedDated.map((r) => {
+      const px = n(r.avg_entry_price), supply = n(r.total_supply);
+      return {
+        closedMs: r.closedMs, openedMs: ms(r.opened_at), realizedUsd: n(r.realized_pnl_usd),
+        entryMcapUsd: px !== null && px > 0 && supply !== null && supply > 0 ? px * supply : null,
+      };
+    }),
+    byToken.map((c) => ({
+      betUsd: c.betUsd, multipleRealized: c.multipleRealized, closedMonth: c.closedMonth,
+      lastClosedMs: c.lastClosedAt === null ? null : Date.parse(c.lastClosedAt),
+    })),
+    nowMs,
+  );
 
   const windows = {
     basis: "realized profit only — closed trades, summed by closed_at. Unrealised movement " +
@@ -800,11 +976,7 @@ export async function scorecardBody(
             "windows.all.realizedUsd — `beforeWindowUsd` is exactly that difference.",
     },
     // max(captured_at) over the same rows — identical to the query this replaces, and free.
-    asOf: (() => {
-      const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
-        .filter((x): x is number => x !== null && Number.isFinite(x));
-      return times.length ? new Date(Math.max(...times)).toISOString() : null;
-    })(),
+    asOf: loadedAtIso,
     /** WHAT THIS SCORECARD WAS COMPUTED OVER, and whether that is the whole record. See docs/DECISIONS.md#d165 */
     sample: {
       returned: rows.length,
@@ -961,7 +1133,18 @@ export async function scorecardBody(
     moneyOut: { usd: exitRows.length ? round(exitRows.reduce((s, r) => s + r.amount * r.px, 0)) : null, coverage: outCov },
     returnPct: { value: basis > 0 ? Number(((closedPnl / basis) * 100).toFixed(2)) : null,
                  coverage: cov(closedPriced.length, closed.length) },
-    typicalBetUsd: bet,
+    /** C2: `perCoinUsd` is the median of `byToken[].betUsd`, the composite floor. `value` is unchanged. */
+    typicalBetUsd: { ...bet, perCoinUsd: composite.typicalBetPerCoinUsd },
+    medianWinUsd: composite.medianWinUsd,
+    medianLossUsd: composite.medianLossUsd,
+    bigWinMonths: composite.bigWinMonths,
+    recent: composite.recent,
+    career: composite.career,
+    bleeding: composite.bleeding,
+    bleedingBasis: composite.bleedingBasis,
+    /** C5: share of closed coins now priced below his weighted exit; null under 5 such coins. */
+    exitTimingScore: exitTimingScoreFrom(byToken.filter((c) => c.closed > 0)
+      .map((c) => ({ exitPrice: c.avgExitPrice, currentPrice: c.currentPriceUsd }))),
     /** THE SAME VOCABULARY, SUMMARISED FOR THE WHOLE ANSWER. See docs/DECISIONS.md#d171 */
     fieldReasons: (() => {
       const why: Record<string, string> = {};
@@ -1032,11 +1215,7 @@ export async function scorecardBody(
           window: "all recorded history",
           why: lastTradeIso === null ? "no closed positions on record" : null,
         },
-        asOf: (() => {
-          const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
-            .filter((x): x is number => x !== null && Number.isFinite(x));
-          return times.length ? new Date(Math.max(...times)).toISOString() : null;
-        })(),
+        asOf: loadedAtIso,
       };
     })(),
     holdingTime: {

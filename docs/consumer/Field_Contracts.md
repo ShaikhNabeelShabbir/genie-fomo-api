@@ -394,3 +394,23 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `byToken[].honeypotSince` | same | as `security.honeypotSince` above, on the coin the trader traded |
 | `byToken[].exitedBeforeFlag` | same | `true` when `honeypotSince` is set and the trader's `lastClosedAt` is before it; `false` when set and he closed after it or still holds; `null` when the coin was never flagged (Rug Dodger) |
 | `byToken[].coHolders` | same | distinct OTHER tracked traders with a `trades` row in the same coin on the same chain; `0` when he is alone, `null` only when the row could not be counted (Cabal Trader; linked-wallet collapsing is on `/tokens/:address.cohort`, not here) |
+
+## Added 17 Sep 2026, composite badges
+
+| Field | Route | Contract |
+|---|---|---|
+| `byToken[].exitMcapUsd`, `byToken[].betUsd` | /scorecard | the same values as `avgExitMarketCapUsd` and `costUsd`, under the badge note's names: one value, two names |
+| `byToken[].currentPriceUsd`, `byToken[].currentMcapUsd` | /scorecard | `token_info.price_usd` / `market_cap_usd` at the last token-info load; null when no row |
+| `byToken[].peakMcapSinceEntryUsd` | /scorecard | `token_price_stats.ath_usd × totalSupply`, only when `ath_at >= firstOpenedAt`. Null before hourly sampling reached the coin, or when the sampled high pre-dates his entry (someone else's run) |
+| `byToken[].multipleRealized`, `multipleCurrent`, `multiplePeak` | /scorecard | weighted exit / current price / sampled ATH, each divided by `avgEntryPrice` (4 dp). Null, never 0, when either leg is missing; `multiplePeak` follows the `peakMcapSinceEntryUsd` gate |
+| `byToken[].realizedShare` | /scorecard | exit quantity ÷ entry quantity, clamped to 0..1; null when no entry quantity is recoverable (`costQuantity` null). 0 = nothing sold |
+| `byToken[].closedMonth` | /scorecard | `YYYY-MM` of `lastClosedAt`; null when never closed |
+| `byToken[].entryHoursAfterLaunch` | /scorecard | hours from launch to `firstOpenedAt`; launch = `tokens.created_at` (chain read) when set, else GMGN's `tokenCreatedAt`; null when neither |
+| `typicalBetUsd.perCoinUsd` | /scorecard | median of `byToken[].betUsd`; the composite floor. `typicalBetUsd.value` and `.method` are unchanged (per-position median or volume-per-trade) |
+| `medianWinUsd`, `medianLossUsd` | /scorecard | median realised P&L over closed positions with a figure, winners and losers separately; `medianLossUsd` is negative; null when the side is empty |
+| `bigWinMonths` | /scorecard | distinct `closedMonth` with a coin at `multipleRealized >= 10`; null when no coin carries a multiple, 0 when some do and none reached 10x |
+| `recent` | /scorecard | `{ lastBigWinAt (last close of a coin at >= 5x), closes4w, green4w (closes in the last 28 days, and those with realised > 0), last20: { avgRealizedUsd, redShare }, entryMcapMedianUsd, holdHoursMedian, tradesPerDay, basis }`; `last20`, the medians and the pace are over the 20 most recent closes |
+| `career` | /scorecard | `{ avgRealizedUsd, entryMcapMedianUsd, holdHoursMedian, tradesPerDay, basis }` over every closed position with a close time. `tradesPerDay` here is closes per day over the closes' own span (floored at one day), not the top-level positions-per-day figure |
+| `bleeding`, `bleedingBasis` | /scorecard | true only when `career.avgRealizedUsd − recent.last20.avgRealizedUsd > typicalBetUsd.perCoinUsd` OR `recent.last20.redShare >= 0.6`; false otherwise; null with no dated close. `bleedingBasis: { floorUsd, redShareFloor: 0.6, plain }` publishes the floor |
+| `exitTimingScore` | /scorecard | share of closed coins whose `currentPriceUsd` is below `avgExitPrice`, in 0..1; null under 5 closed coins carrying both prices |
+| `perHolder[].exitTimingScore` | /tokens/:address/activity | the same score for that trader across every coin he has closed, not this coin alone; same null rule |

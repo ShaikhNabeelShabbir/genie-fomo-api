@@ -11,36 +11,43 @@ import { pnlAgg, pnlBody } from "../shared/pnl-core.ts";
 
 get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   const [t] = await sql`
-    select t.handle, t.display_handle, t.name, t.source, s.volume_usd, s.trade_count, ld.*
+    select t.handle, t.display_handle, t.name, t.source, s.volume_usd, s.trade_count, ld.*,
+           w.sol_address, w.evm_address_key
     from traders t left join trader_stats_current s using (handle) ${latestLoad()}
+    left join wallets w using (handle)
     where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const h = t.handle as string;
+  // Address keys resolved here, not in a join: `address_key = any(...)` hits the index where
+  // an OR over two wallet columns forced a BitmapOr plus a heap filter per row.
+  const addrs = [t.sol_address ? String(t.sol_address).toLowerCase() : null, t.evm_address_key]
+    .filter((a): a is string => !!a);
   /*
    * Three queries became one. The entry price, the exit P&L and the individual buys are all
    * derived from the same swap rows, so they are fetched once -- see `swapsFor`.
    */
-  const [rows, swapBy, feeBy, [seen]] = await Promise.all([
+  const [rows, swapBy, feeBy, [seen], startCapBy] = await Promise.all([
     scorecardRows([h]),
     swapsFor([h]),
     nativePrices().then((nat) => feesFor([h], nat)),
     /** T3. Swap-shaped groups in `transactions` — the denominator of `onChain.coverage`. */
-    sql`select count(*)::int as n from (
-          select x.network_id, x.tx_hash from transactions x
-          join wallets w on lower(w.sol_address) = x.address_key or w.evm_address_key = x.address_key
-          where w.handle = ${h} and x.tx_type = 'SWAP'
-          group by x.network_id, x.tx_hash) g`,
+    addrs.length
+      ? sql`select count(*)::int as n from (
+              select network_id, tx_hash from transactions
+              where address_key = any(${addrs}) and tx_type = 'SWAP'
+              group by network_id, tx_hash) g`
+      : Promise.resolve([{ n: 0 }]),
+    monthStartCapital([h]),
   ]);
   if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
 
   const swaps = swapBy.get(h) ?? [];
   const entries = chainEntriesFrom(swaps);
-  const startCap = (await monthStartCapital([h])).get(h) ?? null;
-  return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
-    entries,
-    exits: chainExitsFrom(swaps, entries),
-  }, feeBy.get(h) ?? null, buysFrom(swaps), startCap, onChainFrom(swaps, Number(seen?.n ?? 0)));
+  const exits = chainExitsFrom(swaps, entries);
+  return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }),
+    { entries, exits }, feeBy.get(h) ?? null, buysFrom(swaps), startCapBy.get(h) ?? null,
+    onChainFrom(swaps, Number(seen?.n ?? 0), exits));
 });
 
 
