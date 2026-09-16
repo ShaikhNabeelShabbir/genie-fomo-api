@@ -28,3 +28,6 @@ captures/
 worker/dist/
 # wrangler dev scratch state
 worker/.wrangler/
+
+# Claude Code agent worktrees
+.claude/

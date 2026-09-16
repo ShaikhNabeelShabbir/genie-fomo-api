@@ -366,18 +366,18 @@ document it in `PARAMETER_ROUTES.md` as the unbucketed form.
 
 | # | Ask | Owner | Status |
 |---|---|---|---|
-| 1 | V1 | | open |
-| 2 | N1 | | open |
-| 3 | Z1 | | open |
-| 4 | Z2, R5 | | open |
-| 5 | R1, R2, R3 | | open |
-| 6 | T2 | | open |
-| 7 | S1 | | open |
-| 8 | L1, K1 | | open |
-| 9 | V2 | | open |
+| 1 | V1 | agents, merged 17 Sep | on branch, not deployed |
+| 2 | N1 | agents, merged 17 Sep | on branch, not deployed |
+| 3 | Z1 | agents, merged 17 Sep | on branch, not deployed |
+| 4 | Z2, R5 | agents, merged 17 Sep | on branch, not deployed |
+| 5 | R1, R2, R3 | agents, merged 17 Sep | on branch, not deployed |
+| 6 | T2 | agents, merged 17 Sep | on branch, not deployed |
+| 7 | S1 | agents, merged 17 Sep | on branch, not deployed |
+| 8 | L1, K1 | agents, merged 17 Sep | on branch, not deployed |
+| 9 | V2 | agents, merged 17 Sep | on branch, not deployed |
 | 10 | P1 | | open |
 | 11 | T1 | | open |
-| 12 | A1, F2, F3 | | open |
-| 13 | H1 | | open |
-| 14 | W1, O1 | | open |
-| 15 | B3 | | open |
+| 12 | A1, F2, F3 | | partly: per-chain counts on branch; historyState counts and `never_read` still open |
+| 13 | H1 | agents, merged 17 Sep | on branch, not deployed |
+| 14 | W1, O1 | agents, merged 17 Sep | on branch, not deployed |
+| 15 | B3 | agents, merged 17 Sep | on branch, not deployed |

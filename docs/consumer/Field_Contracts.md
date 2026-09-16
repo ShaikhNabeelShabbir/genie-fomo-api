@@ -303,3 +303,23 @@ Errors carry a stable code	An empty-bodied 503 is indistinguishable from a netwo
 Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.ts on 15 September 2026, and cross-checked against live v10 answers for poopinyourhands and notanicecat69. Counts across the roster are from our own store of 441 tracked traders and from the service's directory of 445\. Where a figure was not measured, it is not stated.
 
 &nbsp;
+
+## Added 17 Sep 2026 (vocabulary v3, pre-migration fixes)
+
+| Field | Route | Contract |
+|---|---|---|
+| `aum.points[].refused`, `aum.gaps[].reason` | /aum | + `price_suspect` (one coin dominates and its price fails the cap or concentration check), + `no_tokens_known` (a chain the sampler had nothing to read on) |
+| `aum.chains[].reason` | /aum | + `wallet_unreadable`, `service_timeout`, `no_tokens_known`, `price_suspect` |
+| `aum.drawing.reason` | /aum | + `rebuilt_only`: usable points exist but none is sampled |
+| `aum.points[].reliability` | /aum | `low` on every `basis: rebuilt` point; absent otherwise |
+| `aum.stepChosenFrom` | /aum | `window` \| `tracked_span` \| `fallback`; null when the caller passed `step` |
+| `aum.coverage.partialReason = unpriced_positions` | /aum | may now carry `totalUsd` (served partial, figure >= `constants.partialServeFloorUsd`) |
+| `constants` | /fields | `{ pricedFloor: 0.25, partialServeFloorUsd: 100, drawableMinPoints: 2 }` |
+| `traders[].aum.liveRead` | POST /traders/aum | always `{ state: "skipped", note }`; the batch never reads live |
+| `positions[].isNative` | /positions, POST /traders/positions | true for the chain's own coin; EVM sentinel `0x0000000000000000000000000000000000000000`, Solana `11111111111111111111111111111111` |
+| `positions[].priceSuspect`, `priceSuspectReason` | /positions, POST /traders/positions | boolean; `implied_mcap_over_ceiling` \| `concentration_over_ceiling` \| null |
+| `positions[].isHoneypot`, `canSell`, `unsellableUsd`, `partial`, `partialReason` | /positions, /portfolio, POST /traders/positions | flagged value is excluded from totals into `unsellableUsd`; `partialReason: unsellable_positions` |
+| `wallets.resolvedBy.{evm,solana}`, `wallets.fingerprintMatches` | /wallets | `fomoapi` \| `gmgn` \| `submitted`; `fingerprintMatches` is always null (no count is stored) |
+| `onChain.chainsCovered` | /traders/:handle | chains present in the stored transaction feed; all-zero counts outside this list mean "not covered" |
+| `health.staleFeeds[]` | /health | + `scorecards` when any scorecard is past its own `staleAfterHours`; `dataState` is then `degraded` |
+| `health.feeds.aum.chains.{chain}` | /health | `{ accepted36h, failed24h, newestAcceptedAt }` per chain |

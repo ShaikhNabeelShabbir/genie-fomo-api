@@ -15,6 +15,8 @@ alter table aum_samples add constraint aum_samples_refused_reason_check
   check (refused_reason is null or refused_reason in
     ('wallet_unreadable','service_timeout','no_prices','price_rejected',
      'chains_unrebuildable',
+     -- One coin is most of the reading and its price is not believable (20260917100000_price_suspect.sql).
+     'price_suspect',
      -- No chain could be asked: the sampler holds no token list for any of his EVM chains
      -- and he has no Solana wallet. Unread, not empty.
      'no_tokens_known'));

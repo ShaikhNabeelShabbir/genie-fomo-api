@@ -6,7 +6,10 @@ TS2339 [ERROR]: Property 'closed' does not exist on type '{}'.
 TS2339 [ERROR]: Property 'display_handle' does not exist on type '{}'.
 TS2339 [ERROR]: Property 'id' does not exist on type '{}'.
 TS2339 [ERROR]: Property 'id' does not exist on type '{}'.
+TS2339 [ERROR]: Property 'px' does not exist on type 'number'.
 TS2339 [ERROR]: Property 'realized' does not exist on type '{}'.
+TS2339 [ERROR]: Property 'supply' does not exist on type 'number'.
+TS2339 [ERROR]: Property 'supply' does not exist on type 'number'.
 TS2345 [ERROR]: Argument of type '{} | null' is not assignable to parameter of type '{ chains: number; on_solana: boolean; on_evm: boolean; } | null'.
 TS7006 [ERROR]: Parameter 'a' implicitly has an 'any' type.
 TS7006 [ERROR]: Parameter 'a' implicitly has an 'any' type.

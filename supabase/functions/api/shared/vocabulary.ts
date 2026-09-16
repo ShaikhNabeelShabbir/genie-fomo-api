@@ -5,24 +5,20 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 2,
+  version: 3,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
     "aum.points[].tier": ["verified", "reported"],
-    "aum.points[].refused": ["too_little_priced", "nothing_answered", "chains_unrebuildable",
-                             "no_prices", "wallet_unreadable",
-                             "service_timeout", "price_rejected"],
-    "aum.gaps[].reason": ["too_little_priced", "nothing_answered", "chains_unrebuildable",
-                          "no_prices", "wallet_unreadable",
-                             "service_timeout", "price_rejected"],
+    "aum.points[].refused": ["too_little_priced", "nothing_answered", "chains_unrebuildable", "no_prices", "wallet_unreadable", "service_timeout", "price_rejected", "price_suspect", "no_tokens_known"],
+    "aum.gaps[].reason": ["too_little_priced", "nothing_answered", "chains_unrebuildable", "no_prices", "wallet_unreadable", "service_timeout", "price_rejected", "price_suspect", "no_tokens_known"],
     /* gaps[] now carries `from` and `to` as well as `at` — the span, not just the moment. */
     "aum.breaks[].reason": ["chains_changed", "method_changed", "priced_share_changed",
                             "method_and_chains_changed", "method_and_priced_share_changed",
                             "chains_and_priced_share_changed",
                             "method_and_chains_and_priced_share_changed"],
-    "aum.drawing.reason": ["too_few_points", "nothing_answered", "warming", "short_coverage"],
-    "aum.chains[].reason": ["no_prices"],
+    "aum.drawing.reason": ["too_few_points", "nothing_answered", "warming", "short_coverage", "rebuilt_only"],
+    "aum.chains[].reason": ["no_prices", "wallet_unreadable", "service_timeout", "no_tokens_known", "price_suspect"],
     /* `none` is a chain we know he uses and hold no balance history for at all. */
     "aum.knownChains[].historyState": ["ready", "warming", "none"],
     "aum.sampler.state": ["current", "stale", "warming"],
@@ -32,6 +28,13 @@ export const VOCABULARY = {
     /* What this request did about freshness before answering. See the /aum route. */
     "aum.liveRead.state": ["fetched", "still_running", "not_needed", "skipped",
                            "unavailable"],
+    /* 17 Sep 2026, v3: the words added by the pre-migration fixes (docs/TO-DO-BEFORE-MIGRATION.md). */
+    "aum.stepChosenFrom": ["window", "tracked_span", "fallback"],
+    "aum.points[].reliability": ["low"],
+    "positions.partialReason": ["unsellable_positions", "unpriced_positions"],
+    "positions[].priceSuspectReason": ["implied_mcap_over_ceiling", "concentration_over_ceiling"],
+    "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
+    "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards"],
     "wallets.walletState": ["on_record", "unresolved_upstream"],
     "traders.delisted.reason": ["absent_from_source"],
     "aum.comparability.reason": ["coverage_differs_by_method"],
