@@ -44,9 +44,10 @@ export async function knownChainsFor(handles: string[]): Promise<Map<string, Kno
     with hs as (
       select handle, network_id, count(*) filter (where human_amount > 0) as pos
       from holdings_current where handle = any(${handles}) group by 1, 2),
+    /* Only chain rows that answered with a figure: the sampler's definition of a known chain (aum-sample/index.ts). */
     ah as (
-      select handle, network_id, count(*) filter (where total_usd is not null) as pts
-      from aum_chain_samples where handle = any(${handles}) group by 1, 2),
+      select handle, network_id, count(*) as pts
+      from aum_chain_samples where handle = any(${handles}) and total_usd is not null group by 1, 2),
     pr as (
       select handle, network_id from wallet_chain_presence where handle = any(${handles})),
     seen as (
