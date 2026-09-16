@@ -258,6 +258,33 @@ that trader, so the next URL never has to be guessed. It also separates `reporte
 (the leaderboard's own figures) from `stored` (what we actually hold), which is the same
 Reported-vs-Verified split that runs through the rest of this document.
 
+### `/fields` — the published vocabulary, and the constants the rules apply
+
+```bash
+curl -s "$B/fields" | jq '{version, closed, constants}'
+curl -s "$B/fields" | jq '.fields["aum.points[].refused"]'
+```
+
+```json
+{ "version": 4, "closed": true,
+  "constants": { "pricedFloor": 0.25, "partialServeFloorUsd": 100, "drawableMinPoints": 2 } }
+```
+
+**`fields` is every word any route can emit, and `version` moves when a word is added.** The
+consumer's build fails on a word it has no sentence for, so a word is published here before
+any route says it. Version 4 (17 Sep 2026) added the words the pre-migration fixes emit:
+`price_suspect`, `no_tokens_known`, `rebuilt_only`, `never_read`, `closed_by_balance`,
+`indexer_coverage_low`, `unsellable_positions`, and the `stepChosenFrom`, `reliability`,
+`resolvedBy`, `loadOutcome`, `nextLoadBasis` and `openPositionsBasis` lists.
+
+**`constants` is the thresholds, so a refusal can be explained without reading this file.**
+
+| `constants.*` | Used by |
+| --- | --- |
+| `pricedFloor` (0.25) | the count share of priced positions below which an `/aum` reading is partial or refused — §9 |
+| `partialServeFloorUsd` (100) | a reading under the floor is **served** `partial` at or above this figure, refused `too_little_priced` below it |
+| `drawableMinPoints` (2) | dated figures an `/aum` series needs before `drawing.drawable` is true |
+
 ---
 
 ## 0a. Errors — telling apart "stop", "back off" and "retry"
@@ -529,6 +556,23 @@ registered without an address on record.
 **Rename-safe.** `handleChangedAt` carries the moment a display handle last changed, so a
 consumer following a name can notice it moved.
 
+**`resolvedBy` says how each address was found; `fingerprintMatches` says no count is stored.**
+
+```bash
+curl -s "$B/traders/unipcs/wallets" | jq '{resolvedBy, fingerprintMatches}'
+# { "resolvedBy": { "evm": "fomoapi", "solana": "fomoapi" }, "fingerprintMatches": null }
+```
+
+| `resolvedBy.{evm,solana}` | The address came from |
+| --- | --- |
+| `fomoapi` | the fomoapi.io directory, as the trader's listed wallet |
+| `gmgn` | the GMGN directory |
+| `submitted` | `POST /traders/:handle/wallets` |
+| `null` | no address of that family on record |
+
+`fingerprintMatches` is always `null`: the service does not store a fingerprint count, and a
+number invented here would read as one. It is on the response so the absence is explicit.
+
 ---
 
 ## 0f. How old is this answer
@@ -597,6 +641,7 @@ curl -s "$B/traders/unipcs/aum?window=1w" | jq '{status, asOf, now: .now.ageSeco
 | `current` | **this trader's own** newest reading is inside `staleAfterHours` |
 | `stale` | past that allowance. The points are still true, they are simply old, and `reason` says how old |
 | `warming` | no measured reading yet for this trader |
+| `never_read` | the sampler has never covered this trader at all — no reading row, accepted or refused. `status` is `no_reading`; `reason` says so |
 
 **The state is the trader's, not the pipeline's.** It used to be computed from the newest
 successful run anywhere in the table — so on a night the sampler ran for most of the directory,
@@ -654,14 +699,25 @@ never run has a different cause and a different fix.
 
 **`staleFeeds` names them**, and `dataState` is `current` or `degraded`.
 
+**A feed is stale when its clock is old *or* any trader is past that feed's own allowance.**
+The `trades` clock moves whenever anyone loads, so sixteen traders sat 221 hours old under
+`dataState: current`. `staleFeeds` now carries `scorecards` whenever `staleTraders.scorecardStale`
+is above zero, and `dataState` reads `degraded` while it does.
+
 **`staleTraders` counts the traders themselves, which no feed clock can express.**
 
 ```json
 { "readingStale": 14, "readingStaleAfterHours": 36, "noReading": 14,
   "oldestReadingHours": 177,
-  "scorecardStale": 175, "scorecardStaleAfterHours": 72, "oldestScorecardHours": 189,
+  "scorecardStale": 175, "scorecardStaleAfterHours": 72, "scorecardLoadFailed": 9,
+  "oldestScorecardHours": 189,
   "of": 448 }
 ```
+
+**`noReading` counts traders with no *accepted* reading.** A refused reading is not a reading
+here; a trader whose every row is refused is counted as having none. **`scorecardLoadFailed`**
+is, of the stale, how many the loader last asked fomoapi about and did not get back — the same
+`loadOutcome` each scorecard carries (§1), counted.
 
 A feed reports when its job last wrote *anything*. A trader the job did not reach keeps his old
 figures and moves no feed — so `feeds` can read `current` across the board, `dataState` can say
@@ -673,9 +729,29 @@ a reload has stopped landing, without hand-checking traders one at a time.
 check it for that. Whether the *data* is still arriving is the separate question `dataState`
 answers.
 
-**`aum` reports two moments.** `newestReadingAt` is the newest reading's own timestamp;
-`lastSuccessAt` is when the sampler last wrote one. They differ, and the second is the one that
-says the job ran.
+**`aum` reports three moments, and its `state` follows the first.** `lastRefreshAt` is the
+newest **accepted** reading, and `state` is judged on it; `newestReadingAt` is the newest
+reading's own timestamp, accepted or not; `samplerLastRunAt` is when the sampler last wrote
+anything. A sampler that runs every five minutes and refuses everything it reads moves only the
+third, so the feed reads `stale` rather than `current`.
+
+**`aum` also counts coverage per chain**, so "BSC stopped answering on the 14th" is visible
+without a sweep:
+
+```bash
+curl -s "$B/health" | jq '.feeds.aum | {historyState, chains}'
+```
+
+```json
+{ "historyState": { "ready": 610, "warming": 41, "none": 120 },
+  "chains": {
+    "bsc": { "accepted36h": 176, "failed24h": 12, "newestAcceptedAt": "…",
+             "historyState": { "ready": 181, "warming": 9, "none": 56 } } } }
+```
+
+`historyState` is `knownChains[].historyState` (§9) summed over every trader-chain, at the
+top for the whole roster and inside each chain. `accepted36h` is chain rows carrying a figure;
+`failed24h` is chain rows carrying a reason.
 
 **`traders` is the directory build.** It used to be filled from the trade loader's clock — two
 different jobs under one name — so a five-day-old trade load read as a five-day-old directory
@@ -710,6 +786,38 @@ curl -s "$B/traders/unipcs/scorecard" | jq -r '.plain'
 across a sign change and describe nothing. It is emitted only when mean and median are both
 positive; both dollar figures are always returned regardless.
 
+**`openPositions` counts trade records; `openPositionsHeld` counts the ones the wallet still
+holds.** The two used to be one number, and it was ten times the `/positions` list for 104
+traders: fomo calls a trade open until it sees a sell, and a coin that left by transfer never
+gets one. Both are on `/pnl` and on `?include=pnl`, with `openPositionsBasis` naming each:
+
+```bash
+curl -s "$B/traders/unipcs/pnl" | jq '{openPositions, openPositionsHeld, openPositionsBasis}'
+# { "openPositions": 320, "openPositionsHeld": 97,
+#   "openPositionsBasis": { "openPositions": "trade_records",
+#                           "openPositionsHeld": "trade_records_still_held_on_chain" } }
+```
+
+A trade whose token a chain read no longer holds is stored as `status: closed_by_balance`. It
+is never counted as open and never as a realised close — there was no sell to value — so
+`closedTrades`, `winRate` and the realised figures do not move when it is marked.
+
+**The scorecard says when the loader last *tried*, not only when it last succeeded.** A trader
+whose fomoapi fetch fails was reselected every night and never written, so `loadedAt` aged for
+nine days with nothing on the response to say the loader had been asking:
+
+```bash
+curl -s "$B/traders/smokey0x/scorecard" | jq '.sample | {loadedAt, loadAttemptedAt, loadOutcome, nextLoadAt, nextLoadBasis}'
+```
+
+| field | |
+| --- | --- |
+| `loadAttemptedAt` | the last fomoapi fetch for this trader, whatever it returned; `null` when never attempted |
+| `loadOutcome` | `loaded` · `unavailable` · `degraded` · `not_found` · `error` — what that fetch came back with |
+| `nextLoadBasis` | `nightly_slot`: `nextLoadAt` is the next 06:00 UTC run, not a per-trader schedule. A 6-hourly retry pass also picks up traders past their own `staleAfterHours` |
+
+`staleTraders.scorecardLoadFailed` on `/health` is the roster-wide count of the same thing.
+
 ---
 
 ## 2. Trader — positions
@@ -723,7 +831,8 @@ positive; both dollar figures are always returned regardless.
 | **T15** | "How many open, how many closed?" | `GET $B/traders/unipcs/pnl` | `openPositions`, `closedTrades` | **320 open, 43 closed** |
 
 T11 and T13 ship together by rule. "Holds 97 coins" reads as diversified until you see that
-98.7% of the money is in one of them.
+98.7% of the money is in one of them. T15's `openPositions` is trade records, not holdings;
+`openPositionsHeld` beside it is the count that matches T11 (§1).
 
 ### Paging the asset list
 
@@ -758,8 +867,15 @@ curl -s "$B/traders/unipcs/portfolio" | jq '.byChain[] | {chain, valueUsd, nativ
 **`nativeAmount` is `valueUsd / nativeUsd` and nothing more**, so the two always agree. The
 rate and its source travel with it so the division can be rechecked.
 
-**Three of five chains answer `null`, and `whyNoNative` says why.** The rate has to be a
-*market* price. Most of what we hold for a wrapped native is `fomo_reported_entry` — the price
+**The chain's own coin is a position, and is priced.** Since 17 Sep the sampler reads
+`eth_getBalance` beside `balanceOf`, so ETH and BNB appear on `entries[]` and on the batch
+rows with `isNative: true`, under the sentinel address `0x0000000000000000000000000000000000000000`
+(Solana's SOL under `11111111111111111111111111111111`), priced from the same Binance pairs
+as the wrapped coin. Before that only SOL was read, and $241K of ETH across the roster was
+counted nowhere.
+
+**A chain with no market price for its coin answers `null`, and `whyNoNative` says why.** The
+rate has to be a *market* price. Most of what we hold for a wrapped native is `fomo_reported_entry` — the price
 a trader reported paying, not what the coin is worth now — and some rows carry a price with no
 source at all. Neither can be stood behind: one chain's WETH rows range $1,885 to $2,931. A
 portfolio converted at a number nobody can defend is a worse answer than no number.
@@ -831,10 +947,39 @@ curl -s "$B/traders/frankdegods/positions?limit=1" \
 | `priceSource` | `pegged_usd` · `gmgn_token_info` · `token_prices_daily` · `fomo_reported_entry` · `wallet_swap_derived` |
 | `pricedAt` | when that price was true — a reported entry price can be older than a live quote, and says so |
 | `whyNoPrice` | present instead of a bare `null` when a holding cannot be valued |
+| `isNative` | `true` for the chain's own coin (ETH, BNB, SOL), read from the wallet balance rather than a token contract |
+| `priceSuspect` | `true` when the price fails a sanity check; the row is listed but its value stays out of `totalValueUsd` |
+| `priceSuspectReason` | `implied_mcap_over_ceiling` (price × total supply over $20B) · `concentration_over_ceiling` (one row over 90% of a total over $1B, or its supply unknown) · `null` |
+| `isHoneypot` | GMGN's verdict on the coin, `null` where the chain is not assessed (§5a) |
+| `canSell` | `false` when GMGN says the coin cannot be sold; `null` when never judged |
 
 **A coin we cannot price is counted, never zeroed.** It appears in `positions` and in
 `coverage.unpricedPositions`, and stays out of `totalValueUsd` — so the count of what someone
 holds and the value of what we could measure are two separate, honest numbers.
+
+**A coin that cannot be sold is counted, and valued, but not summed.** A confirmed honeypot
+was counted at $58,631 on one trader's `/portfolio` while `/tokens` said `canSell: false`.
+The flags now ride on the row, its priced value goes into `unsellableUsd` instead of
+`totalValueUsd`, and the answer is marked `partial: true, partialReason: unsellable_positions`
+on `/portfolio`, `/positions` and `POST /traders/positions` alike:
+
+```bash
+curl -s "$B/traders/Lasercat397/positions" | jq '{totalValueUsd, unsellableUsd, partial, partialReason}'
+```
+
+**`coverage.chains` says how much of a wallet's history the indexer has actually seen.** One
+`eth_getTransactionCount` per sampled EVM chain gives the wallet's own transaction count; the
+rows the indexer holds for it are counted beside it:
+
+```bash
+curl -s "$B/traders/gmgn_0xf1d07077/positions" | jq '.coverage.chains'
+# { "bsc": { "chainTxCount": 1412, "rowsHeld": 63, "share": 0.0446, "readAt": "…" } }
+```
+
+`share` is `rowsHeld / chainTxCount`, `null` when either side is unknown. Any chain under 0.5
+marks the list `partialReason: indexer_coverage_low`; with an unsellable coin as well the word
+is `unsellable_positions_and_indexer_coverage_low`. On the batch route it is on
+`contractVersion: 2` rows.
 
 **Verified against the chain.** The example above reads 2,389,557.26 USDC; a direct
 `getTokenAccountsByOwner` call on the same wallet returns 2,389,565.66 — the two agree to
@@ -1286,7 +1431,8 @@ curl -s "$B/traders/unipcs" | jq '{fomo: .reported, ours: .onChain}'
 
 ```json
 {
-  "transactions": 33359,  "transfers": 33863,
+  "transactions": 33359,  "chainsCovered": ["solana"],
+  "transfers": 33863,
   "inbound": 33244,       "outbound": 619,
   "swaps": 14138,         "tokensTouched": 726,
   "activeDays": 58,
@@ -1298,6 +1444,11 @@ curl -s "$B/traders/unipcs" | jq '{fomo: .reported, ours: .onChain}'
 ```
 
 ### What to know before you use it
+
+**`chainsCovered` says which chains the counts are counted over.** The transfer feed is
+almost entirely Solana, so an Ethereum-only trader answered all zeros here while his chain
+was being read for balances — and zeros read as "inactive". A chain absent from
+`chainsCovered` is one this block does not see; the zeros beside it say nothing about him.
 
 **`tier: "verified"` is the point of this block.** Everywhere else in the API, a trading
 number carries `tier: "reported"` — meaning fomo said so. These are counted from transfers we
@@ -2140,6 +2291,18 @@ coarsen the whole series.
 **A caller who names a `step` gets it in both places.** They asked; the answer does not argue.
 `observedStepMs` still reports what the data does.
 
+**`stepChosenFrom` says what the default was chosen from.** The rule used to look at the
+window alone, so a trader tracked for six days asked for a month, got `1d`, and drew one point
+with `too_few_points` while `1w` drew three. The chooser now takes the shorter of the window
+and `now − trackedSince`:
+
+| `stepChosenFrom` | |
+| --- | --- |
+| `window` | the requested span decided |
+| `tracked_span` | the record is shorter than the window, and the record decided |
+| `fallback` | daily bucketing left fewer than two usable points, so the finest step that gives two was taken |
+| `null` | the caller passed `step` |
+
 **`stepUnderstated` is true when the label cannot tell the truth.** `step` is an enum — `1h`,
 `6h`, `1d` — so a consumer can switch on it. A one-day window over readings three and a half
 days apart has no honest value in that set: `1d` is the coarsest name available and it still
@@ -2277,7 +2440,7 @@ thousand unpriced coins. `partialReason` names which:
 | `partialReason` | |
 | --- | --- |
 | `chains_missing` | a chain this trader uses did not answer |
-| `unpriced_positions` | every chain answered, but not every position could be priced |
+| `unpriced_positions` | every chain answered, but not every position could be priced. Since 17 Sep this also covers a reading under `pricedFloor` whose figure is at least `partialServeFloorUsd` — it is **served** with its `totalUsd`, marked partial, rather than refused |
 | `chains_missing_and_unpriced_positions` | both |
 
 **A zero that nothing answered for is not a zero.** A trader whose wallets all answered and held
@@ -2387,7 +2550,14 @@ or from missing data, so it makes the call rather than leaving each consumer to 
 | `too_few_points` | fewer than two comparable numeric points |
 | `short_coverage` | enough points, but not across the requested window |
 | `too_little_priced` | the newest point priced too small a share of the wallet to be a balance — see below |
-| `wallet_unreadable` · `service_timeout` · `no_prices` · `price_rejected` | the newest point's own refusal |
+| `rebuilt_only` | enough points, but every one is `basis: rebuilt`; a line needs sampled points |
+| `wallet_unreadable` · `service_timeout` · `no_prices` · `price_rejected` · `price_suspect` · `no_tokens_known` | the newest point's own refusal |
+
+**Rebuilt points carry `reliability: "low"`, and never make a series drawable on their own.**
+A rebuilt point prices a median 1.7% of the wallet (see below); drawing a line through
+rebuilt points alone showed coins the wallet no longer held. `drawableMinPoints` (2, published
+in `/fields`) is met by **sampled** points only; a rebuilt point has `reliability: "low"` and a
+sampled one carries no `reliability` key at all.
 
 **`gaps[]` lists every bucket with no number, and its reason.** Nothing is interpolated — a
 chart breaks its line at each gap rather than drawing through it, because joining two points
@@ -2470,6 +2640,26 @@ curl -s "$B/traders/unipcs/aum?window=1m" | jq '[.points[] | select(.refused == 
 
 Of the 134 that remain, about half have **both** sides pricing over 50% of the wallet — those
 are most likely real moves, and marking them would be a false alarm rather than a fix.
+
+**The floor is a count share, it is published, and a large figure under it is served.** The
+rule counts positions, not value, so a wallet with hundreds of dust mints and a few valuable
+ones was refused for its whole life — one trader had 0 of 32 readings accepted with a $221K
+partial beside each, while `/positions` valued him at $26K. Since 17 Sep:
+
+- the floor is `constants.pricedFloor` on `/fields` (0.25), and the second threshold is
+  `constants.partialServeFloorUsd` ($100);
+- a reading under the floor whose figure is at least $100 is served: `totalUsd` stands,
+  `partial: true`, `partialReason: unpriced_positions`, `pricedPositionShare` beside it;
+- only a reading that is both thin and small is refused `too_little_priced`, keeping
+  `partialUsd` as before.
+
+The floor is applied at read time, so every reading ever refused by it was re-classified at
+once; nothing was re-priced, and there is nothing to retry (their R3). To see every reading
+including a same-day retry, ask `?step=1h`.
+
+```bash
+curl -s "$B/traders/gmgn_hzyjnkimyy/aum?window=all&live=false" | jq '[.points[] | select(.partialReason == "unpriced_positions")] | length'
+```
 
 **The threshold is one constant**, chosen against the measured trade:
 
@@ -2557,9 +2747,34 @@ rather than a straight line through it.
 
 **`totalUsd` is `null`, never a smaller number, when a wallet could not be read** — with
 `refused` naming which wall was hit (`wallet_unreadable`, `service_timeout`, `no_prices`,
-`price_rejected`). A partial total would read exactly like a real drawdown.
+`price_rejected`, `price_suspect`, `no_tokens_known`). A partial total would read exactly like
+a real drawdown. The same words appear as `chains[].reason` on the chain that hit the wall,
+and as `gaps[].reason`.
 
-**A trader whose wallets all answered and held nothing is `0`.** That zero is a measurement.
+**`price_suspect` is a reading one impossible price would have dominated.** A verified
+$101 billion was served for a wallet holding one coin at $8,923 a unit — an implied market
+cap of $8.9 trillion. A price is now refused when `price × total supply` exceeds $20B, and a
+reading is refused `price_suspect` when a single position is over 90% of the total and either
+its implied cap is unknown or the total exceeds $1B. The refused reading keeps its partial
+figure and is never `tier: verified`; the row on `/positions` carries `priceSuspect: true`
+with the reason (§2).
+
+**`no_tokens_known` is a chain the sampler had nothing to read on.** EVM chains are read over
+the tokens the trader has traded there; a chain with an empty token set and no native balance
+to read is unread, not "answered with zero". It is `totalUsd: null` with this reason, and it
+does not count in `chainsAnswered`.
+
+**A trader whose wallets all answered and held nothing is `0`.** That zero is a measurement,
+and it is written only when at least one chain was actually queried and every answer was
+empty. A priced sum under a cent is still a figure, published as `0.00` with
+`pricedPositions ≥ 1`, never rounded away in storage.
+
+**A chain that fails does not cost the others.** One unreadable wallet used to refuse the whole
+trader-hour; each chain is now read on its own, the chains that answered are written, the
+ones that did not carry a `reason`, and a reading that answered fewer chains than
+`knownChains` lists is `partial: true, partialReason: chains_missing`, with `chains[]` naming
+which ones answered. A reading that answered no chain is `null`, always. A chain refused
+`wallet_unreadable` is retried once at the end of the slice.
 
 **The series deepens on its own.** `trackedSince` marks where sampling began and `count`
 says how many points came back, so a consumer renders whatever exists rather than waiting
@@ -2776,6 +2991,19 @@ Without it, a screen of fifty traders on one chain was fifty calls. It is now on
 
 **`requested` is the value you sent; `id` is canonical.** Join on either. A handle can change
 between your request and the answer — `requested` cannot, so a row is never ambiguous.
+
+**The batch never reads live, and every row says so.** `live` — `?live=` on the URL or
+`live` in the body — is accepted and ignored on `POST /traders/aum`; the route only ever
+serves stored readings, so a batch of fifty cannot trigger fifty chain reads. Each row's
+`aum.liveRead` is the constant `{ "state": "skipped", "note": "batch never reads live; use GET /v1/traders/:handle/aum" }`
+(on `contractVersion: 2` under `aum`, on the older shape on the row). A consumer that needs a
+fresh read asks the single-trader route with `?live=true`.
+
+```bash
+curl -s -X POST "$B/traders/aum?live=true" -H 'content-type: application/json' \
+  -d '{"contractVersion":2,"ids":["unipcs"],"window":"1w","live":true}' | jq '.traders[0].aum.liveRead'
+# { "state": "skipped", "note": "batch never reads live; use GET /v1/traders/:handle/aum" }
+```
 
 **`row.aum` is the individual response, not a summary of it.** Both are produced by the same
 function from the same rows, so they cannot drift. Verified on all four windows: identical
