@@ -26,6 +26,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import pg from "pg";
+import { value } from "./lib/value.mjs";
 import { rpc, word, scale } from "./lib/chain_reads.mjs";
 
 const DB = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
@@ -59,20 +60,10 @@ const CHAINS = {
 };
 
 const BAL = "0x70a08231";
-const MAX_PRICE_PER_TOKEN = 1_000_000;
-const MAX_POSITION_USD    = 1_000_000_000_000;
 const PRICE_GAP_DAYS = 7;
 
 const pool = new pg.Pool({ connectionString: DB, ssl: { rejectUnauthorized: false }, max: 3 });
 const hex = (n) => "0x" + BigInt(n).toString(16);
-
-function value(amount, price) {
-  if (price === null || !Number.isFinite(price) || price <= 0) return {};
-  if (price > MAX_PRICE_PER_TOKEN) return { rejected: true };
-  const usd = amount * price;
-  if (!Number.isFinite(usd) || usd > MAX_POSITION_USD) return { rejected: true };
-  return { usd };
-}
 
 /** Block timestamps are pure facts about the chain; once known they are cached forever. */
 let tsCache = {};
