@@ -77,13 +77,15 @@ function buildAum(
   const span = AUM_WINDOWS[windowKey];
   const from = span === null ? null : new Date(to.getTime() - span);
 
-  rows = rows.map(applyFloor);
+  /** `at` is parsed once per row; every pass below reads `atMs`, never the string again. */
+  rows = rows.map((r) => ({ ...applyFloor(r), at_ms: Date.parse(String(r.at)) }));
+  const atMs = (r: Record<string, unknown>): number => r.at_ms as number;
 
   /** THE READING JUST BEFORE THE WINDOW IS KEPT, as an anchor. See docs/DECISIONS.md#d018 */
-  const inWindow = from === null ? rows : rows.filter((r) => Date.parse(String(r.at)) >= from.getTime());
+  const inWindow = from === null ? rows : rows.filter((r) => atMs(r) >= from.getTime());
   const before = from === null
     ? []
-    : rows.filter((r) => Date.parse(String(r.at)) < from.getTime());
+    : rows.filter((r) => atMs(r) < from.getTime());
 
   /** Reach back far enough for a LINE, not just for one point. See docs/DECISIONS.md#d019 */
   /** BORROWED POINTS MUST SHARE THE NEWEST POINT'S BASIS. See docs/DECISIONS.md#d020 */
@@ -108,12 +110,12 @@ function buildAum(
     if (hasFigure(comparable[i])) have++;
   }
   const windowed = [...anchors, ...inWindow];
-  const anchorAts = new Set(anchors.map((r) => new Date(String(r.at)).toISOString()));
+  const anchorAts = new Set(anchors.map(atMs));
 
   /** THE DEFAULT STEP IS THE COARSER OF WHAT THE WINDOW AFFORDS AND WHAT THE DATA HOLDS. See docs/DECISIONS.md#d021 */
   const rawGaps: number[] = [];
   for (let i = 1; i < windowed.length; i++) {
-    const g = Date.parse(String(windowed[i].at)) - Date.parse(String(windowed[i - 1].at));
+    const g = atMs(windowed[i]) - atMs(windowed[i - 1]);
     if (Number.isFinite(g) && g > 0) rawGaps.push(g);
   }
   rawGaps.sort((a, b) => a - b);
@@ -143,7 +145,7 @@ function buildAum(
   const thin = (bucketMs: number): Record<string, unknown>[] => {
     const kept = new Map<number, Record<string, unknown>>();
     for (const r of windowed) {
-      const ms = Date.parse(String(r.at));
+      const ms = atMs(r);
       if (!Number.isFinite(ms)) continue;
       kept.set(Math.floor(ms / bucketMs), r);
     }
@@ -161,7 +163,7 @@ function buildAum(
     }
   }
   const points = thinned.map((r) => ({
-    at: new Date(String(r.at)).toISOString(),
+    at: new Date(atMs(r)).toISOString(),
     totalUsd: round(n(r.total_usd)),
     /** THE FIGURE BEHIND A REFUSAL. See docs/DECISIONS.md#d023 */
     partialUsd: round(n((r as { partial_usd?: unknown }).partial_usd)),
@@ -209,7 +211,7 @@ function buildAum(
     },
     ...(r.refused_reason ? { refused: r.refused_reason as string } : {}),
     /** True for a real dated reading borrowed from just before the requested window. */
-    ...(anchorAts.has(new Date(String(r.at)).toISOString()) ? { outsideWindow: true } : {}),
+    ...(anchorAts.has(atMs(r)) ? { outsideWindow: true } : {}),
   }));
 
   /** ===================== THE SEAM BETWEEN TWO KINDS OF POINT ===================== Section 9… See docs/DECISIONS.md#d026 */
@@ -242,7 +244,7 @@ function buildAum(
   const valuedRowByKey = new Map<string, Record<string, unknown>>();
   for (const r of rows) {
     valuedRowByKey.set(
-      `${new Date(String(r.at)).toISOString()}|${r.basis}`, r);
+      `${new Date(atMs(r)).toISOString()}|${r.basis}`, r);
   }
   /** A THIRD REASON, AND IT IS THE COMMONEST ONE. See docs/DECISIONS.md#d027 */
   const SHARE_RATIO = 2;
@@ -319,19 +321,19 @@ function buildAum(
   let newest: Record<string, unknown> | null = null;
   if (withFigure.length) {
     /** RECENT FIRST, THEN COMPLETE. See docs/DECISIONS.md#d029 */
-    const freshest = Date.parse(String(withFigure[withFigure.length - 1].at));
-    const recent = withFigure.filter((r) => freshest - Date.parse(String(r.at)) <= RECENT_MS);
+    const freshest = atMs(withFigure[withFigure.length - 1]);
+    const recent = withFigure.filter((r) => freshest - atMs(r) <= RECENT_MS);
     const pool = recent.length ? recent : [withFigure[withFigure.length - 1]];
 
     const score = (r: Record<string, unknown>): [number, number, number] => [
       cover(r),
       r.basis === "sampled" ? 1 : 0,
-      Date.parse(String(r.at)),
+      atMs(r),
     ];
-    let best = pool[0];
+    let best = pool[0], b = score(best);
     for (const r of pool) {
-      const a = score(r), b = score(best);
-      if (a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])))) best = r;
+      const a = score(r);
+      if (a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])))) { best = r; b = a; }
     }
     newest = best;
   } else if (rows.length) {
