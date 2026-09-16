@@ -442,7 +442,7 @@ export async function scorecardBody(
       exitMethod: x.method,
       /** The pre-ISSUE-4 value, kept so anyone reading the old field can reconcile. */
       firstEntryPrice: px(e.first),
-      /** When the token itself was created, and how old it was when this trader first opened a posi See docs/DECISIONS.md#d150 */
+      /** When the token itself was created, and how old it was when this trader first opened a posi… See docs/DECISIONS.md#d150 */
       tokenCreatedAt: tokenCreatedUnix !== null
         ? new Date(tokenCreatedUnix * 1000).toISOString()
         : null,
@@ -461,7 +461,7 @@ export async function scorecardBody(
         x.value !== null && r.totalSupply !== null && r.totalSupply > 0
           ? Number((x.value * r.totalSupply).toPrecision(10))
           : null,
-      /** DOLLARS IN AND DOLLARS OUT on this coin, which is what "how much a bet" and the profit ban See docs/DECISIONS.md#d153 */
+      /** DOLLARS IN AND DOLLARS OUT on this coin, which is what "how much a bet" and the profit ban… See docs/DECISIONS.md#d153 */
       costUsd: e.legsWeighted > 0 ? round(e.sum) : null,
       proceedsUsd: x.legsWeighted > 0 ? round(x.sum) : null,
       /** The quantity each sum was taken over, so the division can be rechecked. */

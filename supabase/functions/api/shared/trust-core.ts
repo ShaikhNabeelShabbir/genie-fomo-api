@@ -33,7 +33,7 @@ export const BLACKLIST_CHECK = {
        "An absent blacklist flag means NOT CHECKED — never 'checked and clear'.",
 };
 
-/** `asOf` is the board-wide fallback, used only for a trader with no holdings row at all — `t See docs/DECISIONS.md#d183 */
+/** `asOf` is the board-wide fallback, used only for a trader with no holdings row at all — `t… See docs/DECISIONS.md#d183 */
 // deno-lint-ignore no-explicit-any
 export function trustBody(t: any, h: any | undefined, asOf: string | null) {
   const pnl = n(t.pnl_usd), volume = n(t.volume_usd), trades = n(t.trade_count);

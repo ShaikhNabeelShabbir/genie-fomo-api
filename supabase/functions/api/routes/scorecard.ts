@@ -48,7 +48,7 @@ const chainPnl = (addrs: string[]) => sql`
          max(block_time)                                           as last_at
   from wallet_swaps where address_key = any(${addrs})`;
 
-/** Positions the wallet opened AND fully closed on chain — where the token quantity nets to a See docs/DECISIONS.md#d079 */
+/** Positions the wallet opened AND fully closed on chain — where the token quantity nets to a… See docs/DECISIONS.md#d079 */
 const chainRoundTrips = (addrs: string[]) => sql`
   select count(*)::int                          as closed_positions,
          coalesce(sum(net_usd), 0)              as realized_usd,

@@ -19,7 +19,7 @@ get("/v1/health", async () => {
   const [b] = await sql`
     select captured_at, window_label from builds order by captured_at desc limit 1`;
 
-  /** Freshness per feed, so "the service is degraded" is distinguishable from "there is nothing See docs/DECISIONS.md#d065 */
+  /** Freshness per feed, so "the service is degraded" is distinguishable from "there is nothing… See docs/DECISIONS.md#d065 */
   const [f] = await sql`
     select (select max(captured_at) from trades)                         as trades_at,
            (select max(captured_at) from holdings)                       as holdings_at,

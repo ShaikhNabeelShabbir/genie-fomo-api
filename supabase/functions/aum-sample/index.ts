@@ -2,6 +2,7 @@ import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
 import {
   SOLANA_NETWORK_ID, solanaBalances, evmBalances,
 } from "../_shared/chain_reads.ts";
+import { value } from "./value.ts";
 
 /** AUM sampler, as a Supabase Edge Function. See docs/DECISIONS.md#d188 */
 
@@ -22,10 +23,6 @@ const SECRET = (Deno.env.get("AUM_SAMPLE_SECRET") ?? "").trim();
  */
 const sql = postgres(url, { max: 1, idle_timeout: 20, connect_timeout: 15, prepare: false, ssl: "require" });
 
-/** Price ceilings, applied BEFORE any multiplication. Identical to the Node job. */
-const MAX_PRICE_PER_TOKEN = 1_000_000;
-/** MAX_POSITION_USD WAS $1 TRILLION, WHICH CAUGHT NOTHING. See docs/DECISIONS.md#d189 */
-const MAX_POSITION_USD = 1_000_000_000;
 
 /**
  * How long one invocation may spend reading chains before it stops and reports.
@@ -41,14 +38,6 @@ const MAX_SLICE = 25;
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body, null, 2), { status, headers: { "Content-Type": "application/json" } });
 
-/** Value one position, or refuse it. See docs/DECISIONS.md#d190 */
-function value(amount: number, price: number | null): { usd?: number; rejected?: boolean } {
-  if (price === null || !Number.isFinite(price) || price <= 0) return {};
-  if (price > MAX_PRICE_PER_TOKEN) return { rejected: true };
-  const usd = amount * price;
-  if (!Number.isFinite(usd) || usd > MAX_POSITION_USD) return { rejected: true };
-  return { usd };
-}
 
 type Position = { network_id: number; token_key: string; address: string; amount: number };
 

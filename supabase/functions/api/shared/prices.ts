@@ -2,7 +2,7 @@ import { sql, n } from "../db.ts";
 
 // ------------------------------------------------------------- T11/T13/T14
 
-/** Each chain's own coin, and what one of them costs — so a chain's dollars can also be said See docs/DECISIONS.md#d137 */
+/** Each chain's own coin, and what one of them costs — so a chain's dollars can also be said… See docs/DECISIONS.md#d137 */
 export type NativePrice = { symbol: string; usd: number | null; source: string | null };
 export let nativeCache: { at: number; by: Map<number, NativePrice> } | null = null;
 

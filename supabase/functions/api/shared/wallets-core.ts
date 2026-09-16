@@ -31,7 +31,7 @@ export function walletsBody(t: any, knownChains: KnownChain[] | null = null) {
     solanaAddress: ok(t.sol_address as string) ? t.sol_address : null,
     evmAddress: ok(t.evm_address as string) ? t.evm_address : null,
     source: t.evm_source ?? t.sol_source ?? null,
-    /** WHY THIS TRADER HAS NO ADDRESS — the difference between "we never looked" and "the source See docs/DECISIONS.md#d186 */
+    /** WHY THIS TRADER HAS NO ADDRESS — the difference between "we never looked" and "the source… See docs/DECISIONS.md#d186 */
     walletState: (ok(t.sol_address as string) || ok(t.evm_address as string))
       ? "on_record"
       : "unresolved_upstream",

@@ -124,7 +124,7 @@ get("/v1/traders", async (_p, url) => {
     select window_label, extract(epoch from captured_at)::bigint as captured
     from builds order by captured_at desc limit 1`;
 
-  /** A range filter over a nullable column drops rows where the value is UNKNOWN, not just rows See docs/DECISIONS.md#d095 */
+  /** A range filter over a nullable column drops rows where the value is UNKNOWN, not just rows… See docs/DECISIONS.md#d095 */
   const anyFilter = [minPnl, maxPnl, minVolume, maxVolume, minTrades, minFollowers]
     .some((v) => v !== null);
   const unratedCount = anyFilter

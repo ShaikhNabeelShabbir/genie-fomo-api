@@ -6,39 +6,12 @@ import { NativePrice, nativePrices } from "../shared/prices.ts";
 import { resolveChain, SOLANA_NET, KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
+import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, applyFloor, chooseStep } from "../shared/aum-rules.ts";
 
 // --------------------------------------------------------------- AUM over time
 
-/** The windows the route accepts, and how far back each reaches. */
-const AUM_WINDOWS: Record<string, number | null> = {
-  "1d": 86_400_000,
-  "1w": 7 * 86_400_000,
-  "1m": 30 * 86_400_000,
-  all: null,
-};
-/** THE SAME WINDOW, SPELLED THE WAY PEOPLE SPELL IT. See docs/DECISIONS.md#d014 */
-const WINDOW_ALIASES: Record<string, string> = {
-  "24h": "1d", "1day": "1d",
-  "7d": "1w", "1week": "1w", "7day": "1w",
-  "30d": "1m", "1month": "1m", "30day": "1m", "1mo": "1m",
-  everything: "all", lifetime: "all", max: "all",
-};
 
-/** Canonical window for a requested one, or null when it is not a window we serve. */
-function resolveWindow(raw: string): string | null {
-  const k = raw.trim().toLowerCase();
-  if (k in AUM_WINDOWS) return k;
-  return WINDOW_ALIASES[k] ?? null;
-}
-
-/** Step sizes, coarsest last. The default picks the coarsest that still leaves >= 24 points. */
-const AUM_STEPS: { name: string; ms: number }[] = [
-  { name: "1h", ms: 3_600_000 },
-  { name: "6h", ms: 6 * 3_600_000 },
-  { name: "1d", ms: 24 * 3_600_000 },
-];
-
-/** A trader's balance over time — one sampled point per hour, in USD, across every wallet and See docs/DECISIONS.md#d015 */
+/** A trader's balance over time — one sampled point per hour, in USD, across every wallet and… See docs/DECISIONS.md#d015 */
 /**
  * Parse and validate the three AUM query parameters, once.
  *
@@ -98,20 +71,7 @@ function buildAum(
   const span = AUM_WINDOWS[windowKey];
   const from = span === null ? null : new Date(to.getTime() - span);
 
-  /** A FIGURE BUILT FROM ALMOST NONE OF A WALLET IS NOT A BALANCE. See docs/DECISIONS.md#d016 */
-  const PRICED_FLOOR = 0.25;
-  /** THE REFUSED FIGURE IS KEPT, not discarded. See docs/DECISIONS.md#d017 */
-  rows = rows.map((r) => {
-    const share = n(r.value_share);
-    if (n(r.total_usd) === null || share === null || share >= PRICED_FLOOR) return r;
-    return {
-      ...r,
-      total_usd: null,
-      refused_reason: "too_little_priced",
-      /** What `total_usd` would have been. Not a balance — see the note above. */
-      partial_usd: n(r.total_usd),
-    };
-  });
+  rows = rows.map(applyFloor);
 
   /** THE READING JUST BEFORE THE WINDOW IS KEPT, as an anchor. See docs/DECISIONS.md#d018 */
   const inWindow = from === null ? rows : rows.filter((r) => Date.parse(String(r.at)) >= from.getTime());
@@ -156,9 +116,7 @@ function buildAum(
 
   const chosen = stepRaw !== null
     ? AUM_STEPS.find((s) => s.name === stepRaw.trim().toLowerCase())!
-    : [...AUM_STEPS].reverse().find((s) =>
-        span === null || Math.floor(span / s.ms) >= 24
-      ) ?? AUM_STEPS[0];
+    : chooseStep(span);
 
   /** WHAT IS DECLARED IS NOT WHAT IS BUCKETED, and conflating them costs real readings. See docs/DECISIONS.md#d022 */
   const declared = stepRaw !== null
@@ -227,7 +185,7 @@ function buildAum(
     ...(anchorAts.has(new Date(String(r.at)).toISOString()) ? { outsideWindow: true } : {}),
   }));
 
-  /** ===================== THE SEAM BETWEEN TWO KINDS OF POINT ===================== Section 9 See docs/DECISIONS.md#d026 */
+  /** ===================== THE SEAM BETWEEN TWO KINDS OF POINT ===================== Section 9… See docs/DECISIONS.md#d026 */
   const pointChains = opts.pointChains ?? null;
   const keyOf = (at: string, basis: string) => `${at}|${basis}`;
 
@@ -469,13 +427,13 @@ function buildAum(
   const answeredWallets =
     ([...answeredNets].some((x) => x !== SOLANA_NET) ? 1 : 0) +
     (answeredNets.has(SOLANA_NET) ? 1 : 0);
-  /** IS THE NEWEST READING SHORT OF A CHAIN -- asked of the ENVELOPE when the reading cannot sa See docs/DECISIONS.md#d040 */
+  /** IS THE NEWEST READING SHORT OF A CHAIN -- asked of the ENVELOPE when the reading cannot sa… See docs/DECISIONS.md#d040 */
   const newestPartial = (() => {
     const r = newest;
     if (!r) return { partial: null as boolean | null, reason: null as string | null };
     const ownCover = cover(r), ownWanted = wanted(r);
     const hasOwn = ownCover >= 0 && ownWanted >= 0;
-    /** EITHER MEASURE SAYING "SHORT" MAKES IT SHORT, and it has to be an OR rather than a prefere See docs/DECISIONS.md#d041 */
+    /** EITHER MEASURE SAYING "SHORT" MAKES IT SHORT, and it has to be an OR rather than a prefere… See docs/DECISIONS.md#d041 */
     const ownShort = hasOwn && ownCover < ownWanted;
     const envShort = totalChains > 0 && answeredNets.size < totalChains;
     const chainsShort = ownShort || envShort;
@@ -807,7 +765,7 @@ async function aumFor(
     a.push(r);
   }
 
-  /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char See docs/DECISIONS.md#d052 */
+  /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
   const allChainRows = present.length
     ? await sql`
         select a.handle, a.at, a.basis, c.name as chain, a.total_usd
@@ -997,7 +955,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
     return at !== null && (best === null || at > best) ? at : best;
   }, null);
 
-  /** THE FULL ENVELOPE IS THE DEFAULT here too, for the reason above and one measurement: witho See docs/DECISIONS.md#d058 */
+  /** THE FULL ENVELOPE IS THE DEFAULT here too, for the reason above and one measurement: witho… See docs/DECISIONS.md#d058 */
   if (Number(b?.contractVersion) !== 1) {
     const idRows = await sql`
       select handle, id from traders where handle = any(${handles})`;

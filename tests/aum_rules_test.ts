@@ -1,0 +1,31 @@
+import { assertEquals } from "jsr:@std/assert@1";
+
+// db.ts reads DB_URL at import; `deno task test` sets a dummy so the pure rules load.
+const { AUM_WINDOWS, applyFloor, chooseStep, resolveWindow } = await import(
+  "../supabase/functions/api/shared/aum-rules.ts"
+);
+
+Deno.test("resolveWindow: canonical keys and aliases, null otherwise", () => {
+  assertEquals(resolveWindow("1w"), "1w");
+  assertEquals(resolveWindow(" 30D "), "1m");
+  assertEquals(resolveWindow("lifetime"), "all");
+  assertEquals(resolveWindow("2y"), null);
+});
+
+Deno.test("chooseStep: coarsest step leaving >= 24 buckets; `all` takes 1d", () => {
+  assertEquals(chooseStep(AUM_WINDOWS["1d"]).name, "1h");
+  assertEquals(chooseStep(AUM_WINDOWS["1w"]).name, "6h");
+  assertEquals(chooseStep(AUM_WINDOWS["1m"]).name, "1d");
+  assertEquals(chooseStep(null).name, "1d");
+});
+
+Deno.test("applyFloor: below the priced floor is refused with the figure kept beside it", () => {
+  const thin = applyFloor({ total_usd: "100", value_share: "0.2" });
+  assertEquals(thin.total_usd, null);
+  assertEquals(thin.refused_reason, "too_little_priced");
+  assertEquals(thin.partial_usd, 100);
+  const ok = { total_usd: "100", value_share: "0.25" };
+  assertEquals(applyFloor(ok), ok);
+  const refused = { total_usd: null, value_share: "0.1", refused_reason: "no_prices" };
+  assertEquals(applyFloor(refused), refused);
+});

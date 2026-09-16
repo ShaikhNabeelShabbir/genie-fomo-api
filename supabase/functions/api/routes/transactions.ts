@@ -86,7 +86,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     where address_key = any(${keys})
       ${net === null ? sql`` : sql`and network_id = ${net}`}`;
 
-  /** The money block is a WHOLE-WALLET total, identical on every page — so it is computed when See docs/DECISIONS.md#d112 */
+  /** The money block is a WHOLE-WALLET total, identical on every page — so it is computed when… See docs/DECISIONS.md#d112 */
   const wantMoney = url.searchParams.get("money") === "true" ||
     (after === null && url.searchParams.get("money") !== "false");
   const [[stored], moneyRows] = await Promise.all([
@@ -438,7 +438,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
       chainsTradedButUnresolved: presence
         .map((p: any) => p.chain as string)
         .filter((c: string) => !resolvedChains.has(c)),
-      /** PER CHAIN, so "he made no trades there" and "we have not read that chain" stop looking ide See docs/DECISIONS.md#d121 */
+      /** PER CHAIN, so "he made no trades there" and "we have not read that chain" stop looking ide… See docs/DECISIONS.md#d121 */
       byChain: (() => {
         const span = new Map<string, { from: number; to: number; rows: number }>();
         for (const r of allSwaps as Record<string, unknown>[]) {

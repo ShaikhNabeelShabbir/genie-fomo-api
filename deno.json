@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "check": "./scripts/typecheck_gate.sh",
+    "test": "DB_URL=postgres://test:test@localhost:1/test deno test --allow-env --allow-read tests/"
+  }
+}

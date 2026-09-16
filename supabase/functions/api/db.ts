@@ -23,7 +23,7 @@ export const sql = postgres(url, {
   idle_timeout: 20,
   connect_timeout: 15,
   prepare: false,
-  /** Deno verifies TLS against its own trust store and rejects the Supabase pooler's chain with See docs/DECISIONS.md#d004 */
+  /** Deno verifies TLS against its own trust store and rejects the Supabase pooler's chain with… See docs/DECISIONS.md#d004 */
   ssl: "require",
 });
 

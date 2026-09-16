@@ -1,4 +1,4 @@
-/** Typed errors, so a caller can tell apart the three cases that need different reactions: 40 See docs/DECISIONS.md#d005 */
+/** Typed errors, so a caller can tell apart the three cases that need different reactions: 40… See docs/DECISIONS.md#d005 */
 import { sql } from "./db.ts";
 
 export class ApiError extends Error {
