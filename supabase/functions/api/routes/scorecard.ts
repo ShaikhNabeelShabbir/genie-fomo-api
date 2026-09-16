@@ -6,7 +6,7 @@ import { intParam } from "../shared/params.ts";
 import { cov, money } from "../shared/format.ts";
 import { nativePrices } from "../shared/prices.ts";
 import { resolveTrader } from "../shared/traders.ts";
-import { scorecardRows, feesFor, swapsFor, chainEntriesFrom, chainExitsFrom, buysFrom, monthStartCapital, scorecardBody, latestLoad } from "../shared/scorecard-core.ts";
+import { scorecardRows, feesFor, swapsFor, chainEntriesFrom, chainExitsFrom, buysFrom, onChainFrom, monthStartCapital, scorecardBody, latestLoad } from "../shared/scorecard-core.ts";
 import { pnlAgg, pnlBody } from "../shared/pnl-core.ts";
 
 get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
@@ -21,10 +21,16 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
    * Three queries became one. The entry price, the exit P&L and the individual buys are all
    * derived from the same swap rows, so they are fetched once -- see `swapsFor`.
    */
-  const [rows, swapBy, feeBy] = await Promise.all([
+  const [rows, swapBy, feeBy, [seen]] = await Promise.all([
     scorecardRows([h]),
     swapsFor([h]),
     nativePrices().then((nat) => feesFor([h], nat)),
+    /** T3. Swap-shaped groups in `transactions` — the denominator of `onChain.coverage`. */
+    sql`select count(*)::int as n from (
+          select x.network_id, x.tx_hash from transactions x
+          join wallets w on lower(w.sol_address) = x.address_key or w.evm_address_key = x.address_key
+          where w.handle = ${h} and x.tx_type = 'SWAP'
+          group by x.network_id, x.tx_hash) g`,
   ]);
   if (!rows.length) throw notFound(`no stored trades for '${t.handle}'`);
 
@@ -34,7 +40,7 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
     entries,
     exits: chainExitsFrom(swaps, entries),
-  }, feeBy.get(h) ?? null, buysFrom(swaps), startCap);
+  }, feeBy.get(h) ?? null, buysFrom(swaps), startCap, onChainFrom(swaps, Number(seen?.n ?? 0)));
 });
 
 

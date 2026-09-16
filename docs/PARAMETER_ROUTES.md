@@ -818,6 +818,22 @@ curl -s "$B/traders/smokey0x/scorecard" | jq '.sample | {loadedAt, loadAttempted
 
 `staleTraders.scorecardLoadFailed` on `/health` is the roster-wide count of the same thing.
 
+**When fomoapi is behind, `onChain` is the scorecard we can still stand behind (T3, bounded).**
+The top-level figures come only from the trade load, so a trader stuck since 7 Sep carried a
+stale `winRate` with nothing to draw in its place. `onChain` is the same handful of figures —
+`swaps`, `buys`, `sells`, `volumeUsd`, `realizedPnlUsd`, `winRate`, `wins`, `losses` — from the
+wallet's own resolved swaps (`basis: wallet_swaps`, the rows `/trades` serves), each sell paired
+against the token's average buy cost exactly as `perExit` does. `coverage` is resolved swaps over
+the swap-shaped transactions we hold, so a low share reads as "we resolved little", not "he
+traded little". `staleness.fallback` says which block to draw: `on_chain` when the record is
+`stale` or `never` and `onChain.swaps > 0`, else `null`. Figures are `null`, never `0`, when no
+swap resolved. Computed on the single-trader route only; `?include=scorecard` carries
+`onChain: null` and `onChainNote`, so the page does not slow down.
+
+```bash
+curl -s "$B/traders/smokey0x/scorecard?tokens=0" | jq '{fallback: .staleness.fallback, onChain}'
+```
+
 ---
 
 ## 2. Trader — positions
