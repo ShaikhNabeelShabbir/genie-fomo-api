@@ -6,6 +6,18 @@ import { throttled } from "./chain_reads.mjs";
 
 export const DEXSCREENER = "https://api.dexscreener.com/tokens/v1";
 export const ADDRESSES_PER_CALL = 30;
+/** DexScreener chain ids by our network_id; the same words as chains.name. */
+export const CHAIN_IDS = { 1399811149: "solana", 1: "ethereum", 56: "bsc", 8453: "base", 4663: "robinhood" };
+
+/**
+ * Fold one sample into a token's running ATH. `prev` is null for a token never sampled;
+ * `drawdownShare = 1 - usd / athUsd`, 0..1, 0 when the sample IS the high.
+ */
+export function athUpdate(prev, sample) {
+  const isHigh = !prev || sample.usd >= prev.athUsd;
+  const athUsd = isHigh ? sample.usd : prev.athUsd;
+  return { athUsd, athAt: isHigh ? sample.at : prev.athAt, drawdownShare: Number((1 - sample.usd / athUsd).toFixed(4)) };
+}
 
 /** One pair per token: the deepest pool wins, and a pair with no USD price is no pair. */
 export function bestPairs(pairs) {
