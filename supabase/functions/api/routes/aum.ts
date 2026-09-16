@@ -7,7 +7,10 @@ import { NativePrice, nativePrices } from "../shared/prices.ts";
 import { resolveChain, SOLANA_NET, KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
-import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, MIN_DRAWABLE_POINTS, type StepChosenFrom, applyFloor, chooseStep } from "../shared/aum-rules.ts";
+import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, MIN_DRAWABLE_POINTS, type StepChosenFrom, applyFloor, chooseStep, PRICED_FLOOR, PARTIAL_SERVE_FLOOR_USD } from "../shared/aum-rules.ts";
+
+/** How far back from the freshest figured reading `now` may be picked. See docs/DECISIONS.md#d029 */
+const RECENT_MS = 36 * 3_600_000;
 
 // --------------------------------------------------------------- AUM over time
 
@@ -65,6 +68,8 @@ function buildAum(
     knownChains?: KnownChain[] | null;
     /** Each chain's own coin and what one costs, for the native amounts on `chains[]`. */
     natives?: Map<number, NativePrice> | null;
+    /** Whole-history facts the window-bounded `rows` cannot show. */
+    tracked: { sinceMs: number | null; anyRebuilt: boolean };
     sampler?: { lastAt: Date | null; lastSuccess: Date | null };
   },
 ) {
@@ -116,8 +121,7 @@ function buildAum(
   const observedStepMs = rawGaps.length ? rawGaps[Math.floor(rawGaps.length / 2)] : 0;
 
   /** THE STEP IS CHOSEN OVER THE RECORD HELD, not only the window asked for (S1). */
-  const firstSampled = rows.find((r) => r.basis === "sampled");
-  const trackedSpan = firstSampled ? to.getTime() - Date.parse(String(firstSampled.at)) : null;
+  const trackedSpan = opts.tracked.sinceMs !== null ? to.getTime() - opts.tracked.sinceMs : null;
   const pick = chooseStep(span, trackedSpan);
   let chosen: { name: string; ms: number } = stepRaw !== null
     ? AUM_STEPS.find((s) => s.name === stepRaw.trim().toLowerCase())!
@@ -303,7 +307,7 @@ function buildAum(
    * for one day hid the current total entirely -- `now: null` on a trader carrying a month of
    * history and a $5.1M balance.
    */
-  const trackedSince = firstSampled ? new Date(String(firstSampled.at)).toISOString() : null;
+  const trackedSince = opts.tracked.sinceMs !== null ? new Date(opts.tracked.sinceMs).toISOString() : null;
 
   /** `now` IS THE MOST COMPLETE RECENT READING, NOT SIMPLY THE NEWEST. See docs/DECISIONS.md#d028 */
   const withFigure = rows.filter((r) => n(r.total_usd) !== null);
@@ -316,7 +320,6 @@ function buildAum(
   if (withFigure.length) {
     /** RECENT FIRST, THEN COMPLETE. See docs/DECISIONS.md#d029 */
     const freshest = Date.parse(String(withFigure[withFigure.length - 1].at));
-    const RECENT_MS = 36 * 3_600_000;
     const recent = withFigure.filter((r) => freshest - Date.parse(String(r.at)) <= RECENT_MS);
     const pool = recent.length ? recent : [withFigure[withFigure.length - 1]];
 
@@ -711,7 +714,7 @@ function buildAum(
         (chainFilter ? ` on ${chainFilter.name} alone` : "") + "." +
         (trackedSince === null
           ? " Every point is a marked rebuild — sampling has not started."
-          : rows.some((r) => r.basis === "rebuilt")
+          : opts.tracked.anyRebuilt
           ? ` Points before ${trackedSince} are rebuilt from chain transfers, not measured.`
           : ""),
   };
@@ -726,16 +729,61 @@ async function aumFor(
   if (!handles.length) return out;
 
   const to = new Date();
+  const span = AUM_WINDOWS[opts.windowKey];
 
-  /*
-   * EVERY ROW, WINDOWED IN MEMORY. The window used to be a WHERE clause, which meant a short
-   * window could not see the reading just outside it -- and `window=1d` returned nothing at
-   * all, not even the current total, for a trader we hold a month of history for.
-   */
   const traders = await sql`
     select handle, display_handle from traders where handle = any(${handles})`;
   if (!traders.length) return out;
   const present = traders.map((r: Record<string, unknown>) => String(r.handle));
+
+  /*
+   * THE READ IS BOUNDED TO THE WINDOW, per trader. This is the one cost curve that grows with
+   * a trader's AGE rather than with the window asked for -- ~1k rows each today, ~50k in a
+   * year, times a 50-id batch -- and the only one that would hit the 15 s route race.
+   *
+   * The window used to be applied in memory over the whole history, so that a short window
+   * could still see the reading just outside it and the current total. What needs the whole
+   * history is now one aggregate per trader, and the row read floors at the earliest of
+   *   window start - 2 days     the anchors: two figured readings before the window (d018-d020)
+   *   freshest figured - 36 h   the pool `now` is picked from (d029), wherever it lies
+   *   freshest row              the refused newest, when no recent row carries a figure
+   * `window=all` has no floor. "Figured" mirrors `applyFloor`, which runs on the rows later:
+   * a row the floor blanks must not count as figured here either.
+   */
+  const history = opts.chainFilter
+    ? await sql`
+        select handle,
+               min(at) filter (where basis = 'sampled') as tracked_since,
+               bool_or(basis = 'rebuilt') as any_rebuilt,
+               max(at) as freshest,
+               max(at) filter (where total_usd is not null and (priced_share is null
+                 or priced_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
+        from aum_chain_samples
+        where handle = any(${present}) and network_id = ${opts.chainFilter.network_id}
+        group by handle`
+    : await sql`
+        select handle,
+               min(at) filter (where basis = 'sampled') as tracked_since,
+               bool_or(basis = 'rebuilt') as any_rebuilt,
+               max(at) as freshest,
+               max(at) filter (where total_usd is not null and (value_share is null
+                 or value_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
+        from aum_samples
+        where handle = any(${present})
+        group by handle`;
+  const histBy = new Map<string, Record<string, unknown>>(
+    history.map((h: Record<string, unknown>) => [String(h.handle), h]));
+  /** (handle, floor) pairs for the unnest joins below; a trader with no history has no pair. */
+  const lh: string[] = [], lo: string[] = [];
+  for (const h of history) {
+    const freshestMs = Date.parse(String(h.freshest));
+    /** A minute of slack: `at` is compared whole-second in JS and exact in SQL. */
+    const poolMs = h.freshest_figured ? Date.parse(String(h.freshest_figured)) - RECENT_MS - 60_000 : freshestMs;
+    lh.push(String(h.handle));
+    lo.push(span === null
+      ? "-infinity"
+      : new Date(Math.min(to.getTime() - span - 2 * 86_400_000, poolMs)).toISOString());
+  }
 
   /*
    * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
@@ -750,14 +798,17 @@ async function aumFor(
         from aum_chain_samples a
         join aum_samples s
           on s.handle = a.handle and s.at = a.at and s.basis = a.basis
-        where a.handle = any(${present}) and a.network_id = ${opts.chainFilter.network_id}
+        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+          on u.handle = a.handle and a.at >= u.lo
+        where a.network_id = ${opts.chainFilter.network_id}
         order by a.handle, a.at asc`
     : await sql`
-        select handle, at, total_usd, refused_reason, priced_positions, total_positions,
-               value_share, basis, tier, chains_answered, chains_expected
-        from aum_samples
-        where handle = any(${present})
-        order by handle, at asc`;
+        select s.handle, s.at, s.total_usd, s.refused_reason, s.priced_positions, s.total_positions,
+               s.value_share, s.basis, s.tier, s.chains_answered, s.chains_expected
+        from aum_samples s
+        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+          on u.handle = s.handle and s.at >= u.lo
+        order by s.handle, s.at asc`;
 
   const byHandle = new Map<string, Record<string, unknown>[]>();
   for (const r of rows) {
@@ -800,7 +851,8 @@ async function aumFor(
         select a.handle, a.at, a.basis, c.name as chain, a.total_usd
         from aum_chain_samples a
         join chains c using (network_id)
-        where a.handle = any(${present})
+        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+          on u.handle = a.handle and a.at >= u.lo
         order by a.handle, a.at asc`
     : [];
   /** Window-independent chain list, one query for the whole batch. */
@@ -841,13 +893,17 @@ async function aumFor(
 
   for (const t of traders) {
     const h = String(t.handle);
+    const hist = histBy.get(h);
     out.set(h, buildAum(
       { handle: h, display_handle: String(t.display_handle) },
       byHandle.get(h) ?? [],
       chainsBy.get(h) ?? [],
       presBy.get(h) ?? null,
       { ...opts, to, pointChains: pointChainsBy.get(h) ?? null,
-        knownChains: knownBy.get(h) ?? [], natives, sampler: {
+        knownChains: knownBy.get(h) ?? [], natives, tracked: {
+          sinceMs: hist?.tracked_since ? Date.parse(String(hist.tracked_since)) : null,
+          anyRebuilt: hist?.any_rebuilt === true,
+        }, sampler: {
         lastAt: samplerRow?.last_at ? new Date(String(samplerRow.last_at)) : null,
         lastSuccess: samplerRow?.last_success ? new Date(String(samplerRow.last_success)) : null,
       } },
