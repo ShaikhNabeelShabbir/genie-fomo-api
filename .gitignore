@@ -1,5 +1,6 @@
 node_modules/
 dist/
+scripts/lib/dist/
 .env
 .env.local
 *.log

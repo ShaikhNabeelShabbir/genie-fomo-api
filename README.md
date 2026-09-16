@@ -207,7 +207,7 @@ window did, and `trackedSince` marks where measurement begins.
 It cannot simply be extended backwards: 57–76% of the tokens a trader holds have no transaction
 record at all, transactions begin on average 120 days after a trader's first trade, and the
 database holds dated prices for 2 tokens out of 26,196. A longer rebuild would produce mostly
-unpriceable points. See [ACCEPTANCE_TEST_PLAN.md](ACCEPTANCE_TEST_PLAN.md) §2.3.
+unpriceable points. See [ACCEPTANCE_TEST_PLAN.md](docs/consumer/ACCEPTANCE_TEST_PLAN.md) §2.3.
 
 ---
 
@@ -317,7 +317,7 @@ npx supabase secrets set \
 
 The sampler's schedule lives in a migration
 (`20260916120000_aum_sample_schedule.sql`) and needs `pg_cron` and `pg_net` enabled, plus two
-Vault secrets. Full steps in [ACCEPTANCE_TEST_PLAN.md](ACCEPTANCE_TEST_PLAN.md) §4.4.
+Vault secrets. Full steps in [ACCEPTANCE_TEST_PLAN.md](docs/consumer/ACCEPTANCE_TEST_PLAN.md) §4.4.
 
 **Test `/v1/health` specifically after any deploy.** It is the one route that has failed while
 every other kept working — parallelising its four queries once took it to a 90-second timeout
@@ -354,12 +354,12 @@ Two independent suites, both run against the deployed service.
 
 | | |
 |---|---|
-| **[Acceptance_Tests.md](Acceptance_Tests.md)** | 50 behavioural tests written by the consumer. **45 passing**, 3 closed by decision, 1 self-resolving, 1 waiting upstream |
-| **[Field_Contracts.md](Field_Contracts.md)** | Every field the consumer reads. **150 of 150 correct**, mapped in [Field_Contracts_Mapping.md](Field_Contracts_Mapping.md) |
+| **[Acceptance_Tests.md](docs/consumer/Acceptance_Tests.md)** | 50 behavioural tests written by the consumer. **45 passing**, 3 closed by decision, 1 self-resolving, 1 waiting upstream |
+| **[Field_Contracts.md](docs/consumer/Field_Contracts.md)** | Every field the consumer reads. **150 of 150 correct**, mapped in [Field_Contracts_Mapping.md](docs/consumer/Field_Contracts_Mapping.md) |
 
 Results and the reasoning behind every fix are in
-[ACCEPTANCE_TEST_REPORT.md](ACCEPTANCE_TEST_REPORT.md) and
-[ACCEPTANCE_TEST_PLAN.md](ACCEPTANCE_TEST_PLAN.md).
+[ACCEPTANCE_TEST_REPORT.md](docs/consumer/ACCEPTANCE_TEST_REPORT.md) and
+[ACCEPTANCE_TEST_PLAN.md](docs/consumer/ACCEPTANCE_TEST_PLAN.md).
 
 Current shape of the data:
 
@@ -374,13 +374,13 @@ Current shape of the data:
 
 | | |
 |---|---|
-| **[PARAMETER_ROUTES.md](PARAMETER_ROUTES.md)** | Every route and parameter in detail, with worked examples. The reference |
-| **[Field_Contracts_Mapping.md](Field_Contracts_Mapping.md)** | All 150 consumer-read fields → route, JSON path, live value |
-| **[ACCEPTANCE_TEST_REPORT.md](ACCEPTANCE_TEST_REPORT.md)** | The 50 tests, measured |
-| **[ACCEPTANCE_TEST_PLAN.md](ACCEPTANCE_TEST_PLAN.md)** | What was fixed, why, and what remains |
-| **[AUM_CHART_PRD.md](AUM_CHART_PRD.md)** · **[AUM_PLAN.md](AUM_PLAN.md)** · **[AUM_ROUTES.md](AUM_ROUTES.md)** | The balance-history design |
-| **[PARAMETERS.md](PARAMETERS.md)** | What each published figure means |
-| **[PROD-STEPS.md](PROD-STEPS.md)** · **[STEPS.md](STEPS.md)** | Deployment and directory-build runbooks |
+| **[PARAMETER_ROUTES.md](docs/PARAMETER_ROUTES.md)** | Every route and parameter in detail, with worked examples. The reference |
+| **[Field_Contracts_Mapping.md](docs/consumer/Field_Contracts_Mapping.md)** | All 150 consumer-read fields → route, JSON path, live value |
+| **[ACCEPTANCE_TEST_REPORT.md](docs/consumer/ACCEPTANCE_TEST_REPORT.md)** | The 50 tests, measured |
+| **[ACCEPTANCE_TEST_PLAN.md](docs/consumer/ACCEPTANCE_TEST_PLAN.md)** | What was fixed, why, and what remains |
+| **[AUM_CHART_PRD.md](docs/AUM_CHART_PRD.md)** · **[AUM_PLAN.md](docs/AUM_PLAN.md)** · **[AUM_ROUTES.md](docs/AUM_ROUTES.md)** | The balance-history design |
+| **[PARAMETERS.md](docs/PARAMETERS.md)** | What each published figure means |
+| **[PROD-STEPS.md](docs/PROD-STEPS.md)** · **[STEPS.md](docs/STEPS.md)** | Deployment and directory-build runbooks |
 
 ---
 

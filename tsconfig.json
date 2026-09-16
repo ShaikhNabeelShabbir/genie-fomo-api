@@ -8,9 +8,9 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "outDir": "dist",
-    "rootDir": "src",
+    "outDir": "scripts/lib/dist",
+    "rootDir": "scripts/lib/ts",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["scripts/lib/ts/**/*.ts"]
 }

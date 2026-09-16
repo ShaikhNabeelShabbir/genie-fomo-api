@@ -8,10 +8,16 @@ import { fileURLToPath } from "node:url";
  * the genie-fomo monorepo.
  */
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
-/** Package root — one level up from src/, or two from dist/src when built. */
-export const PKG_ROOT = fs.existsSync(path.join(SRC_DIR, "..", "package.json"))
-  ? path.resolve(SRC_DIR, "..")
-  : path.resolve(SRC_DIR, "../..");
+/** Package root — the nearest ancestor holding package.json (this file lives in scripts/lib/{ts,dist}). */
+export const PKG_ROOT = ((): string => {
+  let dir = SRC_DIR;
+  while (!fs.existsSync(path.join(dir, "package.json"))) {
+    const up = path.dirname(dir);
+    if (up === dir) throw new Error(`package.json not found above ${SRC_DIR}`);
+    dir = up;
+  }
+  return dir;
+})();
 
 /** Node does not read .env on its own — load it before anything reads process.env. */
 function loadDotenv(): void {

@@ -18,7 +18,7 @@
  * guessed: the same address really can be deployed twice, and picking one would quietly
  * attribute P&L to the wrong chain.
  */
-import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../dist/settings.js";
+import { EVM_CHAINS, SOLANA_NETWORK_ID } from "./lib/dist/settings.js";
 import { Pool } from "pg";
 
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i > -1 ? process.argv[i+1] : d; };

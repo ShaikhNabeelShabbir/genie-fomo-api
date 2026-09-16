@@ -14,7 +14,7 @@
  *   node scripts/load_token_supply.mjs            # every token that needs one
  *   node scripts/load_token_supply.mjs --limit 20
  */
-import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../dist/settings.js";
+import { EVM_CHAINS, SOLANA_NETWORK_ID } from "./lib/dist/settings.js";
 import { Pool } from "pg";
 
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i > -1 ? process.argv[i+1] : d; };

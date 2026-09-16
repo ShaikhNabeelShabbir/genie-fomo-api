@@ -15,8 +15,8 @@
  *   node scripts/backfill_transactions.mjs --limit 5       # smoke test
  *   node scripts/backfill_transactions.mjs --only unipcs
  */
-import { fetchTransactions } from "../dist/transactions.js";
-import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../dist/settings.js";
+import { fetchTransactions } from "./lib/dist/transactions.js";
+import { EVM_CHAINS, SOLANA_NETWORK_ID } from "./lib/dist/settings.js";
 
 /** SOL as `quote_assets` records it. Native lamport movements carry no mint of their own. */
 const SOL_MINT = "11111111111111111111111111111111";

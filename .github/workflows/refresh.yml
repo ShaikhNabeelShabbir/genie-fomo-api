@@ -75,14 +75,14 @@ jobs:
       # Exits non-zero on an empty build, a rejected key, or a directory that would shrink
       # by more than 20% — so a bad fomo night fails here rather than overwriting good data.
       - name: Build directory from fomoapi
-        run: python3 build_directory_fomoapi.py --top 100
+        run: python3 loaders/build_directory_fomoapi.py --top 100
 
       # ---------------------------------------------------------------- 2. load
       # Appends a new generation: captured_at is part of the primary key on holdings and
       # trader_stats, so nothing is overwritten. This is also what makes K2 momentum
       # possible — it diffs the two most recent generations.
       - name: Load directory into Postgres
-        run: python3 load_to_db.py
+        run: python3 loaders/load_to_db.py
 
       # ---------------------------------------------------------------- 3. trades
       # --converge because fomo sheds load over a time window: one pass reached 41 of 100
@@ -92,7 +92,7 @@ jobs:
       # --stale-hours 20 is the refresh selector and is self-converging: a trader that
       # fetches successfully has ingested_at moved to now and drops out of the next pass.
       - name: Refresh trades
-        run: python3 load_trades.py --converge --all --stale-hours 20
+        run: python3 loaders/load_trades.py --converge --all --stale-hours 20
 
       # ---------------------------------------------------------------- 4. chains
       # Tokens traded but no longer held match nothing in `tokens`, so their trades carry no
