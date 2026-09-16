@@ -39,9 +39,9 @@ const rateHeaders = (r: RateState | null): Record<string, string> =>
       }
     : {};
 
-/** Every response is serialised here, so the requested API version is applied to its links once. */
+/** Every response is serialised here, compact (pretty-printing was 1.5-2x the bytes on batch bodies), with the requested API version applied to its links once. */
 const json = (body: unknown, status = 200, extra: Record<string, string> = {}, version: ApiVersion = "v1") =>
-  new Response(rewriteVersion(JSON.stringify(body, null, 2), version), { status, headers: headers(extra) });
+  new Response(rewriteVersion(JSON.stringify(body), version), { status, headers: headers(extra) });
 
 /**
  * A per-request id, echoed on every error and in the `x-request-id` header.
