@@ -69,6 +69,9 @@ get("/v1/tokens", async (_p, url) => {
            max(ti.sell_tax)             as sell_tax,
            max(ti.rug_ratio)            as rug_ratio,
            max(ti.security_fetched_at)  as security_fetched_at,
+           -- Launch metadata (docs/LAUNCH_METADATA.md): the two words worth scanning by.
+           max(tk.launchpad)            as launchpad,
+           bool_or(tk.graduated)        as graduated,
            count(distinct h.handle)::int              as holders,
            sum(h.value) filter (where h.value > 0)    as total_value,
            count(h.value) filter (where h.value > 0)::int as priced,
@@ -211,6 +214,9 @@ get("/v1/tokens", async (_p, url) => {
       sellTax: n(r.sell_tax),
       rugRatio: n(r.rug_ratio),
       securityChecked: !!r.security_fetched_at,
+      /** Launch metadata on the row; the detail route carries the curve and timestamps. */
+      launchpad: r.launchpad ?? null,
+      graduated: r.graduated === null || r.graduated === undefined ? null : Boolean(r.graduated),
       fundamentalsTier: r.info_fetched_at ? "third_party" : null,
       holderShare: Number((Number(r.holders) / Number(traderCount)).toFixed(4)),
       totalValueUsd: Number(r.priced) ? round(n(r.total_value)) : null,
@@ -234,6 +240,8 @@ get("/v1/tokens/:address", async ({ address }, url) => {
 
   const rows = await sql`
     select h.network_id, c.name as chain, tk.address, t.display_handle, h.human_amount, h.value,
+           -- Launch metadata (docs/LAUNCH_METADATA.md), one on-chain read per Solana mint.
+           tk.created_at as launch_created_at, tk.launchpad, tk.curve_progress, tk.graduated, tk.launch_read_at,
            ti.price_usd, ti.liquidity_usd, ti.market_cap_usd, ti.total_supply,
            ti.circulating_supply, ti.holder_count, ti.top_10_holder_rate,
            ti.symbol as gmgn_symbol, ti.source as info_source, ti.fetched_at as info_fetched_at,
@@ -402,6 +410,18 @@ get("/v1/tokens/:address", async ({ address }, url) => {
             };
           })()
           : null,
+        /**
+         * Launch metadata, from the chain (docs/LAUNCH_METADATA.md). Every field is null
+         * until the loader has read the mint; `launchpad` null AFTER a read (readAt set)
+         * means no pump.fun curve exists for it. Solana only today.
+         */
+        launch: {
+          createdAt: group[0].launch_created_at ? new Date(String(group[0].launch_created_at)).toISOString() : null,
+          launchpad: group[0].launchpad ?? null,
+          curveProgress: n(group[0].curve_progress),
+          graduated: group[0].graduated === null || group[0].graduated === undefined ? null : Boolean(group[0].graduated),
+          readAt: group[0].launch_read_at ? new Date(String(group[0].launch_read_at)).toISOString() : null,
+        },
         /** T3b. See docs/DECISIONS.md#d085 */
         chainConcentration: group[0].info_fetched_at
           ? {
