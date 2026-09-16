@@ -638,6 +638,48 @@ and skip rows claimed inside the last five minutes.
 
 ## 8. Secrets
 
+### 8.0 Credentials
+
+Nothing below runs without an API token and the account ID. Neither is in the repository.
+
+**API token.** Cloudflare dashboard → My Profile → API Tokens → Create Token → template
+*Edit Cloudflare Workers*. Add two permissions to it: *Account › Hyperdrive › Edit* and
+*Account › Account Settings › Read*. Under Account Resources scope it to the one account.
+
+**Account ID.** Workers & Pages → Overview; it is in the right-hand sidebar.
+
+**Locally:**
+
+```bash
+export CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=…
+npx wrangler whoami            # must print the account, not "not authenticated"
+```
+
+**In GitHub** (`.github/workflows/cloudflare.yml` reads these):
+
+```bash
+gh secret set CLOUDFLARE_API_TOKEN
+gh secret set CLOUDFLARE_ACCOUNT_ID
+gh variable set CLOUDFLARE_DEPLOY --body true          # turns the deploy job on
+gh variable set WORKER_URL --body https://genie-fomo.<subdomain>.workers.dev
+```
+
+**The first credentialed commands**, in order:
+
+```bash
+cd worker
+npx wrangler hyperdrive create genie-fomo-db \
+  --connection-string="postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres" \
+  --caching-disabled
+# paste the printed id over REPLACE_WITH_HYPERDRIVE_ID in worker/wrangler.toml
+npx wrangler secret put HELIUS_WEBHOOK_SECRET
+npx wrangler deploy
+```
+
+If `hyperdrive create` cannot connect, that is the IPv6 question from §4.2.
+
+### 8.1 Secrets
+
 ```bash
 npx wrangler secret put AUM_SAMPLE_SECRET
 npx wrangler secret put WALLET_SUBMIT_SECRET
@@ -917,6 +959,10 @@ item, which Supabase currently bundles; size it against `transactions` growing a
 **About a fortnight for Option A′**, most of it in Phase 5 and most of *that* being the
 mechanical `Deno.env.get` → `env` change across 26 call sites plus threading `sql` through
 `routes.ts`.
+
+**Phase status (17 Sep 2026):** Phase 3 done — `worker/` builds, `/webhook` is ported (not
+deployed: no credentials yet, Hyperdrive id is a placeholder). Phases 1, 2, 4 and 5 not started:
+`/sample` and `/v1/*` answer 501.
 
 Option B adds four to eight weeks for the SQL rewrite, and should be scheduled as its own
 project with the acceptance suite as the gate.

@@ -14,6 +14,7 @@ Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
 | `supabase/functions/api/shared/*.ts` | helpers used by 2+ families; `vocabulary.ts` is the published word list; `aum-rules.ts` the pure /aum rules |
 | `supabase/functions/aum-sample/` | the balance sampler; `value.ts` holds the price ceilings. Fired every 5 min by `pg_cron` (`supabase/migrations/20260916120000_aum_sample_schedule.sql`) |
 | `supabase/functions/helius-webhook/` | Solana transfer push receiver |
+| `worker/` | the Cloudflare port (`docs/CLOUDFLARE_MIGRATION.md`): **scaffold, not deployed**. `/webhook` ported; `/sample`, `/v1/*` answer 501 |
 | `supabase/functions/_shared/chain_reads.ts` | balance reads. **Twin of `scripts/lib/chain_reads.mjs`: edit both.** |
 | `supabase/migrations/` | schema; check constraints are the only SQL-enforced vocabulary |
 | `scripts/*.mjs` | Node loaders run by `.github/workflows/refresh.yml` nightly 06:00 UTC |
@@ -63,6 +64,7 @@ The consumer's build fails on an unpublished word, so this order is a contract.
 ```bash
 deno task check      # typecheck gate: no NEW errors vs scripts/typecheck_baseline.txt (90 known, postgres.js row typing)
 deno task test       # pure-function tests
+npx tsc -p worker/tsconfig.json                    # the Worker; `cd worker && npx wrangler deploy --dry-run --outdir dist` bundles it
 ./scripts/smoke.sh   # 8 checks against production
 ./scripts/acceptance_capture.sh $BASE captures/x   # 72-file normalised capture; diff two runs
 npm run build        # scripts/lib/ts -> scripts/lib/dist for the loaders
