@@ -36,12 +36,18 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `Jun
       fixes + C1 per-coin multiples + C2 windows/bleeding + C5 exit-timing score; C4 `/market/regime`;
       C3 honeypot-since + cohort. Plus a fix: the nightly re-price pass now honours the ceilings.
       52 tests. Vocabulary v7.
-- [ ] A1 (aum window bound, perf indexes, compact JSON, statement_timeout) — merging when it reports.
+- [x] A1: `aumFor` window-bounded (+2 d anchor slack, `trackedSince`/`newest` in SQL), `Promise.all` over
+      the five independent reads, compact JSON, `statement_timeout` 14 s on both clients + `clearTimeout`,
+      malformed `%` → 400, migration `20260917220000_perf_indexes.sql`. Merged; worker `tsc` needed one
+      row-type annotation in `routes/positions.ts` (A3's query). 53 tests, gate 0, bundle 408 KB.
+      Caveat: `statement_timeout` as a startup parameter may be refused by Supavisor's transaction
+      pooler / Hyperdrive — run `scripts/smoke.sh` right after each deploy; if it fails, move it to a
+      `set local` per query.
 
 ## Status for the morning (17 Sep 2026)
 
-Everything that needed no input is done and pushed. Total: 12 agents over 4 waves.
-Vocabulary is at **v5**; the consumer reply draft is `docs/consumer/reply-to-genie-17-sep.md`.
+Everything that needed no input is done and pushed. Total: ~30 agents over 4 overnight waves, the workflow-gap wave and wave A.
+Vocabulary is at **v7**; the consumer reply draft is `docs/consumer/reply-to-genie-17-sep.md`.
 
 Waiting on you, in order:
 1. Cloudflare token: add `Account › Workers Scripts › Edit`, then I deploy the Worker and set
@@ -49,9 +55,9 @@ Waiting on you, in order:
 2. Database password (from the dev): `wrangler hyperdrive create … --caching-disabled`, paste the id
    into `worker/wrangler.toml` (uncomment the block), `wrangler secret put HELIUS_WEBHOOK_SECRET`,
    `AUM_SAMPLE_SECRET`, `HELIUS_SOLANA_KEY`, `WALLET_SUBMIT_SECRET`; redeploy; shadow diff.
-3. Supabase: `supabase db push` (6 migrations dated 20260917), deploy `api` + `aum-sample`;
+3. Supabase: `supabase db push` (15 migrations dated 20260917), deploy `api` + `aum-sample`;
    re-sample `luckedhub`/`shahh`; run `scripts/acceptance_capture.sh` on main-vs-branch.
-4. Send the reply draft to the Genie team (vocabulary v5 will fail their build until they add
+4. Send the reply draft to the Genie team (vocabulary v7 will fail their build until they add
    the words).
 5. `.env.example` tail by hand.
 

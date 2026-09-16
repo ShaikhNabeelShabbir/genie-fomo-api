@@ -8,7 +8,7 @@ import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import {
-  CostBasis, costBasisFor, costBlock, coverageLow, indexerCoverageFor, latestIso, portfolioFrom,
+  CostBasis, PortfolioRow, costBasisFor, costBlock, coverageLow, indexerCoverageFor, latestIso, portfolioFrom,
   positionsPartialReason, sellFlags, unsellable,
 } from "../shared/positions-core.ts";
 import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
@@ -37,7 +37,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
    * the current snapshot, so a cross-chain-looking AUM is in practice a Solana figure.
    * Saying so per chain is the difference between a total and a total that misleads.
    */
-  const rows = await sql`
+  const rows = await sql<PortfolioRow[]>`
     select tk.address, h.network_id, h.token_key, c.name as chain, h.value, h.captured_at,
            (q.token_key is not null) as is_quote, ti.is_honeypot, ti.can_not_sell
     from holdings_current h
