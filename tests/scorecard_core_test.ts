@@ -1,12 +1,15 @@
 import { assertEquals } from "jsr:@std/assert@1";
 
 // db.ts no longer touches the database at import; the pure helpers load with no env at all.
-const { onChainFrom } = await import("../supabase/functions/api/shared/scorecard-core.ts");
+const { onChainFrom, chainEntriesFrom, chainExitsFrom } =
+  await import("../supabase/functions/api/shared/scorecard-core.ts");
 type Swap = Parameters<typeof onChainFrom>[0][number];
 
 const swap = (o: Partial<Swap>): Swap => ({
   handle: "h", net: 1, tokenKey: "tok", txHash: "x", at: null, tokenDelta: 0, quoteUsd: null, ...o,
 });
+const onChain = (swaps: Swap[], seen: number) =>
+  onChainFrom(swaps, seen, chainExitsFrom(swaps, chainEntriesFrom(swaps)));
 
 Deno.test("T3: onChainFrom pairs sells against the average buy cost, like perExit", () => {
   const swaps = [
@@ -16,7 +19,7 @@ Deno.test("T3: onChainFrom pairs sells against the average buy cost, like perExi
     swap({ at: "2026-09-04T00:00:00.000Z", tokenDelta: -5, quoteUsd: 50 }),     // sell 5 @ $10: -50
     swap({ at: "2026-09-05T00:00:00.000Z", tokenKey: "unv", tokenDelta: -1 }),  // unvalued: not paired
   ];
-  const b = onChainFrom(swaps, 20);
+  const b = onChain(swaps, 20);
   assertEquals(b.basis, "wallet_swaps");
   assertEquals([b.swaps, b.buys, b.sells], [5, 2, 3]);
   assertEquals(b.volumeUsd, 600);
@@ -26,12 +29,12 @@ Deno.test("T3: onChainFrom pairs sells against the average buy cost, like perExi
 });
 
 Deno.test("T3: no resolved swaps is null figures, never zero; swaps stays a real count", () => {
-  const b = onChainFrom([], 1252);
+  const b = onChain([], 1252);
   assertEquals(b.swaps, 0);
   assertEquals([b.buys, b.sells, b.volumeUsd, b.realizedPnlUsd, b.winRate, b.wins, b.losses, b.asOf],
                [null, null, null, null, null, null, null, null]);
   assertEquals(b.coverage, { of: 0, total: 1252, share: 0 });
   // Buys only: volume is real, but nothing has closed, so the P&L side is null.
-  const open = onChainFrom([swap({ tokenDelta: 3, quoteUsd: -30 })], 1);
+  const open = onChain([swap({ tokenDelta: 3, quoteUsd: -30 })], 1);
   assertEquals([open.volumeUsd, open.realizedPnlUsd, open.winRate, open.wins], [30, null, null, null]);
 });

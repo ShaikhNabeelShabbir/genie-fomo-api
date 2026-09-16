@@ -44,11 +44,10 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
 
   const swaps = swapBy.get(h) ?? [];
   const entries = chainEntriesFrom(swaps);
-  return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
-    entries,
-    exits: chainExitsFrom(swaps, entries),
-  }, feeBy.get(h) ?? null, buysFrom(swaps), startCapBy.get(h) ?? null,
-  onChainFrom(swaps, Number(seen?.n ?? 0)));
+  const exits = chainExitsFrom(swaps, entries);
+  return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }),
+    { entries, exits }, feeBy.get(h) ?? null, buysFrom(swaps), startCapBy.get(h) ?? null,
+    onChainFrom(swaps, Number(seen?.n ?? 0), exits));
 });
 
 

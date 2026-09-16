@@ -205,8 +205,8 @@ export function chainExitsFrom(swaps: Swap[], entries: Map<string, number>): num
  * is a real count and may be 0. `swapsSeen` is the swap-shaped groups in `transactions`.
  */
 export type OnChainBlock = ReturnType<typeof onChainFrom>;
-export function onChainFrom(swaps: Swap[], swapsSeen: number) {
-  const exits = chainExitsFrom(swaps, chainEntriesFrom(swaps));
+/** `exits` is `chainExitsFrom(swaps, chainEntriesFrom(swaps))`, which the caller already built. */
+export function onChainFrom(swaps: Swap[], swapsSeen: number, exits: number[]) {
   const valued = swaps.map((s) => s.quoteUsd).filter((x): x is number => x !== null);
   const wins = exits.filter((v) => v > 0).length;
   const times = swaps.map((s) => s.at).filter((x): x is string => x !== null);
@@ -624,12 +624,14 @@ export async function scorecardBody(
   /** T4 — profit by window. See docs/DECISIONS.md#d157 */
   /** Computed from `rows`, not from a second query. See docs/DECISIONS.md#d158 */
   const nowMs = Date.now();
-  const closedDated = rows.filter((r) =>
-    r.status === "closed" && r.closed_at !== null && r.closed_at !== undefined);
+  // `closed_at` parsed once per row; every window, day and month bucket below reads `closedMs`.
+  const closedDated = rows
+    .filter((r) => r.status === "closed" && r.closed_at !== null && r.closed_at !== undefined)
+    .map((r) => ({ ...r, closedMs: Date.parse(String(r.closed_at)) }));
   const windowAgg = (sinceMs: number | null, windowKey: string) => {
     const inWindow = sinceMs === null
       ? closedDated
-      : closedDated.filter((r) => Date.parse(String(r.closed_at)) > sinceMs);
+      : closedDated.filter((r) => r.closedMs > sinceMs);
     // `sum()` skips NULLs and `coalesce(..., 0)` makes an empty window zero — matched here,
     // because a window with no closed trades earned nothing, which is a real 0 and not a
     // missing value.
@@ -677,7 +679,7 @@ export async function scorecardBody(
   const dayBuckets = new Map<string, { realizedUsd: number; closedTrades: number }>();
   const since30 = nowMs - 30 * 86_400_000;
   for (const r of closedDated) {
-    const ms = Date.parse(String(r.closed_at));
+    const ms = r.closedMs;
     if (!Number.isFinite(ms) || ms <= since30) continue;
     const day = new Date(ms).toISOString().slice(0, 10);
     const b = dayBuckets.get(day) ?? { realizedUsd: 0, closedTrades: 0 };
@@ -701,7 +703,7 @@ export async function scorecardBody(
   const monthBuckets = new Map<string,
     { realizedUsd: number; closedTrades: number; withFigure: number }>();
   for (const r of closedDated) {
-    const ms = Date.parse(String(r.closed_at));
+    const ms = r.closedMs;
     if (!Number.isFinite(ms) || ms < since12m) continue;
     const m = monthKey(ms);
     const b = monthBuckets.get(m) ?? { realizedUsd: 0, closedTrades: 0, withFigure: 0 };
@@ -783,11 +785,7 @@ export async function scorecardBody(
             "windows.all.realizedUsd — `beforeWindowUsd` is exactly that difference.",
     },
     // max(captured_at) over the same rows — identical to the query this replaces, and free.
-    asOf: (() => {
-      const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
-        .filter((x): x is number => x !== null && Number.isFinite(x));
-      return times.length ? new Date(Math.max(...times)).toISOString() : null;
-    })(),
+    asOf: loadedAtIso,
     /** WHAT THIS SCORECARD WAS COMPUTED OVER, and whether that is the whole record. See docs/DECISIONS.md#d165 */
     sample: {
       returned: rows.length,
@@ -1015,11 +1013,7 @@ export async function scorecardBody(
           window: "all recorded history",
           why: lastTradeIso === null ? "no closed positions on record" : null,
         },
-        asOf: (() => {
-          const times = rows.map((r) => (r.captured_at ? Date.parse(String(r.captured_at)) : null))
-            .filter((x): x is number => x !== null && Number.isFinite(x));
-          return times.length ? new Date(Math.max(...times)).toISOString() : null;
-        })(),
+        asOf: loadedAtIso,
       };
     })(),
     holdingTime: {
