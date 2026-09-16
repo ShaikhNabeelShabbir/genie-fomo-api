@@ -4,7 +4,7 @@
 
 Written 16 September 2026 from the Genie app team's fix request v2
 (`genie-fomo-fix-request-v2-16-sep.md`, copied into this repo unchanged), read against the
-code on branch `Junaid-deve-starts`. Every item names the ask ids from that document, the
+code on branch `cloudflare-migration`. Every item names the ask ids from that document, the
 root cause with a file and line, the fix, its size, and how to prove it.
 
 ## Why these come before the migration, not after
@@ -28,7 +28,7 @@ they rank first: **V1, N1, Z1, Z2, R2, R5**. That order is kept here.
 
 ## How to use this file
 
-Each item is one PR on `Junaid-deve-starts` (or a branch off it), deployed with
+Each item is one PR on `cloudflare-migration` (or a branch off it), deployed with
 `npx supabase functions deploy`, verified with the repro requests quoted, and then captured:
 
 ```bash
@@ -353,7 +353,7 @@ document it in `PARAMETER_ROUTES.md` as the unbucketed form.
 ## Where this touches the migration
 
 Status 17 Sep 2026: P0 (items 1–8), P1 (items 9–15) and R4 / R6 from the P2 table are all
-merged on `Junaid-deve-starts` and **not deployed**; production (`main`) still serves the
+merged on `cloudflare-migration` and **not deployed**; production (`main`) still serves the
 pre-fix behaviour. Vocabulary is at version 4.
 
 - Items 1–4 changed `aum-sample/index.ts` and both `chain_reads` twins on the branch. Deploy

@@ -1,6 +1,6 @@
 # Overnight autonomous run (2026-09-17, started ~19:30 UTC)
 
-Goal: finish every to-do that needs no user input; nothing deployed. Branch `Junaid-deve-starts`.
+Goal: finish every to-do that needs no user input; nothing deployed. Branch `cloudflare-migration`.
 
 - [x] Wave 1 (5 agents, parallel, worktrees): P1 (#10), T1 (#11), A1/F2/F3 remainder (#12),
       R6 indexer coverage, R4 Robinhood prices (DexScreener) + refresh.yml reorder + rebuild twins.
@@ -72,7 +72,7 @@ for Hyperdrive; Supabase deploy + `db push`; Genie-team notification (vocabulary
 
 # Restructure for lower token cost — plan (2026-09-17)
 
-Branch: `Junaid-deve-starts`. One commit per phase. Decisions from the user: install deno;
+Branch: `cloudflare-migration`. One commit per phase. Decisions from the user: install deno;
 retire `src/` (keep only the modules the loaders need); push only, no deploy; move comment
 blocks of 8+ lines.
 

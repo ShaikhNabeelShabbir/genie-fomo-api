@@ -1,6 +1,6 @@
 # Coverage of the app team's composite workflows (badges and protection)
 
-Checked 17 September 2026 against branch `Junaid-deve-starts`. Source: the team's "Composite
+Checked 17 September 2026 against branch `cloudflare-migration`. Source: the team's "Composite
 Workflows" note. Their premise holds: most badges are one scorecard call per trader, because
 `scorecard.byToken[]` already carries per coin the first/weighted entry and exit price, the
 quantity legs, supply (so entry market cap), fomo's token creation time, first-open and

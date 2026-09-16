@@ -10,7 +10,7 @@ name: cloudflare worker
 
 on:
   push:
-    branches: [main, Junaid-deve-starts]
+    branches: [main, cloudflare-migration]
     paths:
       - 'worker/**'
       - 'supabase/functions/**'

@@ -987,7 +987,7 @@ exists; verified locally only against a dead binding (404 route list, rate limit
 `/v1/health` → 503 `unavailable`). Phases 1, 2 and 6 (the shadow diff) wait on Hyperdrive.
 
 The pre-migration fixes (`TO-DO-BEFORE-MIGRATION.md` P0 items 1–8, P1 items 9–15, and R4 / R6
-from P2) are all merged on `Junaid-deve-starts` and not deployed. They change `aum-sample`,
+from P2) are all merged on `cloudflare-migration` and not deployed. They change `aum-sample`,
 both `chain_reads` twins and the `api` routes, and publish vocabulary v4. Two consequences for
 this plan:
 
