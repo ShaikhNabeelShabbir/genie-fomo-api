@@ -39,9 +39,9 @@ const rateHeaders = (r: RateState | null): Record<string, string> =>
       }
     : {};
 
-/** Every response is serialised here, so the requested API version is applied to its links once. */
+/** Every response is serialised here, compact (pretty-printing was 1.5-2x the bytes on batch bodies), with the requested API version applied to its links once. */
 const json = (body: unknown, status = 200, extra: Record<string, string> = {}, version: ApiVersion = "v1") =>
-  new Response(rewriteVersion(JSON.stringify(body, null, 2), version), { status, headers: headers(extra) });
+  new Response(rewriteVersion(JSON.stringify(body), version), { status, headers: headers(extra) });
 
 /**
  * A per-request id, echoed on every error and in the `x-request-id` header.
@@ -90,6 +90,7 @@ export async function handle(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const version = requestVersion(url.pathname);
   let rate: RateState | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // Rate limit before auth so a flood of bad keys cannot be used to hammer the database.
     rate = await checkRate(callerKey(req));
@@ -149,10 +150,11 @@ export async function handle(req: Request): Promise<Response> {
      */
     const answered = await Promise.race([
       Promise.resolve(hit.handler(hit.params, url, body)),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new ApiError(503, "timeout",
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new ApiError(503, "timeout",
           `this route did not answer within ${ROUTE_TIMEOUT_MS / 1000}s — retry`,
-          undefined, 5)), ROUTE_TIMEOUT_MS)),
+          undefined, 5)), ROUTE_TIMEOUT_MS);
+      }),
     ]);
     /** COST IS WHAT THE CALL ACTUALLY ASKED FOR, not a flat 1. See docs/DECISIONS.md#d012 */
     const asked = (answered as { asked?: unknown } | null)?.asked;
@@ -171,5 +173,8 @@ export async function handle(req: Request): Promise<Response> {
       rate = { limit: RATE_LIMIT, remaining: 0, reset: err.retryAfterSeconds ?? 60, scope: "global" };
     }
     return fail(err, rateHeaders(rate), version);
+  } finally {
+    // A route that answered early must not leave its timer holding the isolate open.
+    clearTimeout(timer);
   }
 }

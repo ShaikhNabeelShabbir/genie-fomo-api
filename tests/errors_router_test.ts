@@ -29,6 +29,14 @@ Deno.test("router: the /api prefix is stripped and /v1 is optional", () => {
   assertEquals(match("GET", "/v1/nope"), null);
 });
 
+Deno.test("router: a malformed % sequence in a parameter is a 400, not a 500", () => {
+  get("/v1/traders/:handle/aum", () => "aum");
+  assertEquals(match("GET", "/v1/traders/a%20b/aum")?.params, { handle: "a b" });
+  let caught: unknown = null;
+  try { match("GET", "/v1/traders/%E0%A4%A/aum"); } catch (e) { caught = e; }
+  assertEquals(caught instanceof ApiError && [caught.status, caught.code], [400, "bad_request"]);
+});
+
 Deno.test("router: /v2 matches the same registrations and reports its version", () => {
   get("/v1/echo", () => "v1-registered");
   assertEquals(match("GET", "/v2/echo")?.handler({}, new URL("http://x")), "v1-registered");

@@ -7,7 +7,10 @@ import { NativePrice, nativePrices } from "../shared/prices.ts";
 import { resolveChain, SOLANA_NET, KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
-import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, MIN_DRAWABLE_POINTS, type StepChosenFrom, applyFloor, chooseStep } from "../shared/aum-rules.ts";
+import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, MIN_DRAWABLE_POINTS, type StepChosenFrom, applyFloor, chooseStep, PRICED_FLOOR, PARTIAL_SERVE_FLOOR_USD } from "../shared/aum-rules.ts";
+
+/** How far back from the freshest figured reading `now` may be picked. See docs/DECISIONS.md#d029 */
+const RECENT_MS = 36 * 3_600_000;
 
 // --------------------------------------------------------------- AUM over time
 
@@ -65,6 +68,8 @@ function buildAum(
     knownChains?: KnownChain[] | null;
     /** Each chain's own coin and what one costs, for the native amounts on `chains[]`. */
     natives?: Map<number, NativePrice> | null;
+    /** Whole-history facts the window-bounded `rows` cannot show. */
+    tracked: { sinceMs: number | null; anyRebuilt: boolean };
     sampler?: { lastAt: Date | null; lastSuccess: Date | null };
   },
 ) {
@@ -72,13 +77,15 @@ function buildAum(
   const span = AUM_WINDOWS[windowKey];
   const from = span === null ? null : new Date(to.getTime() - span);
 
-  rows = rows.map(applyFloor);
+  /** `at` is parsed once per row; every pass below reads `atMs`, never the string again. */
+  rows = rows.map((r) => ({ ...applyFloor(r), at_ms: Date.parse(String(r.at)) }));
+  const atMs = (r: Record<string, unknown>): number => r.at_ms as number;
 
   /** THE READING JUST BEFORE THE WINDOW IS KEPT, as an anchor. See docs/DECISIONS.md#d018 */
-  const inWindow = from === null ? rows : rows.filter((r) => Date.parse(String(r.at)) >= from.getTime());
+  const inWindow = from === null ? rows : rows.filter((r) => atMs(r) >= from.getTime());
   const before = from === null
     ? []
-    : rows.filter((r) => Date.parse(String(r.at)) < from.getTime());
+    : rows.filter((r) => atMs(r) < from.getTime());
 
   /** Reach back far enough for a LINE, not just for one point. See docs/DECISIONS.md#d019 */
   /** BORROWED POINTS MUST SHARE THE NEWEST POINT'S BASIS. See docs/DECISIONS.md#d020 */
@@ -103,12 +110,12 @@ function buildAum(
     if (hasFigure(comparable[i])) have++;
   }
   const windowed = [...anchors, ...inWindow];
-  const anchorAts = new Set(anchors.map((r) => new Date(String(r.at)).toISOString()));
+  const anchorAts = new Set(anchors.map(atMs));
 
   /** THE DEFAULT STEP IS THE COARSER OF WHAT THE WINDOW AFFORDS AND WHAT THE DATA HOLDS. See docs/DECISIONS.md#d021 */
   const rawGaps: number[] = [];
   for (let i = 1; i < windowed.length; i++) {
-    const g = Date.parse(String(windowed[i].at)) - Date.parse(String(windowed[i - 1].at));
+    const g = atMs(windowed[i]) - atMs(windowed[i - 1]);
     if (Number.isFinite(g) && g > 0) rawGaps.push(g);
   }
   rawGaps.sort((a, b) => a - b);
@@ -116,8 +123,7 @@ function buildAum(
   const observedStepMs = rawGaps.length ? rawGaps[Math.floor(rawGaps.length / 2)] : 0;
 
   /** THE STEP IS CHOSEN OVER THE RECORD HELD, not only the window asked for (S1). */
-  const firstSampled = rows.find((r) => r.basis === "sampled");
-  const trackedSpan = firstSampled ? to.getTime() - Date.parse(String(firstSampled.at)) : null;
+  const trackedSpan = opts.tracked.sinceMs !== null ? to.getTime() - opts.tracked.sinceMs : null;
   const pick = chooseStep(span, trackedSpan);
   let chosen: { name: string; ms: number } = stepRaw !== null
     ? AUM_STEPS.find((s) => s.name === stepRaw.trim().toLowerCase())!
@@ -139,7 +145,7 @@ function buildAum(
   const thin = (bucketMs: number): Record<string, unknown>[] => {
     const kept = new Map<number, Record<string, unknown>>();
     for (const r of windowed) {
-      const ms = Date.parse(String(r.at));
+      const ms = atMs(r);
       if (!Number.isFinite(ms)) continue;
       kept.set(Math.floor(ms / bucketMs), r);
     }
@@ -157,7 +163,7 @@ function buildAum(
     }
   }
   const points = thinned.map((r) => ({
-    at: new Date(String(r.at)).toISOString(),
+    at: new Date(atMs(r)).toISOString(),
     totalUsd: round(n(r.total_usd)),
     /** THE FIGURE BEHIND A REFUSAL. See docs/DECISIONS.md#d023 */
     partialUsd: round(n((r as { partial_usd?: unknown }).partial_usd)),
@@ -205,7 +211,7 @@ function buildAum(
     },
     ...(r.refused_reason ? { refused: r.refused_reason as string } : {}),
     /** True for a real dated reading borrowed from just before the requested window. */
-    ...(anchorAts.has(new Date(String(r.at)).toISOString()) ? { outsideWindow: true } : {}),
+    ...(anchorAts.has(atMs(r)) ? { outsideWindow: true } : {}),
   }));
 
   /** ===================== THE SEAM BETWEEN TWO KINDS OF POINT ===================== Section 9… See docs/DECISIONS.md#d026 */
@@ -238,7 +244,7 @@ function buildAum(
   const valuedRowByKey = new Map<string, Record<string, unknown>>();
   for (const r of rows) {
     valuedRowByKey.set(
-      `${new Date(String(r.at)).toISOString()}|${r.basis}`, r);
+      `${new Date(atMs(r)).toISOString()}|${r.basis}`, r);
   }
   /** A THIRD REASON, AND IT IS THE COMMONEST ONE. See docs/DECISIONS.md#d027 */
   const SHARE_RATIO = 2;
@@ -303,7 +309,7 @@ function buildAum(
    * for one day hid the current total entirely -- `now: null` on a trader carrying a month of
    * history and a $5.1M balance.
    */
-  const trackedSince = firstSampled ? new Date(String(firstSampled.at)).toISOString() : null;
+  const trackedSince = opts.tracked.sinceMs !== null ? new Date(opts.tracked.sinceMs).toISOString() : null;
 
   /** `now` IS THE MOST COMPLETE RECENT READING, NOT SIMPLY THE NEWEST. See docs/DECISIONS.md#d028 */
   const withFigure = rows.filter((r) => n(r.total_usd) !== null);
@@ -315,20 +321,19 @@ function buildAum(
   let newest: Record<string, unknown> | null = null;
   if (withFigure.length) {
     /** RECENT FIRST, THEN COMPLETE. See docs/DECISIONS.md#d029 */
-    const freshest = Date.parse(String(withFigure[withFigure.length - 1].at));
-    const RECENT_MS = 36 * 3_600_000;
-    const recent = withFigure.filter((r) => freshest - Date.parse(String(r.at)) <= RECENT_MS);
+    const freshest = atMs(withFigure[withFigure.length - 1]);
+    const recent = withFigure.filter((r) => freshest - atMs(r) <= RECENT_MS);
     const pool = recent.length ? recent : [withFigure[withFigure.length - 1]];
 
     const score = (r: Record<string, unknown>): [number, number, number] => [
       cover(r),
       r.basis === "sampled" ? 1 : 0,
-      Date.parse(String(r.at)),
+      atMs(r),
     ];
-    let best = pool[0];
+    let best = pool[0], b = score(best);
     for (const r of pool) {
-      const a = score(r), b = score(best);
-      if (a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])))) best = r;
+      const a = score(r);
+      if (a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])))) { best = r; b = a; }
     }
     newest = best;
   } else if (rows.length) {
@@ -711,10 +716,24 @@ function buildAum(
         (chainFilter ? ` on ${chainFilter.name} alone` : "") + "." +
         (trackedSince === null
           ? " Every point is a marked rebuild — sampling has not started."
-          : rows.some((r) => r.basis === "rebuilt")
+          : opts.tracked.anyRebuilt
           ? ` Points before ${trackedSince} are rebuilt from chain transfers, not measured.`
           : ""),
   };
+}
+
+/**
+ * When the sampler last ran and last succeeded, cached per isolate for a minute the way
+ * `nativeCache` is: one whole-table aggregate that every `/aum` call used to repeat.
+ */
+let samplerCache: { at: number; row: Record<string, unknown> | undefined } | null = null;
+async function samplerLast(): Promise<Record<string, unknown> | undefined> {
+  if (samplerCache && Date.now() - samplerCache.at < 60_000) return samplerCache.row;
+  const [row] = await sql`
+    select max(at) as last_at, max(sampled_at) as last_success
+    from aum_samples where basis = 'sampled'`;
+  samplerCache = { at: Date.now(), row };
+  return row;
 }
 
 /** AUM envelopes for MANY traders in a fixed number of queries. See docs/DECISIONS.md#d051 */
@@ -726,23 +745,69 @@ async function aumFor(
   if (!handles.length) return out;
 
   const to = new Date();
+  const span = AUM_WINDOWS[opts.windowKey];
 
-  /*
-   * EVERY ROW, WINDOWED IN MEMORY. The window used to be a WHERE clause, which meant a short
-   * window could not see the reading just outside it -- and `window=1d` returned nothing at
-   * all, not even the current total, for a trader we hold a month of history for.
-   */
   const traders = await sql`
     select handle, display_handle from traders where handle = any(${handles})`;
   if (!traders.length) return out;
   const present = traders.map((r: Record<string, unknown>) => String(r.handle));
 
   /*
+   * THE READ IS BOUNDED TO THE WINDOW, per trader. This is the one cost curve that grows with
+   * a trader's AGE rather than with the window asked for -- ~1k rows each today, ~50k in a
+   * year, times a 50-id batch -- and the only one that would hit the 15 s route race.
+   *
+   * The window used to be applied in memory over the whole history, so that a short window
+   * could still see the reading just outside it and the current total. What needs the whole
+   * history is now one aggregate per trader, and the row read floors at the earliest of
+   *   window start - 2 days     the anchors: two figured readings before the window (d018-d020)
+   *   freshest figured - 36 h   the pool `now` is picked from (d029), wherever it lies
+   *   freshest row              the refused newest, when no recent row carries a figure
+   * `window=all` has no floor. "Figured" mirrors `applyFloor`, which runs on the rows later:
+   * a row the floor blanks must not count as figured here either.
+   */
+  const history = opts.chainFilter
+    ? await sql`
+        select handle,
+               min(at) filter (where basis = 'sampled') as tracked_since,
+               bool_or(basis = 'rebuilt') as any_rebuilt,
+               max(at) as freshest,
+               max(at) filter (where total_usd is not null and (priced_share is null
+                 or priced_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
+        from aum_chain_samples
+        where handle = any(${present}) and network_id = ${opts.chainFilter.network_id}
+        group by handle`
+    : await sql`
+        select handle,
+               min(at) filter (where basis = 'sampled') as tracked_since,
+               bool_or(basis = 'rebuilt') as any_rebuilt,
+               max(at) as freshest,
+               max(at) filter (where total_usd is not null and (value_share is null
+                 or value_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
+        from aum_samples
+        where handle = any(${present})
+        group by handle`;
+  const histBy = new Map<string, Record<string, unknown>>(
+    history.map((h: Record<string, unknown>) => [String(h.handle), h]));
+  /** (handle, floor) pairs for the unnest joins below; a trader with no history has no pair. */
+  const lh: string[] = [], lo: string[] = [];
+  for (const h of history) {
+    const freshestMs = Date.parse(String(h.freshest));
+    /** A minute of slack: `at` is compared whole-second in JS and exact in SQL. */
+    const poolMs = h.freshest_figured ? Date.parse(String(h.freshest_figured)) - RECENT_MS - 60_000 : freshestMs;
+    lh.push(String(h.handle));
+    lo.push(span === null
+      ? "-infinity"
+      : new Date(Math.min(to.getTime() - span - 2 * 86_400_000, poolMs)).toISOString());
+  }
+
+  /*
    * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
    * parent row are whole-trader for a sampled point and one chain's for a rebuilt one.
    */
-  const rows = opts.chainFilter
-    ? await sql`
+  const [rows, allChainRows, knownBy, natives, samplerRow, presenceRows] = await Promise.all([
+    opts.chainFilter
+      ? sql`
         select a.handle, a.at, a.total_usd, a.reason as refused_reason,
                null::int as priced_positions, null::int as total_positions,
                a.priced_share as value_share, a.basis, s.tier,
@@ -750,14 +815,44 @@ async function aumFor(
         from aum_chain_samples a
         join aum_samples s
           on s.handle = a.handle and s.at = a.at and s.basis = a.basis
-        where a.handle = any(${present}) and a.network_id = ${opts.chainFilter.network_id}
+        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+          on u.handle = a.handle and a.at >= u.lo
+        where a.network_id = ${opts.chainFilter.network_id}
         order by a.handle, a.at asc`
-    : await sql`
-        select handle, at, total_usd, refused_reason, priced_positions, total_positions,
-               value_share, basis, tier, chains_answered, chains_expected
-        from aum_samples
-        where handle = any(${present})
-        order by handle, at asc`;
+      : sql`
+        select s.handle, s.at, s.total_usd, s.refused_reason, s.priced_positions, s.total_positions,
+               s.value_share, s.basis, s.tier, s.chains_answered, s.chains_expected
+        from aum_samples s
+        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+          on u.handle = s.handle and s.at >= u.lo
+        order by s.handle, s.at asc`,
+    /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
+    sql`
+        select a.handle, a.at, a.basis, c.name as chain, a.total_usd
+        from aum_chain_samples a
+        join chains c using (network_id)
+        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+          on u.handle = a.handle and a.at >= u.lo
+        order by a.handle, a.at asc`,
+    /** Window-independent chain list, one query for the whole batch. */
+    knownChainsFor(present),
+    /** Cached for the process; five rows that barely move. */
+    nativePrices(),
+    /*
+     * WHEN THE SAMPLER LAST SUCCEEDED, read once for the whole batch.
+     *
+     * The consumer measured every answer saying `ready` while the newest reading anywhere was
+     * 75 hours old, and nothing in the response said so. Freshness has to travel WITH the
+     * number rather than be reconstructed from dates by every caller.
+     */
+    samplerLast(),
+    sql`
+    select handle, count(distinct network_id)::int as chains,
+           bool_or(network_id = ${SOLANA_NET}) as on_solana,
+           bool_or(network_id <> ${SOLANA_NET}) as on_evm
+    from holdings_current where handle = any(${present}) and human_amount > 0
+    group by handle`,
+  ]);
 
   const byHandle = new Map<string, Record<string, unknown>[]>();
   for (const r of rows) {
@@ -794,20 +889,6 @@ async function aumFor(
     a.push(r);
   }
 
-  /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
-  const allChainRows = present.length
-    ? await sql`
-        select a.handle, a.at, a.basis, c.name as chain, a.total_usd
-        from aum_chain_samples a
-        join chains c using (network_id)
-        where a.handle = any(${present})
-        order by a.handle, a.at asc`
-    : [];
-  /** Window-independent chain list, one query for the whole batch. */
-  const knownBy = await knownChainsFor(present);
-  /** Cached for the process; five rows that barely move. */
-  const natives = await nativePrices();
-
   /** handle -> "<iso at>|<basis>" -> [{ chain, usd }]. One map, built once for the batch. */
   const pointChainsBy = new Map<string, Map<string, { chain: string; usd: number | null }[]>>();
   for (const r of allChainRows) {
@@ -818,36 +899,23 @@ async function aumFor(
     a.push({ chain: String(r.chain), usd: n(r.total_usd) });
   }
 
-  /*
-   * WHEN THE SAMPLER LAST SUCCEEDED, read once for the whole batch.
-   *
-   * The consumer measured every answer saying `ready` while the newest reading anywhere was
-   * 75 hours old, and nothing in the response said so. Freshness has to travel WITH the
-   * number rather than be reconstructed from dates by every caller.
-   */
-  const [samplerRow] = await sql`
-    select max(at) as last_at, max(sampled_at) as last_success
-    from aum_samples where basis = 'sampled'`;
-
-  const presenceRows = await sql`
-    select handle, count(distinct network_id)::int as chains,
-           bool_or(network_id = ${SOLANA_NET}) as on_solana,
-           bool_or(network_id <> ${SOLANA_NET}) as on_evm
-    from holdings_current where handle = any(${present}) and human_amount > 0
-    group by handle`;
   const presBy = new Map<string, { chains: number; on_solana: boolean; on_evm: boolean }>(presenceRows.map((r: Record<string, unknown>) => [String(r.handle), {
     chains: Number(r.chains), on_solana: r.on_solana === true, on_evm: r.on_evm === true,
   }]));
 
   for (const t of traders) {
     const h = String(t.handle);
+    const hist = histBy.get(h);
     out.set(h, buildAum(
       { handle: h, display_handle: String(t.display_handle) },
       byHandle.get(h) ?? [],
       chainsBy.get(h) ?? [],
       presBy.get(h) ?? null,
       { ...opts, to, pointChains: pointChainsBy.get(h) ?? null,
-        knownChains: knownBy.get(h) ?? [], natives, sampler: {
+        knownChains: knownBy.get(h) ?? [], natives, tracked: {
+          sinceMs: hist?.tracked_since ? Date.parse(String(hist.tracked_since)) : null,
+          anyRebuilt: hist?.any_rebuilt === true,
+        }, sampler: {
         lastAt: samplerRow?.last_at ? new Date(String(samplerRow.last_at)) : null,
         lastSuccess: samplerRow?.last_success ? new Date(String(samplerRow.last_success)) : null,
       } },
