@@ -26,6 +26,12 @@ setDefaultSql(postgres(url, {
   idle_timeout: 20,
   connect_timeout: 15,
   prepare: false,
+  /**
+   * A route that loses the 15 s race (`ROUTE_TIMEOUT_MS`, app.ts) used to keep its query and
+   * its connection running; with `max: 2` two slow routes starved the pool. 14 s so the
+   * statement dies just before the race does and the connection is free for the next caller.
+   */
+  connection: { statement_timeout: 14000 },
   /** Deno verifies TLS against its own trust store and rejects the Supabase pooler's chain with… See docs/DECISIONS.md#d004 */
   ssl: "require",
 }));
