@@ -135,14 +135,39 @@ def fetch(handle: str, key: str, limit: int) -> dict:
     return {"handle": handle, "error": "unreachable"}
 
 
+def outcome_of(doc: dict, source: str | None) -> tuple[str, str | None]:
+    """The `trade_loads` row for one fetched document: (outcome, detail)."""
+    if doc.get("error"):
+        return "error", doc["error"]
+    if doc.get("missing"):
+        return "not_found", "HTTP 404"
+    if doc.get("available") is False:
+        # fomo answers {available:false} both when it sheds load and for anyone outside its
+        # leaderboard; the trader's directory source is what tells the two apart.
+        return ("degraded" if source == "fomoapi.io" else "unavailable"), None
+    return "loaded", f"{len(doc.get('trades') or [])} trades"
+
+
+def record_loads(db: str, loads: list[tuple]) -> None:
+    """
+    One `trade_loads` row per attempt, written BEFORE the trades so a fetch that returned
+    nothing still leaves a trace. Without it a trader fomo will not serve looks exactly like
+    one nobody asked about (T1: the same 16 sat at 7 Sep for nine days).
+    """
+    with psycopg.connect(db) as conn, conn.cursor() as cur:
+        cur.executemany("insert into trade_loads (handle, outcome, detail) values (%s, %s, %s)", loads)
+        conn.commit()
+
+
 def select_targets(cur, args) -> list[tuple]:
     """
     Which traders to fetch this run.
 
-    `--all --stale-hours N` is the refresh selector, and it is SELF-CONVERGING: a trader
-    that fetches successfully has their `ingested_at` moved to now and drops out of the
-    next pass, while a trader fomo degraded keeps their old timestamp and stays selected.
-    That is what makes `--converge` terminate without needing to track state.
+    `--stale-hours N` is the refresh selector, and it is SELF-CONVERGING: a trader that
+    fetches successfully has their `ingested_at` (or, for an empty document, their `loaded`
+    attempt) moved to now and drops out of the next pass, while a trader fomo degraded
+    keeps their old timestamp and stays selected. That is what makes `--converge` terminate
+    without needing to track state.
 
     The default (neither flag) is the backfill selector — traders with no trades at all.
     Correct when filling an empty table, useless for a refresh where all 100 already have
@@ -154,10 +179,12 @@ def select_targets(cur, args) -> list[tuple]:
     # every pass. At 250 credits a call and 8 passes that is 2,328 calls spent learning the
     # same thing eight times, against a budget of under a thousand.
     src = getattr(args, "source", None)
-    if args.all and args.stale_hours is not None:
+    if args.stale_hours is not None:
         cur.execute("""
-            select t.handle, t.display_handle from traders t
-            where coalesce((select max(x.ingested_at) from trades x where x.handle = t.handle),
+            select t.handle, t.display_handle, t.source from traders t
+            where greatest((select max(x.ingested_at) from trades x where x.handle = t.handle),
+                           (select max(l.attempted_at) from trade_loads l
+                             where l.handle = t.handle and l.outcome = 'loaded'),
                            -- `make_interval(hours => ...)` needs an integer and psycopg
                            -- sends a float, so multiply an interval instead. This also
                            -- keeps fractional hours working.
@@ -166,11 +193,11 @@ def select_targets(cur, args) -> list[tuple]:
             order by t.handle
         """, (args.stale_hours, src, src))
     elif args.all:
-        cur.execute("""select handle, display_handle from traders
+        cur.execute("""select handle, display_handle, source from traders
                        where (%s::text is null or source = %s) order by handle""", (src, src))
     else:
         cur.execute("""
-            select t.handle, t.display_handle from traders t
+            select t.handle, t.display_handle, t.source from traders t
             where not exists (select 1 from trades x where x.handle = t.handle)
             order by t.handle
         """)
@@ -183,7 +210,7 @@ def _build_parser():
     ap.add_argument("--all", action="store_true",
                     help="refetch every trader, including ones we already have trades for")
     ap.add_argument("--stale-hours", type=float, default=None,
-                    help="with --all, only refetch traders whose newest trade row is older than this")
+                    help="only refetch traders whose newest trade row (or empty load) is older than this")
     ap.add_argument("--trade-limit", type=int, default=500, help="trades per trader")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--converge", action="store_true",
@@ -243,12 +270,14 @@ def run_once(args, fatal_on_empty: bool = True):
             print(f"  [{i:3}/{len(rows)}] {doc.get('handle','?'):<20} {state}", flush=True)
 
     display_to_handle = {r[1]: r[0] for r in rows}
-    trades, symbols = [], {}
+    source_of = {r[0]: r[2] for r in rows}
+    trades, symbols, loads = [], {}, []
     ok = degraded = missing = errored = 0
     unmatched_tokens = set()
 
     for doc in docs:
         handle = display_to_handle.get(doc.get("handle"), (doc.get("handle") or "").lower())
+        loads.append((handle, *outcome_of(doc, source_of.get(handle))))
         if doc.get("error"):
             errored += 1
             continue
@@ -287,6 +316,7 @@ def run_once(args, fatal_on_empty: bool = True):
     if args.dry_run:
         print("\ndry run — nothing written")
         return len(rows), ok
+    record_loads(db, loads)
     if not trades:
         # A single-shot run that fetched nothing is a failure worth shouting about — it
         # usually means the key is wrong or fomo is down, and writing nothing over something

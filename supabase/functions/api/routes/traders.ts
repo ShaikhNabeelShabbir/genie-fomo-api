@@ -10,7 +10,7 @@ import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { trustHoldings, trustBody } from "../shared/trust-core.ts";
 import { walletRows, walletsBody } from "../shared/wallets-core.ts";
-import { scorecardRows, FeeWindows, feesFor, Swap, swapsFor, chainEntriesFrom, chainExitsFrom, monthStartCapital, scorecardBody } from "../shared/scorecard-core.ts";
+import { scorecardRows, FeeWindows, feesFor, Swap, swapsFor, chainEntriesFrom, chainExitsFrom, monthStartCapital, scorecardBody, latestLoad } from "../shared/scorecard-core.ts";
 import { pnlAgg, pnlBody } from "../shared/pnl-core.ts";
 
 get("/v1/traders/:handle/trust", async ({ handle }) => {
@@ -91,7 +91,7 @@ get("/v1/traders", async (_p, url) => {
 
   const rows = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at, t.source,
-           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
+           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at, ld.*,
            case
              when ${q} = '' then 0
              when lower(t.display_handle) = ${q} or lower(coalesce(t.name,'')) = ${q} then 0
@@ -99,7 +99,7 @@ get("/v1/traders", async (_p, url) => {
              else 2
            end as score
     from traders t
-    left join trader_stats_current s using (handle)
+    left join trader_stats_current s using (handle) ${latestLoad()}
     where (${includeDelisted} or t.listed)
       and (${q} = '' or lower(t.display_handle) like ${"%" + q + "%"}
                      or lower(coalesce(t.name,'')) like ${"%" + q + "%"})
