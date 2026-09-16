@@ -936,10 +936,17 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
 });
 
 
+/** WHAT THE BATCH DOES ABOUT FRESHNESS: nothing, and it says so on every row (L1). */
+const BATCH_LIVE_READ = {
+  state: "skipped",
+  note: "batch never reads live; use GET /v1/traders/:handle/aum",
+} as const;
+
 /** AUM for many traders in one call. See docs/DECISIONS.md#d057 */
 post("/v1/traders/aum", async (_p, _url, body) => {
   const { requested, handles, asked, capped } = await batchIds(body);
-  const b = body as { window?: string; step?: string; contractVersion?: number; chain?: string };
+  /** `live` is accepted and ignored: the batch never reads live (L1); every row says so. */
+  const b = body as { window?: string; step?: string; contractVersion?: number; chain?: string; live?: unknown };
   /* Same aliases as the individual route, from the same table, so the two cannot disagree. */
   const askedWindow = (b?.window ?? "1w").trim();
   const windowKey = resolveWindow(askedWindow);
@@ -998,7 +1005,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
         requested: req,
         id: idBy.get(h) ?? null,
         handle: aum.handle,
-        aum,
+        aum: { ...aum, liveRead: BATCH_LIVE_READ },
       };
     });
 
@@ -1031,6 +1038,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
       const aum = envelopes.get(h);
       return {
         handle: h,
+        liveRead: BATCH_LIVE_READ,
         trackedSince: aum?.trackedSince ?? null,
         count: aum?.count ?? 0,
         now: aum?.now

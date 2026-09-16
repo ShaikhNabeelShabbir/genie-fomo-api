@@ -113,6 +113,8 @@ get("/v1/fields", async () => {
     },
 
     plain: "Every enumerated field with its complete set, every quantity with its unit, and " +
-           "how much of the directory carries each field. Counted live, not sampled.",
+           "how much of the directory carries each field. Counted live, not sampled. " +
+           "POST /v1/traders/aum accepts and ignores `live`; its rows carry liveRead: skipped. " +
+           "RateLimit-Remaining is per X-API-Key; RateLimit-Scope says whether the counter is global.",
   };
 });
