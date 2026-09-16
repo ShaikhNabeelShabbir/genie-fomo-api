@@ -1,9 +1,7 @@
 import type { Env } from "./env";
 import { webhook } from "./webhook";
 import { sample, sampleSlice } from "./sampler";
-
-const notPorted = (section: string): Response =>
-  Response.json({ error: "not_ported", see: `docs/CLOUDFLARE_MIGRATION.md ${section}` }, { status: 501 });
+import { api } from "./api";
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -11,7 +9,7 @@ export default {
     if (pathname === "/healthz" && req.method === "GET") return Response.json({ ok: true, worker: "genie-fomo" });
     if (pathname === "/webhook") return webhook(req, env, ctx);
     if (pathname === "/sample") return sample(req, env);
-    return notPorted("§5");
+    return api(req, env, ctx);
   },
 
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {

@@ -1,4 +1,5 @@
 import { sql, n, round } from "../db.ts";
+import { cfg } from "../config.ts";
 import { get, post } from "../router.ts";
 import { notFound, badRequest, ApiError, includeUnavailable } from "../errors.ts";
 import { asOfHoldings } from "../shared/asof.ts";
@@ -513,7 +514,7 @@ const walletActivity = (addrs: string[]) => sql`
 
 /** Wallets, each with its FAMILY and the chains it has actually been seen on. See docs/DECISIONS.md#d105 */
 /** A3 — accept a wallet for a trader we already list. See docs/DECISIONS.md#d106 */
-const WALLET_SUBMIT_SECRET = (Deno.env.get("WALLET_SUBMIT_SECRET") ?? "").trim();
+const walletSubmitSecret = () => (cfg("WALLET_SUBMIT_SECRET") ?? "").trim();
 const EVM_RE = /^0x[0-9a-fA-F]{40}$/;
 /** base58, no 0/O/I/l. Solana addresses are 32-44 of these. */
 const SOL_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -524,12 +525,12 @@ post("/v1/traders/:handle/wallets", async ({ handle }, _url, body) => {
    * A write is not open the way the reads are. Unset means misconfigured, and refusing is the
    * safe reading of that -- an open write route is worse than an absent one.
    */
-  if (!WALLET_SUBMIT_SECRET) {
+  if (!walletSubmitSecret()) {
     throw new ApiError(503, "not_configured",
       "wallet submission is not enabled on this deployment", {});
   }
   const b = (body ?? {}) as Record<string, unknown>;
-  if (String(b.secret ?? "") !== WALLET_SUBMIT_SECRET) {
+  if (String(b.secret ?? "") !== walletSubmitSecret()) {
     throw new ApiError(401, "unauthorized", "a valid `secret` is required to submit a wallet", {});
   }
 

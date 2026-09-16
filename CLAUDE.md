@@ -9,12 +9,12 @@ Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
 
 | Path | What |
 |---|---|
-| `supabase/functions/api/` | the read API: `index.ts` (auth, rate limit, 15 s timeout race), `router.ts`, `errors.ts`, `db.ts`, `routes.ts` (barrel) |
+| `supabase/functions/api/` | the read API: `app.ts` (`handle`: auth, rate limit, 15 s timeout race), `index.ts` (Deno entry: builds the client, serves), `router.ts`, `errors.ts`, `db.ts` (`sql` is a Proxy over the per-request `AsyncLocalStorage` store, falling back to `setDefaultSql`), `config.ts` (`cfg(name)`: store env, then `Deno.env` — the only place `Deno` is touched outside `index.ts`), `routes.ts` (barrel) |
 | `supabase/functions/api/routes/*.ts` | one module per route family (below) |
 | `supabase/functions/api/shared/*.ts` | helpers used by 2+ families; `vocabulary.ts` is the published word list; `aum-rules.ts` the pure /aum rules |
 | `supabase/functions/aum-sample/` | the balance sampler; `value.ts` holds the price ceilings. Fired every 5 min by `pg_cron` (`supabase/migrations/20260916120000_aum_sample_schedule.sql`) |
 | `supabase/functions/helius-webhook/` | Solana transfer push receiver |
-| `worker/` | the Cloudflare port (`docs/CLOUDFLARE_MIGRATION.md`): **scaffold, not deployed**. `/webhook` and `/sample` + `scheduled` ported (`sampler.ts` is the twin of `aum-sample/index.ts`: edit both); `/v1/*` answers 501 |
+| `worker/` | the Cloudflare port (`docs/CLOUDFLARE_MIGRATION.md`): **ported, not deployed**. `/webhook` and `/sample` + `scheduled` (`sampler.ts` is the twin of `aum-sample/index.ts`: edit both); `/v1/*` via `api.ts`, which runs the SAME `supabase/functions/api` modules inside `runWith({ sql, env })` — 503 `not_configured` until Hyperdrive is bound |
 | `supabase/functions/_shared/chain_reads.ts` | balance reads. **Twin of `scripts/lib/chain_reads.mjs`: edit both.** |
 | `supabase/migrations/` | schema; check constraints are the only SQL-enforced vocabulary |
 | `scripts/*.mjs` | Node loaders run by `.github/workflows/refresh.yml` nightly 06:00 UTC |
@@ -46,7 +46,7 @@ Router scores by literal-segment specificity, so registration order never matter
 |---|---|
 | `PRICED_FLOOR = 0.25` (count share, applied at read time only) | `shared/aum-rules.ts` |
 | `MAX_PRICE_PER_TOKEN`, `MAX_POSITION_USD` | `aum-sample/value.ts` (twin in `scripts/load_aum_samples.mjs`) |
-| `ROUTE_TIMEOUT_MS = 15000`, `BATCH_MAX_COST = 50` | `api/index.ts` |
+| `ROUTE_TIMEOUT_MS = 15000`, `BATCH_MAX_COST = 50` | `api/app.ts` |
 | rate limit 240/min, Postgres-backed `bump_rate_limit()` | `api/errors.ts`, migration `20260908090000_rate_limits.sql` |
 | `AUM_SAMPLE_*`, `WALLET_SUBMIT_SECRET`, live-read timing | `routes/aum.ts`, `routes/traders.ts` |
 

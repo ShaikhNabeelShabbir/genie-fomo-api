@@ -320,8 +320,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   /** PAGED, AND HONEST ABOUT IT. See docs/DECISIONS.md#d074 */
   const limit = intParam(url, "limit", { min: 1, max: 500, fallback: null });
   const cursor = url.searchParams.get("cursor");
-  const rowId = (r: { chain: string; tokenAddress: string | null }) =>
-    `${r.chain}:${String(r.tokenAddress ?? "").toLowerCase()}`;
+  const rowId = (r: { chain: unknown; tokenAddress: unknown }) =>
+    `${String(r.chain)}:${String(r.tokenAddress ?? "").toLowerCase()}`;
   const from = cursor ? resumeAfter(filtered, cursor, rowId) : 0;
   const page = limit === null ? filtered.slice(from) : filtered.slice(from, from + limit);
   const last = page.length ? page[page.length - 1] : null;

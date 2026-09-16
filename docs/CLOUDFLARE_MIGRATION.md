@@ -434,8 +434,19 @@ function secret(env: Env) {
 | `MAX_PER_WINDOW`, plus the imported `sql` singleton | `errors.ts` — the rate limiter |
 | the `capabilities` block's key-presence checks (`Deno.env.get(c.key)`, a dynamic key — becomes `env[c.key]`) | `/health` |
 
-The cleanest shape: a `Ctx` object built once per request and threaded through, carrying `sql`
-and the config. It is a mechanical edit across ~7,800 lines but a shallow one.
+~~The cleanest shape: a `Ctx` object built once per request and threaded through.~~ **Done
+differently (17 Sep 2026).** `api/db.ts` no longer builds a client at import: it exports `sql` as
+a Proxy over "the current client", resolved per call from an `AsyncLocalStorage<{ sql, env }>`
+(`node:async_hooks`, available on Deno and on Workers under `nodejs_compat`) with a fallback set
+once by `setDefaultSql()`. `api/config.ts` exports `cfg(name)`, which reads the same store's
+`env` first and `Deno.env` second; every former `Deno.env.get` in `api/` goes through it, and
+the module-scope constants became zero-arg functions or moved inside the handler. The handler
+itself is `api/app.ts` `handle(req)`; `api/index.ts` (Deno) builds the client, registers it and
+serves, while `worker/src/api.ts` does `runWith({ sql: db(env), env }, () => handle(req))` per
+request and closes the client in `ctx.waitUntil`. Why: the same `routes/` and `shared/` modules
+run on both runtimes with none of the 137 `sql\`…\`` call sites touched, and `checkRate` ports
+unchanged after all. The `paths` entry in `worker/tsconfig.json` maps the deno.land type
+import to the identical npm `.d.ts` so `tsc` can check the shared modules.
 
 ### 5.3 The router
 
@@ -964,7 +975,10 @@ mechanical `Deno.env.get` → `env` change across 26 call sites plus threading `
 `/sample` + `scheduled` are ported (`worker/src/sampler.ts`, twin of `aum-sample/index.ts`;
 `chain_reads.ts` and `value.ts` are imported from `supabase/functions`, not copied). Not
 deployed: no credentials yet, Hyperdrive id is a placeholder, `[triggers]` stays commented out
-until Phase 2 of §13. Phases 1, 2 and 5 not started: `/v1/*` answers 501.
+until Phase 2 of §13. Phase 5 ported, not deployed: `/v1/*` runs the shared `api/` modules
+through `worker/src/api.ts` (§5.2) and answers 503 `not_configured` until the Hyperdrive binding
+exists; verified locally only against a dead binding (404 route list, rate limiter fails open,
+`/v1/health` → 503 `unavailable`). Phases 1, 2 and 6 (the shadow diff) wait on Hyperdrive.
 
 The pre-migration fixes (`TO-DO-BEFORE-MIGRATION.md` P0 items 1–8, P1 items 9–15, and R4 / R6
 from P2) are all merged on `Junaid-deve-starts` and not deployed. They change `aum-sample`,

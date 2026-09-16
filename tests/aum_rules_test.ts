@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1";
 
-// db.ts reads DB_URL at import; `deno task test` sets a dummy so the pure rules load.
+// db.ts no longer touches the database at import; the pure rules load with no env at all.
 const { AUM_WINDOWS, PARTIAL_SERVE_FLOOR_USD, applyFloor, chooseStep, resolveWindow } = await import(
   "../supabase/functions/api/shared/aum-rules.ts"
 );

@@ -1,5 +1,6 @@
 /** Typed errors, so a caller can tell apart the three cases that need different reactions: 40… See docs/DECISIONS.md#d005 */
 import { sql } from "./db.ts";
+import { cfg } from "./config.ts";
 
 export class ApiError extends Error {
   constructor(
@@ -69,7 +70,7 @@ export function classify(e: unknown): ApiError {
 
 /** The rate limiter. See docs/DECISIONS.md#d008 */
 const WINDOW_SECONDS = 60;
-const MAX_PER_WINDOW = Number(Deno.env.get("RATE_LIMIT_PER_MINUTE") ?? 240);
+const maxPerWindow = () => Number(cfg("RATE_LIMIT_PER_MINUTE") ?? 240);
 
 export type RateState = {
   limit: number;
@@ -80,12 +81,12 @@ export type RateState = {
   scope: "global" | "unlimited";
 };
 
-const UNLIMITED: RateState = {
-  limit: MAX_PER_WINDOW,
-  remaining: MAX_PER_WINDOW,
+const unlimited = (): RateState => ({
+  limit: maxPerWindow(),
+  remaining: maxPerWindow(),
   reset: WINDOW_SECONDS,
   scope: "unlimited",
-};
+});
 
 /** Counts the request against the shared window and returns the state, or throws 429. */
 export async function checkRate(key: string): Promise<RateState> {
@@ -100,16 +101,16 @@ export async function checkRate(key: string): Promise<RateState> {
     console.error(`rate limiter unavailable, allowing request: ${
       e instanceof Error ? e.message : String(e)
     }`);
-    return UNLIMITED;
+    return unlimited();
   }
-  if (!row) return UNLIMITED;
+  if (!row) return unlimited();
 
   const count = Number(row.hit_count);
   const reset = Number(row.reset_seconds);
-  if (count > MAX_PER_WINDOW) throw rateLimited(reset);
+  if (count > maxPerWindow()) throw rateLimited(reset);
   return {
-    limit: MAX_PER_WINDOW,
-    remaining: Math.max(0, MAX_PER_WINDOW - count),
+    limit: maxPerWindow(),
+    remaining: Math.max(0, maxPerWindow() - count),
     reset,
     scope: "global",
   };
