@@ -2,26 +2,7 @@ import { sql, n, round } from "../db.ts";
 import { get } from "../router.ts";
 import { cov } from "../shared/format.ts";
 
-/**
- * WHAT A TRADER PAID FOR WHAT HE STILL HOLDS.
- *
- * `/positions` gave quantity, price and value with no acquisition cost, so "up 3x on this
- * coin" could not be said at all. Every open position we store carries an entry price and an
- * amount, and that is a cost basis.
- *
- * Two rules shape this:
- *
- *   A holding with no stored position gets `null`, never `0`. Coins arrive by transfer as
- *   well as by purchase, and a transfer in is not a free acquisition -- reading it as one
- *   would turn every airdrop into infinite profit. `costReason` names which case it is.
- *
- *   `unrealizedUsd` is measured against the quantity whose cost we know, not against the
- *   whole holding. Those differ whenever some positions carry an entry price and others do
- *   not, and multiplying a partial cost by a full quantity invents a number.
- *
- * Keyed by handle then "networkId:tokenKey". One query for the batch: 0.6 ms for a trader
- * through trades_handle_idx.
- */
+/** WHAT A TRADER PAID FOR WHAT HE STILL HOLDS. See docs/DECISIONS.md#d136 */
 export type CostBasis = {
   costKnownAmount: number | null; costUsd: number | null; avgCostPrice: number | null;
   realizedUsd: number | null; openPositions: number; openPriced: number;

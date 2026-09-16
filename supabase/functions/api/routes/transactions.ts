@@ -33,35 +33,13 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     };
   }
 
-  /**
-   * ?kind=swap returns only rows a provider classified as a swap.
-   *
-   * The review's sharpest point was that an inbound transfer is not a purchase — it is just
-   * as likely a self-transfer between the trader's own wallets. `tx_type` now carries the
-   * provider's own classification, so "show me actual trades" is finally answerable rather
-   * than being left to the caller to guess at.
-   *
-   * Rows ingested before that column existed have tx_type NULL and are EXCLUDED from a
-   * ?kind filter — absent, not assumed. Unfiltered requests still return everything.
-   */
+  /** ?kind=swap returns only rows a provider classified as a swap. See docs/DECISIONS.md#d109 */
   const kind = (url.searchParams.get("kind") ?? "").trim().toLowerCase() || null;
   if (kind && !["swap", "transfer"].includes(kind)) {
     throw badRequest(`unknown kind '${kind}' — use 'swap' or 'transfer'`);
   }
 
-  /**
-   * True keyset pagination, not an offset.
-   *
-   * This feed is append-only and the webhook writes to it continuously, so rows arrive at the
-   * FRONT of a `block_time desc` ordering. Under `?offset=` every insertion between two calls
-   * pushes the whole list down and page two repeats rows page one already returned. A keyset
-   * asks for "everything ordered after this exact row", which newly-arrived rows cannot
-   * disturb — they sort ahead of the cursor and are simply not in the caller's backward walk.
-   *
-   * `block_time` is NULL on 0 of 386,544 rows, so the ordering needs no NULL branch; the
-   * remaining four columns are the primary key and all ascend, which lets the tail be one
-   * row-value comparison rather than a nested OR chain.
-   */
+  /** True keyset pagination, not an offset. See docs/DECISIONS.md#d110 */
   const after = url.searchParams.get("cursor")
     ? decodeCursor(url.searchParams.get("cursor")!) : null;
   if (after && after.length !== 5) {
@@ -98,18 +76,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     select count(*)::int as total, max(block_time) as newest, min(block_time) as oldest
     from transactions where address_key = any(${keys})`;
 
-  /**
-   * T2.1. The cost-basis figures GMGN publishes as `history_bought_cost` /
-   * `history_sold_income`, derived from the quote leg of each swap.
-   *
-   * We overwhelmingly stored the quote side rather than the memecoin side, which is what
-   * makes this answerable: we know a wallet spent 1.5 SOL even though we never recorded what
-   * came back. So this is how much money MOVED, not what price they paid per token — the
-   * second question needs both legs and we hold those for a small minority of swaps.
-   *
-   * Coverage travels with it because a third of a wallet's swap legs can be unpriceable, and
-   * a spend total drawn from two thirds of the record must not read as the whole of it.
-   */
+  /** T2.1. See docs/DECISIONS.md#d111 */
   const moneyQ = sql`
     select coalesce(sum(value_usd) filter (where direction = 'out'), 0) as spent,
            coalesce(sum(value_usd) filter (where direction = 'in'),  0) as received,
@@ -119,16 +86,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     where address_key = any(${keys})
       ${net === null ? sql`` : sql`and network_id = ${net}`}`;
 
-  /**
-   * The money block is a WHOLE-WALLET total, identical on every page — so it is computed when
-   * you start reading a wallet and not again while you page through it.
-   *
-   * It is the expensive part of this route: 386ms as an index-only scan over 30,907 rows for
-   * a large wallet, which took the route from 2.5s to 3.6s against a 2.7s control. Recomputing
-   * it on all 12 pages of a walk would spend that twelve times over to return the same number
-   * twelve times. Present by default, absent once you are following a cursor, and `?money=true`
-   * forces it either way.
-   */
+  /** The money block is a WHOLE-WALLET total, identical on every page — so it is computed when See docs/DECISIONS.md#d112 */
   const wantMoney = url.searchParams.get("money") === "true" ||
     (after === null && url.searchParams.get("money") !== "false");
   const [[stored], moneyRows] = await Promise.all([
@@ -143,17 +101,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     wallets: { evm: t.evm_address ?? null, solana: t.sol_address ?? null },
     source: "postgres · transactions",
     asOf: stored.newest ? new Date(String(stored.newest)).toISOString() : null,
-    /**
-     * What this feed is, said plainly, because it is easy to mistake for something else.
-     *
-     * These are TRANSFERS, not trades. An incoming transfer is not a purchase — it is
-     * just as likely someone moving coins between their own wallets, and most rows come
-     * back `side: "in"` for exactly that reason. There is no USD value or price on a row
-     * because the providers do not give one and we will not invent it.
-     *
-     * For buy/sell with P&L and entry/exit prices, use /traders/:handle/scorecard, which
-     * reads fomo's trade records rather than raw chain movement.
-     */
+    /** What this feed is, said plainly, because it is easy to mistake for something else. See docs/DECISIONS.md#d113 */
     feed: "transfers",
     caveats: {
       notTrades: "an inbound transfer is commonly a self-transfer between the trader's own " +
@@ -209,14 +157,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     transfers: rows.map((r) => ({
       chain: r.chain,
       networkId: Number(r.network_id),
-      /**
-       * `txHash` is the name every other route uses -- /trades has always spelled it that
-       * way. This route emitted `tx_hash` alone, the one snake_case key in an otherwise
-       * camelCase API, which is an oversight rather than a convention.
-       *
-       * Both are returned: the old spelling stays so nothing reading it breaks, and new
-       * consumers get the name that matches the rest of the API. `tx_hash` is deprecated.
-       */
+      /** `txHash` is the name every other route uses -- /trades has always spelled it that way. See docs/DECISIONS.md#d114 */
       txHash: r.tx_hash,
       tx_hash: r.tx_hash,
       time: r.block_time ?? null,
@@ -226,15 +167,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
       token: r.token_symbol ?? null,
       contract: r.token_key ?? null,
       amount: n(r.amount),
-      /**
-       * T2.1. USD size of this leg — a MAGNITUDE, like `amount`, with the direction in
-       * `side`. `amount` is positive on every row in both directions (measured: 0 of 117,524
-       * swap legs are negative), so signing this column would have made the two disagree.
-       *
-       * `null` is the honest answer for a leg whose token is not a quote asset: ~8,700 of
-       * 117,500 swap legs are the memecoin side, and we did not store what it was worth. It
-       * is never 0 — a swap we could not value is not a swap worth nothing.
-       */
+      /** T2.1. See docs/DECISIONS.md#d115 */
       costUsd: n(r.value_usd) === null ? null : round(n(r.value_usd)),
       counterparty: r.counterparty ?? null,
       source: r.source,
@@ -252,23 +185,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
 
 // ------------------------------------------------------------- trades (§4)
 
-/**
- * The trader's own swaps, both sides, valued from the money side.
- *
- * PRD §4 asks for every swap on every chain. This serves what we have RESOLVED, which is
- * Solana only, and states that in `coverage` rather than implying the rest were quiet.
- *
- * Why only Solana: a swap is the wallet's own two-sided trade, and finding those on EVM was
- * measured and failed. A complete eth_getLogs scan of robinhood -- 2,000,000 blocks, every
- * wallet in the topic array -- produced 30,384 candidate (tx, wallet) groups and ZERO
- * two-sided swaps, because that chain matches off-chain and only settles on-chain in
- * Multicall3 batches. Across all four EVM chains our stored transactions hold 81
- * swap-shaped groups against Solana's 4,696.
- *
- * `valueUsd` comes from the MONEY side -- what was actually paid or received in a coin whose
- * dollar value we know -- not from multiplying the memecoin by a guessed price. That is why
- * it can be trusted where a price cannot.
- */
+/** The trader's own swaps, both sides, valued from the money side. See docs/DECISIONS.md#d116 */
 get("/v1/traders/:handle/trades", async ({ handle }, url) => {
   const h = await resolveTrader(handle);
   const [t] = await sql`
@@ -340,17 +257,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
     ])
     : [[], []];
 
-  /*
-   * FIFO PAIRING: each sell consumes the oldest buy still holding quantity.
-   *
-   * This is what turns a list of swaps into round trips -- "in and out under five seconds",
-   * "still open when our copy landed", and a holding time per trade rather than per coin.
-   * FIFO because it is the convention a reader assumes and the only one we can defend
-   * without knowing the trader's own accounting.
-   *
-   * A lot is identified by the tx that opened it, so a round-trip id is stable and points at
-   * something a consumer can look up on a block explorer.
-   */
+  /** FIFO PAIRING: each sell consumes the oldest buy still holding quantity. See docs/DECISIONS.md#d117 */
   /** `key` is the pairing entry this lot's own buy wrote, so closing it is O(1). */
   type Lot = { id: string; key: string; at: number; left: number };
   const openLots = new Map<string, Lot[]>();
@@ -421,15 +328,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
   }
 
   const capped = rows.length > limit;
-  /*
-   * `pageRaw` is the page as the database returned it; `page` is what survives `?status=`.
-   *
-   * The cursor is taken from `pageRaw` and never from `page`. Filtering happens after paging
-   * -- the pairing that decides open-versus-closed is not a stored column, so the database
-   * cannot do it -- and a page whose rows are all filtered out would otherwise produce a null
-   * cursor and stop the caller dead while rows remained. A sparse page is fine; a lost tail
-   * is not.
-   */
+  /** `pageRaw` is the page as the database returned it; `page` is what survives `?status=`. See docs/DECISIONS.md#d118 */
   const pageRaw = capped ? rows.slice(0, limit) : rows;
   const page = statusQ === null
     ? pageRaw
@@ -473,17 +372,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
         priceUsd: usd !== null && td !== null && td !== 0
           ? Number((Math.abs(usd) / Math.abs(td)).toPrecision(12)) : null,
         tier: "verified",
-        /**
-         * THE ROUND TRIP THIS SWAP BELONGS TO, from FIFO over the trader's whole record.
-         *
-         * `positionId` is the transaction that OPENED the lot, so it is stable and points at
-         * something a consumer can look up. On a buy, `status` is `open` until a later sell
-         * finishes consuming it. On a sell, `openedAt` is when the quantity it sold was
-         * bought, which is what "in and out under five seconds" measures.
-         *
-         * Null on a sell with nothing left to match -- a wallet whose earlier buys predate
-         * what we hold. That is a gap in our record, not a trade from nowhere.
-         */
+        /** THE ROUND TRIP THIS SWAP BELONGS TO, from FIFO over the trader's whole record. See docs/DECISIONS.md#d119 */
         ...(() => {
           const pr = pairing.get(`${r.tx_hash}|${r.network_id}|${r.token_key}`) ?? null;
           const openedAt = pr?.openedAt ?? null;
@@ -503,15 +392,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
         /** Where the row came from and how far to trust it, per row rather than per answer. */
         source: "helius rpc pre/post balances",
         confidence: usd !== null ? "high" : "medium",
-        /**
-         * WHAT THIS TRADE COST TO MAKE.
-         *
-         * `feeNative` is the measurement and is exact -- gas_used x effective_gas_price from
-         * the receipt on the EVM chains, meta.fee on Solana. `feeUsd` values it at the
-         * CURRENT native price, because we hold no historical one; it is an approximation and
-         * `feeUsdBasis` says so. Null, never 0: a trade is never free, so a missing fee is a
-         * gap in our reading, not a costless trade.
-         */
+        /** WHAT THIS TRADE COST TO MAKE. See docs/DECISIONS.md#d120 */
         ...(() => {
           const f = feeBy.get(`${Number(r.network_id)}|${r.tx_hash}`) ?? null;
           const px = f ? (feeNatives.get(f.net)?.usd ?? null) : null;
@@ -557,15 +438,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
       chainsTradedButUnresolved: presence
         .map((p: any) => p.chain as string)
         .filter((c: string) => !resolvedChains.has(c)),
-      /**
-       * PER CHAIN, so "he made no trades there" and "we have not read that chain" stop
-       * looking identical.
-       *
-       * `unresolved` means we hold no swaps for that chain at all though the trader is known
-       * to trade on it -- the honest state for the four EVM chains today. `complete` means we
-       * hold swaps and `from`/`to` say which span they cover, so a caller asking for last
-       * week can tell whether last week was even read.
-       */
+      /** PER CHAIN, so "he made no trades there" and "we have not read that chain" stop looking ide See docs/DECISIONS.md#d121 */
       byChain: (() => {
         const span = new Map<string, { from: number; to: number; rows: number }>();
         for (const r of allSwaps as Record<string, unknown>[]) {

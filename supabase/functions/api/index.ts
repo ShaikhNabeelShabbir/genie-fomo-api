@@ -13,18 +13,7 @@ import "./routes.ts";
 const KEY = (Deno.env.get("GENIE_API_KEY") ?? "").trim();
 const RATE_LIMIT = Number(Deno.env.get("RATE_LIMIT_PER_MINUTE") ?? 240);
 const port = Number(Deno.env.get("PORT") ?? 8000);
-/**
- * No route may hang. See the Promise.race below.
- *
- * The requirement asks for 5s. This ships at 15s, deliberately and visibly, because at 5s
- * three routes -- /health, /traders/:handle and /tokens -- returned `timeout` on EVERY call:
- * measured 5.4s, 5.9s and 6.9s with nothing else running. A bound that turns a slow route
- * into a permanently dead one is worse than the hang it replaced.
- *
- * 15s still does the job the requirement actually wants: a 30-second wait with no body is
- * indistinguishable from a slow success, and this makes that impossible. Getting to 5s is
- * query work on those three routes, not a smaller number here.
- */
+/** No route may hang. See docs/DECISIONS.md#d010 */
 const ROUTE_TIMEOUT_MS = Number(Deno.env.get("ROUTE_TIMEOUT_MS") ?? 15000);
 /** A batch is capped at 50, so a single call can never cost more than that. */
 const BATCH_MAX_COST = 50;
@@ -81,17 +70,7 @@ const fail = (e: ApiError, extra: Record<string, string> = {}, rid = requestId()
       ...(e.retryAfterSeconds ? { "Retry-After": String(e.retryAfterSeconds) } : {}) },
   );
 
-/**
- * The bucket key for a caller.
- *
- * `x-forwarded-for` is a CHAIN — `client, proxy1, proxy2` — and only the leftmost entry is
- * the original caller. Using the whole header made the key move as intermediate hops
- * changed: eight anonymous calls in a row produced 239, 239, 239, 238, 237, 238, 239, 236,
- * because they were landing in several different buckets. The first entry is stable.
- *
- * Note it is also client-supplied and therefore spoofable; this is a fair-use guard, not a
- * security control, and the leftmost-entry rule is what makes it work for honest clients.
- */
+/** The bucket key for a caller. See docs/DECISIONS.md#d011 */
 const callerKey = (req: Request): string => {
   const apiKey = req.headers.get("x-api-key");
   if (apiKey) return `key:${apiKey}`;
@@ -164,15 +143,7 @@ Deno.serve({ port }, async (req) => {
           `this route did not answer within ${ROUTE_TIMEOUT_MS / 1000}s — retry`,
           undefined, 5)), ROUTE_TIMEOUT_MS)),
     ]);
-    /*
-     * COST IS WHAT THE CALL ACTUALLY ASKED FOR, not a flat 1.
-     *
-     * A batch of fifty traders does fifty traders' worth of work, and reporting it as one
-     * unit -- the same as asking for a single trader -- gives a consumer no way to pace
-     * itself or predict a budget. Batch responses carry `asked`, so that is the cost; every
-     * other route costs one. GENIE_FOMO_V7_BATCH_AUM_TDR.md §7 requires the accounting to be
-     * deterministic and documented, and a number that ignores the request size is neither.
-     */
+    /** COST IS WHAT THE CALL ACTUALLY ASKED FOR, not a flat 1. See docs/DECISIONS.md#d012 */
     const asked = (answered as { asked?: unknown } | null)?.asked;
     const cost = typeof asked === "number" && Number.isFinite(asked) && asked > 0
       ? Math.min(asked, BATCH_MAX_COST)

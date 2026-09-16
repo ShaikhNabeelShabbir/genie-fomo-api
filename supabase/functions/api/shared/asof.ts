@@ -13,18 +13,7 @@ export const asOfHoldings = async (handle?: string): Promise<string | null> => {
     : await sql`select max(captured_at) as at from holdings_current`;
   return r?.at ? new Date(String(r.at)).toISOString() : null;
 };
-/**
- * When THIS trader's trade records were measured — not the board's.
- *
- * The unscoped version reported `max(captured_at)` across all 114 traders, so a trader last
- * refreshed two days ago still showed today's timestamp on their own page. That is exactly
- * the failure the consuming team reported against /v1/traders ("we cannot tell a trader
- * refreshed a minute ago from one refreshed a day ago"), which was fixed there with a
- * per-trader `updatedAt` and then quietly reintroduced here.
- *
- * Passing no handle keeps the board-wide value, which is the right answer only for
- * board-wide questions.
- */
+/** When THIS trader's trade records were measured — not the board's. See docs/DECISIONS.md#d122 */
 export const asOfTrades = async (handle?: string): Promise<string | null> => {
   const [r] = handle
     ? await sql`select max(captured_at) as at from trades where handle = ${handle}`

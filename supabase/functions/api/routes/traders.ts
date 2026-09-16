@@ -54,20 +54,7 @@ get("/v1/traders", async (_p, url) => {
    * with it an hourly job moves only what actually changed, which is what keeps this fixed as
    * the directory grows rather than just making today's sync fast.
    */
-  /**
-   * DELISTED TRADERS ARE NOT LISTED, and are still answerable by name.
-   *
-   * Four traders have no wallet and never will: fomoapi has dropped them from every
-   * leaderboard window, and 377 GMGN KOL and smart-money entries matched none of them. A2 is
-   * explicit about them -- "either given one or dropped from the directory; being listed and
-   * unpriceable is the worst of both" -- because a trader on the board with no balance and no
-   * chart is a blank a person cannot interpret.
-   *
-   * They are flagged, not deleted. `cmbarce` alone carries 103 holdings and 144 trades, and
-   * the condition reverses the moment the source lists him again. So the board stops showing
-   * them, `/traders/:handle` still answers for them, and `?includeDelisted=true` puts them
-   * back in the listing for anyone reconciling against an older copy.
-   */
+  /** DELISTED TRADERS ARE NOT LISTED, and are still answerable by name. See docs/DECISIONS.md#d093 */
   const includeDelisted = url.searchParams.get("includeDelisted") === "true";
 
   const sinceRaw = url.searchParams.get("updatedSince");
@@ -81,14 +68,7 @@ get("/v1/traders", async (_p, url) => {
 
   // Ranked by the leaderboard's own `rank`, and search scores exact > prefix > substring so
   // it matches the Node implementation rather than relying on Postgres text ranking.
-  /**
-   * T1.5. Sorting and range filters.
-   *
-   * Every option here is a column we already hold. GMGN exposes ~19 range filters on its
-   * trending board over metrics we do not have at all (`bundler_rate`, `insider_rate`,
-   * `top70_sniper_hold_rate`); this is deliberately the subset we can answer honestly rather
-   * than a claim of parity.
-   */
+  /** T1.5. See docs/DECISIONS.md#d094 */
   const TRADER_SORTS = ["rank", "pnl", "volume", "trades", "followers", "updated"] as const;
   const sort = sortParam(url, TRADER_SORTS, "rank", ["rank"]);
   const minPnl = numParam(url, "minPnl"), maxPnl = numParam(url, "maxPnl");
@@ -144,16 +124,7 @@ get("/v1/traders", async (_p, url) => {
     select window_label, extract(epoch from captured_at)::bigint as captured
     from builds order by captured_at desc limit 1`;
 
-  /**
-   * A range filter over a nullable column drops rows where the value is UNKNOWN, not just
-   * rows that fail the test — 44 of 144 traders have no stats row, so even `minPnl` at
-   * negative infinity returns 100. That is correct SQL and completely invisible to a caller,
-   * who reasonably reads a short list as "few traders qualify" rather than "a third of the
-   * board could not be tested".
-   *
-   * So when a filter is active we say how many rows it could not evaluate. Costs one cheap
-   * count, and only when it is relevant.
-   */
+  /** A range filter over a nullable column drops rows where the value is UNKNOWN, not just rows See docs/DECISIONS.md#d095 */
   const anyFilter = [minPnl, maxPnl, minVolume, maxVolume, minTrades, minFollowers]
     .some((v) => v !== null);
   const unratedCount = anyFilter
@@ -164,15 +135,7 @@ get("/v1/traders", async (_p, url) => {
     )
     : 0;
 
-  /**
-   * Applied before paging, so `offset` walks the filtered set rather than the full board.
-   *
-   * A trader with NO `captured_at` is included, not excluded. 37 of 137 have no stats row, so
-   * filtering them out would make them permanently invisible to every incremental sync —
-   * a consumer would never learn they exist and would never be told anything was missing.
-   * Unknown freshness cannot prove absence of change, so the safe answer is to send them and
-   * let the consumer over-write identical data.
-   */
+  /** Applied before paging, so `offset` walks the filtered set rather than the full board. See docs/DECISIONS.md#d096 */
   const visible = sinceMs === null ? rows : rows.filter((r) =>
     r.captured_at === null || r.captured_at === undefined ||
     Date.parse(String(r.captured_at)) > sinceMs!);
@@ -240,17 +203,7 @@ get("/v1/traders", async (_p, url) => {
     : new Map<string, FeeWindows>();
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
-  /*
-   * A requested include that produced NOTHING is a failure, not an empty truth.
-   *
-   * These queries can resolve to zero rows without throwing -- a degraded pool, a statement
-   * that timed out and came back empty -- and the response would still be 200 with the block
-   * silently absent on every row. That is what cost a consumer their watch list: they asked
-   * for wallets, got 435 traders and no wallets, and believed it.
-   *
-   * 432 of 435 traders have a wallet and every trader has trades, so on a non-empty page a
-   * requested include yielding zero rows is a fault every time. Fail loudly instead.
-   */
+  /** A requested include that produced NOTHING is a failure, not an empty truth. See docs/DECISIONS.md#d097 */
   if (page.length) {
     const empty: string[] = [];
     if (include.includes("wallets") && wRows.length === 0) empty.push("wallets");
@@ -260,15 +213,7 @@ get("/v1/traders", async (_p, url) => {
   }
 
 
-  /**
-   * Sub-resources are nested under `included`, NOT spread onto the entry.
-   *
-   * `entry.pnl` already exists and is fomo's REPORTED figure; the `pnl` sub-resource is the
-   * one we compute from stored trades. Spreading would have silently replaced one with the
-   * other under the same key — the exact reported-versus-verified conflation this API keeps
-   * apart everywhere else. Nesting also means a future include can never collide with a
-   * board field.
-   */
+  /** Sub-resources are nested under `included`, NOT spread onto the entry. See docs/DECISIONS.md#d098 */
   // deno-lint-ignore no-explicit-any
   const attach = async (r: any) => {
     const h = String(r.handle);
@@ -311,18 +256,7 @@ get("/v1/traders", async (_p, url) => {
   return {
     board: "traders",
     window: window_label ?? null,
-    /**
-     * ISO-8601, not the epoch integer this used to be.
-     *
-     * Every other moment this service publishes is an ISO string with an explicit Z, and
-     * `/v1/fields` says so in as many words: "*At / *From / *To / *Since: ISO-8601 with an
-     * explicit Z. Never epoch seconds." This one field contradicted that, on the most-called
-     * route, for a field the consumer's contract marks load-bearing -- "a board with no
-     * captured moment is refused outright".
-     *
-     * `capturedAtEpoch` carries the old integer so nothing that already parses it breaks. It
-     * is the shape that changed, not the meaning, and a consumer gets a version ahead.
-     */
+    /** ISO-8601, not the epoch integer this used to be. See docs/DECISIONS.md#d099 */
     capturedAt: captured ? new Date(Number(captured) * 1000).toISOString() : null,
     /** @deprecated The epoch form. Read `capturedAt`; this is here so old parsers survive. */
     capturedAtEpoch: captured ? Number(captured) : null,
@@ -387,16 +321,7 @@ get("/v1/traders", async (_p, url) => {
       // Empty string is not a URL. The column stores '' where fomo gave nothing, and the
       // Node route passes it through `nonEmpty`, so this has to as well.
       avatarUrl: nonEmpty(r.avatar as string | null),
-      /**
-       * WHERE THIS TRADER CAME FROM.
-       *
-       * The two sources fail in opposite directions and always have: entry prices are thin on
-       * the fomo side and rich on the GMGN side, resolved trades exist on the fomo side and
-       * barely at all on the GMGN side. A profile built to one contract therefore looks rich
-       * on some traders and threadbare on others, and until now nothing in the answer
-       * explained why -- the only tell was that `rank` and `followers` came back null, which
-       * is an inference, not a field.
-       */
+      /** WHERE THIS TRADER CAME FROM. See docs/DECISIONS.md#d100 */
       source: r.source ?? null,
       pnl: n(r.pnl_usd),
       volume: n(r.volume_usd),
@@ -451,14 +376,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     name: t.name ?? null,
     rank: t.rank ?? null,
     verified: !!t.verified,
-    /**
-     * IS THIS TRADER STILL ON THE BOARD, and if not, why.
-     *
-     * `listed: false` means the source stopped carrying them, so the directory no longer shows
-     * them — but this route still answers, because a link that used to work should not start
-     * 404ing over a condition upstream of us. Nothing is deleted: their holdings, trades and
-     * history are intact and the flag reverses if the source lists them again.
-     */
+    /** IS THIS TRADER STILL ON THE BOARD, and if not, why. See docs/DECISIONS.md#d101 */
     listed: t.listed !== false,
     ...(t.listed === false
       ? {
@@ -554,42 +472,15 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
 });
 
 
-/**
- * T1.2. On-chain activity counters for a set of wallets.
- *
- * GMGN publishes `buys_{window}` / `sells_{window}` / `swaps_{window}` per token; this is the
- * per-WALLET equivalent, which is what our routes are organised around. Same source and same
- * index as T1.1, so it costs one round-trip and no new table.
- *
- * `activeDays` counts distinct UTC days with any movement — not the span between first and
- * last. A wallet that traded twice a year apart has 2 active days, not 365, and the two
- * readings support very different conclusions about whether someone is actually trading.
- */
-/**
- * Axis 6's evenness input: how many trades on each active day.
- *
- * Returned as a series rather than a single number so a consumer can compute gini, burstiness
- * or anything else from the same rows — one histogram answers several questions, and a lone
- * coefficient answers exactly one. `evenness` is also computed server-side below for callers
- * who just want the figure.
- */
+/** T1.2. See docs/DECISIONS.md#d102 */
+/** Axis 6's evenness input: how many trades on each active day. See docs/DECISIONS.md#d103 */
 const dailyTradeCounts = (addrs: string[]) => sql`
   select date_trunc('day', block_time)::date as day, count(*)::int as trades
   from transactions
   where address_key = any(${addrs}) and block_time is not null
   group by 1 order by 1`;
 
-/**
- * Gini over trades-per-day, expressed as evenness (1 − gini).
- *
- * 1.0 means every active day carried the same number of trades; 0 approaches all activity in
- * a single day. Days with NO trades are deliberately excluded — the spec defines `activeDays`
- * as days with at least one trade, so including silent days would measure how long we have
- * been watching rather than how evenly they trade.
- *
- * `null` below two active days: a gini over one point is 0, which would read as "perfectly
- * concentrated" when it actually means "nothing to compare".
- */
+/** Gini over trades-per-day, expressed as evenness (1 − gini). See docs/DECISIONS.md#d104 */
 function evennessOf(counts: number[]): number | null {
   const xs = counts.filter((x) => x > 0).sort((a, b) => a - b);
   const n = xs.length;
@@ -616,42 +507,8 @@ const walletActivity = (addrs: string[]) => sql`
   where address_key = any(${addrs})`;
 
 
-/**
- * Wallets, each with its FAMILY and the chains it has actually been seen on.
- *
- * PRD §2. `family` is `solana` or `evm` and never a chain, because one Ethereum-style
- * address is the same wallet on Ethereum, Base, BNB Chain and Robinhood Chain at once --
- * 140 of our 260 EVM-only traders trade on four of them. A consumer that assumes one chain
- * per address files a third of them as quiet while they trade daily.
- *
- * `chains` is what we have OBSERVED, never inferred from the address format. A chain we have
- * never seen the wallet on is absent, not `tradesSeen: 0` -- those are different claims.
- */
-/**
- * A3 — accept a wallet for a trader we already list.
- *
- * WHY THIS EXISTS AND WHY IT IS NARROW. Seven traders are published with no address, so they
- * reach a screen with no balance and no chart. We resolve wallets ourselves and will keep
- * doing so; this is the route that lets whoever already holds one hand it over rather than
- * watching a trader stay unpriceable.
- *
- * IT IS THE ONLY WRITE IN THIS SERVICE, and that is the whole risk. Every other address here
- * came from a resolver we control, carrying its own source and confidence. An address that
- * arrives from outside has neither, and the failure it invites is the worst one available to
- * this API: attribute the wrong wallet to a trader and we price a stranger's money and
- * publish it under his name, plausibly, with nothing downstream able to tell.
- *
- * So the submission is treated as a CLAIM, not a fact:
- *   - the shape is checked, per family, before anything is stored;
- *   - an address already on another trader is REFUSED, never moved -- that single check is
- *     what stops one person's money appearing on another's page;
- *   - an address a trader already has is refused rather than silently overwritten;
- *   - what is stored carries `source: "submitted"` and `confidence: "reported"`, never
- *     `verified`, so every figure derived from it inherits the weaker tier.
- *
- * Every refusal is a machine word, because a caller has to be able to tell "you sent a typo"
- * from "that wallet belongs to somebody else" without reading English.
- */
+/** Wallets, each with its FAMILY and the chains it has actually been seen on. See docs/DECISIONS.md#d105 */
+/** A3 — accept a wallet for a trader we already list. See docs/DECISIONS.md#d106 */
 const WALLET_SUBMIT_SECRET = (Deno.env.get("WALLET_SUBMIT_SECRET") ?? "").trim();
 const EVM_RE = /^0x[0-9a-fA-F]{40}$/;
 /** base58, no 0/O/I/l. Solana addresses are 32-44 of these. */
@@ -690,14 +547,7 @@ post("/v1/traders/:handle/wallets", async ({ handle }, _url, body) => {
       `'${sol}' is not a base58 Solana address`, { parameter: "solanaAddress" });
   }
 
-  /*
-   * IS THIS ADDRESS ALREADY SOMEBODY ELSE'S? The one check that matters most here.
-   *
-   * Two traders sharing an address means one of them is shown the other's money, and it is
-   * invisible afterwards because the figure is real -- it just belongs to a different person.
-   * Refused outright rather than reassigned, and the refusal names the trader who holds it so
-   * the sender can see the collision rather than guess at it.
-   */
+  /** IS THIS ADDRESS ALREADY SOMEBODY ELSE'S? See docs/DECISIONS.md#d107 */
   const clashes = await sql`
     select handle, display_handle,
            case when lower(evm_address) = ${evm ? evm.toLowerCase() : null} then 'evm' else 'solana' end as family
@@ -821,15 +671,7 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
 
   return {
     ...walletsBody(t, knownBy.get(h) ?? []),
-    /**
-     * The stable key. `handle` above is a display name and may change; this does not.
-     *
-     * ONE SPELLING, and it is the directory's. This route used to prefix the uuid with
-     * `trd_` while `GET /traders` returned it bare, so the same trader had two ids depending
-     * on which route you asked -- a consumer storing one and looking up the other found
-     * nothing. The directory is what a consumer reads first, so the directory's form wins.
-     * Both spellings are still ACCEPTED as input, forever; only the output is now consistent.
-     */
+    /** The stable key. See docs/DECISIONS.md#d108 */
     id: t.id ?? null,
     /** Which directory this trader came from. See `GET /v1/traders`. */
     source: t.source ?? null,

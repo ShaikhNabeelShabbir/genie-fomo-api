@@ -3,26 +3,7 @@ import { get } from "../router.ts";
 
 // ------------------------------------------------------------------ fields
 
-/**
- * WHAT EVERY FIELD MEANS, WHAT IT CAN SAY, AND HOW OFTEN IT SAYS ANYTHING.
- *
- * Three questions a consumer has had to answer by observation, one refusal and one empty
- * screen at a time:
- *
- *   1. Which words can this field hold?  Every enumerated value was discovered the hard way --
- *      `chains_unrebuildable`, `too_little_priced`, `no_chains_answered` each arrived as an
- *      unexplained blank on somebody's screen first. Four more break reasons appeared between
- *      one report and the next. A word nobody published is a word with no sentence behind it.
- *   2. What unit is this in?  A unit change under a stable name is undetectable and
- *      catastrophic: every figure stays plausible and every one is wrong by a thousand.
- *   3. Is this field actually populated?  Every screen built on a field that turned out to be
- *      mostly empty was built because a spot check of two or three traders showed it filled.
- *      An entry-size figure good enough to rank on existed for 11 of 144 traders, and that was
- *      discovered after shipping.
- *
- * The fill rates are counted live over the whole directory, not sampled -- 227ms measured, so
- * it costs about what /health does.
- */
+/** WHAT EVERY FIELD MEANS, WHAT IT CAN SAY, AND HOW OFTEN IT SAYS ANYTHING. See docs/DECISIONS.md#d062 */
 get("/v1/fields", async () => {
   const [f] = await sql`
     with sc as (

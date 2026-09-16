@@ -1,24 +1,6 @@
 import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
 
-/**
- * Helius webhook receiver — the live half of the transaction feed.
- *
- * Helius POSTs here whenever any watched wallet transacts, so there is no polling. That
- * distinction is the whole reason this exists: polling ~200 wallets every minute is 288,000
- * calls a day against a ~100,000/month tier, roughly 86x over. Push costs nothing per event.
- *
- * Three rules shape the handler, and all three come from how Helius retries:
- *
- *   ANSWER FAST.  A non-2xx makes Helius retry, so slow work here turns into duplicate
- *                 deliveries. The insert is a single batched statement, nothing else.
- *
- *   BE IDEMPOTENT.  Retries and overlapping deliveries are normal. Rows key on
- *                 (network_id, tx_hash, address_key, transfer_key) with the same
- *                 deterministic digest the backfill uses, so replaying a payload is a no-op.
- *
- *   NEVER 500 ON BAD INPUT.  A malformed payload that returns 500 gets retried forever.
- *                 Anything unparseable is counted, skipped, and acknowledged.
- */
+/** Helius webhook receiver — the live half of the transaction feed. See docs/DECISIONS.md#d196 */
 const SOLANA = 1399811149;
 /**
  * SOL as it appears in `quote_assets` — the system program address. Native lamport movements
@@ -95,20 +77,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    /**
-     * The native SOL side of a swap.
-     *
-     * This loop did not exist, and its absence was the reason chain-derived P&L could not be
-     * built: on Solana the money side of a swap is very often native SOL, which Helius reports
-     * in `nativeTransfers` rather than `tokenTransfers`. Storing only the latter kept the token
-     * and dropped the dollars — 95,740 of 99,187 Solana swap events (96.5%) held a single leg,
-     * so only 3.45% could have a spend attributed to a token. `src/transactions.ts:364` has
-     * always handled both; this receiver did not, and the two quietly disagreed.
-     *
-     * `token_key` is SOL's `quote_assets` address, NOT the string "native" the Express path
-     * uses. It has to join to `quote_assets` or T2.1 cannot price the leg, which would leave
-     * the row present and valueless — no better than not having it.
-     */
+    /** The native SOL side of a swap. See docs/DECISIONS.md#d197 */
     for (const t of (ev?.nativeTransfers ?? []) as any[]) {
       const from = String(t?.fromUserAccount ?? "").toLowerCase();
       const to = String(t?.toUserAccount ?? "").toLowerCase();

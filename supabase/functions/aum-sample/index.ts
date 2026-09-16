@@ -3,37 +3,7 @@ import {
   SOLANA_NETWORK_ID, solanaBalances, evmBalances,
 } from "../_shared/chain_reads.ts";
 
-/**
- * AUM sampler, as a Supabase Edge Function.
- *
- * WHY THIS EXISTS RATHER THAN THE GITHUB ACTION. The same job runs in
- * `scripts/load_aum_samples.mjs`, driven by `refresh.yml` at 06:00 UTC daily. That schedule
- * stopped firing on 14 September and nobody noticed for six days: every balance reading in
- * the database falls on one of three moments, against a published daily promise. Meanwhile
- * the sibling Edge Function `helius-webhook` delivered 292,970 rows over the same week and
- * has never missed. The half of the system that stayed up is the half that lives here.
- *
- * WHAT IT DOES. Reads a slice of traders' balances straight off the chain, prices them from
- * what Postgres already holds, and writes one `aum_samples` row per trader plus one
- * `aum_chain_samples` row per chain. Identical arithmetic to the Node job -- same price
- * order, same refusal rules, same hour truncation -- so the two cannot produce different
- * numbers for the same moment.
- *
- * A SLICE, NEVER THE ROSTER. Measured: ~2.1s per trader plus fixed startup. The full 441
- * would be about fifteen minutes, far past any single invocation's budget. So a call takes a
- * handful of traders, oldest-sampled first, and returns what it did and what is left. Run it
- * on a short schedule and the roster comes round on its own; nothing has to fit in one call.
- *
- * WHAT IT DOES NOT DO. It does not fetch history, backfill anything, or call a price API.
- * Prices come from `quote_assets`, `token_info` and `token_prices` -- rows another job
- * already wrote. The only outbound calls are balance reads: Helius for Solana, and the
- * keyless public RPCs in `chains.rpc` for the four EVM chains.
- *
- *   POST { "limit": 10 }                  the 10 least-recently-sampled traders
- *   POST { "handle": "unipcs" }           one trader, now
- *   POST { "handles": ["a","b"] }         a named slice
- *   POST { "limit": 10, "dryRun": true }  read and price, write nothing
- */
+/** AUM sampler, as a Supabase Edge Function. See docs/DECISIONS.md#d188 */
 
 const url = Deno.env.get("DB_URL") ?? Deno.env.get("SUPABASE_DB_URL") ??
             Deno.env.get("DATABASE_URL") ?? "";
@@ -54,22 +24,7 @@ const sql = postgres(url, { max: 1, idle_timeout: 20, connect_timeout: 15, prepa
 
 /** Price ceilings, applied BEFORE any multiplication. Identical to the Node job. */
 const MAX_PRICE_PER_TOKEN = 1_000_000;
-/*
- * MAX_POSITION_USD WAS $1 TRILLION, WHICH CAUGHT NOTHING.
- *
- * Measured 16 September: four readings over $1bn had been written, topping out at
- * cupseyy $473,460,243,525. The cause is not a price over the per-token ceiling -- the
- * offending tokens price at $28,159 and $8,923, which is plausible beside BTC at $79,035 and
- * sails through. It is 10.4 MILLION units of an unnamed token multiplied by that price.
- *
- * Seventeen held positions price at $1bn or more and every one is a token we cannot even
- * name. The real ones stop far below: 78 positions between $1m and $10m, 21 between $10m and
- * $100m, and the largest genuine PORTFOLIO in the directory is unipcs at $16.5m.
- *
- * $1bn therefore leaves a position sixty times larger than the biggest real portfolio and
- * still refuses every broken one. A number that large is not a rich trader, it is a broken
- * price, and it must never reach a chart.
- */
+/** MAX_POSITION_USD WAS $1 TRILLION, WHICH CAUGHT NOTHING. See docs/DECISIONS.md#d189 */
 const MAX_POSITION_USD = 1_000_000_000;
 
 /**
@@ -86,14 +41,7 @@ const MAX_SLICE = 25;
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body, null, 2), { status, headers: { "Content-Type": "application/json" } });
 
-/**
- * Value one position, or refuse it.
- *
- * `{usd}` when it can be valued, `{rejected:true}` when a price exists but is not believable,
- * `{}` when we simply have no price. Three different states: an unpriced coin is a coverage
- * gap, a rejected one is a finding. One Orca pool once quoted a token at $3,110 against 29
- * pools at $0.187 and turned into a $26.7bn portfolio -- that is what the ceilings stop.
- */
+/** Value one position, or refuse it. See docs/DECISIONS.md#d190 */
 function value(amount: number, price: number | null): { usd?: number; rejected?: boolean } {
   if (price === null || !Number.isFinite(price) || price <= 0) return {};
   if (price > MAX_PRICE_PER_TOKEN) return { rejected: true };
@@ -107,15 +55,7 @@ type Position = { network_id: number; token_key: string; address: string; amount
 /** Chains the current trader's read actually asked. Reset per trader by readBalances(). */
 const attempted = new Set<number>();
 
-/**
- * Prices for a set of (network, token) pairs, from what this service already holds.
- *
- * Order is deliberate and matches the holdings loader AND the Node sampler, so an AUM point
- * and a /portfolio total cannot disagree about which price they used:
- *   quote_assets.pegged_usd   a dollar coin is a dollar, by definition
- *   token_info.price_usd      GMGN's live price, refreshed by its own loader
- *   token_prices              the most recent daily close
- */
+/** Prices for a set of (network, token) pairs, from what this service already holds. See docs/DECISIONS.md#d191 */
 async function pricesFor(pairs: Position[]): Promise<Map<string, number>> {
   const m = new Map<string, number>();
   if (!pairs.length) return m;
@@ -134,14 +74,7 @@ async function pricesFor(pairs: Position[]): Promise<Map<string, number>> {
   return m;
 }
 
-/**
- * Read every wallet this trader has, on every chain, from the chain itself.
- *
- * Throws on the first unreadable wallet. That is the point: the caller turns the throw into a
- * refusal for the WHOLE trader-hour rather than a total missing one wallet's worth. A partial
- * total reads low, looks exactly like a real drawdown, and nothing downstream can tell the
- * two apart.
- */
+/** Read every wallet this trader has, on every chain, from the chain itself. See docs/DECISIONS.md#d192 */
 async function readBalances(
   t: { handle: string; sol_address: string | null; evm_address: string | null },
   chains: { network_id: number; name: string; rpc: string }[],
@@ -223,14 +156,7 @@ Deno.serve(async (req) => {
   const started = Date.now();
 
   try {
-    /*
-     * WHO TO SAMPLE: least-recently-sampled first.
-     *
-     * This is the whole scheduling strategy and it needs no queue table. A trader never
-     * sampled sorts first (nulls first), so a new trader is picked up on the next call; after
-     * that everyone rotates by age. Run this on a short cron and the roster comes round by
-     * itself, with no state to get out of step.
-     */
+    /** WHO TO SAMPLE: least-recently-sampled first. See docs/DECISIONS.md#d193 */
     const targets = one
       ? await sql`
           select t.handle, w.sol_address, w.evm_address
@@ -325,24 +251,7 @@ Deno.serve(async (req) => {
       const perChain = new Map<number, { usd: number; priced: number; total: number }>();
 
       if (positions !== null) {
-        /*
-         * SEED EVERY CHAIN THIS READ ASKED, before counting what came back.
-         *
-         * `perChain` used to be built only from positions FOUND, so a chain that answered
-         * and held nothing never got an entry, never got an `aum_chain_samples` row, and
-         * became byte-identical to a chain nobody read. Downstream that reads as
-         * `historyState: "none"`, `answeredChains: 0 of 1` and `partialReason:
-         * "chains_missing"` — three statements that a wallet was not looked at, about a
-         * wallet that was.
-         *
-         * Measured on gmgn_0xf80d7961: his Ethereum wallet is read every pass and holds none
-         * of the 33 tokens he traded. A live eth_call against all 33 returns zero balances.
-         * The chain works; the wallet is empty; the service said it had never been read.
-         *
-         * An empty chain is a real answer — his balance there is zero — so it gets a row
-         * saying so. A chain that could NOT be read never reaches here: it throws, and the
-         * whole trader-hour is refused above.
-         */
+        /** SEED EVERY CHAIN THIS READ ASKED, before counting what came back. See docs/DECISIONS.md#d194 */
         for (const net of attempted) {
           if (!perChain.has(net)) perChain.set(net, { usd: 0, priced: 0, total: 0 });
         }
@@ -388,19 +297,7 @@ Deno.serve(async (req) => {
 
       if (dryRun) continue;
 
-      /*
-       * HOW MANY OF HIS CHAINS THIS READING COVERED, written onto the parent row.
-       *
-       * Not cosmetic: C2 in the acceptance tests asks what share of days have a reading for
-       * EVERY chain a trader holds, and it reads exactly these two columns. Leaving them null
-       * -- which the first version of this function did -- means a perfectly aligned reading
-       * is indistinguishable from one that missed half of him, and the test can never pass no
-       * matter how well the sampler runs.
-       *
-       * `expected` is the chains this read went and asked. `answered` is those that came back
-       * with something we could price. A chain asked and found genuinely empty counts as
-       * answered, because it was.
-       */
+      /** HOW MANY OF HIS CHAINS THIS READING COVERED, written onto the parent row. See docs/DECISIONS.md#d195 */
       const chainsExpected = positions === null ? null : attemptedCount;
       /*
        * A chain ANSWERED if it returned — including returning "he holds nothing here".

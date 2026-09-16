@@ -92,16 +92,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
       positions: Number(r.positions),
       priced: Number(r.priced),
       valueUsd: usd,
-      /**
-       * The same dollars said in the chain's own coin, which is how a wallet says them.
-       *
-       * `nativeAmount` is `valueUsd / nativeUsd` and nothing more, so the two always agree;
-       * `nativeUsd` and `nativePriceSource` travel with it so the division can be rechecked
-       * and so a consumer can see WHERE the rate came from.
-       *
-       * Null, never 0, when we hold no market price for that coin — see `whyNoNative`. A
-       * portfolio converted at a price nobody can stand behind is a worse answer than none.
-       */
+      /** The same dollars said in the chain's own coin, which is how a wallet says them. See docs/DECISIONS.md#d071 */
       nativeSymbol: nat?.symbol ?? null,
       nativeUsd: nat?.usd ?? null,
       nativePriceSource: nat?.source ?? null,
@@ -182,22 +173,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
 
 // ---------------------------------------------------------- T12 positions
 
-/**
- * T1.1. When a wallet first received a token, last sent it, and last did anything.
- *
- * READ, NOT COMPUTED. This used to aggregate the wallet's whole transaction history on every
- * request. For our busiest wallet that is 66,773 rows and about 9 seconds of CPU -- per view
- * -- which put GET /traders/:id/positions past its 15-second budget and returned 503 to the
- * traders people most want to look at. A covering index cut the disk reads a hundredfold and
- * left the CPU cost untouched, because the work was the wrong shape rather than merely slow.
- *
- * These values change only when new transactions arrive, so the nightly loader derives them
- * once into position_timing and the route reads them by index. See
- * scripts/refresh_position_timing.mjs.
- *
- * Both of a trader's wallets go in one `any()` rather than a query each, so a trader costs
- * one round-trip regardless of how many chains they use.
- */
+/** T1.1. See docs/DECISIONS.md#d072 */
 const positionTiming = (addrs: string[]) => sql`
   select network_id, token_key, start_at, end_at, last_at
   from position_timing
@@ -238,14 +214,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   ]);
   const costs = costBy.get(t.handle as string) ?? new Map<string, CostBasis>();
 
-  /**
-   * The floor under every timestamp on this page, derived in memory from `timing`.
-   *
-   * This was `select min(block_time) from transactions`. `block_time` leads no index, so that
-   * planned as a Parallel Seq Scan over 384k rows — 7.9s measured — on every request, to
-   * produce one constant. The earliest row we hold for THIS trader answers the same question
-   * for this response and costs nothing, since the rows are already here.
-   */
+  /** The floor under every timestamp on this page, derived in memory from `timing`. See docs/DECISIONS.md#d073 */
   const observedFrom = timing
     .map((r) => (r.start_at ? Date.parse(String(r.start_at)) : null))
     .filter((x): x is number => x !== null && Number.isFinite(x));
@@ -307,17 +276,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
 
   const filtered = url.searchParams.get("includeQuote") === "false"
     ? all.filter((r) => !r.isQuoteAsset) : all;
-  /*
-   * PAGED, AND HONEST ABOUT IT. This route used to return the first `limit` rows with nothing
-   * saying more existed -- so 50 of unipcs' 521 positions looked exactly like his whole
-   * portfolio, and a `cursor` parameter was accepted and silently ignored. The PRD forbids
-   * precisely that: "Paged or capped assets are visibly incomplete and never presented as the
-   * entire portfolio."
-   *
-   * The cursor names the last row returned, not an offset, so inserting or removing a
-   * position between pages cannot skip or repeat one. Identity is (chain, token address) --
-   * never the symbol, which is display metadata two different coins can share.
-   */
+  /** PAGED, AND HONEST ABOUT IT. See docs/DECISIONS.md#d074 */
   const limit = intParam(url, "limit", { min: 1, max: 500, fallback: null });
   const cursor = url.searchParams.get("cursor");
   const rowId = (r: { chain: string; tokenAddress: string | null }) =>
@@ -348,14 +307,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     complete: !more,
     totalValueUsd: total > 0 ? round(total) : null,
     coverage: { pricedPositions: priced, unpricedPositions: all.length - priced },
-    /**
-     * T1.1. The boundary every `startHoldingAt` on this page has to be read against.
-     *
-     * We began ingesting transactions on this date; trades on record predate it. A position
-     * whose `startHoldingAt` equals this timestamp was very likely opened EARLIER and simply
-     * first observed here — which is a different statement from "opened here", and only the
-     * caller can tell which matters to them.
-     */
+    /** T1.1. See docs/DECISIONS.md#d075 */
     chainHistory: {
       observedFrom: historyFrom,
       note: "on-chain timing is a FLOOR, not a first event. Ingestion began part-way through " +
@@ -376,36 +328,10 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
  * POST rather than GET because fifty ids do not belong in a query string: a 2 KB URL breaks
  * proxies and fills logs. Nothing here mutates -- it is a read that needs a body.
  */
-/**
- * Positions for many traders in one call.
- *
- * POST rather than GET because fifty ids do not belong in a query string: a 2 KB URL breaks
- * proxies and fills logs. Nothing here mutates -- it is a read that needs a body.
- *
- * TWO CONTRACTS, CHOSEN BY THE CALLER, for the same reason as batch AUM. `contractVersion: 2`
- * names every row by the value submitted and the canonical id, states explicitly whether each
- * one succeeded, and reports the counts and completeness
- * GENIE_FOMO_V7_BATCH_AUM_TDR.md §3 asks for. Without that field the older shape is returned
- * unchanged.
- *
- * DELIBERATELY NOT INCLUDED: the holding/activity times the individual route returns. Those
- * come from an aggregate over `transactions` that costs 12.5 seconds for our busiest trader,
- * measured; running it fifty times would take the call far past any sane budget. A consumer
- * that needs them reads the individual route for the trader it is showing, which is the one
- * place the cost is worth paying.
- */
+/** Positions for many traders in one call. See docs/DECISIONS.md#d076 */
 post("/v1/traders/positions", async (_p, _url, body) => {
   const { requested, handles, asked, capped } = await batchIds(body);
-  /*
-   * THE FULL ENVELOPE IS THE DEFAULT. `contractVersion: 1` opts back into the short shape.
-   *
-   * The short projection omits the per-row `ok` / `requested` / `id` and the explicit
-   * not-found refusal, so an id that could not be resolved is indistinguishable from a trader
-   * with no data. A consumer's bulk pass is the one place that shape does the most damage --
-   * measured on the sibling route, 435 of 435 warmed traders were stored chainless, while the
-   * same trader spot-checked one at a time carried five chains. Defaulting to the complete
-   * answer means a caller has to ASK for the lossy one rather than discover it.
-   */
+  /** THE FULL ENVELOPE IS THE DEFAULT. See docs/DECISIONS.md#d077 */
   const v2 = Number((body as { contractVersion?: number })?.contractVersion) !== 1;
 
   const rows = await sql`

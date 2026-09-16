@@ -23,15 +23,7 @@ export function post(pattern: string, handler: Handler): void {
   routes.push({ method: "POST", parts: pattern.split("/").filter(Boolean), handler });
 }
 
-/**
- * Match a path, preferring literal segments over parameters.
- *
- * Declaration order is NOT the tiebreak, deliberately. `/v1/tokens/momentum` and
- * `/v1/tokens/:address` are the same shape, and with first-match-wins the literal route is
- * unreachable if it happens to be declared second — which is exactly the bug this hit:
- * `momentum` resolved as a token address and returned "no leader holds 'momentum'".
- * Scoring by specificity makes the outcome independent of the order things are written in.
- */
+/** Match a path, preferring literal segments over parameters. See docs/DECISIONS.md#d013 */
 export function match(method: string, pathname: string) {
   // Strip the function name Supabase prefixes onto the path (/api/v1/... -> /v1/...).
   const parts = pathname.split("/").filter(Boolean);

@@ -63,16 +63,7 @@ export function pnlBody(t: any, r: any | undefined) {
     onPaperUsd: any ? round(unrealized) : null,
     openPositions: open,
     realizedShare: share,
-    /**
-     * WHY `realizedShare` IS NULL, as a machine word rather than only in `plain`.
-     *
-     * It is withheld on purpose and the sign discipline above explains why: a trader who lost
-     * $10,000 would otherwise render as "80% banked". That reasoning was sound and completely
-     * invisible to a machine -- 391 of 448 traders serve a null here, and not one carried a
-     * stated reason, which made this field alone 386 of the 425 silent absences across the
-     * six axes. A hollow axis is honest; a hollow axis with no reason is a hole a person reads
-     * as a judgement about the trader.
-     */
+    /** WHY `realizedShare` IS NULL, as a machine word rather than only in `plain`. See docs/DECISIONS.md#d135 */
     realizedShareReason: share !== null
       ? null
       : (!any

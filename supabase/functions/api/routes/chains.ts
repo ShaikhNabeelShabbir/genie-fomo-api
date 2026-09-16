@@ -23,17 +23,7 @@ get("/v1/chains", async () => {
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
   const [{ total }] = await sql`select count(*)::int as total from holdings_current`;
 
-  /**
-   * C3 — realized profit per chain.
-   *
-   * Previously marked unavailable because the source gives one `pnl` per trader and
-   * splitting it would mean inventing an attribution. That is still true of the LEADERBOARD
-   * figure — but per-trade records carry their own chain, so this attributes nothing: it
-   * sums realized P&L over trades that already know where they happened.
-   *
-   * `unattributed` is published rather than folded in. 26 closed trades still have no chain,
-   * and a breakdown that silently absorbed them would misstate every row.
-   */
+  /** C3 — realized profit per chain. See docs/DECISIONS.md#d060 */
   const profit = await sql`
     select t.network_id,
            count(*) filter (where t.status = 'closed')::int as closed,
@@ -47,18 +37,7 @@ get("/v1/chains", async () => {
   return {
     board: "chains",
     asOf: await asOfHoldings(),
-    /**
-     * THE CHAIN VOCABULARY IS CLOSED, AND SAYS SO.
-     *
-     * Chain words are this service's own -- a consumer takes them off this block and asks
-     * with them verbatim, because a word they invented is a read spent on nothing. That only
-     * works if the set is known to be complete: today there are five words, each with exactly
-     * one network id and no collisions, but nothing said whether a sixth was a new chain or a
-     * typo. `closed: true` means this list is the whole set; `vocabularyVersion` changes when
-     * a word is added or retired, so a diff is a release note rather than a surprise.
-     *
-     * A word is never renamed in place. A rename is a retirement and an addition.
-     */
+    /** THE CHAIN VOCABULARY IS CLOSED, AND SAYS SO. See docs/DECISIONS.md#d061 */
     vocabulary: {
       closed: true,
       version: 1,

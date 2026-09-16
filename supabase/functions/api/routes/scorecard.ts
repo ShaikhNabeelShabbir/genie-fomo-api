@@ -38,18 +38,7 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
 });
 
 
-/**
- * T2.2. Profit derived from the chain, independent of fomo.
- *
- * Every other money figure on this API is fomo's, which is exactly what `/trust` exists to
- * test. This one is ours: both sides of each swap resolved from Helius RPC pre/post balances,
- * so a buy and its matching sell reconcile on quantity.
- *
- * It is deliberately narrow. `transactions.tx_type` is the TRANSACTION's type, not the
- * wallet's action — measured on 60 random rows tagged SWAP, the wallet was not even among the
- * transaction's accounts in 57. Only the two-sided remainder is a trade the wallet made, and
- * only those are counted here. Coverage says how few that is rather than hiding it.
- */
+/** T2.2. See docs/DECISIONS.md#d078 */
 const chainPnl = (addrs: string[]) => sql`
   select count(*)::int                                             as swaps,
          count(distinct token_key)::int                            as tokens,
@@ -59,14 +48,7 @@ const chainPnl = (addrs: string[]) => sql`
          max(block_time)                                           as last_at
   from wallet_swaps where address_key = any(${addrs})`;
 
-/**
- * Positions the wallet opened AND fully closed on chain — where the token quantity nets to
- * approximately zero, so the dollars in and out are a complete round trip.
- *
- * This is the only subset where "realised profit" is literally true. A position still open
- * has spent dollars and no proceeds; counting it would report every holder as loss-making.
- * The 1e-6 tolerance absorbs the rounding in a UI-unit balance, not a real residual.
- */
+/** Positions the wallet opened AND fully closed on chain — where the token quantity nets to a See docs/DECISIONS.md#d079 */
 const chainRoundTrips = (addrs: string[]) => sql`
   select count(*)::int                          as closed_positions,
          coalesce(sum(net_usd), 0)              as realized_usd,

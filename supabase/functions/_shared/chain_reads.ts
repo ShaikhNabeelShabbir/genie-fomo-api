@@ -1,16 +1,4 @@
-/**
- * Reading true balances off the five chains we carry — the Deno half.
- *
- * A DELIBERATE PORT, NOT A REWRITE. `scripts/lib/chain_reads.mjs` is the Node original and
- * every line here matches it: the same token programs, the same 40-call batch, the same
- * per-host throttle, the same refusal to turn an unreadable balance into a zero. Two
- * implementations of this WILL drift the first time either is edited, and the two figures
- * disagreeing is precisely the bug the AUM feature exists to remove — a running total and a
- * balance are not the same number. If you change one, change both.
- *
- * Nothing here touches Postgres. These are network reads and pure arithmetic; the caller
- * decides what to store.
- */
+/** Reading true balances off the five chains we carry — the Deno half. See docs/DECISIONS.md#d001 */
 
 export const SOLANA_NETWORK_ID = 1399811149;
 /** Native SOL under the key quote_assets already uses, so it prices like any other quote. */
@@ -27,17 +15,7 @@ const BATCH = 40;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * One in-flight request per host, with a floor on the gap between them.
- *
- * The public chain RPCs are a shared free resource and robinhood's answers 429 well before
- * anything else does. Serialising per host costs seconds and is the difference between a
- * complete snapshot and a partial one.
- *
- * NOTE for the Edge Function: this map lives per instance. Edge Functions scale horizontally,
- * so N warm instances make N times these calls. That is why the caller caps how many traders
- * one invocation may sample rather than relying on this alone.
- */
+/** One in-flight request per host, with a floor on the gap between them. See docs/DECISIONS.md#d002 */
 const HOST_GAP_MS = 260;
 const hostQueue = new Map<string, Promise<unknown>>();
 export function throttled<T>(url: string, fn: () => Promise<T>): Promise<T> {

@@ -24,15 +24,7 @@ export async function batchIds(
                      { parameter: "ids" });
   }
 
-  /*
-   * OVER THE CAP IS A REFUSAL, NOT A TRIM.
-   *
-   * This used to read the first fifty and set `capped: true`. That is a correct description
-   * of what happened and still the wrong behaviour: the caller asked about sixty traders and
-   * got a 200, so the ten it never heard about look exactly like ten traders with no data.
-   * GENIE_FOMO_V7_BATCH_AUM_TDR.md §6 asks for the refusal instead, and a 400 naming the cap
-   * is a bug the caller fixes once rather than a silent under-count it never notices.
-   */
+  /** OVER THE CAP IS A REFUSAL, NOT A TRIM. See docs/DECISIONS.md#d123 */
   if (ids.length > BATCH_MAX) {
     throw badRequest(
       `at most ${BATCH_MAX} ids per call — got ${ids.length}; split the list rather than ` +
@@ -59,14 +51,7 @@ export async function batchIds(
     seen.add(norm);
   }
 
-  /*
-   * RESOLVE ALL FIFTY IN ONE QUERY, not one query each.
-   *
-   * resolveTrader() looks an id up in the database, so mapping it over the list issued fifty
-   * round trips through the pooler -- about nine seconds of a call whose actual data costs
-   * 1.2. Measured on a 50-id batch: 9.9s for a window returning 65KB, which is the giveaway
-   * that the payload was never the problem. One `any()` answers the whole list.
-   */
+  /** RESOLVE ALL FIFTY IN ONE QUERY, not one query each. See docs/DECISIONS.md#d124 */
   const uuidish = wanted.filter((k) => UUID_RE.test(k.trim().replace(/^trd_/, "")));
   const byId = new Map<string, string>();
   if (uuidish.length) {
@@ -80,19 +65,7 @@ export async function batchIds(
     return byId.get(bare) ?? k.trim().toLowerCase();
   });
 
-  /*
-   * THE `display_handle` FALLBACK, which the single routes have had and this one did not.
-   *
-   * resolveTrader() tries the stored handle, then `display_handle`, because for one trader
-   * they differ: `yeon__ (gmgn)` is published under that name and stored as `gmgn_yeon__`.
-   * Lowercasing the published name therefore matched nothing here, so the SAME trader
-   * answered 200 with a full envelope on /traders/:handle/aum and `not_found` in the batch.
-   * One trader of 448, resolvable by id, and the only one whose two routes disagreed about
-   * whether he exists -- which is precisely the failure the batch contract forbids.
-   *
-   * Only the handles that missed are looked up, so the ordinary batch pays nothing: the
-   * query runs at all only when a name did not match a stored handle.
-   */
+  /** THE `display_handle` FALLBACK, which the single routes have had and this one did not. See docs/DECISIONS.md#d125 */
   const missed = [...new Set(handles)];
   if (missed.length) {
     const known = await sql`
@@ -121,14 +94,7 @@ export async function batchIds(
     resolved.add(h);
   }
 
-  /*
-   * `requested` is what the caller actually sent, kept beside the resolved handle.
-   *
-   * Without it a response is ambiguous the moment a handle changes: the caller asked about
-   * an id, the row comes back under a handle, and nothing in between says they are the same
-   * trader. GENIE_FOMO_V7_BATCH_AUM_TDR.md §5 asks for the submitted value to be echoed for
-   * exactly this reason, so a row can be joined back without guessing.
-   */
+  /** `requested` is what the caller actually sent, kept beside the resolved handle. See docs/DECISIONS.md#d126 */
   return { requested: wanted, handles, asked: wanted.length, capped: false };
 }
 

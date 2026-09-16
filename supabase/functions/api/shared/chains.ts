@@ -2,19 +2,7 @@ import { sql } from "../db.ts";
 import { get } from "../router.ts";
 import { badRequest } from "../errors.ts";
 
-/**
- * PARAMETERS.md routes, served from Postgres.
- *
- * Two rules carry over from the Express implementation and are the reason several of these
- * queries look more careful than they need to:
- *
- *   A MISSING PRICE IS NOT ZERO.  `value` is nullable and 1,688 of 2,038 rows have none.
- *   SQL's `sum()` skips nulls, which is what we want — but `count(*)` does not, so every
- *   ratio here names the column it counts rather than counting rows.
- *
- *   A RATIO SHIPS WITH ITS DENOMINATOR.  A concentration of 97% computed over 44% of a
- *   portfolio is not a fact about the portfolio, so `coverage` travels with every figure.
- */
+/** PARAMETERS.md routes, served from Postgres. See docs/DECISIONS.md#d127 */
 
 export const chainWhere = async (chain: string | null) => {
   if (!chain) return null;
@@ -42,22 +30,7 @@ export const SOLANA_NET = 1399811149;
 
 // ----------------------------------------------------------------- wallets
 
-/**
- * EVERY CHAIN A TRADER USES, independent of any window or any single reading.
- *
- * `aum.chains` lists the chains in the NEWEST reading, which is a fact about that reading and
- * not about the trader -- it showed Solana alone for a trader whose portfolio spans five. A
- * consumer drawing chain switches from it offered 128 of 435 traders fewer switches than the
- * service itself says they use.
- *
- * So the list is built from every place a chain can be evidenced, unioned:
- *   - a chain his wallets have been SEEN trading on (wallet_chain_presence)
- *   - a chain he currently HOLDS something on (holdings_current)
- *   - a chain we hold BALANCE HISTORY for (aum_chain_samples)
- *
- * Set-based over every handle at once, so the batch routes pay one query rather than fifty:
- * measured 116 ms for fifty traders.
- */
+/** EVERY CHAIN A TRADER USES, independent of any window or any single reading. See docs/DECISIONS.md#d128 */
 export type KnownChain = {
   chain: string; networkId: number; wallets: number;
   hasPositions: boolean; historyState: string;

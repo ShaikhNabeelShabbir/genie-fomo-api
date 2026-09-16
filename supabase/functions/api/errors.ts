@@ -1,15 +1,4 @@
-/**
- * Typed errors, so a caller can tell apart the three cases that need different reactions:
- *
- *   401 unauthorized  — the key is missing or wrong. STOP; retrying will not help.
- *   429 rate_limited  — back off and retry. `Retry-After` says how long.
- *   503 unavailable   — we are briefly down. Retry, and keep showing your last good copy.
- *
- * A single generic 500 forces a consumer to render "something went wrong" for all three,
- * which is exactly the complaint this exists to answer. Every error body carries a stable
- * machine-readable `code` alongside the human `detail`, because status alone cannot
- * distinguish "no such trader" from "no such route".
- */
+/** Typed errors, so a caller can tell apart the three cases that need different reactions: 40 See docs/DECISIONS.md#d005 */
 import { sql } from "./db.ts";
 
 export class ApiError extends Error {
@@ -40,15 +29,7 @@ export const rateLimited = (retryAfter: number) =>
 export const unavailable = (detail: string) =>
   new ApiError(503, "unavailable", detail, undefined, 5);
 
-/**
- * A sub-resource the caller explicitly asked for could not be produced.
- *
- * 503 rather than 200-with-the-block-missing, and this is not a style choice. A consumer
- * asked `?include=wallets`, got 200 with 435 traders and no wallets on any of them, and
- * treated the silence as "these traders have no wallets" -- it nearly deleted their entire
- * watch list. A success-shaped empty answer is worse than an error, because nothing
- * downstream can tell it from the truth.
- */
+/** A sub-resource the caller explicitly asked for could not be produced. See docs/DECISIONS.md#d006 */
 export const includeUnavailable = (blocks: string[]) =>
   new ApiError(
     503,
@@ -66,14 +47,7 @@ export const includeUnavailable = (blocks: string[]) =>
  * not a bug in the request — returning 500 for it tells the caller to give up when they
  * should be backing off and keeping their last good copy on screen.
  */
-/**
- * Map anything thrown to a stable, documented code -- and never hand the caller driver text.
- *
- * A consumer was once returned `bind message supplies 8 parameters, but prepared statement
- * requires 0`. That is a postgres wire-protocol detail: it names no route, suggests no
- * action, and leaks how the service is built. Internal faults now answer `internal_error`
- * with a fixed sentence and the detail goes to the log, where it belongs.
- */
+/** Map anything thrown to a stable, documented code -- and never hand the caller driver text. See docs/DECISIONS.md#d007 */
 export function classify(e: unknown): ApiError {
   if (e instanceof ApiError) return e;
   const msg = e instanceof Error ? e.message : String(e);
@@ -93,18 +67,7 @@ export function classify(e: unknown): ApiError {
   return new ApiError(500, "internal_error", "the service failed to answer this request");
 }
 
-/**
- * The rate limiter.
- *
- * This was a `Map` in module scope. That never worked: every Edge Function invocation gets
- * a fresh isolate, so the map arrived empty and was thrown away on exit. Measured: 132
- * consecutive calls each reported `remaining: 239`, and 400 calls never produced a 429. The
- * limit did not bind, and the header was a constant wearing a budget's clothing — worse
- * than no header, because a client would have paced against it.
- *
- * The counter now lives in Postgres, the one thing every instance shares, and is bumped in
- * a single atomic statement so two instances cannot interleave a read-modify-write.
- */
+/** The rate limiter. See docs/DECISIONS.md#d008 */
 const WINDOW_SECONDS = 60;
 const MAX_PER_WINDOW = Number(Deno.env.get("RATE_LIMIT_PER_MINUTE") ?? 240);
 
@@ -113,14 +76,7 @@ export type RateState = {
   remaining: number;
   /** Seconds until the window resets. */
   reset: number;
-  /**
-   * `global` when the shared counter answered, `unlimited` when it did not.
-   *
-   * The limiter fails OPEN: if the database is unreachable the request is served rather
-   * than rejected. A rate limiter that turns a database blip into a site-wide outage has
-   * done more damage than the traffic it was guarding against. `scope` says which happened,
-   * so a header reading 240/240 is never mistaken for a fresh window.
-   */
+  /** `global` when the shared counter answered, `unlimited` when it did not. See docs/DECISIONS.md#d009 */
   scope: "global" | "unlimited";
 };
 

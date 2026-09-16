@@ -14,14 +14,7 @@ get("/v1/tokens", async (_p, url) => {
   const net = await chainWhere(chainQ);
   const minHolders = intParam(url, "minHolders", { min: 1, fallback: 1 }) ?? 1;
 
-  /**
-   * T1.5. Board sorting and value filters.
-   *
-   * `value` uses the same coalesce-to-0 the ordering already used, so an unpriced token sorts
-   * and filters as 0 here rather than dropping out. That is a filtering convenience and NOT a
-   * claim it is worth nothing — `totalValueUsd` in the response stays `null` for those rows,
-   * which is the figure a consumer actually reads.
-   */
+  /** T1.5. See docs/DECISIONS.md#d080 */
   // T3d adds three: a board that carries market cap and liquidity but cannot sort on them is
   // only half a board. `chainHolders` is GMGN's count across every holder, distinct from
   // `holders`, which counts the leaders WE track.
@@ -50,14 +43,7 @@ get("/v1/tokens", async (_p, url) => {
   const minMarketCap = numParam(url, "minMarketCap"), maxMarketCap = numParam(url, "maxMarketCap");
   const minLiquidity = numParam(url, "minLiquidity");
 
-  /**
-   * T3a. `?excludeHoneypots=true` drops tokens GMGN flags as unsellable.
-   *
-   * Opt-in rather than the default: silently removing rows would misstate the board — a
-   * consumer counting the tokens their leaders hold would get a different number with no
-   * indication why. It also only removes tokens PROVEN unsellable; a Solana token, where the
-   * check does not run, is never dropped for failing a test that was never applied.
-   */
+  /** T3a. See docs/DECISIONS.md#d081 */
   const excludeHoneypots = url.searchParams.get("excludeHoneypots") === "true";
 
 
@@ -320,18 +306,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
         holders,
         holderShare: Number((holders / Number(traderCount)).toFixed(4)),
         totalValueUsd: priced.length ? round(total) : null,
-        /**
-         * T3d. Chain-wide facts about the token, from GMGN — NOT computed by us.
-         *
-         * They describe every holder and every pool; we observe 137 traders and could not
-         * derive any of this from our own rows. It therefore arrives wearing `tier` and
-         * `source`, like every other borrowed figure in this API, so it stays
-         * distinguishable from the numbers we stand behind. That separation is the one thing
-         * we have that GMGN does not, and quietly blending the two would spend it.
-         *
-         * `null` when the token has not been fetched yet — the loader covers held tokens and
-         * a newly-held one waits for the next nightly pass.
-         */
+        /** T3d. See docs/DECISIONS.md#d082 */
         fundamentals: group[0].info_fetched_at
           ? {
             priceUsd: n(group[0].price_usd),
@@ -352,34 +327,14 @@ get("/v1/tokens/:address", async ({ address }, url) => {
             fetchedAt: new Date(String(group[0].info_fetched_at)).toISOString(),
           }
           : null,
-        /**
-         * What the leaders' holdings would be worth at GMGN's price.
-         *
-         * Separate from `totalValueUsd`, never a replacement for it: that figure is what we
-         * stored, this one is arithmetic on someone else's price. 64.7% of holdings carry no
-         * price of our own, so without this the honest answer for two thirds of the board is
-         * `null` — but a borrowed answer must not be able to pass as our own.
-         */
+        /** What the leaders' holdings would be worth at GMGN's price. See docs/DECISIONS.md#d083 */
         estimatedValueUsd: n(group[0].price_usd) !== null
           ? round(group.reduce((acc, g) => acc + (n(g.human_amount) ?? 0), 0) * n(group[0].price_usd)!)
           : null,
         estimatedValueBasis: n(group[0].price_usd) !== null
           ? "sum(holdings.amount) x GMGN price — third-party, not our stored value"
           : null,
-        /**
-         * T3a. Can you actually sell it, and who controls the contract?
-         *
-         * This closes the one place where our silence was dangerous: the API ranks tokens by
-         * how many tracked leaders hold them and, until now, said nothing about whether the
-         * contract permits selling. A crowd of leaders in a honeypot looked identical to a
-         * crowd in a good token. 14 of the tokens on this board are confirmed honeypots.
-         *
-         * **Every field is three-valued and `null` never means safe.** `isHoneypot: null` is
-         * "not assessed on this chain" — always so on Solana, where GMGN does not evaluate it
-         * — and reading that as `false` is exactly the mistake this shape prevents.
-         * `applicableChecks` names what could be judged here, so an absent field is visibly
-         * out of scope rather than silently missing.
-         */
+        /** T3a. See docs/DECISIONS.md#d084 */
         security: group[0].security_fetched_at
           ? (() => {
             const b = (v: unknown) => (v === null || v === undefined ? null : Boolean(v));
@@ -434,15 +389,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
             };
           })()
           : null,
-        /**
-         * T3b. Concentration across EVERY holder on chain, from GMGN.
-         *
-         * The counterpart to `leaderConcentration` above, and the reason that one was never
-         * allowed to be called `top_10_holder_rate`: ours is the share among the leaders we
-         * track, this is the share of supply across the whole holder base. On a typical
-         * token they read 0.592 and 0.197. Both are useful; neither substitutes for the
-         * other, and the pair is more informative than either alone.
-         */
+        /** T3b. See docs/DECISIONS.md#d085 */
         chainConcentration: group[0].info_fetched_at
           ? {
             holderCount: group[0].holder_count === null ? null : Number(group[0].holder_count),
@@ -458,17 +405,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
             source: group[0].info_source ?? "gmgn",
           }
           : null,
-        /**
-         * T3e. How GMGN classifies the token's holders.
-         *
-         * Every count is CAPPED AT 1000 and the cap is invisible in the raw figure. Measured
-         * over 1,095 tokens: the distribution runs 0, 1, 2, 3 … then piles up at exactly 1000
-         * — 450 tokens on `fresh`, 271 on `bundler`, 29 on `whale` — with not one token above
-         * it on any tag. A smooth distribution ending in a hard spike at a round number with
-         * nothing beyond is a truncation, not a count, so a tag reading 1000 means "at least
-         * 1000" and the response says which tags are in that state rather than leaving a
-         * reader to infer a precise-looking number that is not one.
-         */
+        /** T3e. See docs/DECISIONS.md#d086 */
         walletTags: (() => {
           const w = group[0].wallet_tags as Record<string, unknown> | null;
           if (!w) return null;
@@ -534,15 +471,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
               ? null
               : String(group[0].cto_flag) === "1",
             tokensLaunched: n(group[0].creator_open_count),
-            /**
-             * The creator's best previous launch — null when there is not one.
-             *
-             * GMGN returns the object PRESENT BUT EMPTY for creators with no prior token:
-             * blank symbol, blank address, ath_mc of 0. Passing that through published
-             * `peakMarketCapUsd: 0`, which reads as "their best token peaked at nothing"
-             * rather than "they have no previous token". Emitted only when there is a real
-             * one, and the cap follows the same rule — never 0 for unknown.
-             */
+            /** The creator's best previous launch — null when there is not one. See docs/DECISIONS.md#d087 */
             bestPreviousToken: (() => {
               const a = group[0].creator_ath as Record<string, unknown> | null;
               if (!a) return null;
@@ -560,33 +489,9 @@ get("/v1/tokens/:address", async ({ address }, url) => {
             source: group[0].info_source ?? "gmgn",
           }
           : null,
-        /**
-         * T1.3. Concentration among the leaders WE TRACK — deliberately not named
-         * `top_10_holder_rate`.
-         *
-         * GMGN's field of that name is supply across every holder on chain. This one is the
-         * share of value among the handful of tracked traders holding this token. For our
-         * top-ranked token those two read 0.1974 and 0.4234 — same shape, same plausible
-         * magnitude, completely different denominators. Giving ours GMGN's name would make
-         * the two silently interchangeable, and the day both appear in one response the
-         * mistake becomes permanent.
-         *
-         * Value is summed PER HANDLE first: a trader holding the same token in two wallets
-         * is one leader, and counting their rows separately would understate concentration.
-         */
+        /** T1.3. See docs/DECISIONS.md#d088 */
         leaderConcentration: (() => {
-          /**
-           * Computed from AMOUNTS, not values — and that is not a shortcut, it is exact.
-           *
-           * Every holder here holds the same token at the same price, so in
-           * `sum(top N amount x price) / sum(all amount x price)` the price cancels out
-           * entirely. The ratio is identical either way.
-           *
-           * It used to be computed from `value`, which needed a price and therefore returned
-           * `null` for 63% of the board — 689 of 1,095 tokens — for no arithmetic reason at
-           * all. Amounts are on every holding, so this now answers for every token, and it
-           * stays a figure about OUR leaders with nothing borrowed in it.
-           */
+          /** Computed from AMOUNTS, not values — and that is not a shortcut, it is exact. See docs/DECISIONS.md#d089 */
           const amounts = group.map((g) => n(g.human_amount) ?? 0).filter((a) => a > 0);
           const totalAmount = amounts.reduce((a, b) => a + b, 0);
           if (!amounts.length || totalAmount <= 0) return null;
@@ -651,17 +556,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
 
   // No fan-out, no per-holder API call, no 25-holder cap: every trader who has ever traded
   // this token, from one query.
-  /**
-   * ISSUE-4, the K5 half. `entry` was `min(avg_entry_price)` — not the average the field
-   * name promised, and not even the "first value" the doc claimed: the CHEAPEST entry the
-   * trader ever got. The scorecard took the first and this took the minimum, so the two
-   * routes disagreed with each other as well as with their documentation.
-   *
-   * Now a quantity-weighted average per trader, using the same `trade_qty()` rule as the
-   * scorecard's `legQty`. Falls back to the earliest value only when no leg carries a
-   * recoverable quantity, and reports how many legs were weighted so the fallback is
-   * visible rather than inferred.
-   */
+  /** ISSUE-4, the K5 half. See docs/DECISIONS.md#d090 */
   const per = await sql`
     with legs as (
       select t.display_handle as handle, tr.status, tr.trade_id,
@@ -748,16 +643,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     asOf: await asOfToken(key),
     totalValueUsd: priced.length ? round(priced.reduce((s, h) => s + (n(h.value) ?? 0), 0)) : null,
     source: "postgres · trades",
-    /**
-     * Two different populations, kept apart on purpose.
-     *
-     * `holdersNow` is who holds it in the current snapshot. `withTradeRecord` is everyone
-     * who has ever traded it — which can be LARGER, because traders who sold out entirely
-     * no longer hold it but very much have a record. The Express route conflated them
-     * under one "sampled" count, which read as nonsense (30 of 12).
-     *
-     * `capped` and `failed` are gone: there is no sample and no fan-out to fail.
-     */
+    /** Two different populations, kept apart on purpose. See docs/DECISIONS.md#d091 */
     coverage: {
       holdersNow: holderCount,
       withTradeRecord: per.length,
@@ -771,15 +657,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     crowdAvgEntryPrice: {
       value: entries.length ? Number((entries.reduce((a, b) => a + b, 0) / entries.length).toPrecision(8)) : null,
       coverage: cov(entries.length, per.length),
-      /**
-       * One trader, one vote — deliberately NOT weighted by position size.
-       *
-       * This answers "what did a typical leader pay", which is the question the board is
-       * read for. Weighting by size would answer "what did the crowd's money pay" and be
-       * set almost entirely by the largest holder. ISSUE-4 was that the INPUTS were
-       * first-entries rather than averages; that is what changed here, not the way holders
-       * are combined.
-       */
+      /** One trader, one vote — deliberately NOT weighted by position size. See docs/DECISIONS.md#d092 */
       method: "unweighted mean across holders of each holder's quantity-weighted entry",
       holdersMultiPosition: multiPosition,
       holdersFullyWeighted: fullyWeighted,

@@ -33,16 +33,7 @@ export const BLACKLIST_CHECK = {
        "An absent blacklist flag means NOT CHECKED — never 'checked and clear'.",
 };
 
-/**
- * `asOf` is the board-wide fallback, used only for a trader with no holdings row at all —
- * `trustHoldings` carries each trader's own `as_of` and that is what wins.
- *
- * It stopped being safe to share one value the moment chain-read balances landed. Every
- * fomo row is stamped with one nightly build time, but a chain snapshot is stamped when we
- * read it, so a single global max would put today's timestamp on a trader whose numbers
- * came from yesterday's fomo build — the exact complaint the consuming team raised against
- * /v1/traders, fixed there with a per-trader `updatedAt`.
- */
+/** `asOf` is the board-wide fallback, used only for a trader with no holdings row at all — `t See docs/DECISIONS.md#d183 */
 // deno-lint-ignore no-explicit-any
 export function trustBody(t: any, h: any | undefined, asOf: string | null) {
   const pnl = n(t.pnl_usd), volume = n(t.volume_usd), trades = n(t.trade_count);
@@ -58,22 +49,7 @@ export function trustBody(t: any, h: any | undefined, asOf: string | null) {
   const usd = (x: number) => `$${Math.round(x).toLocaleString("en-US")}`;
   const pricedShare = positions > 0 ? priced / positions : null;
 
-  /**
-   * The two "exceeds" flags look alike and are not.
-   *
-   * pnl_exceeds_volume divides fomo's REPORTED profit by fomo's REPORTED volume. Both sides
-   * are their own figures, stored verbatim, so a ratio above 1 is a contradiction inside
-   * their data and nothing to do with our coverage. It stays.
-   *
-   * pnl_exceeds_holdings divides that same reported profit by OUR sum of priced positions —
-   * and for `ogle` that is 6 of 48 positions. "2,364x everything they hold" was 2,364x an
-   * eighth of what they hold. A denominator we know is partial cannot support a claim about
-   * the whole, so the flag is withheld below the same 0.5 floor the rest of the API uses,
-   * and a note explains why instead.
-   *
-   * The wording changed too. "That cannot come from trading alone" is a conclusion; the
-   * response now states the arithmetic and leaves the conclusion to the reader.
-   */
+  /** The two "exceeds" flags look alike and are not. See docs/DECISIONS.md#d184 */
   if (pnlToVolume !== null && pnlToVolume > 1) {
     flags.push({ code: "pnl_exceeds_volume", severity: "warn",
       plain: `fomo reports ${usd(pnl!)} of profit on ${usd(volume!)} of lifetime volume — ` +
@@ -112,18 +88,7 @@ export function trustBody(t: any, h: any | undefined, asOf: string | null) {
 
   return {
     handle: t.display_handle, name: t.name ?? null,
-    /**
-     * WHAT WAS CHECKED, so an absent flag cannot be read as a clean bill of health.
-     *
-     * Every flag this route raises is an internal-consistency check on figures we already
-     * hold: two numbers that cannot both be true, or too little evidence to judge. NOTHING
-     * here consults an external reputation service, a blacklist, or a known-scam list.
-     *
-     * That distinction is the whole point of publishing this block. "We checked a blacklist
-     * and this trader is not on it" and "we never looked" are opposite statements, and until
-     * now an absent blacklist flag was indistinguishable from the first while meaning the
-     * second. `blacklist.checked: false` says which one it is.
-     */
+    /** WHAT WAS CHECKED, so an absent flag cannot be read as a clean bill of health. See docs/DECISIONS.md#d185 */
     checks: {
       performed: [
         "pnl_exceeds_volume", "pnl_exceeds_holdings", "holdings_coverage_too_low",

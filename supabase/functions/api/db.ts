@@ -1,17 +1,6 @@
 import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
 
-/**
- * One Postgres connection for the whole function instance.
- *
- * Edge Functions are Deno, not Node, so none of `src/` runs here — this is a parallel
- * implementation whose job is to produce byte-identical output to the Express API. Every
- * route is diffed against it before it ships.
- *
- * `prepare: false` is required, not optional: SUPABASE_DB_URL points at the transaction
- * pooler when port 6543 is used, and transaction-mode pooling does not support prepared
- * statements. With it left on, queries fail intermittently under load rather than
- * immediately, which is the worst way to find out.
- */
+/** One Postgres connection for the whole function instance. See docs/DECISIONS.md#d003 */
 /**
  * Supabase injects SUPABASE_DB_URL into every Edge Function automatically, pointing at the
  * direct connection — which resolves IPv6-only. That is fine from inside Supabase's own
@@ -34,14 +23,7 @@ export const sql = postgres(url, {
   idle_timeout: 20,
   connect_timeout: 15,
   prepare: false,
-  /**
-   * Deno verifies TLS against its own trust store and rejects the Supabase pooler's chain
-   * with `UnknownIssuer`, where Node's `rejectUnauthorized: false` simply skipped the
-   * check. `require` still encrypts; it just does not demand a chain Deno cannot build.
-   *
-   * In a deployed Edge Function the database is reached inside Supabase's own network, so
-   * this only matters when running the file locally to diff it against the Node service.
-   */
+  /** Deno verifies TLS against its own trust store and rejects the Supabase pooler's chain with See docs/DECISIONS.md#d004 */
   ssl: "require",
 });
 

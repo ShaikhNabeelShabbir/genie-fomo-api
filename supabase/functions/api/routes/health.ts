@@ -4,31 +4,8 @@ import { get } from "../router.ts";
 // ------------------------------------------------------------------ health
 
 get("/v1/health", async () => {
-  /*
-   * Exact counts everywhere except `transactions`, which is an estimate and says so.
-   *
-   * count(*) over transactions is a sequential scan. At 666,895 rows it measured 23.8s and
-   * hit the 2min statement timeout once -- on the endpoint whose entire job is to answer
-   * quickly whether the service is alive. The planner's own row estimate answers the same
-   * question in microseconds.
-   *
-   * It is reported under `transactions` as before so no consumer breaks, and listed in
-   * `estimatedRows` so nobody mistakes it for a counted figure. An approximate number that
-   * admits it is approximate is honest; one that does not is the failure this API is
-   * organised against.
-   */
-  /*
-   * FOUR SEQUENTIAL AWAITS, DELIBERATELY.
-   *
-   * Each is a round trip and the queries themselves measure about 150 ms, so running them
-   * together looked like free latency. It was not: batched into one Promise.all against a
-   * pool of 2, this endpoint stopped answering entirely -- 90 seconds, the route timeout,
-   * with every underlying query still returning in 150 ms when run by hand.
-   *
-   * The cause was not worth chasing on a liveness endpoint. Sequential is 2.4 seconds and
-   * works. If this is made concurrent again, test /health specifically after deploying:
-   * every other route kept working while this one hung, so a smoke test that skips it passes.
-   */
+  /** Exact counts everywhere except `transactions`, which is an estimate and says so. See docs/DECISIONS.md#d063 */
+  /** FOUR SEQUENTIAL AWAITS, DELIBERATELY. See docs/DECISIONS.md#d064 */
   const [c] = await sql`
     select (select count(*) from traders where listed)           as traders,
            (select count(*) from traders where not listed)       as delisted,
@@ -42,14 +19,7 @@ get("/v1/health", async () => {
   const [b] = await sql`
     select captured_at, window_label from builds order by captured_at desc limit 1`;
 
-  /*
-   * Freshness per feed, so "the service is degraded" is distinguishable from "there is
-   * nothing". A consumer comparing a stale figure against a fresh one has no way to know
-   * which feed lagged unless the service says so.
-   *
-   * Each row is the newest measurement time for that feed and how many rows stand behind
-   * it. `null` means the feed has never run, which is a different statement from zero.
-   */
+  /** Freshness per feed, so "the service is degraded" is distinguishable from "there is nothing See docs/DECISIONS.md#d065 */
   const [f] = await sql`
     select (select max(captured_at) from trades)                         as trades_at,
            (select max(captured_at) from holdings)                       as holdings_at,
@@ -61,18 +31,7 @@ get("/v1/health", async () => {
            (select max(last_seen_at) from wallets)                       as wallets_at,
            (select count(*) from aum_samples)::int                       as aum_rows,
            (select count(distinct handle) from aum_samples)::int         as aum_traders`;
-  /*
-   * HOW MANY TRADERS ARE THEMSELVES STALE.
-   *
-   * Every feed above can read `current` while individual traders carry week-old figures: a
-   * feed's clock is the job's last write, and a job that runs without reaching a trader
-   * leaves that trader behind without moving any feed. Fourteen traders were sitting on
-   * readings four to seven days old while every feed said `current`, and the only way to find
-   * them was to check traders one at a time.
-   *
-   * So the count is published. It is the number either team would look at to notice the
-   * reload has stopped landing, and it measures 168 ms.
-   */
+  /** HOW MANY TRADERS ARE THEMSELVES STALE. See docs/DECISIONS.md#d066 */
   const [st] = await sql`
     with newest as (
       select handle, max(at) filter (where total_usd is not null) as reading_at
@@ -98,19 +57,7 @@ get("/v1/health", async () => {
 
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
 
-  /*
-   * EVERY FEED SAYS WHETHER IT IS STILL ARRIVING, NOT ONLY WHEN IT LAST DID.
-   *
-   * `lastRefreshAt` was already here and a consumer could in principle subtract it from the
-   * clock -- but nobody did, and the balance readings sat 75 hours old while every answer
-   * said `ready`. A date is not a verdict. Each feed now carries its own allowance and the
-   * verdict that follows from it, so one call to /health shows which feed stopped.
-   *
-   * The allowances are the schedules themselves plus one missed run: the daily jobs get 36
-   * hours, the trade loader 72 because it is the expensive one and skips runs by design.
-   * `state` is `current`, `stale`, or `never` -- and `never` is not `stale`, because a feed
-   * that has not run once has a different cause and a different fix.
-   */
+  /** EVERY FEED SAYS WHETHER IT IS STILL ARRIVING, NOT ONLY WHEN IT LAST DID. See docs/DECISIONS.md#d067 */
   const nowMs = Date.now();
   const feed = (at: unknown, staleAfterHours: number, extra: Record<string, unknown> = {}) => {
     const t = at ? Date.parse(String(at)) : NaN;
@@ -156,18 +103,7 @@ get("/v1/health", async () => {
     runtime: "supabase edge function (deno)",
     source: "postgres",
     build: { capturedAt: b?.captured_at ?? null, window: b?.window_label ?? null },
-    /**
-     * Per-feed freshness AND a verdict on it. A stale feed is visible here before it misleads
-     * a screen.
-     *
-     * `traders` is the directory build, which is what the directory's own `capturedAt`
-     * reports. It used to be filled from the trade loader's clock -- two different jobs under
-     * one name, so a five-day-old trade load read as a five-day-old directory and the loader
-     * itself had no entry at all. `trades` is now its own feed.
-     *
-     * `aum.lastRefreshAt` is the newest reading's own timestamp; `lastSuccessAt` is when the
-     * sampler last wrote one. They differ, and the second is the one that says the job ran.
-     */
+    /** Per-feed freshness AND a verdict on it. See docs/DECISIONS.md#d068 */
     feeds,
     /**
      * `status` stays `ok` while the service answers, because that is what it has always meant
@@ -217,20 +153,7 @@ get("/v1/health", async () => {
     },
     /** Which entries in `rows` are planner estimates rather than counted. */
     estimatedRows: ["transactions"],
-    /**
-     * HOW MANY EXTERNAL CALLS A REQUEST CAN COST — no longer flatly zero.
-     *
-     * It was 0, and the claim was load-bearing: every route answered from Postgres, so a
-     * thousand visitors cost what one does. `/traders/:handle/aum` now breaks that on purpose
-     * — when its stored reading is past the freshness floor it fetches a live one, which is
-     * one call to the sampler and, behind that, a sweep of the trader's wallets.
-     *
-     * Reported as a range rather than left at 0. A field that quietly stops being true is the
-     * exact failure this service is organised against, and it is worth recording that this
-     * very field was accidentally DELETED from this response earlier today by the edit that
-     * rewrote `capabilities` below — removed from a live deployment with nothing announcing
-     * it, which is the fault F9 exists to catch.
-     */
+    /** HOW MANY EXTERNAL CALLS A REQUEST CAN COST — no longer flatly zero. See docs/DECISIONS.md#d069 */
     externalCallsPerRequest: {
       typical: 0,
       max: 1,
@@ -242,26 +165,7 @@ get("/v1/health", async () => {
         freshnessFloorMinutes: Number(Deno.env.get("AUM_LIVE_AFTER_MINUTES") ?? 5),
       },
     },
-    /**
-     * WHICH CAPABILITIES ARE STILL DELIVERING, by name, judged on evidence.
-     *
-     * A consumer checks health once and routes thousands of times, so a capability that only
-     * reveals itself on the thousandth call is one every consumer discovers the expensive way.
-     *
-     * THE FIRST VERSION OF THIS BLOCK WAS WRONG, and deploying it is what showed that. It
-     * reported whether each provider's KEY was set in this process, which read correctly on a
-     * laptop -- where .env is loaded -- and reported all five providers degraded on the
-     * deployed function, where none of those keys exists. They are not supposed to: the keys
-     * belong to the scheduled loaders, which run in GitHub Actions and never inside this
-     * function. `externalCallsPerRequest` is 0 precisely because of that. So key presence here
-     * is evidence of nothing, and publishing it as `degraded` was a permanent false alarm on
-     * exactly the field a consumer would page on.
-     *
-     * What CAN be answered from here is the question that actually matters: is this
-     * capability's data still arriving? Every provider is judged by the feeds it fills.
-     * A capability whose feeds have all gone stale is degraded whatever its key says, and one
-     * whose feeds are current is working whatever this process can see.
-     */
+    /** WHICH CAPABILITIES ARE STILL DELIVERING, by name, judged on evidence. See docs/DECISIONS.md#d070 */
     capabilities: (() => {
       type FeedName = keyof typeof feeds;
       const caps: { name: string; supplies: FeedName[]; key: string }[] = [

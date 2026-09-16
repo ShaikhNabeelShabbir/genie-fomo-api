@@ -2,19 +2,7 @@ import { sql, n } from "../db.ts";
 
 // ------------------------------------------------------------- T11/T13/T14
 
-/**
- * Each chain's own coin, and what one of them costs — so a chain's dollars can also be said
- * the way a wallet says them, "114.09 BNB" beside "$83.6K".
- *
- * The price has to be a MARKET price or it is worse than nothing. Most of what we hold for a
- * wrapped native is `fomo_reported_entry` — the price a trader reported paying, not what the
- * coin is worth now — and some rows carry a price with no source at all, which cannot be
- * stood behind either. Both are excluded, so three of five chains answer `null` today rather
- * than converting a portfolio at a number nobody can defend.
- *
- * Five rows, cached for the process: chains do not change and the price moves slowly enough
- * that a per-request query would be pure cost.
- */
+/** Each chain's own coin, and what one of them costs — so a chain's dollars can also be said See docs/DECISIONS.md#d137 */
 export type NativePrice = { symbol: string; usd: number | null; source: string | null };
 export let nativeCache: { at: number; by: Map<number, NativePrice> } | null = null;
 
