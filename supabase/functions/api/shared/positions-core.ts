@@ -77,3 +77,12 @@ export function costBlock(cb: CostBasis | undefined, amount: number | null, pric
       ? Number(Math.min(1, known / amount).toFixed(4)) : null,
   };
 }
+
+/** V2. A confirmed honeypot or unsellable coin is held, priced, and NOT part of the total. */
+export const unsellable = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) =>
+  r.is_honeypot === true || r.can_not_sell === true;
+export const sellFlags = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) => ({
+  isHoneypot: r.is_honeypot === true,
+  /** null when the security source never judged it; false when it said "cannot sell". */
+  canSell: r.can_not_sell === null || r.can_not_sell === undefined ? null : !r.can_not_sell,
+});

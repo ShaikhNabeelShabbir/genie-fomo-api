@@ -161,6 +161,8 @@ function buildAum(
     /** THE FIGURE BEHIND A REFUSAL. See docs/DECISIONS.md#d023 */
     partialUsd: round(n((r as { partial_usd?: unknown }).partial_usd)),
     basis: r.basis as string,
+    /** H1. A rebuilt point is arithmetic over everything ever received, not a balance read. */
+    ...(r.basis === "rebuilt" ? { reliability: "low" } : {}),
     tier: r.tier as string,
     coverage: {
       pricedPositions: r.priced_positions === null ? null : Number(r.priced_positions),
@@ -399,6 +401,10 @@ function buildAum(
     reason = newest?.refused_reason
       ? String(newest.refused_reason)
       : (usable.length === 0 ? "warming" : "too_few_points");
+  } else if (usable.filter((p) => p.basis === "sampled").length < MIN_DRAWABLE_POINTS) {
+    // H1. Rebuilt points never draw alone: the minimum must be met by sampled readings.
+    drawable = false;
+    reason = "rebuilt_only";
   } else if (!reachesBack) {
     // Enough points to draw, but not across the span that was asked for. Both facts are true
     // and the consumer needs the second one to label its axis honestly.

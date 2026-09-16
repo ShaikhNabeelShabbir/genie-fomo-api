@@ -416,6 +416,8 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     onChain: act
       ? {
         transactions: Number(act.transactions),
+        /** O1. Chains present in `transactions` for these wallets; all-zeros elsewhere means "not covered". */
+        chainsCovered: (act.chains_covered as string[]) ?? [],
         transfers: Number(act.transfers),
         inbound: Number(act.inbound),
         outbound: Number(act.outbound),
@@ -502,9 +504,11 @@ const walletActivity = (addrs: string[]) => sql`
          count(distinct date_trunc('day', block_time))::int        as active_days,
          count(distinct token_key)::int                            as tokens_touched,
          min(block_time)                                           as first_at,
-         max(block_time)                                           as last_at
-  from transactions
-  where address_key = any(${addrs})`;
+         max(block_time)                                           as last_at,
+         -- O1: which chains the counts above actually cover.
+         coalesce(array_agg(distinct c.name) filter (where c.name is not null), '{}') as chains_covered
+  from transactions x left join chains c using (network_id)
+  where x.address_key = any(${addrs})`;
 
 
 /** Wallets, each with its FAMILY and the chains it has actually been seen on. See docs/DECISIONS.md#d105 */

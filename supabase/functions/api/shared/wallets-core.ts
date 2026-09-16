@@ -11,6 +11,10 @@ export const walletRows = (handles: string[]) => sql`
   from traders t left join wallets w using (handle)
   where t.handle = any(${handles})`;
 
+/** W1. How an address was found: a straight mapping of `wallets.*_source` (fomoapi's own `src_*`). */
+export const resolvedBy = (source: unknown): string | null =>
+  source === "fomoapi.io" ? "fomoapi" : (source ? String(source) : null);
+
 /** Shared by the single route and the bulk route, so the two cannot diverge. */
 // deno-lint-ignore no-explicit-any
 export function walletsBody(t: any, knownChains: KnownChain[] | null = null) {
@@ -37,6 +41,10 @@ export function walletsBody(t: any, knownChains: KnownChain[] | null = null) {
       : "unresolved_upstream",
     tier: (t.evm_confidence || t.sol_confidence) ? "verified" : "reported",
     confidence: { evm: t.evm_confidence ?? null, solana: t.sol_confidence ?? null },
+    /** W1. Per wallet: `fomoapi` | `gmgn` | `submitted`, or the raw source word. */
+    resolvedBy: { evm: resolvedBy(t.evm_source), solana: resolvedBy(t.sol_source) },
+    /** W1. Always null: no fingerprint count is stored anywhere in the schema. */
+    fingerprintMatches: null,
     ...(bad ? { warning: `${bad} stored address(es) are malformed and were withheld` } : {}),
     /** EVERY CHAIN THIS TRADER USES, window-independent and stable. See docs/DECISIONS.md#d187 */
     knownChains,
