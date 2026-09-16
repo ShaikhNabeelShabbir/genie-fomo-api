@@ -192,6 +192,14 @@ jobs:
           HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
         run: node scripts/load_chain_balances.mjs
 
+      # Item 10: a trade fomo still calls open for a token the wallet no longer holds (per the
+      # chain read just taken) is marked closed_by_balance, so /pnl stops counting it.
+      - name: Close trades the wallet no longer holds
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: node scripts/close_stale_trades.mjs
+
       - name: Sample AUM
         if: '!cancelled()'
         continue-on-error: true
