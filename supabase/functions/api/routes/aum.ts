@@ -6,7 +6,7 @@ import { NativePrice, nativePrices } from "../shared/prices.ts";
 import { resolveChain, SOLANA_NET, KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
-import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, applyFloor, chooseStep } from "../shared/aum-rules.ts";
+import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, MIN_DRAWABLE_POINTS, applyFloor, chooseStep } from "../shared/aum-rules.ts";
 
 // --------------------------------------------------------------- AUM over time
 
@@ -361,7 +361,6 @@ function buildAum(
   /** TWO WAYS TO HAVE NOTHING, and both must stop `ready`. See docs/DECISIONS.md#d035 */
   const newestIsEmpty = emptyRead(newest) || withFigure.length === 0;
 
-  const MIN_DRAWABLE_POINTS = 2;
   const usable = points.filter((p) => p.totalUsd !== null);
   let drawable = true;
   let reason: string | null = null;

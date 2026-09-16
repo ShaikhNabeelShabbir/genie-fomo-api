@@ -1,6 +1,7 @@
 import { sql } from "../db.ts";
 import { get } from "../router.ts";
 import { VOCABULARY } from "../shared/vocabulary.ts";
+import { MIN_DRAWABLE_POINTS, PARTIAL_SERVE_FLOOR_USD, PRICED_FLOOR } from "../shared/aum-rules.ts";
 
 // ------------------------------------------------------------------ fields
 
@@ -70,6 +71,16 @@ get("/v1/fields", async () => {
       "coverage{of,total,share}": "counts as integers; share is of/total from 0 to 1",
       note: "absence is always null. Zero is a claim and null is an absence — no string ever " +
             "stands in for a missing number, and no number for a missing fact",
+    },
+
+    /** THE THRESHOLDS THE RULES APPLY, published so a consumer can explain a refusal (R2). */
+    constants: {
+      /** Count share of priced positions below which a reading is partial or refused. */
+      pricedFloor: PRICED_FLOOR,
+      /** A figure below the count floor is served as partial at or above this; refused below. */
+      partialServeFloorUsd: PARTIAL_SERVE_FLOOR_USD,
+      /** Dated figures needed before an /aum series is drawable. */
+      drawableMinPoints: MIN_DRAWABLE_POINTS,
     },
 
     /**
