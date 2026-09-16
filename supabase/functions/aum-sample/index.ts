@@ -50,13 +50,14 @@ type Settled = {
   priced: number; total: number; rejected: number; perChain: Map<number, Tally>;
 };
 
-/** Prices for a set of (network, token) pairs, from what this service already holds. See docs/DECISIONS.md#d191 */
-async function pricesFor(pairs: Position[]): Promise<Map<string, number>> {
-  const m = new Map<string, number>();
+/** Prices (and total supply, for the implied-cap check) for a set of (network, token) pairs, from what this service already holds. See docs/DECISIONS.md#d191 */
+async function pricesFor(pairs: Position[]): Promise<Map<string, { px: number; supply: number | null }>> {
+  const m = new Map<string, { px: number; supply: number | null }>();
   if (!pairs.length) return m;
   const rows = await sql`
     select u.n as network_id, u.k as token_key,
-           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px
+           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px,
+           tk.total_supply::float8 as supply
     from unnest(${pairs.map((p) => p.network_id)}::bigint[],
                 ${pairs.map((p) => p.token_key)}::text[]) as u(n, k)
     left join quote_assets qa on qa.network_id = u.n and qa.token_key = u.k
@@ -64,8 +65,14 @@ async function pricesFor(pairs: Position[]): Promise<Map<string, number>> {
     left join lateral (
       select usd from token_prices p
       where p.network_id = u.n and p.token_key = u.k order by day desc limit 1
-    ) tp on true`;
-  for (const r of rows) if (r.px !== null) m.set(`${r.network_id}:${r.token_key}`, Number(r.px));
+    ) tp on true
+    left join tokens tk on tk.network_id = u.n and tk.token_key = u.k`;
+  for (const r of rows) {
+    if (r.px !== null) {
+      m.set(`${r.network_id}:${r.token_key}`,
+            { px: Number(r.px), supply: r.supply === null ? null : Number(r.supply) });
+    }
+  }
   return m;
 }
 
