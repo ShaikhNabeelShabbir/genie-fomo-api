@@ -141,23 +141,33 @@ export type Swap = {
 export async function swapsFor(handles: string[]): Promise<Map<string, Swap[]>> {
   const out = new Map<string, Swap[]>();
   if (!handles.length) return out;
+  // Address keys resolved here, then `any(...)` on the indexed column: the OR-join over two
+  // wallet columns forced a BitmapOr and a heap filter per swap row.
+  const handleByAddr = new Map<string, string[]>();
+  for (const w of await sql`
+    select handle, lower(sol_address) as sol, evm_address_key as evm
+    from wallets where handle = any(${handles})`) {
+    for (const a of [w.sol, w.evm]) {
+      if (!a) continue;
+      const k = String(a);
+      handleByAddr.set(k, [...(handleByAddr.get(k) ?? []), String(w.handle)]);
+    }
+  }
+  if (!handleByAddr.size) return out;
   const rows = await sql`
-    select w.handle, ws.network_id, ws.token_key, ws.tx_hash, ws.block_time,
-           ws.token_delta, ws.quote_usd
-    from wallet_swaps ws
-    join wallets w
-      on lower(w.sol_address) = ws.address_key or w.evm_address_key = ws.address_key
-    where w.handle = any(${handles})
-    order by w.handle, ws.block_time asc`;
+    select address_key, network_id, token_key, tx_hash, block_time, token_delta, quote_usd
+    from wallet_swaps where address_key = any(${[...handleByAddr.keys()]})
+    order by block_time asc`;
   for (const r of rows) {
-    const h = String(r.handle);
-    let a = out.get(h); if (!a) out.set(h, a = []);
-    a.push({
-      handle: h, net: Number(r.network_id), tokenKey: String(r.token_key),
-      txHash: String(r.tx_hash),
-      at: r.block_time ? new Date(String(r.block_time)).toISOString() : null,
-      tokenDelta: n(r.token_delta) ?? 0, quoteUsd: n(r.quote_usd),
-    });
+    for (const h of handleByAddr.get(String(r.address_key)) ?? []) {
+      let a = out.get(h); if (!a) out.set(h, a = []);
+      a.push({
+        handle: h, net: Number(r.network_id), tokenKey: String(r.token_key),
+        txHash: String(r.tx_hash),
+        at: r.block_time ? new Date(String(r.block_time)).toISOString() : null,
+        tokenDelta: n(r.token_delta) ?? 0, quoteUsd: n(r.quote_usd),
+      });
+    }
   }
   return out;
 }
