@@ -222,8 +222,10 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            h.price_source, h.priced_at, h.captured_at, h.source as balance_source,
            (q.token_key is not null) as is_quote,
            ti.is_honeypot, ti.can_not_sell,
-           tk.total_supply::float8 as total_supply
-    from holdings_current h
+           tk.total_supply::float8 as total_supply,
+           -- Workflow gap 4: Solana rolled forward from the webhook feed since the read.
+           h.human_amount_live, h.delta, h.last_transfer_at
+    from holdings_live h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
@@ -268,6 +270,10 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       chain: r.chain,
       isNative: isNative(r.token_key),
       amount: n(r.human_amount) ?? 0,
+      /** Solana: `amount` + signed transfers since `balanceAt` (see `liveBasis`). EVM: null. */
+      amountLive: n(r.human_amount_live),
+      deltaSinceRead: n(r.delta),
+      lastTransferAt: iso(r.last_transfer_at),
       /**
        * PRD §3. When the balance was read, and whether we read it or were told it.
        *
@@ -276,7 +282,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
        * holding is not a detail.
        */
       balanceAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
-      tier: r.balance_source === "chain" ? "verified" : "reported",
+      tier: r.balance_source === "chain" ? "verified"
+        : r.balance_source === null ? "rolled_forward" : "reported",
       priceUsd: n(r.price),
       /** pegged_usd | gmgn_token_info | token_prices_daily | fomo_reported_entry | wallet_swap_derived */
       priceSource: (r.price_source as string) ?? null,
@@ -334,6 +341,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     // This trader's snapshot, not the board's — chain-read rows and fomo builds are
     // stamped at different times, so a global max would misdate one of them.
     asOf: await asOfHoldings(t.handle as string),
+    /** What `amountLive` is: Solana is a roll-forward of webhook transfers, EVM the nightly read. */
+    liveBasis: { solana: "rolled_forward_from_transfers", evm: "nightly_read" },
     count: page.length,
     positions: filtered.length,
     /** What was asked for, so a short page is legible as a page rather than a total. */

@@ -347,3 +347,14 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `scorecard.onChain` | /scorecard | `{ basis: wallet_swaps, swaps, buys, sells, volumeUsd, realizedPnlUsd, winRate, wins, losses, coverage: { of: swapsResolved, total: swapsSeen, share }, asOf }` — the same figures as the top of the scorecard, from the wallet's own resolved swaps instead of fomoapi. `swaps` is a real count (0 allowed); every other figure is `null` when there are no resolved swaps, never 0. P&L pairs each sell against the token's average buy cost (the `perExit` pairing). `null` under `?include=scorecard`, with `onChainNote` saying so |
 | `scorecard.staleness.fallback` | /scorecard, /traders?include=scorecard | `on_chain` when `staleness.state` is `stale` or `never` AND `onChain.swaps > 0`: draw `onChain` instead of the fomo figures. Otherwise `null`. Always `null` on the embedded scorecard, where `onChain` is not computed |
 
+## Added 17 Sep 2026, live holdings
+
+| Field | Route | Contract |
+|---|---|---|
+| `entries[].amountLive` | /positions | Solana: `amount` + signed transfers (`in` +, `out` −) with `block_time > balanceAt`, from the webhook feed. EVM: `null`. Not a chain read; only as complete as the webhook's coverage. `amount` and `valueUsd` stay the read values |
+| `entries[].deltaSinceRead` | /positions | the signed sum itself. `0` = nothing moved since the read (Solana); `null` = not rolled forward (EVM) |
+| `entries[].lastTransferAt` | /positions | newest transfer since the read, else `null` |
+| `entries[].tier` | /positions | new value `rolled_forward`: a position opened since the read, with `amount: 0`, `balanceAt: null`, no price. Only once the mint is in `tokens`; otherwise on `/flow` only |
+| `liveBasis` | /positions | `{ solana: "rolled_forward_from_transfers", evm: "nightly_read" }` — what `amountLive` is on each chain |
+| `rows[]` | /traders/:handle/flow?since=, POST /traders/flow { ids, since } | `{ chain, tokenAddress, tokenKey, in, out, net, transfers, firstAt, lastAt }` per token moved since `since` (required, ISO-8601). Solana only, from `transactions`. `tokenAddress` `null` when the mint is not in the directory; `tokenKey` always. Envelope: `since`, `basis: "transactions"`, `chains: ["solana"]`. Batch: §11 rules, one `traders[]` entry per id. No category taxonomy: group by `tokenKey` yourself |
+

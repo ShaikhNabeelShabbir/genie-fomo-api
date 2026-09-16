@@ -4,6 +4,7 @@ import "./routes/traders.ts";
 import "./routes/positions.ts";
 import "./routes/scorecard.ts";
 import "./routes/transactions.ts";
+import "./routes/flow.ts";
 import "./routes/tokens.ts";
 import "./routes/aum.ts";
 import "./routes/fields.ts";
