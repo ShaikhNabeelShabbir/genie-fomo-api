@@ -112,12 +112,6 @@ jobs:
         if: '!cancelled()'
         run: node scripts/resolve_trade_chains.mjs
 
-      # ---------------------------------------------------------------- 5. supply
-      # Needed to express average entry as a market cap rather than a per-token price.
-      - name: Resolve supply for new tokens
-        if: '!cancelled()'
-        run: node scripts/load_token_supply.mjs
-
       # ---------------------------------------------------------------- 6. transfers
       - name: Refresh on-chain transfers
         if: '!cancelled()'
@@ -136,8 +130,16 @@ jobs:
         if: '!cancelled()'
         run: node scripts/load_quote_prices.mjs
 
+      # ---------------------------------------------------------------- 6b'. robinhood prices
+      # R4: GMGN indexes a thin slice of chain 4663, so the held coins it misses are priced
+      # from DexScreener (keyless, 30 tokens a call) into token_prices; docs/R4_ROBINHOOD_PRICES.md.
+      - name: Price Robinhood-chain coins
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: node scripts/load_robinhood_prices.mjs
+
       # ---------------------------------------------------------------- 6c. token info
-      # After supply resolution, so a token discovered tonight is fetched in the same run.
       #
       # GMGN allows 1 request/second per IP and we fetch only tokens a leader actually holds
       # (~1,100 of 3,100 known), so a full pass is ~20 minutes. `--stale-hours 20` means a
@@ -191,6 +193,13 @@ jobs:
         env:
           HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
         run: node scripts/load_chain_balances.mjs
+
+      # ---------------------------------------------------------------- 8b. supply
+      # After the balance read, so a mint first seen tonight gets its supply the same night.
+      # Needed to express average entry as a market cap rather than a per-token price.
+      - name: Resolve supply for new tokens
+        if: '!cancelled()'
+        run: node scripts/load_token_supply.mjs
 
       - name: Sample AUM
         if: '!cancelled()'

@@ -30,6 +30,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import pg from "pg";
+import { value } from "./lib/value.mjs";
 import { rpc, scale } from "./lib/chain_reads.mjs";
 
 const DB = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
@@ -87,10 +88,6 @@ const WINDOW_BLOCKS = 500_000;
 const ADDR_CHUNK    = 64;
 const MIN_WINDOW    = 2_000;
 
-/** The same ceilings the sampler applies, so a rebuilt point and a sampled one cannot disagree. */
-const MAX_PRICE_PER_TOKEN = 1_000_000;
-const MAX_POSITION_USD    = 1_000_000_000_000;
-
 /** A dated price may stand in for a day this far away, and no further. */
 const PRICE_GAP_DAYS = 7;
 
@@ -145,14 +142,6 @@ const hex   = (n) => "0x" + BigInt(n).toString(16);
 const anchorSec = (t) => Math.floor(new Date(t).getTime() / 1000);
 const padTopic = (a) => "0x" + a.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 const addrOf   = (topic) => "0x" + topic.slice(-40).toLowerCase();
-
-function value(amount, price) {
-  if (price === null || !Number.isFinite(price) || price <= 0) return {};
-  if (price > MAX_PRICE_PER_TOKEN) return { rejected: true };
-  const usd = amount * price;
-  if (!Number.isFinite(usd) || usd > MAX_POSITION_USD) return { rejected: true };
-  return { usd };
-}
 
 async function call(method, params, tries = 5) {
   const j = await rpc(RPC_URL, { jsonrpc: "2.0", id: 1, method, params }, tries);

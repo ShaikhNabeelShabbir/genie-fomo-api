@@ -25,6 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import pg from "pg";
+import { value } from "./lib/value.mjs";
 
 const DB  = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 const KEY = (process.env.HELIUS_SOLANA_KEY ?? "").trim();
@@ -53,8 +54,6 @@ const NETWORK_ID = 1399811149;
 const RPC = `https://mainnet.helius-rpc.com/?api-key=${KEY}`;
 const SPL = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const T22 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-const MAX_PRICE_PER_TOKEN = 1_000_000;
-const MAX_POSITION_USD    = 1_000_000_000_000;
 const PRICE_GAP_DAYS = 7;
 /** A balance is "reproduced" within this relative tolerance; below it is float noise. */
 const VERIFY_TOL = 1e-3;
@@ -72,14 +71,6 @@ const VERIFY_MIN_VALUE_SHARE = 0.9;
 
 const pool = new pg.Pool({ connectionString: DB, ssl: { rejectUnauthorized: false }, max: 3 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function value(amount, price) {
-  if (price === null || !Number.isFinite(price) || price <= 0) return {};
-  if (price > MAX_PRICE_PER_TOKEN) return { rejected: true };
-  const usd = amount * price;
-  if (!Number.isFinite(usd) || usd > MAX_POSITION_USD) return { rejected: true };
-  return { usd };
-}
 
 const WAITS = [2_000, 5_000, 10_000, 20_000, 40_000, 60_000, 90_000, 120_000, 180_000];
 
