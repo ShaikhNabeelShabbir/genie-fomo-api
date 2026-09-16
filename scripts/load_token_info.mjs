@@ -214,10 +214,11 @@ async function main() {
            top_10_holder_rate, raw, source, fetched_at,
            is_honeypot, buy_tax, sell_tax, is_open_source, is_renounced, renounced_mint,
            renounced_freeze, rug_ratio, burn_ratio, is_blacklisted, can_not_sell,
-           security_fetched_at)
+           security_fetched_at, honeypot_since)
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'gmgn',now(),
                  $14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-                 case when $25::boolean then now() else null end)
+                 case when $25::boolean then now() else null end,
+                 case when $25::boolean and ($14::boolean or $24::boolean) then now() end)
          on conflict (network_id, token_key) do update set
            symbol=excluded.symbol, name=excluded.name, price_usd=excluded.price_usd,
            liquidity_usd=excluded.liquidity_usd, market_cap_usd=excluded.market_cap_usd,
@@ -239,6 +240,10 @@ async function main() {
            burn_ratio       = case when $25::boolean then excluded.burn_ratio       else token_info.burn_ratio end,
            is_blacklisted   = case when $25::boolean then excluded.is_blacklisted   else token_info.is_blacklisted end,
            can_not_sell     = case when $25::boolean then excluded.can_not_sell     else token_info.can_not_sell end,
+           -- First flip only, never cleared (Rug Dodger, C3). Same guard: a failed security
+           -- call carries no flag and must not stamp today's date.
+           honeypot_since   = coalesce(token_info.honeypot_since,
+                                case when $25::boolean and (excluded.is_honeypot or excluded.can_not_sell) then now() end),
            security_fetched_at = case when $25::boolean then now() else token_info.security_fetched_at end`,
         [
           t.network_id, t.token_key, clean(d.symbol), clean(d.name), price,

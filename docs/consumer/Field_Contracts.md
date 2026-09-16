@@ -373,3 +373,13 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `GET /creators/:address` | new route | `{ creator, asOf, ledger, tokens: [{ chain, tokenAddress, symbol, status, isHoneypot, marketCapUsd }], tier: third_party, source: gmgn }`. `?chain=` optional; without it an EVM address sums across chains. `tokens[].status` is GMGN's own word, `creator_hold` or `creator_close`, `null` when GMGN was silent. 404 `not_found` for an address the ledger has never seen; 503 `unavailable` when the database is down |
 | `linked[]` | /wallets | `[{ chain, address, linkedFrom, kind, firstSeenAt, evidenceTx, watch }]`, wallets the trader funded from his known Solana wallet (`linked_wallets`, nightly). `kind` is `funded_by`; `submitted` is reserved and not yet written. `address` is the case-preserved spelling when resolved, otherwise the lowercased key. `watch: true` means the Helius webhook is registered for it, so its transfers appear under this trader's `/transactions`. `[]` when none, never absent |
 
+## Added 17 Sep 2026, honeypot-since and cohort
+
+| Field | Route | Contract |
+|---|---|---|
+| `entries[].security.honeypotSince` | /tokens/:address | ISO time of the first nightly security read where `isHoneypot` or sell-blocked became true (`token_info.honeypot_since`); never cleared, even if a later read says otherwise. `null` when never flagged, or flagged before the column existed (backfills from the first refresh after 17 Sep 2026) |
+| `entries[].cohort` | /tokens/:address | `{ holders, independent, linkedGroups }`, per chain. `holders`: distinct tracked traders with any `trades` row in the coin — by trades, so it can differ from the holdings-snapshot `holders` beside it. `independent`: `holders` minus traders whose wallet is another trader's `linked_wallets` address. `linkedGroups = holders − independent`. Real zeros, never null |
+| `byToken[].isHoneypotNow` | /scorecard, `?include=scorecard` | latest GMGN read: `true` when honeypot or sell-blocked, `false` when checked and neither, `null` when the chain is not assessed (Solana) or the token was never checked |
+| `byToken[].honeypotSince` | same | as `security.honeypotSince` above, on the coin the trader traded |
+| `byToken[].exitedBeforeFlag` | same | `true` when `honeypotSince` is set and the trader's `lastClosedAt` is before it; `false` when set and he closed after it or still holds; `null` when the coin was never flagged (Rug Dodger) |
+| `byToken[].coHolders` | same | distinct OTHER tracked traders with a `trades` row in the same coin on the same chain; `0` when he is alone, `null` only when the row could not be counted (Cabal Trader; linked-wallet collapsing is on `/tokens/:address.cohort`, not here) |

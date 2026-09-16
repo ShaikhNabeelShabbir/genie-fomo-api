@@ -35,3 +35,15 @@ Deno.test("T3: no resolved swaps is null figures, never zero; swaps stays a real
   const open = onChainFrom([swap({ tokenDelta: 3, quoteUsd: -30 })], 1);
   assertEquals([open.volumeUsd, open.realizedPnlUsd, open.winRate, open.wins], [30, null, null, null]);
 });
+
+Deno.test("C3: exitedBeforeFlag is null with no flag, true only when the last close precedes it", async () => {
+  const { exitedBeforeFlag } = await import("../supabase/functions/api/shared/scorecard-core.ts");
+  const since = "2026-09-10T00:00:00.000Z";
+  assertEquals(exitedBeforeFlag(Date.parse("2026-09-01T00:00:00Z"), null), null);
+  assertEquals(exitedBeforeFlag(null, null), null);
+  assertEquals(exitedBeforeFlag(Date.parse("2026-09-01T00:00:00Z"), since), true);
+  assertEquals(exitedBeforeFlag(Date.parse("2026-09-10T00:00:00Z"), since), false);
+  assertEquals(exitedBeforeFlag(Date.parse("2026-09-12T00:00:00Z"), since), false);
+  // Flagged and never closed: still holding a honeypot is not an exit before the flag.
+  assertEquals(exitedBeforeFlag(null, since), false);
+});
