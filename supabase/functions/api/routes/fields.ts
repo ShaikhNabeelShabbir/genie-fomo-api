@@ -14,7 +14,7 @@ get("/v1/fields", async () => {
         count(*) filter (where t.status = 'closed' and t.realized_pnl_usd is not null)::int as realized,
         count(*) filter (where t.avg_entry_price is not null and t.avg_entry_price > 0)::int as entry_px,
         count(distinct to_char(t.closed_at, 'YYYY-MM')) filter (where t.status = 'closed')::int as months,
-        count(*) filter (where t.status <> 'closed' and t.unrealized_pnl_usd is not null)::int as unreal
+        count(*) filter (where t.status not in ('closed', 'closed_by_balance') and t.unrealized_pnl_usd is not null)::int as unreal
       from trades t group by t.handle),
     w as (select handle from wallets where evm_address is not null or sol_address is not null),
     a as (select handle, count(*) filter (where total_usd is not null)::int as pts
