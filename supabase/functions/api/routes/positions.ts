@@ -8,7 +8,10 @@ import { nativePrices } from "../shared/prices.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
-import { CostBasis, costBasisFor, costBlock, sellFlags, unsellable } from "../shared/positions-core.ts";
+import {
+  CostBasis, costBasisFor, costBlock, coverageLow, indexerCoverageFor, positionsPartialReason,
+  sellFlags, unsellable,
+} from "../shared/positions-core.ts";
 import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
 import { priceSuspectReason } from "../../aum-sample/value.ts";
 
@@ -232,11 +235,14 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     order by (case when h.value > 0 then h.value else null end) desc nulls last,
              lower(tk.address)`;
 
-  const [timing, costBy] = await Promise.all([
+  const [timing, costBy, coverBy] = await Promise.all([
     addrs.length ? positionTiming(addrs) : Promise.resolve([]),
     costBasisFor([t.handle as string]),
+    indexerCoverageFor([t.handle as string]),
   ]);
   const costs = costBy.get(t.handle as string) ?? new Map<string, CostBasis>();
+  /** R6. How much of each chain's activity the indexer holds; a thin chain makes the list partial. */
+  const chains = coverBy.get(t.handle as string) ?? {};
 
   /** The floor under every timestamp on this page, derived in memory from `timing`. See docs/DECISIONS.md#d073 */
   const observedFrom = timing
@@ -343,9 +349,9 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     totalValueUsd: total > 0 ? round(total) : null,
     /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
     unsellableUsd,
-    partial: unsellableUsd > 0,
-    partialReason: unsellableUsd > 0 ? "unsellable_positions" : null,
-    coverage: { pricedPositions: priced, unpricedPositions: all.length - priced },
+    partial: unsellableUsd > 0 || coverageLow(chains),
+    partialReason: positionsPartialReason(unsellableUsd > 0, coverageLow(chains)),
+    coverage: { pricedPositions: priced, unpricedPositions: all.length - priced, chains },
     /** T1.1. See docs/DECISIONS.md#d075 */
     chainHistory: {
       observedFrom: historyFrom,
@@ -403,8 +409,8 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     return best === null || at > best ? at : best;
   }, null);
 
-  /** Same cost basis the individual route serves, from the same function. */
-  const costByHandle = await costBasisFor(handles);
+  /** Same cost basis and indexer coverage the individual route serves, from the same functions. */
+  const [costByHandle, coverByHandle] = await Promise.all([costBasisFor(handles), indexerCoverageFor(handles)]);
 
   /** Per-trader gross totals, for the concentration check on each row. */
   const grossBy = new Map<string, number>();
@@ -472,6 +478,8 @@ post("/v1/traders/positions", async (_p, _url, body) => {
           : priced.length === 0
           ? null
           : round(sellable.reduce((sum, r) => sum + Number(r.value), 0));
+        const chains = coverByHandle.get(h) ?? {};
+        const partialReason = positionsPartialReason(unsellableUsd > 0, coverageLow(chains));
         return {
           ok: true as const,
           requested: req,
@@ -483,8 +491,8 @@ post("/v1/traders/positions", async (_p, _url, body) => {
           totalValueUsd,
           /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
           unsellableUsd,
-          ...(unsellableUsd > 0 ? { partial: true, partialReason: "unsellable_positions" } : {}),
-          coverage: cov(priced.length, own.length),
+          ...(partialReason ? { partial: true, partialReason } : {}),
+          coverage: { ...cov(priced.length, own.length), chains },
           /*
            * Every position this trader holds is in this row -- the batch does not page, so a
            * consumer never has to wonder whether it saw all of them. `nextCursor` is null for
