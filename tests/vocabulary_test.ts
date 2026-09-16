@@ -30,3 +30,8 @@ Deno.test("basis and tier match their check constraints exactly", async () => {
 Deno.test("points[].refused and gaps[].reason publish the same words", () => {
   assertEquals([...VOCABULARY.fields["aum.points[].refused"]], [...VOCABULARY.fields["aum.gaps[].reason"]]);
 });
+
+Deno.test("every trade_loads.outcome the database can store is published", async () => {
+  const published = new Set<string>(VOCABULARY.fields["scorecard.loadOutcome"]);
+  for (const w of await sqlAllowed("outcome")) assert(published.has(w), `unpublished: ${w}`);
+});

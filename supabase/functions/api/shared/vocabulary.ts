@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 3,
+  version: 4,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -21,7 +21,7 @@ export const VOCABULARY = {
     "aum.chains[].reason": ["no_prices", "wallet_unreadable", "service_timeout", "no_tokens_known", "price_suspect"],
     /* `none` is a chain we know he uses and hold no balance history for at all. */
     "aum.knownChains[].historyState": ["ready", "warming", "none"],
-    "aum.sampler.state": ["current", "stale", "warming"],
+    "aum.sampler.state": ["current", "stale", "warming", "never_read"],
     "aum.coverage.partialReason": ["chains_missing", "unpriced_positions",
                                    "chains_missing_and_unpriced_positions"],
     "aum.progress.boundedBy": ["window", "history"],
@@ -31,10 +31,15 @@ export const VOCABULARY = {
     /* 17 Sep 2026, v3: the words added by the pre-migration fixes (docs/TO-DO-BEFORE-MIGRATION.md). */
     "aum.stepChosenFrom": ["window", "tracked_span", "fallback"],
     "aum.points[].reliability": ["low"],
-    "positions.partialReason": ["unsellable_positions", "unpriced_positions"],
+    "positions.partialReason": ["unsellable_positions", "unpriced_positions", "indexer_coverage_low", "unsellable_positions_and_indexer_coverage_low"],
     "positions[].priceSuspectReason": ["implied_mcap_over_ceiling", "concentration_over_ceiling"],
     "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
     "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards"],
+    /* 17 Sep 2026, v4: second wave (items 10, 11, 12, R6). */
+    "scorecard.loadOutcome": ["loaded", "unavailable", "degraded", "not_found", "error"],
+    "scorecard.nextLoadBasis": ["nightly_slot"],
+    "pnl.openPositionsBasis.*": ["trade_records", "trade_records_still_held_on_chain"],
+    "trades.status": ["open", "closed", "closed_by_balance"],
     "wallets.walletState": ["on_record", "unresolved_upstream"],
     "traders.delisted.reason": ["absent_from_source"],
     "aum.comparability.reason": ["coverage_differs_by_method"],

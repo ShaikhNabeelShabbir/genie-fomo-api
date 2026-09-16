@@ -323,3 +323,19 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `onChain.chainsCovered` | /traders/:handle | chains present in the stored transaction feed; all-zero counts outside this list mean "not covered" |
 | `health.staleFeeds[]` | /health | + `scorecards` when any scorecard is past its own `staleAfterHours`; `dataState` is then `degraded` |
 | `health.feeds.aum.chains.{chain}` | /health | `{ accepted36h, failed24h, newestAcceptedAt }` per chain |
+
+
+## Added 17 Sep 2026, second wave (vocabulary v4)
+
+| Field | Route | Contract |
+|---|---|---|
+| `pnl.openPositionsHeld`, `pnl.openPositionsBasis` | /pnl, /traders?include=pnl | open trade records whose token the wallet still holds on chain; basis words `trade_records`, `trade_records_still_held_on_chain` |
+| `trades.status = closed_by_balance` | stored; affects /pnl, /scorecard, /tokens | a trade fomo calls open for a token a chain read no longer holds; never counted as open, never as a realised close |
+| `scorecard.loadAttemptedAt`, `loadOutcome`, `nextLoadBasis` | /scorecard | last fomoapi fetch attempt and its outcome (`loaded` \| `unavailable` \| `degraded` \| `not_found` \| `error`, null = never attempted); `nextLoadBasis: nightly_slot` |
+| `health.staleTraders.scorecardLoadFailed` | /health | traders past 72 h whose latest load attempt was not `loaded` |
+| `health.feeds.aum.historyState`, `health.feeds.aum.chains.{chain}.historyState` | /health | `{ ready, warming, none }` counts of trader-chains, same definition as `wallets.knownChains[].historyState` |
+| `health.feeds.aum.state`, `samplerLastRunAt` | /health | the feed clock is the newest ACCEPTED reading; the sampler's own clock moved to `samplerLastRunAt` |
+| `health.staleTraders.noReading` | /health | now counts every listed trader with no accepted reading (refused readings do not count) |
+| `aum.sampler.state = never_read` | /aum | the sampler has never covered this trader (no reading row at all) |
+| `positions.coverage.chains.{chain}` | /positions, POST /traders/positions v2 | `{ chainTxCount, rowsHeld, share, readAt }` from one `eth_getTransactionCount` per sampled EVM chain; `partialReason: indexer_coverage_low` when any share < 0.5, composed with `unsellable_positions` as `unsellable_positions_and_indexer_coverage_low` |
+| Robinhood-chain prices | /positions, /aum | coins GMGN misses are priced nightly from DexScreener into `token_prices`; they surface as the existing `priceSource: token_prices_daily` (`docs/R4_ROBINHOOD_PRICES.md`) |

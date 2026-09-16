@@ -333,9 +333,9 @@ document it in `PARAMETER_ROUTES.md` as the unbucketed form.
 
 | Ask | What it needs | Why later |
 |---|---|---|
-| **R4** price Robinhood-chain coins (28 of 39 refused chains price under 5%) | a price source for chain 4663 that GMGN does not cover: on-chain DEX pool reads or an aggregator | data-source decision and a new loader |
+| **R4** price Robinhood-chain coins | DONE on branch: DexScreener loader `scripts/load_robinhood_prices.mjs`, nightly; see `docs/R4_ROBINHOOD_PRICES.md` | not deployed |
 | **T3** build the scorecard from the on-chain swap stream | `wallet_swaps` holds 81 EVM swap groups against Solana's 4,696 (`routes.ts:5940-5950`); EVM receipt resolution first | L, and depends on T1 |
-| **R6** per-chain indexer coverage (`eth_getTransactionCount` vs rows held) | one RPC call per wallet per sample, a `coverage` block on `/positions` | M; do with Z2's health work |
+| **R6** per-chain indexer coverage | DONE on branch: `chain_coverage` table, `positions.coverage.chains`, `indexer_coverage_low` | not deployed |
 | **L2** 4 s for a stored single-trader answer | profile `aumFor` (`routes.ts:5620-5700`); the migration's Hyperdrive caching helps only once query caching is turned back on | after the port, where the cost is measured on the new runtime |
 | **H1** rebuild from balance-at-block | archive `eth_call`s for every held token at every point | declined for now (see 13) |
 
@@ -375,9 +375,9 @@ document it in `PARAMETER_ROUTES.md` as the unbucketed form.
 | 7 | S1 | agents, merged 17 Sep | on branch, not deployed |
 | 8 | L1, K1 | agents, merged 17 Sep | on branch, not deployed |
 | 9 | V2 | agents, merged 17 Sep | on branch, not deployed |
-| 10 | P1 | | open |
-| 11 | T1 | | open |
-| 12 | A1, F2, F3 | | partly: per-chain counts on branch; historyState counts and `never_read` still open |
+| 10 | P1 | agent, merged 17 Sep | on branch, not deployed |
+| 11 | T1 | agent, merged 17 Sep | on branch, not deployed; 6-hourly retry workflow added |
+| 12 | A1, F2, F3 | agents, merged 17 Sep | on branch, not deployed |
 | 13 | H1 | agents, merged 17 Sep | on branch, not deployed |
 | 14 | W1, O1 | agents, merged 17 Sep | on branch, not deployed |
 | 15 | B3 | agents, merged 17 Sep | on branch, not deployed |

@@ -1,3 +1,22 @@
+# Overnight autonomous run (2026-09-17, started ~19:30 UTC)
+
+Goal: finish every to-do that needs no user input; nothing deployed. Branch `Junaid-deve-starts`.
+
+- [ ] Wave 1 (5 agents, parallel, worktrees): P1 (#10), T1 (#11), A1/F2/F3 remainder (#12),
+      R6 indexer coverage, R4 Robinhood prices + refresh.yml reorder + rebuild twins.
+- [ ] Merge wave 1; publish words in `shared/vocabulary.ts` (v4); update Field_Contracts.
+- [ ] Wave 2 (1 agent): clear the 90 baseline type errors (postgres.js row typing).
+- [ ] Wave 3 (parallel): port `aum-sample` into the Worker (`/sample` + `scheduled`); thread a
+      `Ctx { sql, env }` through the api modules so the Worker serves `/v1/*`; docs agent
+      (PARAMETER_ROUTES, TO-DO tracker, DECISIONS pointers).
+- [ ] Final: gate + tests + worker tsc + dry-run; push; status summary here.
+
+Blocked on the user (not attempted): Cloudflare token `Workers Scripts: Edit`; database password
+for Hyperdrive; Supabase deploy + `db push`; Genie-team notification (vocabulary v3+);
+`.env.example`.
+
+---
+
 # Restructure for lower token cost — plan (2026-09-17)
 
 Branch: `Junaid-deve-starts`. One commit per phase. Decisions from the user: install deno;
