@@ -836,6 +836,22 @@ swap resolved. Computed on the single-trader route only; `?include=scorecard` ca
 curl -s "$B/traders/smokey0x/scorecard?tokens=0" | jq '{fallback: .staleness.fallback, onChain}'
 ```
 
+**Composite badges read from the same call (17 Sep).** Each `byToken[]` row now carries its own
+economics: `multipleRealized` (weighted exit ÷ weighted entry), `multipleCurrent`, `multiplePeak`
+(sampled ATH since his first open, null before the hourly sampler reached the coin),
+`realizedShare` (sold ÷ bought, 0..1), `betUsd`, `exitMcapUsd`, `currentMcapUsd`,
+`peakMcapSinceEntryUsd`, `closedMonth` and `entryHoursAfterLaunch`. The scorecard adds
+`medianWinUsd`, `medianLossUsd`, `bigWinMonths`, `typicalBetUsd.perCoinUsd`, a `recent` block
+(`lastBigWinAt`, `closes4w`, `green4w`, `last20: { avgRealizedUsd, redShare }`, plus the
+entry-mcap median, hold-hours median and pace over the last 20 closes), the same three under
+`career`, `bleeding` with its floor in `bleedingBasis`, and `exitTimingScore` (share of closed
+coins now priced below his exit; null under five). Null is "not known", never 0.
+
+```bash
+curl -s "$B/traders/unipcs/scorecard?tokens=3" | jq '{bleeding, bleedingBasis, exitTimingScore, recent, career,
+  coins: [.byToken[] | {symbol, multipleRealized, multiplePeak, realizedShare, betUsd, closedMonth}]}'
+```
+
 ---
 
 ## 2. Trader — positions
