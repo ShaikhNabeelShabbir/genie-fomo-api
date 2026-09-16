@@ -31,10 +31,12 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `Jun
       `holdings_live` + `/flow`, dev ledger + linked wallets. Vocabulary v6. 42 tests.
 - [x] Composite workflows coverage (`docs/consumer/composite-workflows-coverage-17-sep.md`).
 - [x] Efficiency review (`docs/REVIEW_EFFICIENCY_17_SEP.md`).
-- [ ] Wave A (7 agents, running): opt A1 aum window/indexes/app, A2 health scans + chain-history
-      view, A3 positions/portfolio queries, A4 sampler parallel chains + scripts, A5 scorecard opt
-      + composite C1/C2/C5, C4 `/market/regime`, C3 honeypot-since + cohort.
-- [ ] Merge wave A, vocabulary v7, push; then the v2 contract note to the Genie team.
+- [x] Wave A (7 agents): A2 health scans + `trader_chain_history` view + 30 s cache; A3 `/portfolio`
+      7→2 queries; A4 sampler chains in parallel + supply loader unnest/throttle; A5 scorecard join
+      fixes + C1 per-coin multiples + C2 windows/bleeding + C5 exit-timing score; C4 `/market/regime`;
+      C3 honeypot-since + cohort. Plus a fix: the nightly re-price pass now honours the ceilings.
+      52 tests. Vocabulary v7.
+- [ ] A1 (aum window bound, perf indexes, compact JSON, statement_timeout) — merging when it reports.
 
 ## Status for the morning (17 Sep 2026)
 

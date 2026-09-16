@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 6,
+  version: 7,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -54,6 +54,8 @@ export const VOCABULARY = {
     "flow.basis": ["transactions"],
     "wallets.linked[].kind": ["funded_by", "submitted"],
     "creators.tokens[].status": ["creator_hold", "creator_close"],
+    /* 17 Sep 2026, v7: composite badges (C1-C5) and the efficiency wave. */
+    "market.regime": ["open", "caution", "closed"],
     "wallets.walletState": ["on_record", "unresolved_upstream"],
     "traders.delisted.reason": ["absent_from_source"],
     "aum.comparability.reason": ["coverage_differs_by_method"],
