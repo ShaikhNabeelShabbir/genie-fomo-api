@@ -189,6 +189,33 @@ export function chainExitsFrom(swaps: Swap[], entries: Map<string, number>): num
   return out;
 }
 
+/**
+ * T3 (bounded). The block a consumer draws when fomoapi is behind: the same swap rows and the
+ * same average-cost pairing as `perExit`, summed. Null figures when nothing resolved; `swaps`
+ * is a real count and may be 0. `swapsSeen` is the swap-shaped groups in `transactions`.
+ */
+export type OnChainBlock = ReturnType<typeof onChainFrom>;
+export function onChainFrom(swaps: Swap[], swapsSeen: number) {
+  const exits = chainExitsFrom(swaps, chainEntriesFrom(swaps));
+  const valued = swaps.map((s) => s.quoteUsd).filter((x): x is number => x !== null);
+  const wins = exits.filter((v) => v > 0).length;
+  const times = swaps.map((s) => s.at).filter((x): x is string => x !== null);
+  const some = swaps.length > 0;
+  return {
+    basis: "wallet_swaps",
+    swaps: swaps.length,
+    buys: some ? swaps.filter((s) => s.tokenDelta > 0).length : null,
+    sells: some ? swaps.filter((s) => s.tokenDelta < 0).length : null,
+    volumeUsd: valued.length ? round(valued.reduce((a, b) => a + Math.abs(b), 0)) : null,
+    realizedPnlUsd: exits.length ? round(exits.reduce((a, b) => a + b, 0)) : null,
+    winRate: exits.length ? Number((wins / exits.length).toFixed(4)) : null,
+    wins: exits.length ? wins : null,
+    losses: exits.length ? exits.filter((v) => v < 0).length : null,
+    coverage: cov(swaps.length, swapsSeen),
+    asOf: times.length ? times.reduce((a, b) => (a > b ? a : b)) : null,
+  };
+}
+
 /** The individual buys, grouped by "net:token", from the same rows. */
 export function buysFrom(swaps: Swap[]): Map<string, Buy[]> {
   const out = new Map<string, Buy[]>();
@@ -240,6 +267,8 @@ export async function scorecardBody(
   buys?: Map<string, Buy[]> | null,
   /** month (YYYY-MM) -> the balance he entered it with. See monthStartCapital(). */
   startCapital?: Map<string, number> | null,
+  /** T3. Only the single-trader route computes this; `?include=scorecard` passes nothing. */
+  onChain?: OnChainBlock | null,
 ) {
   const chainEntry = chain?.entries ?? new Map<string, number>();
   const chainExits = chain?.exits ?? [];
@@ -802,14 +831,21 @@ export async function scorecardBody(
       const t = loadedAtIso ? Date.parse(loadedAtIso) : NaN;
       const ageSeconds = Number.isFinite(t) ? Math.max(0, Math.round((Date.now() - t) / 1000)) : null;
       const staleAfterHours = 72;
+      const state = ageSeconds === null
+        ? "never"
+        : (ageSeconds > staleAfterHours * 3600 ? "stale" : "current");
       return {
-        state: ageSeconds === null
-          ? "never"
-          : (ageSeconds > staleAfterHours * 3600 ? "stale" : "current"),
+        state,
         ageSeconds,
         staleAfterHours,
+        /** T3. Which block to draw: `on_chain` when this record is behind and `onChain` has rows. */
+        fallback: state !== "current" && (onChain?.swaps ?? 0) > 0 ? "on_chain" : null,
       };
     })(),
+    onChain: onChain ?? null,
+    onChainNote: onChain
+      ? null
+      : "computed on /v1/traders/:handle/scorecard only; null under ?include=scorecard",
     /** FEES, ANSWERED HONESTLY RATHER THAN ASSUMED EITHER WAY. See docs/DECISIONS.md#d167 */
     fees: {
       /**
