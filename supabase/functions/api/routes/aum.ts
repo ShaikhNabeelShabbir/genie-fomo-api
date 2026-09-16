@@ -803,8 +803,9 @@ async function aumFor(
    * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
    * parent row are whole-trader for a sampled point and one chain's for a rebuilt one.
    */
-  const rows = opts.chainFilter
-    ? await sql`
+  const [rows, allChainRows, knownBy, natives, samplerRow, presenceRows] = await Promise.all([
+    opts.chainFilter
+      ? sql`
         select a.handle, a.at, a.total_usd, a.reason as refused_reason,
                null::int as priced_positions, null::int as total_positions,
                a.priced_share as value_share, a.basis, s.tier,
@@ -816,13 +817,40 @@ async function aumFor(
           on u.handle = a.handle and a.at >= u.lo
         where a.network_id = ${opts.chainFilter.network_id}
         order by a.handle, a.at asc`
-    : await sql`
+      : sql`
         select s.handle, s.at, s.total_usd, s.refused_reason, s.priced_positions, s.total_positions,
                s.value_share, s.basis, s.tier, s.chains_answered, s.chains_expected
         from aum_samples s
         join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
           on u.handle = s.handle and s.at >= u.lo
-        order by s.handle, s.at asc`;
+        order by s.handle, s.at asc`,
+    /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
+    sql`
+        select a.handle, a.at, a.basis, c.name as chain, a.total_usd
+        from aum_chain_samples a
+        join chains c using (network_id)
+        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+          on u.handle = a.handle and a.at >= u.lo
+        order by a.handle, a.at asc`,
+    /** Window-independent chain list, one query for the whole batch. */
+    knownChainsFor(present),
+    /** Cached for the process; five rows that barely move. */
+    nativePrices(),
+    /*
+     * WHEN THE SAMPLER LAST SUCCEEDED, read once for the whole batch.
+     *
+     * The consumer measured every answer saying `ready` while the newest reading anywhere was
+     * 75 hours old, and nothing in the response said so. Freshness has to travel WITH the
+     * number rather than be reconstructed from dates by every caller.
+     */
+    samplerLast(),
+    sql`
+    select handle, count(distinct network_id)::int as chains,
+           bool_or(network_id = ${SOLANA_NET}) as on_solana,
+           bool_or(network_id <> ${SOLANA_NET}) as on_evm
+    from holdings_current where handle = any(${present}) and human_amount > 0
+    group by handle`,
+  ]);
 
   const byHandle = new Map<string, Record<string, unknown>[]>();
   for (const r of rows) {
@@ -859,21 +887,6 @@ async function aumFor(
     a.push(r);
   }
 
-  /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
-  const allChainRows = present.length
-    ? await sql`
-        select a.handle, a.at, a.basis, c.name as chain, a.total_usd
-        from aum_chain_samples a
-        join chains c using (network_id)
-        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
-          on u.handle = a.handle and a.at >= u.lo
-        order by a.handle, a.at asc`
-    : [];
-  /** Window-independent chain list, one query for the whole batch. */
-  const knownBy = await knownChainsFor(present);
-  /** Cached for the process; five rows that barely move. */
-  const natives = await nativePrices();
-
   /** handle -> "<iso at>|<basis>" -> [{ chain, usd }]. One map, built once for the batch. */
   const pointChainsBy = new Map<string, Map<string, { chain: string; usd: number | null }[]>>();
   for (const r of allChainRows) {
@@ -884,21 +897,6 @@ async function aumFor(
     a.push({ chain: String(r.chain), usd: n(r.total_usd) });
   }
 
-  /*
-   * WHEN THE SAMPLER LAST SUCCEEDED, read once for the whole batch.
-   *
-   * The consumer measured every answer saying `ready` while the newest reading anywhere was
-   * 75 hours old, and nothing in the response said so. Freshness has to travel WITH the
-   * number rather than be reconstructed from dates by every caller.
-   */
-  const samplerRow = await samplerLast();
-
-  const presenceRows = await sql`
-    select handle, count(distinct network_id)::int as chains,
-           bool_or(network_id = ${SOLANA_NET}) as on_solana,
-           bool_or(network_id <> ${SOLANA_NET}) as on_evm
-    from holdings_current where handle = any(${present}) and human_amount > 0
-    group by handle`;
   const presBy = new Map<string, { chains: number; on_solana: boolean; on_evm: boolean }>(presenceRows.map((r: Record<string, unknown>) => [String(r.handle), {
     chains: Number(r.chains), on_solana: r.on_solana === true, on_evm: r.on_evm === true,
   }]));
