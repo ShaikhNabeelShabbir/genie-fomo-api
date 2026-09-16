@@ -15,9 +15,34 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `Jun
       the Worker serves `/v1/*` from the SAME modules (`worker/src/api.ts`). Verified under
       workerd with a dead DB: 404 route list and 503 unavailable both correct. Pushed 0b3ac30.
 - [x] Comment extractor re-run: nothing new to move (agents kept comments short).
-- [ ] Wave 4 (2 agents): T3 bounded (on-chain scorecard fallback block); read-only bug review of
-      the whole branch diff → fixes applied by me afterwards.
-- [ ] Final: gate + tests + worker tsc + dry-run; push; status summary here.
+- [x] Wave 4 (2 agents): T3 bounded (`scorecard.onChain` + `staleness.fallback`, vocabulary v5);
+      read-only review found 5 bugs + 1 twin divergence, all confirmed and fixed by a 5th agent
+      (price_suspect backfill also fixes chain rows and tier; `nothing_answered` instead of
+      `wallet_unreadable` when nothing was asked; GET /positions total null/zero contract;
+      known chains from answered rows only; dead `applyFloor` fields; MJS twin imports
+      `decideTotal`).
+- [x] Final: gate 0 errors, 32 tests, worker tsc clean, bundle 371 KB, node/py checks, loaders
+      build; pushed 1e652b4 (78 commits ahead of main, 6 new migrations).
+
+## Status for the morning (17 Sep 2026)
+
+Everything that needed no input is done and pushed. Total: 12 agents over 4 waves.
+Vocabulary is at **v5**; the consumer reply draft is `docs/consumer/reply-to-genie-17-sep.md`.
+
+Waiting on you, in order:
+1. Cloudflare token: add `Account › Workers Scripts › Edit`, then I deploy the Worker and set
+   `CLOUDFLARE_DEPLOY=true` + `WORKER_URL`.
+2. Database password (from the dev): `wrangler hyperdrive create … --caching-disabled`, paste the id
+   into `worker/wrangler.toml` (uncomment the block), `wrangler secret put HELIUS_WEBHOOK_SECRET`,
+   `AUM_SAMPLE_SECRET`, `HELIUS_SOLANA_KEY`, `WALLET_SUBMIT_SECRET`; redeploy; shadow diff.
+3. Supabase: `supabase db push` (6 migrations dated 20260917), deploy `api` + `aum-sample`;
+   re-sample `luckedhub`/`shahh`; run `scripts/acceptance_capture.sh` on main-vs-branch.
+4. Send the reply draft to the Genie team (vocabulary v5 will fail their build until they add
+   the words).
+5. `.env.example` tail by hand.
+
+Not done, deliberately: full T3 (EVM receipt resolution, `/trades` from the swap stream), L2
+latency (needs measurements against a database), H1 rebuild-from-balance (declined).
 
 Blocked on the user (not attempted): Cloudflare token `Workers Scripts: Edit`; database password
 for Hyperdrive; Supabase deploy + `db push`; Genie-team notification (vocabulary v3+);
