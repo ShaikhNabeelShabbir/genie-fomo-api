@@ -960,9 +960,11 @@ item, which Supabase currently bundles; size it against `transactions` growing a
 mechanical `Deno.env.get` → `env` change across 26 call sites plus threading `sql` through
 `routes.ts`.
 
-**Phase status (17 Sep 2026):** Phase 3 done — `worker/` builds, `/webhook` is ported (not
-deployed: no credentials yet, Hyperdrive id is a placeholder). Phases 1, 2, 4 and 5 not started:
-`/sample` and `/v1/*` answer 501.
+**Phase status (17 Sep 2026):** Phases 3 and 4 done — `worker/` builds, `/webhook` and
+`/sample` + `scheduled` are ported (`worker/src/sampler.ts`, twin of `aum-sample/index.ts`;
+`chain_reads.ts` and `value.ts` are imported from `supabase/functions`, not copied). Not
+deployed: no credentials yet, Hyperdrive id is a placeholder, `[triggers]` stays commented out
+until Phase 2 of §13. Phases 1, 2 and 5 not started: `/v1/*` answers 501.
 
 Option B adds four to eight weeks for the SQL rewrite, and should be scheduled as its own
 project with the acceptance suite as the gate.
