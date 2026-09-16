@@ -1,0 +1,28 @@
+# The one Worker. See docs/CLOUDFLARE_MIGRATION.md §11.
+name = "genie-fomo"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+# `npx wrangler hyperdrive create genie-fomo-db --connection-string=… --caching-disabled` prints it (§8.0).
+id = "REPLACE_WITH_HYPERDRIVE_ID"
+# `wrangler dev` without --remote connects straight to this; no pooling, no caching.
+localConnectionString = "postgresql://postgres:postgres@localhost:5432/postgres"
+
+# Phase 1 (shadow) keeps pg_cron as the only sampler. Uncomment in Phase 2 (§13).
+# [triggers]
+# crons = ["*/5 * * * *"]
+
+[limits]
+cpu_ms = 30000
+
+[vars]
+AUM_LIVE_AFTER_MINUTES = "5"
+AUM_LIVE_WAIT_MS = "3000"
+RATE_LIMIT_PER_MINUTE = "240"
+ROUTE_TIMEOUT_MS = "15000"
+
+[observability]
+enabled = true

@@ -23,3 +23,8 @@ supabase/.temp/
 
 # Output of scripts/acceptance_capture.sh
 captures/
+
+# Output of `wrangler deploy --dry-run --outdir dist`
+worker/dist/
+# wrangler dev scratch state
+worker/.wrangler/

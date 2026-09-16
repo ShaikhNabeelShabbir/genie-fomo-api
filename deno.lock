@@ -299,9 +299,11 @@
   "workspace": {
     "packageJson": {
       "dependencies": [
+        "npm:@cloudflare/workers-types@^5.20260916.1",
         "npm:@types/node@^22.10.0",
         "npm:@types/pg@^8.23.1",
         "npm:pg@^8.23.0",
+        "npm:postgres@^3.4.9",
         "npm:tsx@^4.19.2",
         "npm:typescript@^5.7.0",
         "npm:wrangler@^4.130.0"
