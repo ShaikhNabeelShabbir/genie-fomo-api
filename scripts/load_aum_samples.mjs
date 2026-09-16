@@ -43,7 +43,6 @@ const DRY = flag("dry-run");
  * exhausted: the loaders took the API to 503 mid-run. We reproduced it on 2026-09-09.
  */
 const pool = new pg.Pool({ connectionString: DB, ssl: { rejectUnauthorized: false }, max: 3 });
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /*
  * Price ceilings, applied BEFORE any multiplication.
@@ -284,27 +283,22 @@ async function main() {
       const expected = new Set(knownByHandle.get(trader.handle) ?? []);
       if (trader.sol_address) expected.add(SOLANA_NETWORK_ID);
 
-      const reads = new Map();
-      for (const net of expected) {
-        const c = chainById.get(net);
-        // Known without the wallet that reaches it: expected, not askable; the row says partial.
-        if (!c || !hasWallet(trader, net)) continue;
-        reads.set(net, await readChain(trader, c, decimals, tradedByNet));
-      }
+      // Known without the wallet that reaches it: expected, not askable; the row says partial.
+      const askable = [...expected].filter((net) => chainById.has(net) && hasWallet(trader, net));
+      // Chains in parallel: the per-host throttle in chain_reads serialises same-host calls, so this is safe.
+      const answers = await Promise.all(askable.map((net) => readChain(trader, chainById.get(net), decimals, tradedByNet)));
+      const reads = new Map(askable.map((net, i) => [net, answers[i]]));
       const job = { trader, expected, reads };
       await finish(job, `[${String(i + 1).padStart(4)}/${targets.length}] ${t.handle.padEnd(22)}`);
       if ([...reads.values()].some((r) => r.reason === "wallet_unreadable")) retry.push(job);
-      await sleep(120);
     }
 
     // ONE MORE ASK for every chain that would not answer, after the other traders gave the RPC a rest.
     for (const job of retry) {
+      const stale = [...job.reads].filter(([, r]) => r.reason === "wallet_unreadable").map(([net]) => net);
+      const again = await Promise.all(stale.map((net) => readChain(job.trader, chainById.get(net), decimals, tradedByNet)));
       let flipped = false;
-      for (const [net, r] of job.reads) {
-        if (r.reason !== "wallet_unreadable") continue;
-        const again = await readChain(job.trader, chainById.get(net), decimals, tradedByNet);
-        if (again.positions) { job.reads.set(net, again); flipped = true; }
-      }
+      again.forEach((a, i) => { if (a.positions) { job.reads.set(stale[i], a); flipped = true; } });
       if (flipped) await finish(job, `[retry     ] ${job.trader.handle.padEnd(22)}`);
     }
     const ok = [...verdict.values()].filter((v) => v !== null).length;

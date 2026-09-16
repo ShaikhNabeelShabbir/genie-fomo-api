@@ -348,13 +348,12 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
       const expected = new Set(knownByHandle.get(trader.handle) ?? []);
       if (trader.sol_address) expected.add(SOLANA_NETWORK_ID);
 
-      const reads = new Map<number, ChainRead>();
-      for (const net of expected) {
-        const c = chainById.get(net);
-        /* Known without the wallet that reaches it: expected, not askable; the row says partial. */
-        if (!c || !hasWallet(trader, net)) continue;
-        reads.set(net, await readChain(HELIUS, trader, c, decimals, tradedByNet));
-      }
+      /* Known without the wallet that reaches it: expected, not askable; the row says partial. */
+      const askable = [...expected].filter((net) => chainById.has(net) && hasWallet(trader, net));
+      /* Chains in parallel: the per-host throttle in chain_reads serialises same-host calls, so this is safe. */
+      const answers = await Promise.all(askable.map((net) =>
+        readChain(HELIUS, trader, chainById.get(net)!, decimals, tradedByNet)));
+      const reads = new Map<number, ChainRead>(askable.map((net, i) => [net, answers[i]]));
       const job = { trader, expected, reads };
       await finish(job);
       if ([...reads.values()].some((r) => r.reason === "wallet_unreadable")) retry.push(job);
@@ -363,12 +362,11 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
     /* ONE MORE ASK for every chain that would not answer, after the other traders gave the RPC a rest. */
     for (const job of retry) {
       if (Date.now() - started > BUDGET_MS) { stoppedEarly = true; break; }
+      const stale = [...job.reads].filter(([, r]) => r.reason === "wallet_unreadable").map(([net]) => net);
+      const again = await Promise.all(stale.map((net) =>
+        readChain(HELIUS, job.trader, chainById.get(net)!, decimals, tradedByNet)));
       let flipped = false;
-      for (const [net, r] of job.reads) {
-        if (r.reason !== "wallet_unreadable") continue;
-        const again = await readChain(HELIUS, job.trader, chainById.get(net)!, decimals, tradedByNet);
-        if (again.positions) { job.reads.set(net, again); flipped = true; }
-      }
+      again.forEach((a, i) => { if (a.positions) { job.reads.set(stale[i], a); flipped = true; } });
       if (flipped) await finish(job);
     }
     const ok = [...report.values()].filter((e) => e.totalUsd !== null).length;
