@@ -294,7 +294,7 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
 
     /*
      * EXPECTED CHAINS ARE THE ONES /aum PUBLISHES: presence ∪ holdings ∪ chain samples.
-     * Twin of the `seen` CTE in api/shared/chains.ts knownChainsFor(); change both.
+     * Twin of the `trader_chain_history` view (migration 20260917230000); change both.
      */
     const knownByHandle = new Map<string, Set<number>>();
     for (const r of await sql`

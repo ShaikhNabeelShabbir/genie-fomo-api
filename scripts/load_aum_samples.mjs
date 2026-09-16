@@ -244,7 +244,7 @@ async function main() {
       tradedByNet.get(k).push({ token_key: r.token_key, address: r.address });
     }
     // EXPECTED CHAINS ARE THE ONES /aum PUBLISHES: presence ∪ holdings ∪ chain samples.
-    // Twin of the `seen` CTE in api/shared/chains.ts knownChainsFor(); change both.
+    // Twin of the `trader_chain_history` view (migration 20260917230000); change both.
     const { rows: seen } = await client.query(`
       select s.handle, s.network_id::bigint
       from (select handle, network_id from wallet_chain_presence where handle = any($1)
