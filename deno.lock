@@ -284,12 +284,8 @@
   "workspace": {
     "packageJson": {
       "dependencies": [
-        "npm:@types/cors@^2.8.17",
-        "npm:@types/express@^4.17.21",
         "npm:@types/node@^22.10.0",
         "npm:@types/pg@^8.23.1",
-        "npm:cors@^2.8.5",
-        "npm:express@^4.21.2",
         "npm:pg@^8.23.0",
         "npm:tsx@^4.19.2",
         "npm:typescript@^5.7.0",
