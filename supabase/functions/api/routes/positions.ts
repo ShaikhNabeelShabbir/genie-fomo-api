@@ -8,7 +8,7 @@ import { nativePrices } from "../shared/prices.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
-import { CostBasis, costBasisFor, costBlock } from "../shared/positions-core.ts";
+import { CostBasis, costBasisFor, costBlock, sellFlags, unsellable } from "../shared/positions-core.ts";
 
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
@@ -68,11 +68,14 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [r] = await sql`
     select count(*)::int                                as positions,
            count(value) filter (where value > 0)::int   as priced,
-           sum(value)   filter (where value > 0)        as total,
-           max(value)   filter (where value > 0)        as top_value,
+           -- V2: a confirmed honeypot / unsellable coin is priced but not part of the total.
+           sum(value)   filter (where value > 0 and not coalesce(ti.is_honeypot or ti.can_not_sell, false)) as total,
+           max(value)   filter (where value > 0 and not coalesce(ti.is_honeypot or ti.can_not_sell, false)) as top_value,
+           sum(value)   filter (where value > 0 and coalesce(ti.is_honeypot or ti.can_not_sell, false))     as unsellable,
            sum(value)   filter (where value > 0 and q.token_key is not null) as cash
     from holdings_current h
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
+    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     where h.handle = ${t.handle}`;
 
   const positions = Number(r.positions);
@@ -80,6 +83,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const total = n(r.total);
   const top = n(r.top_value);
   const cash = n(r.cash) ?? 0;
+  const unsellableUsd = round(n(r.unsellable) ?? 0)!;
 
   const natives = await nativePrices();
   const chainCoverage = byChain.map((r) => {
@@ -123,7 +127,11 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
     },
     byChain: chainCoverage,
     ...(includesToken ? { includesToken } : {}),
-    partial: positions > 0 && priced / positions < 0.5,
+    partial: (positions > 0 && priced / positions < 0.5) || unsellableUsd > 0,
+    partialReason: unsellableUsd > 0 ? "unsellable_positions"
+      : positions > 0 && priced / positions < 0.5 ? "unpriced_positions" : null,
+    /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
+    unsellableUsd,
     plain: positions === 0
       ? "No positions on record."
       : "Holds positions, but none of them have a usable price — we cannot say how concentrated this is.",
@@ -134,7 +142,9 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
     select tk.address, h.network_id, h.value
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
+    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     where h.handle = ${t.handle} and h.value > 0
+      and not coalesce(ti.is_honeypot or ti.can_not_sell, false)
     order by h.value desc limit 1`;
 
   const share = top / total;
@@ -196,11 +206,13 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            -- was true. A live quote and a three-week-old reported entry are both usable and
            -- are not the same claim.
            h.price_source, h.priced_at, h.captured_at, h.source as balance_source,
-           (q.token_key is not null) as is_quote
+           (q.token_key is not null) as is_quote,
+           ti.is_honeypot, ti.can_not_sell
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
+    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     where h.handle = ${t.handle}
     -- Priced rows first, descending. Unpriced rows TRAIL rather than being dropped: they
     -- are real holdings we simply cannot value, and hiding them would misstate the count.
@@ -224,7 +236,9 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   for (const r of timing) timeBy.set(`${r.network_id}:${r.token_key}`, r);
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
 
-  const total = rows.reduce((s, r) => s + ((n(r.value) ?? 0) > 0 ? n(r.value)! : 0), 0);
+  const valued = (r: Record<string, unknown>) => ((n(r.value) ?? 0) > 0 ? n(r.value)! : 0);
+  const total = rows.reduce((s, r) => s + (unsellable(r) ? 0 : valued(r)), 0);
+  const unsellableUsd = round(rows.reduce((s: number, r: Record<string, unknown>) => s + (unsellable(r) ? valued(r) : 0), 0))!;
   const all = rows.map((r) => {
     const tm = timeBy.get(`${r.network_id}:${r.token_key}`);
     const v = (n(r.value) ?? 0) > 0 ? n(r.value) : null;
@@ -251,8 +265,9 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       valueUsd: v === null ? null : round(v),
       /** Why there is no value, rather than an unexplained null. */
       whyNoPrice: v === null ? "no price for this token in any source we hold" : null,
-      share: v !== null && total > 0 ? Number((v / total).toFixed(4)) : null,
+      share: v !== null && total > 0 && !unsellable(r) ? Number((v / total).toFixed(4)) : null,
       isQuoteAsset: !!r.is_quote,
+      ...sellFlags(r),
       /**
        * WHAT HE PAID FOR THIS, and the profit measured against it.
        *
@@ -306,6 +321,10 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     /** False whenever rows remain. A consumer must not call a `false` page a portfolio. */
     complete: !more,
     totalValueUsd: total > 0 ? round(total) : null,
+    /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
+    unsellableUsd,
+    partial: unsellableUsd > 0,
+    partialReason: unsellableUsd > 0 ? "unsellable_positions" : null,
     coverage: { pricedPositions: priced, unpricedPositions: all.length - priced },
     /** T1.1. See docs/DECISIONS.md#d075 */
     chainHistory: {
@@ -339,7 +358,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
            tk.address as token_address,
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
-           h.price_source, h.priced_at
+           h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell
     from holdings_current h
     join chains ch using (network_id)
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
@@ -382,6 +401,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     /** null, never 0 — an unpriceable coin is not a worthless one. */
     whyNoPrice: n(r.value) === null ? "no price for this token in any source we hold" : null,
     tier: r.source === "chain" ? "verified" : "reported",
+    ...sellFlags(r),
   });
 
   if (v2) {
@@ -412,11 +432,13 @@ post("/v1/traders/positions", async (_p, _url, body) => {
          * and holds nothing. Collapsing the two would turn an unreadable portfolio into an
          * empty one, which is the difference between "we do not know" and "there is nothing".
          */
+        const sellable = priced.filter((r) => !unsellable(r));
+        const unsellableUsd = round(priced.filter(unsellable).reduce((s: number, r) => s + Number(r.value), 0))!;
         const totalValueUsd = own.length === 0
           ? 0
           : priced.length === 0
           ? null
-          : round(priced.reduce((sum, r) => sum + Number(r.value), 0));
+          : round(sellable.reduce((sum, r) => sum + Number(r.value), 0));
         return {
           ok: true as const,
           requested: req,
@@ -426,6 +448,9 @@ post("/v1/traders/positions", async (_p, _url, body) => {
           positionCount: own.length,
           pricedPositionCount: priced.length,
           totalValueUsd,
+          /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
+          unsellableUsd,
+          ...(unsellableUsd > 0 ? { partial: true, partialReason: "unsellable_positions" } : {}),
           coverage: cov(priced.length, own.length),
           /*
            * Every position this trader holds is in this row -- the batch does not page, so a
