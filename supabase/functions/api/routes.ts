@@ -802,6 +802,22 @@ get("/v1/traders", async (_p, url) => {
    * with it an hourly job moves only what actually changed, which is what keeps this fixed as
    * the directory grows rather than just making today's sync fast.
    */
+  /**
+   * DELISTED TRADERS ARE NOT LISTED, and are still answerable by name.
+   *
+   * Four traders have no wallet and never will: fomoapi has dropped them from every
+   * leaderboard window, and 377 GMGN KOL and smart-money entries matched none of them. A2 is
+   * explicit about them -- "either given one or dropped from the directory; being listed and
+   * unpriceable is the worst of both" -- because a trader on the board with no balance and no
+   * chart is a blank a person cannot interpret.
+   *
+   * They are flagged, not deleted. `cmbarce` alone carries 103 holdings and 144 trades, and
+   * the condition reverses the moment the source lists him again. So the board stops showing
+   * them, `/traders/:handle` still answers for them, and `?includeDelisted=true` puts them
+   * back in the listing for anyone reconciling against an older copy.
+   */
+  const includeDelisted = url.searchParams.get("includeDelisted") === "true";
+
   const sinceRaw = url.searchParams.get("updatedSince");
   let sinceMs: number | null = null;
   if (sinceRaw) {
@@ -852,7 +868,8 @@ get("/v1/traders", async (_p, url) => {
            end as score
     from traders t
     left join trader_stats_current s using (handle)
-    where (${q} = '' or lower(t.display_handle) like ${"%" + q + "%"}
+    where (${includeDelisted} or t.listed)
+      and (${q} = '' or lower(t.display_handle) like ${"%" + q + "%"}
                      or lower(coalesce(t.name,'')) like ${"%" + q + "%"})
       ${minPnl === null ? sql`` : sql`and s.pnl_usd >= ${minPnl}`}
       ${maxPnl === null ? sql`` : sql`and s.pnl_usd <= ${maxPnl}`}
@@ -1130,6 +1147,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
   const h = await resolveTrader(handle);
   const [t] = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified,
+           t.listed, t.delisted_at, t.delisted_reason,
            t.last_seen_at, t.source, s.captured_at,
            s.rank, s.pnl_usd, s.volume_usd, s.trade_count, s.followers,
            w.evm_address, w.sol_address
@@ -1159,6 +1177,24 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     name: t.name ?? null,
     rank: t.rank ?? null,
     verified: !!t.verified,
+    /**
+     * IS THIS TRADER STILL ON THE BOARD, and if not, why.
+     *
+     * `listed: false` means the source stopped carrying them, so the directory no longer shows
+     * them — but this route still answers, because a link that used to work should not start
+     * 404ing over a condition upstream of us. Nothing is deleted: their holdings, trades and
+     * history are intact and the flag reverses if the source lists them again.
+     */
+    listed: t.listed !== false,
+    ...(t.listed === false
+      ? {
+        delisted: {
+          at: t.delisted_at ? new Date(String(t.delisted_at)).toISOString() : null,
+          reason: (t.delisted_reason as string) ?? null,
+          note: "removed from the directory listing, not from the database",
+        },
+      }
+      : {}),
     /** Which directory this trader came from. See the note on `source` in `GET /v1/traders`. */
     source: t.source ?? null,
     updatedAt: t.captured_at ? new Date(String(t.captured_at)).toISOString() : null,
@@ -4452,10 +4488,30 @@ function buildAum(
    * plus a rebuild, not a read-path change.
    */
   const PRICED_FLOOR = 0.25;
+  /*
+   * THE REFUSED FIGURE IS KEPT, not discarded.
+   *
+   * Refusing a thin point is right: served as `totalUsd` it is a balance, and a balance built
+   * from 3% of a wallet is wrong in a way no consumer can detect. But the number was computed
+   * from real positions at a real moment, and throwing it away meant a month of history with
+   * three drawable points out of twenty-seven -- the other twenty-four existed and said
+   * nothing at all.
+   *
+   * So the refusal stands and the arithmetic survives beside it. `partialUsd` is the figure as
+   * computed, carrying the coverage it was computed at, and it is NEVER `totalUsd`: a caller
+   * has to reach for it deliberately, and cannot mistake it for a balance the service stands
+   * behind. Plot it as a faint line, a shaded band, a tooltip -- but not as his money.
+   */
   rows = rows.map((r) => {
     const share = n(r.value_share);
     if (n(r.total_usd) === null || share === null || share >= PRICED_FLOOR) return r;
-    return { ...r, total_usd: null, refused_reason: "too_little_priced" };
+    return {
+      ...r,
+      total_usd: null,
+      refused_reason: "too_little_priced",
+      /** What `total_usd` would have been. Not a balance — see the note above. */
+      partial_usd: n(r.total_usd),
+    };
   });
 
   /*
@@ -4582,6 +4638,17 @@ function buildAum(
   const points = [...kept.values()].map((r) => ({
     at: new Date(String(r.at)).toISOString(),
     totalUsd: round(n(r.total_usd)),
+    /**
+     * THE FIGURE BEHIND A REFUSAL. Present only when this point was refused for thin pricing,
+     * null otherwise.
+     *
+     * Not a balance, and deliberately not `totalUsd`. It is what the priced positions summed
+     * to at this moment, and `coverage.valueShare` says how much of him that was. A month
+     * window that draws three points out of twenty-seven has twenty-four of these: real
+     * arithmetic over real positions, too thin to publish as his money, too informative to
+     * throw away. Draw it faint, or on request, or not at all — but never as the line.
+     */
+    partialUsd: round(n((r as { partial_usd?: unknown }).partial_usd)),
     basis: r.basis as string,
     tier: r.tier as string,
     coverage: {
@@ -5014,9 +5081,23 @@ function buildAum(
     if (!r) return { partial: null as boolean | null, reason: null as string | null };
     const ownCover = cover(r), ownWanted = wanted(r);
     const hasOwn = ownCover >= 0 && ownWanted >= 0;
-    const chainsShort = hasOwn
-      ? ownCover < ownWanted
-      : (totalChains > 0 && answeredNets.size < totalChains);
+    /*
+     * EITHER MEASURE SAYING "SHORT" MAKES IT SHORT, and it has to be an OR rather than a
+     * preference for the reading's own numbers.
+     *
+     * The two count different things. A reading's `chains_expected` is what that read went and
+     * ASKED -- the sampler only reaches an EVM chain the trader has traded tokens on. The
+     * envelope's `totalChains` is every chain he is KNOWN to use, from the wider union. For
+     * `enci` those are 4 and 5: his reading answered everything it asked and still covered
+     * four fifths of him, so trusting the reading alone published `partial: false` beside a
+     * `coverage` block that plainly said 4 of 5. Four answers did exactly that.
+     *
+     * Neither number is wrong; they answer different questions. The honest combination is the
+     * pessimistic one -- complete means complete by both.
+     */
+    const ownShort = hasOwn && ownCover < ownWanted;
+    const envShort = totalChains > 0 && answeredNets.size < totalChains;
+    const chainsShort = ownShort || envShort;
     const share = n(r.value_share);
     const priceShort = share !== null && share < 1;
     const known = hasOwn || totalChains > 0 || share !== null;
@@ -5144,6 +5225,8 @@ function buildAum(
       ? {
         at: new Date(String(newest.at)).toISOString(),
         totalUsd: round(n(newest.total_usd)),
+        /** The figure behind a refusal, when this reading was refused. See points[].partialUsd. */
+        partialUsd: round(n((newest as { partial_usd?: unknown }).partial_usd)),
         /** How old this reading is, so a card can say "as of Thursday" without doing date maths. */
         ageSeconds: Math.max(0, Math.round((to.getTime() - Date.parse(String(newest.at))) / 1000)),
         /** `sampled` was read from the chain at the time; `rebuilt` was inferred afterwards. */
@@ -5199,7 +5282,19 @@ function buildAum(
      * The service's own answer to "can this be drawn". Consumers must not infer readiness
      * from `window`, `from`, `count` or the position counts.
      */
-    drawing: { drawable, usablePoints: usable.length, reason },
+    drawing: {
+      drawable, usablePoints: usable.length, reason,
+      /**
+       * Points carrying a `partialUsd` — real arithmetic refused as too thin to be a balance.
+       *
+       * Published so a consumer can tell "there is nothing here" from "there is something
+       * here we will not call his balance", which are very different answers to a blank
+       * chart and used to look identical.
+       */
+      partialPoints: pointsOut.filter((p) =>
+        (p as { totalUsd: number | null; partialUsd: number | null }).totalUsd === null &&
+        (p as { partialUsd: number | null }).partialUsd !== null).length,
+    },
 
     /** Coverage of the newest point, in wallets and chains rather than positions. */
     coverage: { answeredWallets, totalWallets, answeredChains: answeredNets.size, totalChains },
@@ -5495,14 +5590,145 @@ async function aumFor(
   return out;
 }
 
+/**
+ * READ-THROUGH REFRESH: when the stored reading is old, go and get a new one.
+ *
+ * Until now this route served whatever the sampler last wrote and nothing else, so a trader
+ * nobody had sampled for a day answered with yesterday's money however many times you asked.
+ * The `aum-sample` function can read his wallets in about eight seconds; the only reason not
+ * to do it on every request is cost -- a popular trader viewed a hundred times would be a
+ * hundred chain sweeps for one number.
+ *
+ * So it is a FLOOR, not a cache bypass. Older than `AUM_LIVE_AFTER_MINUTES` and the request
+ * pays for a fresh read; newer and it serves what is already there. At five minutes that is
+ * live for anyone watching and roughly free for everyone else, because the hundred viewers in
+ * that window share one fetch.
+ *
+ * WHAT THIS COSTS, said plainly: this route can now make an external call, which no route
+ * here could before. `/health` reports it under `externalCallsPerRequest` rather than leaving
+ * the old claim standing -- that field was true of every route and must not quietly stop being
+ * true of this one.
+ *
+ * Bounded three ways, because a slow chain must never become a slow API:
+ *   - only the single-trader route, never the batch. Fifty traders is fifty sweeps.
+ *   - `AUM_LIVE_WAIT_MS` caps the wait. Past it the request serves the stored reading and
+ *     lets the sample finish in the background, so the NEXT caller gets it.
+ *   - one in-flight fetch per trader per instance; concurrent callers wait on the same one.
+ *
+ * `?live=false` opts out entirely and `?live=true` forces a read regardless of age.
+ */
+const LIVE_AFTER_MS = Number(Deno.env.get("AUM_LIVE_AFTER_MINUTES") ?? 5) * 60_000;
+/*
+ * SHORT ON PURPOSE. The route's own budget is 15s and its query work is 4-6s, so a nine
+ * second wait measured 14.0s end to end -- inside the limit and far too close to it. A big
+ * trader takes about eight seconds to sample and was never going to finish inside the wait
+ * anyway; a small one finishes in one or two. So the wait is sized for the traders it can
+ * actually catch, and everyone else is served the stored reading with `still_running` and
+ * gets the fresh one on their next call a moment later.
+ */
+const LIVE_WAIT_MS = Number(Deno.env.get("AUM_LIVE_WAIT_MS") ?? 3_000);
+const SAMPLE_URL = (Deno.env.get("AUM_SAMPLE_URL") ?? "").trim();
+const SAMPLE_SECRET = (Deno.env.get("AUM_SAMPLE_SECRET") ?? "").trim();
+/** Per instance. Edge Functions scale out, so this thins the stampede rather than ending it. */
+const inFlight = new Map<string, Promise<void>>();
+
+/** True when a live read is configured and possible at all. */
+const liveReadable = () => SAMPLE_URL !== "" && SAMPLE_SECRET !== "";
+
+async function refreshNow(handle: string): Promise<void> {
+  const running = inFlight.get(handle);
+  if (running) return running;
+  const task = (async () => {
+    try {
+      const r = await fetch(SAMPLE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-sample-secret": SAMPLE_SECRET },
+        body: JSON.stringify({ handle }),
+        /* Its own ceiling, above our wait, so a fetch we stopped waiting for still completes. */
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (!r.ok) console.error(`aum live refresh ${handle}: HTTP ${r.status}`);
+    } catch (e) {
+      /*
+       * A failed refresh is NOT a failed request. The stored reading is still a true reading
+       * of an earlier moment, and `now.ageSeconds` already says how old it is -- serving that
+       * is strictly better than turning a slow chain into a 500.
+       */
+      console.error(`aum live refresh ${handle}: ${(e as Error).message}`);
+    } finally {
+      inFlight.delete(handle);
+    }
+  })();
+  inFlight.set(handle, task);
+  return task;
+}
+
 get("/v1/traders/:handle/aum", async ({ handle }, url) => {
   const h = await resolveTrader(handle);
   const { windowKey, stepRaw, chainKey } = aumOptions(url);
   const chainFilter = await resolveChain(chainKey);
+
+  const liveParam = (url.searchParams.get("live") ?? "").trim().toLowerCase();
+  let refreshed: string | null = null;
+
+  if (liveParam !== "false" && liveReadable()) {
+    /*
+     * AGE IS MEASURED FROM `sampled_at`, NOT `at`, and the difference is the whole feature.
+     *
+     * `at` is the HOUR the reading describes -- truncated, so a sample taken at 06:44 is
+     * stamped 06:00 and reads as forty-four minutes old the moment it is written. Checking
+     * that against a five minute floor meant every request re-fetched a reading taken
+     * seconds earlier, which is not a freshness floor at all, just a slow route. Measured
+     * exactly that way before this line was fixed: `ageSeconds 2651` on a sample a minute old.
+     *
+     * `sampled_at` is when we actually read the chain, which is the only thing "how fresh is
+     * this" can honestly mean.
+     */
+    const [newest] = await sql`
+      select max(sampled_at) as at from aum_samples
+      where handle = ${h} and basis = 'sampled' and total_usd is not null`;
+    const ageMs = newest?.at ? Date.now() - Date.parse(String(newest.at)) : Infinity;
+    if (liveParam === "true" || ageMs > LIVE_AFTER_MS) {
+      const fetching = refreshNow(h);
+      /*
+       * Wait, but not forever. Whichever finishes first decides what this caller gets, and
+       * either way the sample completes and the next caller is served from it.
+       */
+      const won = await Promise.race([
+        fetching.then(() => true),
+        new Promise<boolean>((r) => setTimeout(() => r(false), LIVE_WAIT_MS)),
+      ]);
+      refreshed = won ? "fetched" : "still_running";
+    } else {
+      refreshed = "not_needed";
+    }
+  } else if (liveParam === "false") {
+    refreshed = "skipped";
+  } else if (!liveReadable()) {
+    refreshed = "unavailable";
+  }
+
   const got = await aumFor([h], { windowKey, stepRaw, chainFilter });
   const envelope = got.get(h);
   if (!envelope) throw notFound(`no trader '${handle}' in the directory`);
-  return envelope;
+  return {
+    ...envelope,
+    /**
+     * WHAT THIS REQUEST DID ABOUT FRESHNESS, so `now.ageSeconds` can be read in context.
+     *
+     * `fetched` — a live read finished and `now` is from it.
+     * `still_running` — one was started and outlasted our wait; this answer is the previous
+     *   reading and the next request will have the new one.
+     * `not_needed` — the stored reading is inside the freshness floor.
+     * `skipped` — the caller passed `live=false`.
+     * `unavailable` — no live read is configured on this deployment.
+     */
+    liveRead: {
+      state: refreshed,
+      freshnessFloorMinutes: LIVE_AFTER_MS / 60_000,
+      waitedMs: refreshed === "fetched" || refreshed === "still_running" ? LIVE_WAIT_MS : null,
+    },
+  };
 });
 
 // ------------------------------------------------------------- trades (§4)
@@ -6377,6 +6603,11 @@ get("/v1/fields", async () => {
         "aum.coverage.partialReason": ["chains_missing", "unpriced_positions",
                                        "chains_missing_and_unpriced_positions"],
         "aum.progress.boundedBy": ["window", "history"],
+        /* What this request did about freshness before answering. See the /aum route. */
+        "aum.liveRead.state": ["fetched", "still_running", "not_needed", "skipped",
+                               "unavailable"],
+        "wallets.walletState": ["on_record", "unresolved_upstream"],
+        "traders.delisted.reason": ["absent_from_source"],
         "aum.comparability.reason": ["coverage_differs_by_method"],
         "scorecard.winRateBasis": ["closed_positions_with_realized_figure"],
         /* Why a named figure is null. `not_applicable` means the question does not arise. */
@@ -6391,7 +6622,11 @@ get("/v1/fields", async () => {
         "health.feeds.*.state": ["current", "stale", "never"],
         "health.dataState": ["current", "degraded"],
         "error.code": ["not_found", "bad_request", "duplicate_identifier", "rate_limited",
-                       "timeout", "internal"],
+                       "timeout", "internal",
+                       /* POST /traders/:handle/wallets — see that route. */
+                       "not_configured", "unauthorized", "invalid_address", "address_in_use",
+                       "already_on_record"],
+        "walletSubmission.pricing.state": ["pending_first_read"],
       },
     },
 
@@ -6483,7 +6718,8 @@ get("/v1/health", async () => {
    * every other route kept working while this one hung, so a smoke test that skips it passes.
    */
   const [c] = await sql`
-    select (select count(*) from traders)                        as traders,
+    select (select count(*) from traders where listed)           as traders,
+           (select count(*) from traders where not listed)       as delisted,
            (select count(*) from holdings_current)               as holdings,
            (select count(*) from tokens)                         as tokens,
            (select count(*) from trades)                         as trades,
@@ -6654,8 +6890,46 @@ get("/v1/health", async () => {
       share: Number(m.traders) ? Number((Number(m.measurable) / Number(m.traders)).toFixed(4)) : null,
     },
     rows: Object.fromEntries(Object.entries(c).map(([k, v]) => [k, Number(v)])),
+    /**
+     * TRADERS THE SOURCE NO LONGER CARRIES, taken off the board and kept in the database.
+     *
+     * `rows.traders` counts the LISTED ones, which is what the directory serves and what every
+     * coverage figure here is measured against. These four are excluded from it and still
+     * answer by name, so a consumer reconciling an older copy can tell "dropped" from "gone".
+     */
+    delistedTraders: {
+      count: Number(c.delisted ?? 0),
+      reason: "absent_from_source",
+      note: "not deleted — their holdings, trades and history are intact, and the flag " +
+            "reverses if the source lists them again. Ask for them with ?includeDelisted=true",
+    },
     /** Which entries in `rows` are planner estimates rather than counted. */
     estimatedRows: ["transactions"],
+    /**
+     * HOW MANY EXTERNAL CALLS A REQUEST CAN COST — no longer flatly zero.
+     *
+     * It was 0, and the claim was load-bearing: every route answered from Postgres, so a
+     * thousand visitors cost what one does. `/traders/:handle/aum` now breaks that on purpose
+     * — when its stored reading is past the freshness floor it fetches a live one, which is
+     * one call to the sampler and, behind that, a sweep of the trader's wallets.
+     *
+     * Reported as a range rather than left at 0. A field that quietly stops being true is the
+     * exact failure this service is organised against, and it is worth recording that this
+     * very field was accidentally DELETED from this response earlier today by the edit that
+     * rewrote `capabilities` below — removed from a live deployment with nothing announcing
+     * it, which is the fault F9 exists to catch.
+     */
+    externalCallsPerRequest: {
+      typical: 0,
+      max: 1,
+      note: "0 on every route except /traders/:handle/aum, which fetches a live reading when " +
+            "the stored one is past the freshness floor. Pass ?live=false to forbid it",
+      liveAum: {
+        enabled: (Deno.env.get("AUM_SAMPLE_URL") ?? "").trim() !== "" &&
+                 (Deno.env.get("AUM_SAMPLE_SECRET") ?? "").trim() !== "",
+        freshnessFloorMinutes: Number(Deno.env.get("AUM_LIVE_AFTER_MINUTES") ?? 5),
+      },
+    },
     /**
      * WHICH CAPABILITIES ARE STILL DELIVERING, by name, judged on evidence.
      *
@@ -6828,6 +7102,28 @@ function walletsBody(t: any, knownChains: KnownChain[] | null = null) {
     solanaAddress: ok(t.sol_address as string) ? t.sol_address : null,
     evmAddress: ok(t.evm_address as string) ? t.evm_address : null,
     source: t.evm_source ?? t.sol_source ?? null,
+    /**
+     * WHY THIS TRADER HAS NO ADDRESS — the difference between "we never looked" and
+     * "the source is still working on it".
+     *
+     * Seven traders are published with no wallet, and until now the answer said nothing about
+     * why. Asked of fomoapi directly on 16 September, they are not one problem but two:
+     * three (`zeri_term`, `bamblewood8`, `qwerty888`) come back `status: "resolving"` — the
+     * upstream has not finished resolving them and there is no address to fetch. The other
+     * four have dropped off every fomoapi window entirely and are stale directory entries.
+     *
+     * Those are opposite facts about the same blank screen. One will fix itself; the other
+     * never will.
+     *
+     * Both report `unresolved_upstream` today, which is as far as the stored data can
+     * separate them: all seven have no `wallets` row at all, and fomoapi's own
+     * `wallets.status` is not something we keep. Telling `resolving` from `delisted` means
+     * storing that status on the directory load — worth doing, and a change to the loader
+     * rather than to this route.
+     */
+    walletState: (ok(t.sol_address as string) || ok(t.evm_address as string))
+      ? "on_record"
+      : "unresolved_upstream",
     tier: (t.evm_confidence || t.sol_confidence) ? "verified" : "reported",
     confidence: { evm: t.evm_confidence ?? null, solana: t.sol_confidence ?? null },
     ...(bad ? { warning: `${bad} stored address(es) are malformed and were withheld` } : {}),
@@ -6918,6 +7214,160 @@ async function resolveTrader(key: string): Promise<string> {
  * `chains` is what we have OBSERVED, never inferred from the address format. A chain we have
  * never seen the wallet on is absent, not `tradesSeen: 0` -- those are different claims.
  */
+/**
+ * A3 — accept a wallet for a trader we already list.
+ *
+ * WHY THIS EXISTS AND WHY IT IS NARROW. Seven traders are published with no address, so they
+ * reach a screen with no balance and no chart. We resolve wallets ourselves and will keep
+ * doing so; this is the route that lets whoever already holds one hand it over rather than
+ * watching a trader stay unpriceable.
+ *
+ * IT IS THE ONLY WRITE IN THIS SERVICE, and that is the whole risk. Every other address here
+ * came from a resolver we control, carrying its own source and confidence. An address that
+ * arrives from outside has neither, and the failure it invites is the worst one available to
+ * this API: attribute the wrong wallet to a trader and we price a stranger's money and
+ * publish it under his name, plausibly, with nothing downstream able to tell.
+ *
+ * So the submission is treated as a CLAIM, not a fact:
+ *   - the shape is checked, per family, before anything is stored;
+ *   - an address already on another trader is REFUSED, never moved -- that single check is
+ *     what stops one person's money appearing on another's page;
+ *   - an address a trader already has is refused rather than silently overwritten;
+ *   - what is stored carries `source: "submitted"` and `confidence: "reported"`, never
+ *     `verified`, so every figure derived from it inherits the weaker tier.
+ *
+ * Every refusal is a machine word, because a caller has to be able to tell "you sent a typo"
+ * from "that wallet belongs to somebody else" without reading English.
+ */
+const WALLET_SUBMIT_SECRET = (Deno.env.get("WALLET_SUBMIT_SECRET") ?? "").trim();
+const EVM_RE = /^0x[0-9a-fA-F]{40}$/;
+/** base58, no 0/O/I/l. Solana addresses are 32-44 of these. */
+const SOL_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+post("/v1/traders/:handle/wallets", async ({ handle }, _url, body) => {
+  /*
+   * A write is not open the way the reads are. Unset means misconfigured, and refusing is the
+   * safe reading of that -- an open write route is worse than an absent one.
+   */
+  if (!WALLET_SUBMIT_SECRET) {
+    throw new ApiError(503, "not_configured",
+      "wallet submission is not enabled on this deployment", {});
+  }
+  const b = (body ?? {}) as Record<string, unknown>;
+  if (String(b.secret ?? "") !== WALLET_SUBMIT_SECRET) {
+    throw new ApiError(401, "unauthorized", "a valid `secret` is required to submit a wallet", {});
+  }
+
+  const h = await resolveTrader(handle);
+  const [t] = await sql`select handle, display_handle from traders where handle = ${h}`;
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+
+  const evm = typeof b.evmAddress === "string" ? b.evmAddress.trim() : null;
+  const sol = typeof b.solanaAddress === "string" ? b.solanaAddress.trim() : null;
+  if (!evm && !sol) {
+    throw badRequest("send `evmAddress`, `solanaAddress`, or both", { parameter: "evmAddress" });
+  }
+  if (evm && !EVM_RE.test(evm)) {
+    throw new ApiError(400, "invalid_address",
+      `'${evm}' is not a 20-byte hex address`, { parameter: "evmAddress" });
+  }
+  if (sol && !SOL_RE.test(sol)) {
+    throw new ApiError(400, "invalid_address",
+      `'${sol}' is not a base58 Solana address`, { parameter: "solanaAddress" });
+  }
+
+  /*
+   * IS THIS ADDRESS ALREADY SOMEBODY ELSE'S? The one check that matters most here.
+   *
+   * Two traders sharing an address means one of them is shown the other's money, and it is
+   * invisible afterwards because the figure is real -- it just belongs to a different person.
+   * Refused outright rather than reassigned, and the refusal names the trader who holds it so
+   * the sender can see the collision rather than guess at it.
+   */
+  const clashes = await sql`
+    select handle, display_handle,
+           case when lower(evm_address) = ${evm ? evm.toLowerCase() : null} then 'evm' else 'solana' end as family
+    from wallets w join traders using (handle)
+    where handle <> ${h}
+      and (lower(evm_address) = ${evm ? evm.toLowerCase() : null}
+           or sol_address = ${sol})`;
+  if (clashes.length) {
+    const c = clashes[0];
+    throw new ApiError(409, "address_in_use",
+      `that address is already on record for '${c.display_handle}'`,
+      { heldBy: String(c.display_handle), family: String(c.family) });
+  }
+
+  const [existing] = await sql`
+    select evm_address, sol_address from wallets where handle = ${h}`;
+  if (evm && existing?.evm_address) {
+    throw new ApiError(409, "already_on_record",
+      "this trader already has an EVM address; it is not overwritten by a submission",
+      { family: "evm", current: String(existing.evm_address) });
+  }
+  if (sol && existing?.sol_address) {
+    throw new ApiError(409, "already_on_record",
+      "this trader already has a Solana address; it is not overwritten by a submission",
+      { family: "solana", current: String(existing.sol_address) });
+  }
+
+  /*
+   * `source: "submitted"` and `confidence: "reported"`, never `verified`. `verified_at` stays
+   * null because nothing here proved the address belongs to this person -- it was asserted.
+   * The distinction travels with every figure the address later produces.
+   */
+  await sql`
+    insert into wallets (handle, evm_address, evm_address_key, evm_source, evm_confidence,
+                         sol_address, sol_address_key, sol_source, sol_confidence,
+                         first_seen_at, last_seen_at)
+    values (${h},
+            ${evm}, ${evm ? evm.toLowerCase() : null},
+            ${evm ? "submitted" : null}, ${evm ? "reported" : null},
+            ${sol}, ${sol ? sol.toLowerCase() : null},
+            ${sol ? "submitted" : null}, ${sol ? "reported" : null},
+            now(), now())
+    on conflict (handle) do update set
+      evm_address     = coalesce(wallets.evm_address, excluded.evm_address),
+      evm_address_key = coalesce(wallets.evm_address_key, excluded.evm_address_key),
+      evm_source      = coalesce(wallets.evm_source, excluded.evm_source),
+      evm_confidence  = coalesce(wallets.evm_confidence, excluded.evm_confidence),
+      sol_address     = coalesce(wallets.sol_address, excluded.sol_address),
+      sol_address_key = coalesce(wallets.sol_address_key, excluded.sol_address_key),
+      sol_source      = coalesce(wallets.sol_source, excluded.sol_source),
+      sol_confidence  = coalesce(wallets.sol_confidence, excluded.sol_confidence),
+      last_seen_at    = now()`;
+
+  const [now] = await sql`
+    select evm_address, sol_address, evm_source, sol_source, evm_confidence, sol_confidence
+    from wallets where handle = ${h}`;
+
+  return {
+    handle: t.display_handle,
+    accepted: { evmAddress: evm, solanaAddress: sol },
+    onRecord: {
+      evmAddress: now?.evm_address ?? null,
+      solanaAddress: now?.sol_address ?? null,
+      evmSource: now?.evm_source ?? null,
+      solanaSource: now?.sol_source ?? null,
+      evmConfidence: now?.evm_confidence ?? null,
+      solanaConfidence: now?.sol_confidence ?? null,
+    },
+    /**
+     * WHEN THIS TURNS INTO A BALANCE. The sampler picks a trader up by age, so a new wallet
+     * is read on the next rotation; asking for his AUM reads it immediately, because that
+     * route fetches live when the stored reading is stale and there is no stored reading yet.
+     */
+    pricing: {
+      state: "pending_first_read",
+      readsOn: `/v1/traders/${t.display_handle}/aum`,
+      note: "the next balance read prices it; ask for his aum to force one now",
+    },
+    tier: "reported",
+    plain: "Accepted as a claim, not a verified fact — stored with source 'submitted' and " +
+           "confidence 'reported', so every figure derived from it says so.",
+  };
+});
+
 get("/v1/traders/:handle/wallets", async ({ handle }) => {
   const h = await resolveTrader(handle);
   const [t] = await walletRows([h]);

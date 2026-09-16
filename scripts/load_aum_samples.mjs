@@ -57,7 +57,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * see AUM_PLAN.md §4.2.
  */
 const MAX_PRICE_PER_TOKEN = 1_000_000;
-const MAX_POSITION_USD    = 1_000_000_000_000;
+/*
+ * MAX_POSITION_USD WAS $1 TRILLION, WHICH CAUGHT NOTHING.
+ *
+ * Measured 16 September: four readings over $1bn had been written, topping out at
+ * cupseyy $473,460,243,525. The cause is not a price over the per-token ceiling -- the
+ * offending tokens price at $28,159 and $8,923, which is plausible beside BTC at $79,035 and
+ * sails through. It is 10.4 MILLION units of an unnamed token multiplied by that price.
+ *
+ * Seventeen held positions price at $1bn or more and every one is a token we cannot even
+ * name. The real ones stop far below: 78 positions between $1m and $10m, 21 between $10m and
+ * $100m, and the largest genuine PORTFOLIO in the directory is unipcs at $16.5m.
+ *
+ * $1bn therefore leaves a position sixty times larger than the biggest real portfolio and
+ * still refuses every broken one. A number that large is not a rich trader, it is a broken
+ * price, and it must never reach a chart.
+ */
+const MAX_POSITION_USD    = 1_000_000_000;
 
 /**
  * Value one position, or refuse it.
