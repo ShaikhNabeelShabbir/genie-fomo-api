@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Typecheck gate for the Deno edge functions.
 #
-# `deno check` on the untouched code reports 90 errors with Deno 2.6 / TypeScript 6 — all
-# from postgres.js row typing (implicit any on `.map((r) => …)`, `{}` rows). They predate
-# every change on this branch and fixing them is a separate job. Until then the gate is
+# `deno check` used to report 90 postgres.js row-typing errors (implicit any on
+# `.map((r) => …)`, `{}` rows); those are fixed and the baseline is now empty. The gate is
 # "no NEW errors": the set of error messages must equal the recorded baseline, ignoring
 # file names and line numbers (a split moves both).
 #

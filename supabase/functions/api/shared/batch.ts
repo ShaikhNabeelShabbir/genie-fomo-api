@@ -70,14 +70,14 @@ export async function batchIds(
   if (missed.length) {
     const known = await sql`
       select handle from traders where handle = any(${missed})`;
-    const have = new Set(known.map((r) => String(r.handle)));
+    const have = new Set(known.map((r: Record<string, unknown>) => String(r.handle)));
     const unknown = missed.filter((h) => !have.has(h));
     if (unknown.length) {
       const byDisplay = await sql`
         select lower(display_handle) as display, handle from traders
          where lower(display_handle) = any(${unknown})`;
       if (byDisplay.length) {
-        const dmap = new Map(byDisplay.map((r) => [String(r.display), String(r.handle)]));
+        const dmap = new Map<string, string>(byDisplay.map((r: Record<string, unknown>) => [String(r.display), String(r.handle)]));
         handles = handles.map((h) => dmap.get(h) ?? h);
       }
     }

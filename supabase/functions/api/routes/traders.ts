@@ -20,7 +20,7 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
     where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
   const [h, asOf] = await Promise.all([
-    trustHoldings([t.handle as string]).then((r) => r[0]),
+    trustHoldings([t.handle as string]).then((r: Record<string, unknown>[]) => r[0]),
     asOfHoldings(),
   ]);
   return trustBody(t, h, asOf);
@@ -136,7 +136,7 @@ get("/v1/traders", async (_p, url) => {
     : 0;
 
   /** Applied before paging, so `offset` walks the filtered set rather than the full board. See docs/DECISIONS.md#d096 */
-  const visible = sinceMs === null ? rows : rows.filter((r) =>
+  const visible = sinceMs === null ? rows : rows.filter((r: Record<string, unknown>) =>
     r.captured_at === null || r.captured_at === undefined ||
     Date.parse(String(r.captured_at)) > sinceMs!);
 
@@ -147,7 +147,7 @@ get("/v1/traders", async (_p, url) => {
    */
   const cursor = url.searchParams.get("cursor");
   const start = cursor
-    ? resumeAfter(visible, cursor, (r) => String(r.handle))
+    ? resumeAfter(visible, cursor, (r: Record<string, unknown>) => String(r.handle))
     : offset;
   const page = limit === null ? visible.slice(start) : visible.slice(start, start + limit);
   const last = page[page.length - 1];
@@ -160,7 +160,7 @@ get("/v1/traders", async (_p, url) => {
    *
    * `any($handles)` is what makes this a bulk route rather than a loop wearing one's coat.
    */
-  const handles = page.map((r) => r.handle as string);
+  const handles = page.map((r: Record<string, unknown>) => r.handle as string);
   const wantsScorecard = include.includes("scorecard");
   const [pnlRows, scRows, wRows, trRows, swapBy] = handles.length
     ? await Promise.all([
@@ -195,11 +195,11 @@ get("/v1/traders", async (_p, url) => {
   const wBy = byHandle(wRows as any[]);
   /** One query for the page, not one per trader — same rule as every other include. */
   const knownChainsBy = include.includes("wallets")
-    ? await knownChainsFor(page.map((r) => String(r.handle)))
+    ? await knownChainsFor(page.map((r: Record<string, unknown>) => String(r.handle)))
     : new Map<string, KnownChain[]>();
   /** Same rule for fees: one read of the daily buckets for the whole page. */
   const feesBy = include.includes("scorecard")
-    ? await nativePrices().then((nat) => feesFor(page.map((r) => String(r.handle)), nat))
+    ? await nativePrices().then((nat) => feesFor(page.map((r: Record<string, unknown>) => String(r.handle)), nat))
     : new Map<string, FeeWindows>();
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
@@ -248,7 +248,7 @@ get("/v1/traders", async (_p, url) => {
    * every other include here follows.
    */
   const startCapBy = include.includes("scorecard")
-    ? await monthStartCapital(page.map((r) => String(r.handle)))
+    ? await monthStartCapital(page.map((r: Record<string, unknown>) => String(r.handle)))
     : new Map<string, Map<string, number>>();
 
   const extras = include.length ? await Promise.all(page.map(attach)) : [];
@@ -307,7 +307,7 @@ get("/v1/traders", async (_p, url) => {
     ...(url.searchParams.has("orderBy") || url.searchParams.has("direction")
       ? { orderBy: sort.key, direction: sort.desc ? "desc" : "asc" }
       : {}),
-    entries: page.map((r, i) => ({
+    entries: page.map((r: Record<string, unknown>, i: number) => ({
       rank: r.rank ?? null,
       // Ours, generated once, never reissued. `handle` comes from fomo and is theirs to
       // change; anything keying rows on it loses the trader the day they rename.
@@ -429,9 +429,9 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
          * happened in a burst. `null` under two active days, where the measure has nothing
          * to compare.
          */
-        evenness: evennessOf(daily.map((d) => Number(d.trades))),
+        evenness: evennessOf(daily.map((d: Record<string, unknown>) => Number(d.trades))),
         tradesPerActiveDay: daily.length
-          ? Number((daily.reduce((a, d) => a + Number(d.trades), 0) / daily.length).toFixed(2))
+          ? Number((daily.reduce((a: number, d: Record<string, unknown>) => a + Number(d.trades), 0) / daily.length).toFixed(2))
           : null,
         /**
          * The series the evenness came from, so it can be recomputed or replotted — behind
@@ -441,7 +441,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
          */
         ...(url.searchParams.get("dailyTrades") === "true"
           ? {
-            dailyTrades: daily.map((d) => ({
+            dailyTrades: daily.map((d: Record<string, unknown>) => ({
           // postgres.js returns a Date, whose toString is "Fri Jul 03 2026 …" — slicing that
           // yields "Fri Jul 03", not a date. Same trap that put firstEntryPrice on the wrong
           // leg earlier; formatted through toISOString instead.
@@ -661,7 +661,7 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
       address: t.sol_address as string,
       family: "solana",
       source: t.sol_source ?? null,
-      chains: seen.filter((c) => c.networkId === SOLANA),
+      chains: seen.filter((c: { networkId: number }) => c.networkId === SOLANA),
     });
   }
   if (t.evm_address) {
@@ -669,7 +669,7 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
       address: t.evm_address as string,
       family: "evm",
       source: t.evm_source ?? null,
-      chains: seen.filter((c) => c.networkId !== SOLANA),
+      chains: seen.filter((c: { networkId: number }) => c.networkId !== SOLANA),
     });
   }
 

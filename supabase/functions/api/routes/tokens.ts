@@ -134,7 +134,7 @@ get("/v1/tokens", async (_p, url) => {
   // A token is identified by chain + address: the same address exists on several chains and
   // the board carries one row per pair, so the address alone would be an ambiguous anchor.
   const start = cursor
-    ? resumeAfter(rows, cursor, (r) => `${r.network_id}:${String(r.address).toLowerCase()}`)
+    ? resumeAfter(rows, cursor, (r: Record<string, unknown>) => `${r.network_id}:${String(r.address).toLowerCase()}`)
     : 0;
   const page = limit === null ? rows.slice(start) : rows.slice(start, start + limit);
   const lastRow = page[page.length - 1];
@@ -174,7 +174,7 @@ get("/v1/tokens", async (_p, url) => {
     ...(url.searchParams.has("orderBy") || url.searchParams.has("direction")
       ? { orderBy: tokenSort.key, direction: tokenSort.desc ? "desc" : "asc" }
       : {}),
-    entries: page.map((r, i) => ({
+    entries: page.map((r: Record<string, unknown>, i: number) => ({
       // Rank is the position on the WHOLE board, not within this page. It was `i + 1`, which
       // was correct only while the board could not be paged past the first slice — page two
       // would have restarted the ranking at 1 and quietly reported the 51st token as first.
@@ -542,7 +542,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
   const net = await chainWhere(chainQ);
   const key = address.toLowerCase();
 
-  const holders = await sql`
+  const holders: Record<string, unknown>[] = await sql`
     select t.display_handle, h.network_id, h.value
     from holdings_current h join traders t on t.handle = h.handle
     where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}`;
@@ -557,7 +557,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
   // No fan-out, no per-holder API call, no 25-holder cap: every trader who has ever traded
   // this token, from one query.
   /** ISSUE-4, the K5 half. See docs/DECISIONS.md#d090 */
-  const per = await sql`
+  const per: Record<string, unknown>[] = await sql`
     with legs as (
       select t.display_handle as handle, tr.status, tr.trade_id,
              tr.realized_pnl_usd, tr.unrealized_pnl_usd,
@@ -712,7 +712,11 @@ get("/v1/tokens/momentum", async (_p, url) => {
   }
   const [to, from] = [gens[0].captured_at, gens[1].captured_at];
 
-  const rows = await sql`
+  type MomentumRow = {
+    network_id: number; token_key: string; holders: number; previous_holders: number;
+    now_handles: string[]; before_handles: string[];
+  };
+  const rows: MomentumRow[] = await sql`
     with a as (select network_id, token_key, array_agg(handle) as handles
                from holdings where captured_at = ${from} group by 1,2),
          b as (select network_id, token_key, array_agg(handle) as handles

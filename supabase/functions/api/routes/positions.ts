@@ -65,15 +65,15 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
       join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
       join chains c on c.network_id = h.network_id
       where h.handle = ${t.handle} and h.token_key = ${tokenQ}`;
-    const priced = rows.filter((r) => (n(r.value) ?? 0) > 0);
+    const priced = rows.filter((r: Record<string, unknown>) => (n(r.value) ?? 0) > 0);
     includesToken = {
       tokenAddress: rows[0]?.address ?? tokenQ,
       held: rows.length > 0,
       // Held but unpriced means it is in the portfolio and NOT in the total — the case
       // most likely to be read wrongly if we only returned a boolean.
       inTotal: priced.length > 0,
-      valueUsd: priced.length ? round(priced.reduce((a, r) => a + (n(r.value) ?? 0), 0)) : null,
-      chains: [...new Set(rows.map((r) => r.chain))],
+      valueUsd: priced.length ? round(priced.reduce((a: number, r: Record<string, unknown>) => a + (n(r.value) ?? 0), 0)) : null,
+      chains: [...new Set(rows.map((r: Record<string, unknown>) => r.chain))],
       note: rows.length === 0 ? "this trader does not hold that token"
         : priced.length === 0 ? "held, but unpriced — it is NOT part of totalValueUsd"
         : "held and priced — it IS part of totalValueUsd",
@@ -101,7 +101,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const unsellableUsd = round(n(r.unsellable) ?? 0)!;
 
   const natives = await nativePrices();
-  const chainCoverage = byChain.map((r) => {
+  const chainCoverage = byChain.map((r: Record<string, unknown>) => {
     const net = Number(r.network_id);
     const usd = Number(r.priced) ? round(n(r.value)) : null;
     const nat = natives.get(net) ?? null;
@@ -246,8 +246,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
 
   /** The floor under every timestamp on this page, derived in memory from `timing`. See docs/DECISIONS.md#d073 */
   const observedFrom = timing
-    .map((r) => (r.start_at ? Date.parse(String(r.start_at)) : null))
-    .filter((x): x is number => x !== null && Number.isFinite(x));
+    .map((r: Record<string, unknown>) => (r.start_at ? Date.parse(String(r.start_at)) : null))
+    .filter((x: number | null): x is number => x !== null && Number.isFinite(x));
   const historyFrom = observedFrom.length
     ? new Date(Math.min(...observedFrom)).toISOString() : null;
   const timeBy = new Map<string, Record<string, unknown>>();
@@ -255,10 +255,10 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
 
   const valued = (r: Record<string, unknown>) => ((n(r.value) ?? 0) > 0 ? n(r.value)! : 0);
-  const total = rows.reduce((s, r) => s + (unsellable(r) ? 0 : valued(r)), 0);
+  const total = rows.reduce((s: number, r: Record<string, unknown>) => s + (unsellable(r) ? 0 : valued(r)), 0);
   const unsellableUsd = round(rows.reduce((s: number, r: Record<string, unknown>) => s + (unsellable(r) ? valued(r) : 0), 0))!;
   const grossTotal = rows.reduce((s: number, r: Record<string, unknown>) => s + (gross(r) ?? 0), 0);
-  const all = rows.map((r) => {
+  const all = rows.map((r: Record<string, unknown>) => {
     const tm = timeBy.get(`${r.network_id}:${r.token_key}`);
     const v = (n(r.value) ?? 0) > 0 ? n(r.value) : null;
     const suspect = priceSuspectReason(n(r.price), n(r.total_supply), gross(r), grossTotal);
@@ -316,7 +316,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   });
 
   const filtered = url.searchParams.get("includeQuote") === "false"
-    ? all.filter((r) => !r.isQuoteAsset) : all;
+    ? all.filter((r: Record<string, unknown>) => !r.isQuoteAsset) : all;
   /** PAGED, AND HONEST ABOUT IT. See docs/DECISIONS.md#d074 */
   const limit = intParam(url, "limit", { min: 1, max: 500, fallback: null });
   const cursor = url.searchParams.get("cursor");
@@ -326,7 +326,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const page = limit === null ? filtered.slice(from) : filtered.slice(from, from + limit);
   const last = page.length ? page[page.length - 1] : null;
   const more = from + page.length < filtered.length;
-  const priced = all.filter((r) => r.valueUsd !== null).length;
+  const priced = all.filter((r: Record<string, unknown>) => r.valueUsd !== null).length;
 
   return {
     handle: t.display_handle,
@@ -359,8 +359,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
             "this trader's history, so a position opened earlier shows the first movement we " +
             "saw, not the first that happened. `observedFrom` is the earliest we hold for " +
             "this trader; positions without timing predate it or never moved on chain.",
-      positionsWithTiming: all.filter((r) => r.startHoldingAt !== null).length,
-      positionsWithoutTiming: all.filter((r) => r.startHoldingAt === null).length,
+      positionsWithTiming: all.filter((r: Record<string, unknown>) => r.startHoldingAt !== null).length,
+      positionsWithoutTiming: all.filter((r: Record<string, unknown>) => r.startHoldingAt === null).length,
     },
     entries: page,
   };
@@ -403,7 +403,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
    * The newest balance read across the traders asked for -- taken from the rows already in
    * hand rather than from a second query, so dating the batch costs nothing.
    */
-  const positionsAsOf = rows.reduce<string | null>((best, r) => {
+  const positionsAsOf = rows.reduce<string | null>((best: string | null, r: Record<string, unknown>) => {
     if (!r.captured_at) return best;
     const at = new Date(String(r.captured_at)).toISOString();
     return best === null || at > best ? at : best;
@@ -446,7 +446,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
   if (v2) {
     const known = await sql`
       select handle, display_handle, id from traders where handle = any(${handles})`;
-    const metaBy = new Map(known.map((r) => [String(r.handle), r]));
+    const metaBy = new Map<string, Record<string, unknown>>(known.map((r: Record<string, unknown>) => [String(r.handle), r]));
 
     return {
       contractVersion: 2,
