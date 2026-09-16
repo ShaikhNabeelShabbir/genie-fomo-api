@@ -15,9 +15,16 @@ export const BATCH_MAX = 50;
  * make nine. The cap is returned on every response because a silently truncated list is how
  * a roster under-counts without anyone noticing.
  */
+/** What the directory holds for a resolved handle; absent from `traders` means not found. */
+export type BatchTrader = { display_handle: string; id: string | null };
+
 export async function batchIds(
   body: unknown,
-): Promise<{ requested: string[]; handles: string[]; asked: number; capped: boolean }> {
+): Promise<{
+  requested: string[]; handles: string[]; asked: number; capped: boolean;
+  /** Resolved handle -> directory row, from the same lookups; a route need not re-query. */
+  traders: Map<string, BatchTrader>;
+}> {
   const ids = (body as { ids?: unknown })?.ids;
   if (!Array.isArray(ids) || ids.length === 0) {
     throw badRequest("body must be { \"ids\": [...] } with at least one id or handle",
@@ -66,19 +73,23 @@ export async function batchIds(
   });
 
   /** THE `display_handle` FALLBACK, which the single routes have had and this one did not. See docs/DECISIONS.md#d125 */
+  const traders = new Map<string, BatchTrader>();
+  const remember = (r: Record<string, unknown>) =>
+    traders.set(String(r.handle), { display_handle: String(r.display_handle), id: r.id ? String(r.id) : null });
   const missed = [...new Set(handles)];
   if (missed.length) {
     const known = await sql`
-      select handle from traders where handle = any(${missed})`;
-    const have = new Set(known.map((r: Record<string, unknown>) => String(r.handle)));
-    const unknown = missed.filter((h) => !have.has(h));
+      select handle, display_handle, id from traders where handle = any(${missed})`;
+    for (const r of known) remember(r);
+    const unknown = missed.filter((h) => !traders.has(h));
     if (unknown.length) {
       const byDisplay = await sql`
-        select lower(display_handle) as display, handle from traders
+        select lower(display_handle) as display, handle, display_handle, id from traders
          where lower(display_handle) = any(${unknown})`;
       if (byDisplay.length) {
         const dmap = new Map<string, string>(byDisplay.map((r: Record<string, unknown>) => [String(r.display), String(r.handle)]));
         handles = handles.map((h) => dmap.get(h) ?? h);
+        for (const r of byDisplay) remember(r);
       }
     }
   }
@@ -95,7 +106,7 @@ export async function batchIds(
   }
 
   /** `requested` is what the caller actually sent, kept beside the resolved handle. See docs/DECISIONS.md#d126 */
-  return { requested: wanted, handles, asked: wanted.length, capped: false };
+  return { requested: wanted, handles, asked: wanted.length, capped: false, traders };
 }
 
 export const batchEnvelope = (asked: number, capped: boolean, asOf: string | null = null) => ({

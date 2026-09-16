@@ -127,3 +127,58 @@ export async function indexerCoverageFor(handles: string[]): Promise<Map<string,
   }
   return out;
 }
+
+/** One `holdings_current` row as `/portfolio` reads it. */
+export type PortfolioRow = {
+  address?: unknown; network_id: unknown; chain?: unknown; value: unknown; captured_at?: unknown;
+  is_quote?: unknown; is_honeypot?: unknown; can_not_sell?: unknown;
+};
+export type ChainTotal = {
+  chain: unknown; network_id: number; positions: number; priced: number; value: number | null;
+};
+
+/**
+ * The `/portfolio` totals, derived in memory from the trader's rows (one query, not five).
+ *
+ * Same filters the SQL used: `priced` is `value > 0`; `total`/`top` exclude unsellable coins,
+ * `byChain.value` does NOT (a chain's dollars are what sits on it); `total`/`top` are null when
+ * nothing sellable is priced, as `sum`/`max` over no rows were.
+ */
+export const portfolioFrom = (rows: PortfolioRow[]) => {
+  const priced = rows.filter((r) => (n(r.value) ?? 0) > 0);
+  const sellable = priced.filter((r) => !unsellable(r));
+  const sum = (xs: PortfolioRow[]) => xs.reduce((s, r) => s + (n(r.value) ?? 0), 0);
+  const top = sellable.reduce<PortfolioRow | null>(
+    (best, r) => best === null || n(r.value)! > n(best.value)! ? r : best, null);
+  const byChain = new Map<string, ChainTotal>();
+  for (const r of rows) {
+    const key = `${r.chain}:${Number(r.network_id)}`;
+    const c = byChain.get(key) ??
+      { chain: r.chain, network_id: Number(r.network_id), positions: 0, priced: 0, value: null };
+    const v = n(r.value) ?? 0;
+    byChain.set(key, {
+      ...c,
+      positions: c.positions + 1,
+      priced: c.priced + (v > 0 ? 1 : 0),
+      value: v > 0 ? (c.value ?? 0) + v : c.value,
+    });
+  }
+  return {
+    asOf: latestIso(rows.map((r) => r.captured_at)),
+    positions: rows.length,
+    priced: priced.length,
+    total: sellable.length ? sum(sellable) : null,
+    top,
+    unsellable: sum(priced.filter(unsellable)),
+    cash: sum(priced.filter((r) => !!r.is_quote)),
+    byChain: [...byChain.values()].sort((a, b) => b.positions - a.positions),
+  };
+};
+
+/** `max(captured_at)` over rows already in hand, as ISO; null when none carries one. */
+export const latestIso = (ats: unknown[]): string | null =>
+  ats.reduce<string | null>((best, v) => {
+    if (!v) return best;
+    const at = new Date(String(v)).toISOString();
+    return best === null || at > best ? at : best;
+  }, null);
