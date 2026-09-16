@@ -268,7 +268,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
            -- GMGN's false for a check that chain does not have.
            ti.is_honeypot, ti.buy_tax, ti.sell_tax, ti.is_open_source, ti.is_renounced,
            ti.renounced_mint, ti.renounced_freeze, ti.rug_ratio, ti.burn_ratio,
-           ti.is_blacklisted, ti.can_not_sell, ti.security_fetched_at,
+           ti.is_blacklisted, ti.can_not_sell, ti.security_fetched_at, ti.honeypot_since,
            -- Gap 1: hourly DexScreener sample with a rolling ATH (scripts/load_token_prices.mjs).
            ps.last_usd as ps_usd, ps.last_at as ps_at, ps.ath_usd, ps.ath_at, ps.drawdown_share, ps.source as ps_source
     from holdings_current h
@@ -302,6 +302,21 @@ get("/v1/tokens/:address", async ({ address }, url) => {
     throw notFound(`no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
   }
   const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
+  /**
+   * C3, Cabal Trader. Tracked traders with any trade in the coin, per chain, and how many
+   * remain once wallets linked to another trader (linked_wallets) are collapsed. A trader is
+   * dependent when one of his wallets is another trader's linked address.
+   */
+  const cohortRows: { network_id: number; holders: number; independent: number }[] = await sql`
+    select tr.network_id, count(distinct tr.handle)::int as holders,
+           count(distinct tr.handle) filter (where not exists (
+             select 1 from wallets w join linked_wallets lw
+               on lw.address_key in (w.evm_address_key, w.sol_address_key)
+             where w.handle = tr.handle and lw.handle <> tr.handle))::int as independent
+    from trades tr
+    where tr.token_key = ${key} ${net === null ? sql`` : sql`and tr.network_id = ${net}`}
+    group by 1`;
+  const cohort = new Map(cohortRows.map((c) => [Number(c.network_id), { holders: c.holders, independent: c.independent }]));
 
   // A token address can exist on more than one chain, so without ?chain= every match is
   // returned rather than one being picked silently.
@@ -363,6 +378,11 @@ get("/v1/tokens/:address", async ({ address }, url) => {
           drawdownShare: n(group[0].drawdown_share),
           source: (group[0].ps_source as string | null) ?? null,
         },
+        /** C3. `holders` here is by trades, not by the holdings snapshot `holders` above. */
+        cohort: (() => {
+          const c = cohort.get(Number(group[0].network_id)) ?? { holders: 0, independent: 0 };
+          return { ...c, linkedGroups: c.holders - c.independent };
+        })(),
         /** T3a. See docs/DECISIONS.md#d084 */
         security: group[0].security_fetched_at
           ? (() => {
@@ -383,6 +403,8 @@ get("/v1/tokens/:address", async ({ address }, url) => {
                 ? null
                 : !(group[0].is_honeypot === true || group[0].can_not_sell === true),
               isHoneypot: b(group[0].is_honeypot),
+              /** C3. First nightly read that flagged it (honeypot or sell-blocked); never cleared. */
+              honeypotSince: group[0].honeypot_since ? new Date(String(group[0].honeypot_since)).toISOString() : null,
               buyTax: n(group[0].buy_tax),
               sellTax: n(group[0].sell_tax),
               isOpenSource: b(group[0].is_open_source),

@@ -49,10 +49,20 @@ export const scorecardRows = (handles: string[]) => sql`
          -- Axis 5 wants the token's age at entry, which needs its creation time. GMGN carries
          -- it and we already store the whole document, so this is a read rather than a fetch.
          -- 0 means "they did not tell us" and is nulled here, not published as 1970.
-         nullif((ti.raw->>'creation_timestamp')::bigint, 0) as token_created_unix
+         nullif((ti.raw->>'creation_timestamp')::bigint, 0) as token_created_unix,
+         -- C3. Latest honeypot read, when it first flipped, and how many OTHER tracked
+         -- traders have a trade in the coin (self is always one of holders).
+         ti.is_honeypot, ti.can_not_sell, ti.honeypot_since,
+         co.holders - 1 as co_holders
   from trades tr
   left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
   left join token_info ti on ti.network_id = tr.network_id and ti.token_key = tr.token_key
+  left join (
+    select network_id, token_key, count(distinct handle)::int as holders
+    from trades
+    where (network_id, token_key) in (select network_id, token_key from trades where handle = any(${handles}))
+    group by 1, 2
+  ) co on co.network_id = tr.network_id and co.token_key = tr.token_key
   where tr.handle = any(${handles})`;
 
 
@@ -260,6 +270,16 @@ export async function monthStartCapital(handles: string[]): Promise<Map<string, 
   return out;
 }
 
+/**
+ * Rug Dodger (C3): did the trader's LAST close on a coin land before the coin was first
+ * flagged? `null` when the coin was never flagged; `false` when flagged and still open or
+ * closed after the flag.
+ */
+export function exitedBeforeFlag(lastClosedMs: number | null, honeypotSince: string | null): boolean | null {
+  if (honeypotSince === null) return null;
+  return lastClosedMs !== null && lastClosedMs < Date.parse(honeypotSince);
+}
+
 export async function scorecardBody(
   t: any, rows: any[], tokenLimit: number | null,
   chain?: { entries: Map<string, number>; exits: number[] },
@@ -394,6 +414,7 @@ export async function scorecardBody(
     /* When this coin was first and last closed, so a per-coin row carries its own dates. */
     firstClosedMs: number | null; lastClosedMs: number | null;
     chainKey: string;
+    isHoneypotNow: boolean | null; honeypotSince: string | null; coHolders: number | null;
   }>();
   for (const r of rows) {
     const key = String(r.token_key ?? r.token_symbol ?? "unknown");
@@ -410,6 +431,11 @@ export async function scorecardBody(
       // Chain AND token, because one token_key can exist on two chains and their prices
       // have nothing to do with each other.
       chainKey: `${r.network_id}:${r.token_key}`,
+      /** C3, Rug Dodger and Cabal Trader. Latest flag, first flip, and co-holders; `exitedBeforeFlag` is derived below. */
+      isHoneypotNow: r.is_honeypot === null && r.can_not_sell === null
+        ? null : Boolean(r.is_honeypot) || Boolean(r.can_not_sell),
+      honeypotSince: r.honeypot_since ? new Date(String(r.honeypot_since)).toISOString() : null,
+      coHolders: r.co_holders === null || r.co_holders === undefined ? null : Number(r.co_holders),
     };
     rec.trades++;
     if (r.status === "closed") {
@@ -498,6 +524,7 @@ export async function scorecardBody(
       /** When this coin was closed, first and last. See docs/DECISIONS.md#d151 */
       firstClosedAt: firstClosedMs !== null ? new Date(firstClosedMs).toISOString() : null,
       lastClosedAt:  lastClosedMs  !== null ? new Date(lastClosedMs).toISOString()  : null,
+      exitedBeforeFlag: exitedBeforeFlag(lastClosedMs, r.honeypotSince),
       /** Entry expressed as a MARKET CAP, which is how it is read on screen. See docs/DECISIONS.md#d152 */
       avgEntryMarketCapUsd:
         entryPx !== null && r.totalSupply !== null && r.totalSupply > 0

@@ -1335,6 +1335,16 @@ transactions we hold and have not yet resolved**; for another, 190 of 424. Those
 The rest are not, and no amount of resolving reaches them — `fieldReasons` says so rather than
 implying a pending job.
 
+### Rug Dodger and Cabal Trader — `byToken[].exitedBeforeFlag`, `coHolders`
+
+Added 17 Sep 2026 (C3). Each coin carries `isHoneypotNow` (latest GMGN read, `null` where the
+chain is not assessed), `honeypotSince` (first nightly read that flagged it, never cleared) and
+`exitedBeforeFlag`: `true` when his `lastClosedAt` precedes `honeypotSince`, `false` when he
+closed after it or still holds, `null` when the coin was never flagged. `coHolders` is the number
+of OTHER tracked traders with a trade in the same coin on the same chain, from one grouped pass
+over `trades`; `0` means he was alone. Linked-wallet collapsing is published on
+`/tokens/:address.cohort`, not per coin here.
+
 ### The buys themselves — `byToken[].buys[]`
 
 `avgEntryPrice` is one number per coin, and fomoapi hands it to us **already averaged** across
@@ -1897,6 +1907,15 @@ answer is; there is no external call at request time.
 
 **Versus GMGN.** Same endpoint, same checks. The difference is that ours arrives beside the
 holder data with the per-chain applicability stated, so a `null` cannot be mistaken for a pass.
+
+**`honeypotSince` and `cohort` (C3, added 17 Sep 2026).** `isHoneypot` is only the latest read,
+so `security.honeypotSince` records the first nightly refresh where it (or sell-blocked) turned
+true and is never cleared; `null` means never flagged since the column existed. Beside it,
+`entries[].cohort: { holders, independent, linkedGroups }` counts the tracked traders with any
+trade in the coin on that chain, then collapses traders whose wallet is another trader's
+`linked_wallets` address — `independent` is what remains and `linkedGroups` the difference.
+Both are what the Rug Dodger and Cabal Trader badges read; the exit-before-flag test itself
+sits on the scorecard's `byToken[]`.
 
 ---
 
