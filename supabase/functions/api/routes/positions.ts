@@ -1,7 +1,6 @@
 import { sql, n, round } from "../db.ts";
 import { get, post } from "../router.ts";
 import { notFound } from "../errors.ts";
-import { asOfHoldings } from "../shared/asof.ts";
 import { intParam } from "../shared/params.ts";
 import { cov, money } from "../shared/format.ts";
 import { nativePrices } from "../shared/prices.ts";
@@ -9,7 +8,7 @@ import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import {
-  CostBasis, costBasisFor, costBlock, coverageLow, indexerCoverageFor, portfolioFrom,
+  CostBasis, costBasisFor, costBlock, coverageLow, indexerCoverageFor, latestIso, portfolioFrom,
   positionsPartialReason, sellFlags, unsellable,
 } from "../shared/positions-core.ts";
 import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
@@ -314,8 +313,9 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     handle: t.display_handle,
     name: t.name ?? null,
     // This trader's snapshot, not the board's — chain-read rows and fomo builds are
-    // stamped at different times, so a global max would misdate one of them.
-    asOf: await asOfHoldings(t.handle as string),
+    // stamped at different times, so a global max would misdate one of them. Taken from
+    // the rows in hand: holdings_live carries every holdings_current row's captured_at.
+    asOf: latestIso(rows.map((r: Record<string, unknown>) => r.captured_at)),
     /** What `amountLive` is: Solana is a roll-forward of webhook transfers, EVM the nightly read. */
     liveBasis: { solana: "rolled_forward_from_transfers", evm: "nightly_read" },
     count: page.length,
@@ -389,11 +389,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
    * The newest balance read across the traders asked for -- taken from the rows already in
    * hand rather than from a second query, so dating the batch costs nothing.
    */
-  const positionsAsOf = rows.reduce<string | null>((best: string | null, r: Record<string, unknown>) => {
-    if (!r.captured_at) return best;
-    const at = new Date(String(r.captured_at)).toISOString();
-    return best === null || at > best ? at : best;
-  }, null);
+  const positionsAsOf = latestIso(rows.map((r: Record<string, unknown>) => r.captured_at));
 
   /** Same cost basis and indexer coverage the individual route serves, from the same functions. */
   const [costByHandle, coverByHandle] = await Promise.all([costBasisFor(handles), indexerCoverageFor(handles)]);
