@@ -130,6 +130,15 @@ jobs:
         if: '!cancelled()'
         run: node scripts/load_quote_prices.mjs
 
+      # ---------------------------------------------------------------- 6b'. robinhood prices
+      # R4: GMGN indexes a thin slice of chain 4663, so the held coins it misses are priced
+      # from DexScreener (keyless, 30 tokens a call) into token_prices; docs/R4_ROBINHOOD_PRICES.md.
+      - name: Price Robinhood-chain coins
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: node scripts/load_robinhood_prices.mjs
+
       # ---------------------------------------------------------------- 6c. token info
       #
       # GMGN allows 1 request/second per IP and we fetch only tokens a leader actually holds
