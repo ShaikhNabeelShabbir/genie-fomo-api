@@ -46,6 +46,10 @@ async function insert(env: Env, events: unknown): Promise<void> {
 
 export async function webhook(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (req.method !== "POST") return Response.json({ detail: "POST only" }, { status: 405 });
+  if (!env.HYPERDRIVE) {
+    // Helius must not be pointed here until this is gone; a 503 makes it retry rather than drop.
+    return Response.json({ error: "not_configured", detail: "HYPERDRIVE binding is parked" }, { status: 503 });
+  }
 
   // Without this, anyone who learns the URL can insert rows into the ledger we use to
   // check fomo's claims — which would make the Verified tier worth less than the Reported

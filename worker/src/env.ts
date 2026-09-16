@@ -1,6 +1,7 @@
 /** Bindings, secrets (`wrangler secret put`) and vars (`wrangler.toml`). See docs/CLOUDFLARE_MIGRATION.md §5.1, §8 */
 export interface Env {
-  readonly HYPERDRIVE: Hyperdrive;
+  /** Absent until the binding in wrangler.toml is uncommented with a real id. */
+  readonly HYPERDRIVE?: Hyperdrive;
   readonly GENIE_API_KEY?: string;
   readonly AUM_SAMPLE_SECRET?: string;
   readonly AUM_SAMPLE_URL?: string;

@@ -7,6 +7,7 @@ import type { Env } from "./env";
  * See docs/CLOUDFLARE_MIGRATION.md §4.3
  */
 export function db(env: Env): postgres.Sql {
+  if (!env.HYPERDRIVE) throw new Error("HYPERDRIVE binding is not configured (wrangler.toml)");
   return postgres(env.HYPERDRIVE.connectionString, {
     // Cloudflare's own example uses 5: Workers allow six simultaneous outbound connections,
     // and a route that does `Promise.all` over several queries wants more than one of them.
