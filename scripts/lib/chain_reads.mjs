@@ -21,6 +21,8 @@
 export const SOLANA_NETWORK_ID = 1399811149;
 /** Native SOL under the key quote_assets already uses, so it prices like any other quote. */
 export const SOL_MINT = "11111111111111111111111111111111";
+/** Native ETH/BNB under the EVM sentinel, seeded in tokens + quote_assets (N1). */
+export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const TOKEN_PROGRAMS = [
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   // SPL Token
   "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   // Token-2022; a mint here is invisible to the other
@@ -175,6 +177,10 @@ export async function evmBalances(rpcUrl, wallet, tokens, decimalsByKey) {
       out.push({ address: t.address, amount: scale(raw, dec) });
     }
   }
+  // The chain's own coin: one eth_getBalance per wallet, pushed under the sentinel (N1).
+  const nat = await rpc(rpcUrl, { jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [wallet, "latest"] });
+  const wei = word(nat?.result);
+  if (wei !== null && wei > 0n) out.push({ address: ZERO_ADDRESS, amount: scale(wei, 18) });
   return { balances: out, learned };
 }
 

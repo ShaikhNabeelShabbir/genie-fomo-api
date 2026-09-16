@@ -690,10 +690,9 @@ function buildAum(
         nativeAmount: nat?.usd && usd !== null
           ? Number((usd / nat.usd).toPrecision(10))
           : null,
-        whyNoNative: nat?.usd && usd !== null ? null
+        whyNoNative: !nat?.usd ? "no market price for this chain's own coin"
           : usd === null ? "this chain carries no total at this reading"
-          : "no market price for this chain's own coin — the only figures we hold for it are " +
-            "traders' reported entry prices, which are not what it is worth now",
+          : null,
         ...(r.reason ? { reason: r.reason as string } : {}),
       };
     }),
