@@ -24,6 +24,18 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `Jun
 - [x] Final: gate 0 errors, 32 tests, worker tsc clean, bundle 371 KB, node/py checks, loaders
       build; pushed 1e652b4 (78 commits ahead of main, 6 new migrations).
 
+## Afternoon run (17 Sep 2026)
+
+- [x] Workflow coverage (`docs/consumer/workflow-coverage-17-sep.md`) → gaps 1–5 built by 5 agents
+      and merged: hourly price history + ATH, `/events`, launch metadata (pump.fun curve),
+      `holdings_live` + `/flow`, dev ledger + linked wallets. Vocabulary v6. 42 tests.
+- [x] Composite workflows coverage (`docs/consumer/composite-workflows-coverage-17-sep.md`).
+- [x] Efficiency review (`docs/REVIEW_EFFICIENCY_17_SEP.md`).
+- [ ] Wave A (7 agents, running): opt A1 aum window/indexes/app, A2 health scans + chain-history
+      view, A3 positions/portfolio queries, A4 sampler parallel chains + scripts, A5 scorecard opt
+      + composite C1/C2/C5, C4 `/market/regime`, C3 honeypot-since + cohort.
+- [ ] Merge wave A, vocabulary v7, push; then the v2 contract note to the Genie team.
+
 ## Status for the morning (17 Sep 2026)
 
 Everything that needed no input is done and pushed. Total: 12 agents over 4 waves.

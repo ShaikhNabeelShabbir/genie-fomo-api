@@ -20,7 +20,7 @@ Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
 | `scripts/*.mjs` | Node loaders run by `.github/workflows/refresh.yml` nightly 06:00 UTC |
 | `scripts/lib/ts/` | `transactions.ts`, `settings.ts`: compiled by `npm run build` to `scripts/lib/dist/` for three loaders. Not the API |
 | `loaders/*.py` | directory build, DB load, trades (fomoapi) |
-| `docs/` | design docs and runbooks; `docs/DECISIONS.md` holds the long rationale comments moved out of the code (`See docs/DECISIONS.md#dNNN`) |
+| `docs/` | design docs and runbooks; `REVIEW_EFFICIENCY_17_SEP.md` is the ranked optimisation list; `LAUNCH_METADATA.md`, `R4_ROBINHOOD_PRICES.md` record measured sources; `docs/DECISIONS.md` holds the long rationale comments moved out of the code (`See docs/DECISIONS.md#dNNN`) |
 | `docs/consumer/` | acceptance suites, field contracts, the Genie app team's reports |
 | `tests/` | `deno task test` — pure-function tests, no database |
 
@@ -37,6 +37,10 @@ Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
 | `/:handle/aum`, `POST /traders/aum` | `routes/aum.ts` (rules in `shared/aum-rules.ts`) |
 | `GET /v1/fields` | `routes/fields.ts` (data in `shared/vocabulary.ts`) |
 | `GET /v1/health` | `routes/health.ts` |
+| `GET /v1/events` | `routes/events.ts` (keyset feed over transfers, swaps, readings) |
+| `/:handle/flow`, `POST /traders/flow` | `routes/flow.ts` (Solana net flow since a time; `holdings_live` view) |
+| `GET /v1/creators/:address` | `routes/tokens.ts` (dev ledger from `creators`) |
+| `GET /v1/market/regime` | `routes/market.ts` (cohort reading, 60 s cache) |
 
 Router scores by literal-segment specificity, so registration order never matters.
 
