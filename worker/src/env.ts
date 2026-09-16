@@ -5,6 +5,7 @@ export interface Env {
   readonly GENIE_API_KEY?: string;
   readonly AUM_SAMPLE_SECRET?: string;
   readonly AUM_SAMPLE_URL?: string;
+  readonly AUM_SAMPLE_BUDGET_MS?: string;
   readonly AUM_LIVE_AFTER_MINUTES?: string;
   readonly AUM_LIVE_WAIT_MS?: string;
   readonly WALLET_SUBMIT_SECRET?: string;
