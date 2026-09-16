@@ -720,6 +720,20 @@ function buildAum(
   };
 }
 
+/**
+ * When the sampler last ran and last succeeded, cached per isolate for a minute the way
+ * `nativeCache` is: one whole-table aggregate that every `/aum` call used to repeat.
+ */
+let samplerCache: { at: number; row: Record<string, unknown> | undefined } | null = null;
+async function samplerLast(): Promise<Record<string, unknown> | undefined> {
+  if (samplerCache && Date.now() - samplerCache.at < 60_000) return samplerCache.row;
+  const [row] = await sql`
+    select max(at) as last_at, max(sampled_at) as last_success
+    from aum_samples where basis = 'sampled'`;
+  samplerCache = { at: Date.now(), row };
+  return row;
+}
+
 /** AUM envelopes for MANY traders in a fixed number of queries. See docs/DECISIONS.md#d051 */
 async function aumFor(
   handles: string[],
@@ -877,9 +891,7 @@ async function aumFor(
    * 75 hours old, and nothing in the response said so. Freshness has to travel WITH the
    * number rather than be reconstructed from dates by every caller.
    */
-  const [samplerRow] = await sql`
-    select max(at) as last_at, max(sampled_at) as last_success
-    from aum_samples where basis = 'sampled'`;
+  const samplerRow = await samplerLast();
 
   const presenceRows = await sql`
     select handle, count(distinct network_id)::int as chains,
