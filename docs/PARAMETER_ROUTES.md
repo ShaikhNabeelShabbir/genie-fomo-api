@@ -149,6 +149,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 448
 | **9** | [AUM over time](#9-aum-over-time) | the balance series |
 | **10** | [Trades, both sides](#10-trades-both-sides) | valued from the money side |
 | **11** | [Batch reads](#11-batch-reads) | the whole board in a bounded number of calls |
+| **12** | [Events feed](#12-events-feed) | transfers, swaps and readings, one cursor |
 | **C** | [What the plugin team asked for](#appendix-c-what-the-plugin-team-asked-for) | § by §, and where each landed |
 | **A4** | [The version 8 report, and what changed](#appendix-a4-the-version-8-report-and-what-changed-2026-09-14) | freshness, `now`, and the seam |
 | **A5** | [The version 8 report, the rest of the asks](#appendix-a5-the-version-8-report-the-rest-of-the-asks-2026-09-14) | ten more, measured |
@@ -3099,6 +3100,79 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 **Every successful response also carries** `RateLimit-Limit`, `RateLimit-Remaining`,
 `RateLimit-Reset` and `RateLimit-Scope`, per `GENIE_FOMO_V7_BATCH_AUM_TDR.md` §7.
+
+---
+
+## 12. Events feed
+
+| In plain words | Call | Read | Live value |
+| --- | --- | --- | --- |
+| "What happened across the cohort since I last looked?" | `GET $B/events?since=…` | `events[]`, `nextCursor` | three kinds, one order, oldest first |
+
+**In layman's terms.** Every workflow that starts with "when a tracked wallet does X" needs one
+place to watch. This is that place: transfers (`transactions`), the wallet's own swaps
+(`wallet_swaps`) and the sampler's balance readings (`aum_samples`, `basis: sampled`), unioned
+in SQL and served oldest-first so a poller reads forward with the cursor it was last handed.
+Nothing is pushed; the app polls. Workflow gap 2 in `docs/consumer/workflow-coverage-17-sep.md`.
+
+### How to test
+
+```bash
+# the last 24 hours (the default `since`), first page
+curl -s "$B/events?limit=100" | jq '{count, nextCursor, kinds: [.events[].kind] | unique}'
+
+# from a point in time, one kind, one chain, one trader
+curl -s "$B/events?since=2026-09-17T00:00:00Z&kind=swap&chain=solana&handle=unipcs" \
+  | jq '.events[0]'
+
+# poll: feed nextCursor back until it is null, then keep the last one and ask again later
+curl -s "$B/events?cursor=CURSOR_FROM_ABOVE" | jq '{count, nextCursor}'
+```
+
+```json
+{
+  "asOf": "2026-09-17T12:00:03.120Z", "since": "2026-09-16T12:00:03.000Z",
+  "count": 100, "limit": 100, "nextCursor": "CURSOR",
+  "filters": { "kind": null, "chain": null, "handle": null },
+  "events": [
+    { "kind": "transfer", "at": "2026-09-16T12:04:11.000Z", "handle": "unipcs",
+      "traderSource": "fomoapi.io", "chain": "solana", "tokenAddress": "…pump",
+      "txHash": "5Kj…", "gates": { "isHoneypot": false, "canSell": true, "priceSuspect": null },
+      "direction": "in", "amount": 1250000, "counterparty": "6EF8…", "source": "PUMP_FUN",
+      "txType": "SWAP" },
+    { "kind": "swap", "at": "2026-09-16T12:04:11.000Z", "handle": "unipcs",
+      "traderSource": "fomoapi.io", "chain": "solana", "tokenAddress": "…pump",
+      "txHash": "5Kj…", "gates": null,
+      "tokenDelta": 1250000, "quoteDelta": -1.5, "quoteUsd": -210.46 },
+    { "kind": "reading", "at": "2026-09-16T12:05:00.000Z", "handle": "0xAvast",
+      "traderSource": "gmgn", "totalUsd": 48211.9, "refusedReason": null }
+  ],
+  "note": "Solana transfers and swaps arrive in real time from the Helius webhook; EVM transfers are backfilled nightly…"
+}
+```
+
+### What to know before you use it
+
+**Parameters.** `since` (ISO; default now − 24 h), `cursor`, `limit` (≤ 500, default 100),
+`kind` (`transfer` | `swap` | `reading`), `chain` (a `/chains` name), `handle` (handle or id).
+`?chain=` excludes readings, which are not per chain.
+
+**Ordering is `(at, kind, txHash | handle)` ascending and the cursor carries exactly that.**
+Newest is last. A full page is a hint that more exist; `nextCursor: null` is the end. A cursor
+from `/transactions` or `/trades` gets a **400** here.
+
+**Solana is real time, EVM is nightly.** The Helius webhook writes Solana transfers as they
+land; EVM transfers come from the nightly backfill, so an EVM event with an `at` of yesterday
+can first appear today. Poll with a cursor, not with `since = last poll time`, or nightly rows
+will be skipped.
+
+**`gates` is `null` when `token_info` holds no row for the token** — unassessed, not safe.
+`isHoneypot` and `canSell` are GMGN's security read (G12); `priceSuspect` is reserved and
+always `null` on this feed (the price check lives on `/positions`).
+
+**`traderSource`** is `traders.source` (`fomoapi.io` or `gmgn`): the only class the cohort has.
+
+**`reading.totalUsd: null` means refused**, and `refusedReason` says why — never zero.
 
 ---
 

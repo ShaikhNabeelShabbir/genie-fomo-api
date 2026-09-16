@@ -347,3 +347,9 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `scorecard.onChain` | /scorecard | `{ basis: wallet_swaps, swaps, buys, sells, volumeUsd, realizedPnlUsd, winRate, wins, losses, coverage: { of: swapsResolved, total: swapsSeen, share }, asOf }` — the same figures as the top of the scorecard, from the wallet's own resolved swaps instead of fomoapi. `swaps` is a real count (0 allowed); every other figure is `null` when there are no resolved swaps, never 0. P&L pairs each sell against the token's average buy cost (the `perExit` pairing). `null` under `?include=scorecard`, with `onChainNote` saying so |
 | `scorecard.staleness.fallback` | /scorecard, /traders?include=scorecard | `on_chain` when `staleness.state` is `stale` or `never` AND `onChain.swaps > 0`: draw `onChain` instead of the fomo figures. Otherwise `null`. Always `null` on the embedded scorecard, where `onChain` is not computed |
 
+
+## Added 17 Sep 2026, events feed
+
+| Field | Route | Contract |
+|---|---|---|
+| `events[]`, `nextCursor`, `count`, `asOf`, `since`, `filters`, `note` | GET /events | keyset feed over `transactions`, `wallet_swaps` and `aum_samples` (`basis: sampled`), ordered `(at, kind, txHash \| handle)` ascending, newest last; `since` defaults to now − 24 h; `limit` ≤ 500 (default 100). Every event carries `kind` (`transfer` \| `swap` \| `reading`), `at`, `handle`, `traderSource` (`traders.source`). `transfer`: `chain`, `tokenAddress`, `txHash`, `direction` (`in` \| `out`), `amount`, `counterparty`, `source` (`tx_source`), `txType`. `swap`: `chain`, `tokenAddress`, `txHash`, `tokenDelta`, `quoteDelta`, `quoteUsd`. `reading`: `totalUsd` (null = refused, never 0), `refusedReason`. `transfer` and `swap` carry `gates: { isHoneypot, canSell, priceSuspect: null }` from `token_info`, or `gates: null` when no row exists. Solana rows are real-time (webhook), EVM transfers nightly: poll with the cursor, not with `since` |
