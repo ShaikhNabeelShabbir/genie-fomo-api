@@ -130,6 +130,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 448
 | **1** | [Trader — money](#1-trader-money) | T1–T10 |
 | **2** | [Trader — positions](#2-trader-positions) | T11–T15 |
 | **2b** | [Position timing (G1)](#2b-position-timing-g1) | **G1** |
+| **2c** | [Live holdings between reads, and net flow](#2c-live-holdings-between-reads-and-net-flow) | workflow gap 4: `amountLive`, `/flow` |
 | **3** | [Trader — time](#3-trader-time) | T16–T20 |
 | **3b** | [On-chain activity counters (G2)](#3b-on-chain-activity-counters-g2) | **G2** |
 | **3c** | [USD value per transfer (G6)](#3c-usd-value-per-transfer-g6) | **G6** |
@@ -1053,6 +1054,57 @@ exit date. Treat a missing `endHoldingAt` as "no exit observed", never as "still
 **Versus GMGN.** They publish `start_holding_at` / `end_holding_at` per position and
 `last_active_timestamp` per wallet, across all of chain history. Ours is scoped to what we
 have ingested, and says so in the response. Theirs is more complete; ours is checkable.
+
+---
+
+## 2c. Live holdings between reads, and net flow
+
+Added 17 Sep 2026 for workflow gap 4 (`docs/consumer/workflow-coverage-17-sep.md`: W-F Rotation
+Compass, W-A Genesis Scan). Balances are read from chain nightly; on Solana the Helius webhook
+delivers every transfer in between. These routes roll the read forward from that feed at read
+time. **No new writer, no new chain read.**
+
+### `amountLive` on `/traders/:handle/positions`
+
+| Field | Solana | EVM |
+|---|---|---|
+| `amount`, `valueUsd` | the nightly read, unchanged | the nightly read |
+| `amountLive` | `amount` + Σ signed transfers (`in` +, `out` −) with `block_time > balanceAt` | `null` |
+| `deltaSinceRead` | that sum (`0` when nothing moved) | `null` |
+| `lastTransferAt` | newest transfer since the read, or `null` | `null` |
+| `liveBasis` (top level) | `{ solana: "rolled_forward_from_transfers", evm: "nightly_read" }` | |
+
+A position opened since the read (a mint the read did not hold) appears with `amount: 0`,
+`balanceAt: null`, `tier: "rolled_forward"` and `amountLive` = the net inflow — but only once
+the mint is in `tokens`; until then it is visible on `/flow` only.
+
+**What it is not.** A roll-forward is only as complete as the webhook's coverage: a transfer
+Helius did not deliver, a wallet not registered, a burn or rebase the feed does not carry, all
+leave `amountLive` off by that much until the next nightly read replaces the base. `amount` and
+`valueUsd` stay the read values; the app decides which to show. `valueUsd` is NOT re-priced
+from `amountLive`.
+
+SQL: view `holdings_live` (`supabase/migrations/20260917190000_holdings_live.sql`).
+
+### `GET /traders/:handle/flow?since=<iso>` and `POST /traders/flow { ids, since }`
+
+Net token flow per trader since a moment, from `transactions` — Solana only. `since` is required
+(400 without it). One row per token that moved:
+
+```json
+{ "chain": "solana", "tokenAddress": "…", "tokenKey": "…", "in": 120.5, "out": 20,
+  "net": 100.5, "transfers": 3, "firstAt": "…", "lastAt": "…" }
+```
+
+`tokenAddress` is `null` when the mint is not yet in the directory (the feed stores a lowercased
+key; base58 is case-sensitive, so the key is served as `tokenKey`, not passed off as an
+address). Envelope: `since` (normalised), `basis: "transactions"`, `chains: ["solana"]`. The
+batch form takes up to 50 ids under the §11 rules and answers one `traders[]` entry per id,
+`ok: false` with `not_found` for unknown ones.
+
+This is the W-F "hourly holdings diff across the cohort" substrate: poll it hourly with `since`
+= the previous poll. **A category / launchpad taxonomy for tokens is not in scope here** —
+group by `tokenKey` yourself; the chain is the only taxonomy the directory holds.
 
 ---
 

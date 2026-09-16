@@ -60,3 +60,16 @@ export function sortParam(
 /** '' is not a value. The columns store empty strings where fomo gave nothing. */
 export const nonEmpty = (v: string | null | undefined): string | null =>
   v && v.trim() ? v.trim() : null;
+
+/** An ISO-8601 timestamp from a query or a body, normalised, or a 400. Absent is `null`. */
+export function parseIso(raw: unknown, name: string): string | null {
+  if (raw === null || raw === undefined || String(raw).trim() === "") return null;
+  const ms = Date.parse(String(raw).trim());
+  if (!Number.isFinite(ms)) {
+    throw badRequest(`'${name}' must be an ISO-8601 timestamp — got '${String(raw)}'`, { parameter: name });
+  }
+  return new Date(ms).toISOString();
+}
+
+export const isoParam = (url: URL, name: string): string | null =>
+  parseIso(url.searchParams.get(name), name);

@@ -115,6 +115,7 @@ export async function handle(req: Request): Promise<Response> {
           "GET /traders/:handle/transactions",
           "GET /traders/:handle/trades",
           "GET /traders/:handle/aum",
+          "GET /traders/:handle/flow?since=<iso>",
           "GET /tokens",
           "GET /tokens/momentum",
           "GET /tokens/:address",
@@ -124,6 +125,7 @@ export async function handle(req: Request): Promise<Response> {
           "GET /fields",
           "POST /traders/positions   { ids: [...] }",
           "POST /traders/aum        { ids: [...], window, step }",
+          "POST /traders/flow       { ids: [...], since }",
           "POST /traders/:handle/wallets   { secret, evmAddress?, solanaAddress? }",
         ],
       });

@@ -353,3 +353,15 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | Field | Route | Contract |
 |---|---|---|
 | `events[]`, `nextCursor`, `count`, `asOf`, `since`, `filters`, `note` | GET /events | keyset feed over `transactions`, `wallet_swaps` and `aum_samples` (`basis: sampled`), ordered `(at, kind, txHash \| handle)` ascending, newest last; `since` defaults to now − 24 h; `limit` ≤ 500 (default 100). Every event carries `kind` (`transfer` \| `swap` \| `reading`), `at`, `handle`, `traderSource` (`traders.source`). `transfer`: `chain`, `tokenAddress`, `txHash`, `direction` (`in` \| `out`), `amount`, `counterparty`, `source` (`tx_source`), `txType`. `swap`: `chain`, `tokenAddress`, `txHash`, `tokenDelta`, `quoteDelta`, `quoteUsd`. `reading`: `totalUsd` (null = refused, never 0), `refusedReason`. `transfer` and `swap` carry `gates: { isHoneypot, canSell, priceSuspect: null }` from `token_info`, or `gates: null` when no row exists. Solana rows are real-time (webhook), EVM transfers nightly: poll with the cursor, not with `since` |
+
+## Added 17 Sep 2026, live holdings
+
+| Field | Route | Contract |
+|---|---|---|
+| `entries[].amountLive` | /positions | Solana: `amount` + signed transfers (`in` +, `out` −) with `block_time > balanceAt`, from the webhook feed. EVM: `null`. Not a chain read; only as complete as the webhook's coverage. `amount` and `valueUsd` stay the read values |
+| `entries[].deltaSinceRead` | /positions | the signed sum itself. `0` = nothing moved since the read (Solana); `null` = not rolled forward (EVM) |
+| `entries[].lastTransferAt` | /positions | newest transfer since the read, else `null` |
+| `entries[].tier` | /positions | new value `rolled_forward`: a position opened since the read, with `amount: 0`, `balanceAt: null`, no price. Only once the mint is in `tokens`; otherwise on `/flow` only |
+| `liveBasis` | /positions | `{ solana: "rolled_forward_from_transfers", evm: "nightly_read" }` — what `amountLive` is on each chain |
+| `rows[]` | /traders/:handle/flow?since=, POST /traders/flow { ids, since } | `{ chain, tokenAddress, tokenKey, in, out, net, transfers, firstAt, lastAt }` per token moved since `since` (required, ISO-8601). Solana only, from `transactions`. `tokenAddress` `null` when the mint is not in the directory; `tokenKey` always. Envelope: `since`, `basis: "transactions"`, `chains: ["solana"]`. Batch: §11 rules, one `traders[]` entry per id. No category taxonomy: group by `tokenKey` yourself |
+
