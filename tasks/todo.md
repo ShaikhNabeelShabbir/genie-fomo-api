@@ -44,6 +44,10 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `clo
       pooler / Hyperdrive — run `scripts/smoke.sh` right after each deploy; if it fails, move it to a
       `set local` per query.
 
+- [x] OpenAPI 3.0.3 reference `docs/openapi.yaml` (26 operations, 194 schemas, Redocly-clean) from 4 agents +
+      a pipeline audit; README rewritten; 64 validation flags in `docs/API_VALIDATION_FLAGS_17_SEP.md`;
+      vocabulary v8 (error codes). Worker renamed `genie-copy-trading-api`; branch renamed `cloudflare-migration`.
+
 ## Status for the morning (17 Sep 2026)
 
 Everything that needed no input is done and pushed. Total: ~30 agents over 4 overnight waves, the workflow-gap wave and wave A.

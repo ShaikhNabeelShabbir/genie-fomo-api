@@ -20,7 +20,7 @@ Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
 | `scripts/*.mjs` | Node loaders run by `.github/workflows/refresh.yml` nightly 06:00 UTC |
 | `scripts/lib/ts/` | `transactions.ts`, `settings.ts`: compiled by `npm run build` to `scripts/lib/dist/` for three loaders. Not the API |
 | `loaders/*.py` | directory build, DB load, trades (fomoapi) |
-| `docs/` | design docs and runbooks; `REVIEW_EFFICIENCY_17_SEP.md` is the ranked optimisation list; `LAUNCH_METADATA.md`, `R4_ROBINHOOD_PRICES.md` record measured sources; `docs/DECISIONS.md` holds the long rationale comments moved out of the code (`See docs/DECISIONS.md#dNNN`) |
+| `docs/` | design docs and runbooks; `openapi.yaml` is the API reference (lint: `npx @redocly/cli lint docs/openapi.yaml`); `API_VALIDATION_FLAGS_17_SEP.md` the open validation gaps; `REVIEW_EFFICIENCY_17_SEP.md` is the ranked optimisation list; `LAUNCH_METADATA.md`, `R4_ROBINHOOD_PRICES.md` record measured sources; `docs/DECISIONS.md` holds the long rationale comments moved out of the code (`See docs/DECISIONS.md#dNNN`) |
 | `docs/consumer/` | acceptance suites, field contracts, the Genie app team's reports |
 | `tests/` | `deno task test` — pure-function tests, no database |
 
