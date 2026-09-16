@@ -14,7 +14,7 @@ export async function nativePrices(): Promise<Map<number, NativePrice>> {
              (select q.token_key from quote_assets q
                where q.network_id = c.network_id
                  and upper(q.symbol) in ('W' || upper(c.native_symbol), upper(c.native_symbol))
-               order by (upper(q.symbol) = 'W' || upper(c.native_symbol)) desc
+               order by (upper(q.symbol) = upper(c.native_symbol)) desc
                limit 1) as token_key
       from chains c)
     select n.network_id, n.native_symbol,

@@ -9,6 +9,11 @@ import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import { CostBasis, costBasisFor, costBlock } from "../shared/positions-core.ts";
+import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
+
+/** The chain's own coin: EVM native under the sentinel, SOL under the system-program key. */
+const NATIVE_KEYS = new Set([ZERO_ADDRESS, SOL_MINT.toLowerCase()]);
+const isNative = (tokenKey: unknown): boolean => NATIVE_KEYS.has(String(tokenKey));
 
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
@@ -99,10 +104,9 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
       nativeAmount: nat?.usd && usd !== null
         ? Number((usd / nat.usd).toPrecision(10))
         : null,
-      whyNoNative: nat?.usd && usd !== null ? null
+      whyNoNative: !nat?.usd ? "no market price for this chain's own coin"
         : usd === null ? "nothing on this chain carries a price"
-        : "no market price for this chain's own coin — the only figures we hold for it are " +
-          "traders' reported entry prices, which are not what it is worth now",
+        : null,
     };
   });
 
@@ -232,6 +236,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       tokenAddress: r.address,
       networkId: Number(r.network_id),
       chain: r.chain,
+      isNative: isNative(r.token_key),
       amount: n(r.human_amount) ?? 0,
       /**
        * PRD §3. When the balance was read, and whether we read it or were told it.
@@ -369,6 +374,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
   const position = (r: Record<string, unknown>) => ({
     chain: r.chain, networkId: Number(r.network_id),
     tokenAddress: r.token_address, symbol: r.symbol,
+    isNative: isNative(r.token_key),
     amount: n(r.human_amount),
     ...costBlock(
       costByHandle.get(String(r.handle))?.get(`${Number(r.network_id)}:${r.token_key}`),
