@@ -9,8 +9,8 @@ import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import {
-  CostBasis, costBasisFor, costBlock, coverageLow, indexerCoverageFor, positionsPartialReason,
-  sellFlags, unsellable,
+  CostBasis, costBasisFor, costBlock, coverageLow, indexerCoverageFor, portfolioFrom,
+  positionsPartialReason, sellFlags, unsellable,
 } from "../shared/positions-core.ts";
 import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
 import { priceSuspectReason } from "../../aum-sample/value.ts";
@@ -30,24 +30,24 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
     select handle, display_handle, name from traders where handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
-  const asOf = await asOfHoldings(t.handle as string);
-
   /**
-   * Per-chain breakdown of what the total actually covers.
+   * The trader's rows, once; every figure below (per-chain breakdown, totals, top position,
+   * cash share, asOf) is derived from them in memory.
    *
    * "Which chains are in this number" is not a nicety here: only Solana carries prices in
    * the current snapshot, so a cross-chain-looking AUM is in practice a Solana figure.
    * Saying so per chain is the difference between a total and a total that misleads.
    */
-  const byChain = await sql`
-    select c.name as chain, h.network_id,
-           count(*)::int                              as positions,
-           count(h.value) filter (where h.value > 0)::int as priced,
-           sum(h.value)   filter (where h.value > 0)  as value
-    from holdings_current h join chains c using (network_id)
-    where h.handle = ${t.handle}
-    group by c.name, h.network_id
-    order by positions desc`;
+  const rows = await sql`
+    select tk.address, h.network_id, h.token_key, c.name as chain, h.value, h.captured_at,
+           (q.token_key is not null) as is_quote, ti.is_honeypot, ti.can_not_sell
+    from holdings_current h
+    join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
+    join chains c on c.network_id = h.network_id
+    left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
+    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
+    where h.handle = ${t.handle}`;
+  const p = portfolioFrom(rows);
 
   /**
    * Is a particular coin inside this total, or outside it?
@@ -59,57 +59,37 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const tokenQ = (url.searchParams.get("token") ?? "").trim().toLowerCase() || null;
   let includesToken: Record<string, unknown> | null = null;
   if (tokenQ) {
-    const rows = await sql`
-      select tk.address, h.network_id, c.name as chain, h.value
-      from holdings_current h
-      join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
-      join chains c on c.network_id = h.network_id
-      where h.handle = ${t.handle} and h.token_key = ${tokenQ}`;
-    const priced = rows.filter((r: Record<string, unknown>) => (n(r.value) ?? 0) > 0);
+    const held = rows.filter((r: Record<string, unknown>) => String(r.token_key) === tokenQ);
+    const priced = held.filter((r: Record<string, unknown>) => (n(r.value) ?? 0) > 0);
     includesToken = {
-      tokenAddress: rows[0]?.address ?? tokenQ,
-      held: rows.length > 0,
+      tokenAddress: held[0]?.address ?? tokenQ,
+      held: held.length > 0,
       // Held but unpriced means it is in the portfolio and NOT in the total — the case
       // most likely to be read wrongly if we only returned a boolean.
       inTotal: priced.length > 0,
       valueUsd: priced.length ? round(priced.reduce((a: number, r: Record<string, unknown>) => a + (n(r.value) ?? 0), 0)) : null,
-      chains: [...new Set(rows.map((r: Record<string, unknown>) => r.chain))],
-      note: rows.length === 0 ? "this trader does not hold that token"
+      chains: [...new Set(held.map((r: Record<string, unknown>) => r.chain))],
+      note: held.length === 0 ? "this trader does not hold that token"
         : priced.length === 0 ? "held, but unpriced — it is NOT part of totalValueUsd"
         : "held and priced — it IS part of totalValueUsd",
     };
   }
 
-  const [r] = await sql`
-    select count(*)::int                                as positions,
-           count(value) filter (where value > 0)::int   as priced,
-           -- V2: a confirmed honeypot / unsellable coin is priced but not part of the total.
-           sum(value)   filter (where value > 0 and not coalesce(ti.is_honeypot or ti.can_not_sell, false)) as total,
-           max(value)   filter (where value > 0 and not coalesce(ti.is_honeypot or ti.can_not_sell, false)) as top_value,
-           sum(value)   filter (where value > 0 and coalesce(ti.is_honeypot or ti.can_not_sell, false))     as unsellable,
-           sum(value)   filter (where value > 0 and q.token_key is not null) as cash
-    from holdings_current h
-    left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
-    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
-    where h.handle = ${t.handle}`;
-
-  const positions = Number(r.positions);
-  const priced = Number(r.priced);
-  const total = n(r.total);
-  const top = n(r.top_value);
-  const cash = n(r.cash) ?? 0;
-  const unsellableUsd = round(n(r.unsellable) ?? 0)!;
+  // V2: a confirmed honeypot / unsellable coin is priced but not part of the total.
+  const { positions, priced, total, cash } = p;
+  const top = p.top ? n(p.top.value) : null;
+  const unsellableUsd = round(p.unsellable)!;
 
   const natives = await nativePrices();
-  const chainCoverage = byChain.map((r: Record<string, unknown>) => {
-    const net = Number(r.network_id);
-    const usd = Number(r.priced) ? round(n(r.value)) : null;
+  const chainCoverage = p.byChain.map((r) => {
+    const net = r.network_id;
+    const usd = r.priced ? round(r.value) : null;
     const nat = natives.get(net) ?? null;
     return {
       chain: r.chain,
       networkId: net,
-      positions: Number(r.positions),
-      priced: Number(r.priced),
+      positions: r.positions,
+      priced: r.priced,
       valueUsd: usd,
       /** The same dollars said in the chain's own coin, which is how a wallet says them. See docs/DECISIONS.md#d071 */
       nativeSymbol: nat?.symbol ?? null,
@@ -128,7 +108,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
     handle: t.display_handle,
     name: t.name ?? null,
     // The measurement time of every money figure below.
-    asOf,
+    asOf: p.asOf,
     positions,
     concentration: null as number | null,
     topPosition: null as unknown,
@@ -152,15 +132,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   };
   if (!priced || total === null || top === null || total <= 0) return base;
 
-  const [tp] = await sql`
-    select tk.address, h.network_id, h.value
-    from holdings_current h
-    join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
-    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
-    where h.handle = ${t.handle} and h.value > 0
-      and not coalesce(ti.is_honeypot or ti.can_not_sell, false)
-    order by h.value desc limit 1`;
-
+  const tp = p.top;
   const share = top / total;
   const pct = Math.round(share * 100);
   const unpriced = positions - priced;
