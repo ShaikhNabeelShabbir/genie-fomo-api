@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 7,
+  version: 8,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -72,7 +72,7 @@ export const VOCABULARY = {
     "health.feeds.*.state": ["current", "stale", "never"],
     "health.dataState": ["current", "degraded"],
     "error.code": ["not_found", "bad_request", "duplicate_identifier", "rate_limited",
-                   "timeout", "internal",
+                   "timeout", "unavailable", "include_unavailable", "internal_error",
                    /* POST /traders/:handle/wallets — see that route. */
                    "not_configured", "unauthorized", "invalid_address", "address_in_use",
                    "already_on_record"],

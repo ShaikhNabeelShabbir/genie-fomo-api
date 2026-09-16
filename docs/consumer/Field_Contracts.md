@@ -414,3 +414,9 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `bleeding`, `bleedingBasis` | /scorecard | true only when `career.avgRealizedUsd − recent.last20.avgRealizedUsd > typicalBetUsd.perCoinUsd` OR `recent.last20.redShare >= 0.6`; false otherwise; null with no dated close. `bleedingBasis: { floorUsd, redShareFloor: 0.6, plain }` publishes the floor |
 | `exitTimingScore` | /scorecard | share of closed coins whose `currentPriceUsd` is below `avgExitPrice`, in 0..1; null under 5 closed coins carrying both prices |
 | `perHolder[].exitTimingScore` | /tokens/:address/activity | the same score for that trader across every coin he has closed, not this coin alone; same null rule |
+
+## Added 17 Sep 2026 — error codes (vocabulary v8)
+
+| Field | Route | Contract |
+|---|---|---|
+| `error.code` | every route | One of `not_found`, `bad_request`, `duplicate_identifier`, `rate_limited`, `timeout`, `unavailable`, `include_unavailable`, `internal_error`, `not_configured`, `unauthorized`, `invalid_address`, `address_in_use`, `already_on_record`. v8 corrects the list: `internal` was published but the service emits `internal_error`; `unavailable` (503, Postgres not answering) and `include_unavailable` (503, `blocks[]` names the `?include=` blocks not produced) were emitted but unpublished. |
