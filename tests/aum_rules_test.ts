@@ -17,6 +17,15 @@ Deno.test("chooseStep: coarsest step leaving >= 24 buckets; `all` takes 1d", () 
   assertEquals(chooseStep(AUM_WINDOWS["1w"]).name, "6h");
   assertEquals(chooseStep(AUM_WINDOWS["1m"]).name, "1d");
   assertEquals(chooseStep(null).name, "1d");
+  assertEquals(chooseStep(AUM_WINDOWS["1m"]).chosenFrom, "window");
+});
+
+Deno.test("chooseStep: a shorter tracked span decides the step", () => {
+  const day = 86_400_000;
+  assertEquals(chooseStep(AUM_WINDOWS["1m"], 6 * day), { name: "6h", ms: 6 * 3_600_000, chosenFrom: "tracked_span" });
+  assertEquals(chooseStep(null, 1 * day), { name: "1h", ms: 3_600_000, chosenFrom: "tracked_span" });
+  assertEquals(chooseStep(AUM_WINDOWS["1w"], 60 * day).chosenFrom, "window");
+  assertEquals(chooseStep(AUM_WINDOWS["1w"], 60 * day).name, "6h");
 });
 
 Deno.test("applyFloor: below the priced floor AND below $100 is refused with the figure kept beside it", () => {

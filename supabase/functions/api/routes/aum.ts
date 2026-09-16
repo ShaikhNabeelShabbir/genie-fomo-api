@@ -6,7 +6,7 @@ import { NativePrice, nativePrices } from "../shared/prices.ts";
 import { resolveChain, SOLANA_NET, KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
-import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, MIN_DRAWABLE_POINTS, applyFloor, chooseStep } from "../shared/aum-rules.ts";
+import { AUM_WINDOWS, WINDOW_ALIASES, resolveWindow, AUM_STEPS, MIN_DRAWABLE_POINTS, type StepChosenFrom, applyFloor, chooseStep } from "../shared/aum-rules.ts";
 
 // --------------------------------------------------------------- AUM over time
 
@@ -114,9 +114,15 @@ function buildAum(
   /** Median, not mean: one long gap after a quiet spell must not coarsen the whole series. */
   const observedStepMs = rawGaps.length ? rawGaps[Math.floor(rawGaps.length / 2)] : 0;
 
-  const chosen = stepRaw !== null
+  /** THE STEP IS CHOSEN OVER THE RECORD HELD, not only the window asked for (S1). */
+  const firstSampled = rows.find((r) => r.basis === "sampled");
+  const trackedSpan = firstSampled ? to.getTime() - Date.parse(String(firstSampled.at)) : null;
+  const pick = chooseStep(span, trackedSpan);
+  let chosen: { name: string; ms: number } = stepRaw !== null
     ? AUM_STEPS.find((s) => s.name === stepRaw.trim().toLowerCase())!
-    : chooseStep(span);
+    : pick;
+  /** Null when the caller named the step; then nothing was chosen. */
+  let stepChosenFrom: StepChosenFrom | null = stepRaw !== null ? null : pick.chosenFrom;
 
   /** WHAT IS DECLARED IS NOT WHAT IS BUCKETED, and conflating them costs real readings. See docs/DECISIONS.md#d022 */
   const declared = stepRaw !== null
@@ -129,13 +135,27 @@ function buildAum(
    * Averaging would invent a balance he never held, and a refused hour averaged with a
    * measured one would launder the refusal into a number.
    */
-  const kept = new Map<number, Record<string, unknown>>();
-  for (const r of windowed) {
-    const ms = Date.parse(String(r.at));
-    if (!Number.isFinite(ms)) continue;
-    kept.set(Math.floor(ms / chosen.ms), r);
+  const thin = (bucketMs: number): Record<string, unknown>[] => {
+    const kept = new Map<number, Record<string, unknown>>();
+    for (const r of windowed) {
+      const ms = Date.parse(String(r.at));
+      if (!Number.isFinite(ms)) continue;
+      kept.set(Math.floor(ms / bucketMs), r);
+    }
+    return [...kept.values()];
+  };
+  let thinned = thin(chosen.ms);
+  /** A DAILY BUCKET THAT FOLDS THE RECORD INTO ONE POINT falls back to the finest step (S1). */
+  if (stepChosenFrom !== null && chosen.ms !== AUM_STEPS[0].ms &&
+      thinned.filter(hasFigure).length < MIN_DRAWABLE_POINTS) {
+    const finest = thin(AUM_STEPS[0].ms);
+    if (finest.filter(hasFigure).length >= MIN_DRAWABLE_POINTS) {
+      thinned = finest;
+      chosen = AUM_STEPS[0];
+      stepChosenFrom = "fallback";
+    }
   }
-  const points = [...kept.values()].map((r) => ({
+  const points = thinned.map((r) => ({
     at: new Date(String(r.at)).toISOString(),
     totalUsd: round(n(r.total_usd)),
     /** THE FIGURE BEHIND A REFUSAL. See docs/DECISIONS.md#d023 */
@@ -280,7 +300,6 @@ function buildAum(
    * for one day hid the current total entirely -- `now: null` on a trader carrying a month of
    * history and a $5.1M balance.
    */
-  const firstSampled = rows.find((r) => r.basis === "sampled");
   const trackedSince = firstSampled ? new Date(String(firstSampled.at)).toISOString() : null;
 
   /** `now` IS THE MOST COMPLETE RECENT READING, NOT SIMPLY THE NEWEST. See docs/DECISIONS.md#d028 */
@@ -506,6 +525,8 @@ function buildAum(
      */
     asOf: newest ? new Date(String(newest.at)).toISOString() : null,
     step: declared.name,
+    /** What decided `step`: the window, the shorter tracked span, or the fallback to the finest step. */
+    stepChosenFrom,
     /** The step in milliseconds, so a consumer need not parse "6h". */
     stepMs: declared.ms,
     /** The bucket the points were thinned into, which may be finer than the step declared. */
