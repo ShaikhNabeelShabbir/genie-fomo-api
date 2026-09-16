@@ -1,6 +1,6 @@
 import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
 import {
-  SOLANA_NETWORK_ID, solanaBalances, evmBalances,
+  SOLANA_NETWORK_ID, solanaBalances, evmBalances, evmTxCount,
 } from "../_shared/chain_reads.ts";
 import { concentrationSuspect, decideTotal, value } from "./value.ts";
 
@@ -42,8 +42,8 @@ const json = (body: unknown, status = 200) =>
 type Position = { network_id: number; token_key: string; address: string; amount: number };
 type Chain = { network_id: number; name: string; rpc: string };
 type Trader = { handle: string; sol_address: string | null; evm_address: string | null };
-/** One chain's answer: what it held, or why it could not be asked. Never both. */
-type ChainRead = { positions: Position[] | null; reason: string | null };
+/** One chain's answer: what it held, or why it could not be asked. Never both. `nonce`: the wallet's tx count on an EVM chain that answered (R6). */
+type ChainRead = { positions: Position[] | null; reason: string | null; nonce?: number | null };
 type Tally = { usd: number; priced: number; total: number };
 type Settled = {
   totalUsd: number | null; reason: string | null;
@@ -102,7 +102,7 @@ async function readChain(
       set: (k: string, v: number) => { decimals.set(`${net}:${k}`, v); },
     };
     const res = await evmBalances(c.rpc, t.evm_address ?? "", tokens, view);
-    return { positions: res.balances.map(pos), reason: null };
+    return { positions: res.balances.map(pos), reason: null, nonce: await evmTxCount(c.rpc, t.evm_address ?? "") };
   } catch (e) {
     console.error(`aum-sample: ${t.handle} ${c.name}: ${(e as Error).message}`);
     return { positions: null, reason: "wallet_unreadable" };
@@ -144,9 +144,23 @@ async function settle(reads: Map<number, ChainRead>): Promise<Settled> {
 
 /** The parent row and one row per chain asked, answered or not. See docs/DECISIONS.md#d195 */
 async function write(
-  handle: string, at: Date, expected: number, reads: Map<number, ChainRead>, s: Settled,
+  t: Trader, at: Date, expected: number, reads: Map<number, ChainRead>, s: Settled,
 ) {
+  const handle = t.handle;
   const answered = s.perChain.size;
+  /* R6: the chain's nonce against the rows the indexer holds, per EVM chain that answered. */
+  const covered = [...reads].filter(([, r]) => r.nonce != null);
+  if (covered.length && t.evm_address) {
+    const addr = t.evm_address.toLowerCase();
+    await sql`
+      insert into chain_coverage (handle, network_id, address_key, chain_nonce, rows_held, read_at)
+      select ${handle}, u.n, ${addr}, u.c,
+             (select count(*) from transactions x where x.address_key = ${addr} and x.network_id = u.n), now()
+      from unnest(${covered.map(([n]) => n)}::bigint[], ${covered.map(([, r]) => r.nonce)}::bigint[]) as u(n, c)
+      on conflict (handle, network_id) do update set
+        address_key = excluded.address_key, chain_nonce = excluded.chain_nonce,
+        rows_held = excluded.rows_held, read_at = excluded.read_at`;
+  }
   /* Share of his POSITIONS we could value — what makes a thin line legible as thin. */
   const valueShare = s.total > 0 ? Number((s.priced / s.total).toFixed(4)) : null;
   await sql`
@@ -326,7 +340,7 @@ Deno.serve(async (req) => {
     const finish = async (job: Job) => {
       const s = await settle(job.reads);
       entry(job, s);
-      if (!dryRun) await write(job.trader.handle, at, job.expected.size, job.reads, s);
+      if (!dryRun) await write(job.trader, at, job.expected.size, job.reads, s);
     };
 
     for (const t of targets) {

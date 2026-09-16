@@ -86,3 +86,44 @@ export const sellFlags = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) 
   /** null when the security source never judged it; false when it said "cannot sell". */
   canSell: r.can_not_sell === null || r.can_not_sell === undefined ? null : !r.can_not_sell,
 });
+
+/** R6. Per chain: the wallet's nonce against the transaction rows the indexer holds for it. */
+export type ChainCoverage = {
+  chainTxCount: number | null; rowsHeld: number | null; share: number | null; readAt: string | null;
+};
+export const COVERAGE_FLOOR = 0.5;
+
+export const chainCoverage = (
+  r: { chain_nonce?: unknown; rows_held?: unknown; read_at?: unknown },
+): ChainCoverage => {
+  const chainTxCount = n(r.chain_nonce), rowsHeld = n(r.rows_held);
+  return {
+    chainTxCount, rowsHeld,
+    /* null, not 0, when either side is unknown; a wallet that never sent has nothing to cover. */
+    share: chainTxCount !== null && rowsHeld !== null && chainTxCount > 0
+      ? Number((rowsHeld / chainTxCount).toFixed(4)) : null,
+    readAt: r.read_at ? new Date(String(r.read_at)).toISOString() : null,
+  };
+};
+
+export const coverageLow = (c: Record<string, ChainCoverage>): boolean =>
+  Object.values(c).some((x) => x.share !== null && x.share < COVERAGE_FLOOR);
+
+/** Which of the two made the list partial; both, joined the way aum.coverage.partialReason is. */
+export const positionsPartialReason = (unsellable: boolean, low: boolean): string | null =>
+  [unsellable && "unsellable_positions", low && "indexer_coverage_low"].filter(Boolean).join("_and_") || null;
+
+/** `{ handle -> { chainName -> coverage } }` from the sampler's chain_coverage rows. */
+export async function indexerCoverageFor(handles: string[]): Promise<Map<string, Record<string, ChainCoverage>>> {
+  const out = new Map<string, Record<string, ChainCoverage>>();
+  if (!handles.length) return out;
+  const rows = await sql`
+    select cc.handle, c.name as chain, cc.chain_nonce, cc.rows_held, cc.read_at
+    from chain_coverage cc join chains c using (network_id)
+    where cc.handle = any(${handles})`;
+  for (const r of rows) {
+    const h = String(r.handle);
+    out.set(h, { ...(out.get(h) ?? {}), [String(r.chain)]: chainCoverage(r) });
+  }
+  return out;
+}
