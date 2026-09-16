@@ -40,42 +40,19 @@ export async function knownChainsFor(handles: string[]): Promise<Map<string, Kno
   const out = new Map<string, KnownChain[]>();
   if (!handles.length) return out;
 
+  /* `trader_chain_history` (migration 20260917230000) is the one definition of a seen chain. */
   const rows = await sql`
-    with hs as (
-      select handle, network_id, count(*) filter (where human_amount > 0) as pos
-      from holdings_current where handle = any(${handles}) group by 1, 2),
-    /* Only chain rows that answered with a figure: the sampler's definition of a known chain (aum-sample/index.ts). */
-    ah as (
-      select handle, network_id, count(*) as pts
-      from aum_chain_samples where handle = any(${handles}) and total_usd is not null group by 1, 2),
-    pr as (
-      select handle, network_id from wallet_chain_presence where handle = any(${handles})),
-    seen as (
-      select handle, network_id from pr
-      union select handle, network_id from hs where pos > 0
-      union select handle, network_id from ah),
-    fam as (
-      select t.handle,
-             (w.sol_address is not null) as has_sol,
-             (w.evm_address is not null) as has_evm
-      from traders t left join wallets w using (handle)
-      where t.handle = any(${handles}))
-    select s.handle, c.name as chain, s.network_id,
-           coalesce(hs.pos, 0) as positions,
-           coalesce(ah.pts, 0) as history_points,
-           case when s.network_id = ${SOLANA_NET} then fam.has_sol else fam.has_evm end
-             as has_wallet
-    from seen s
-    join chains c using (network_id)
-    join fam on fam.handle = s.handle
-    left join hs on hs.handle = s.handle and hs.network_id = s.network_id
-    left join ah on ah.handle = s.handle and ah.network_id = s.network_id
-    order by s.handle, c.name`;
+    select h.handle, h.chain, h.network_id, h.positions, h.history_state,
+           case when h.network_id = ${SOLANA_NET} then w.sol_address is not null
+                else w.evm_address is not null end as has_wallet
+    from trader_chain_history h
+    left join wallets w using (handle)
+    where h.handle = any(${handles})
+    order by h.handle, h.chain`;
 
   for (const r of rows) {
     const h = String(r.handle);
     let a = out.get(h); if (!a) out.set(h, a = []);
-    const pts = Number(r.history_points);
     a.push({
       chain: String(r.chain),
       networkId: Number(r.network_id),
@@ -86,11 +63,8 @@ export async function knownChainsFor(handles: string[]): Promise<Map<string, Kno
        */
       wallets: r.has_wallet === true ? 1 : 0,
       hasPositions: Number(r.positions) > 0,
-      /*
-       * Whether this chain can be drawn on its own, by the same two-point rule the series
-       * uses. `none` is not `warming`: one has never produced a reading, the other has.
-       */
-      historyState: pts >= 2 ? "ready" : (pts === 1 ? "warming" : "none"),
+      /* ready | warming | none by the series' two-point rule, decided in the view. */
+      historyState: String(r.history_state),
     });
   }
   return out;
