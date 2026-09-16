@@ -347,3 +347,10 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `scorecard.onChain` | /scorecard | `{ basis: wallet_swaps, swaps, buys, sells, volumeUsd, realizedPnlUsd, winRate, wins, losses, coverage: { of: swapsResolved, total: swapsSeen, share }, asOf }` — the same figures as the top of the scorecard, from the wallet's own resolved swaps instead of fomoapi. `swaps` is a real count (0 allowed); every other figure is `null` when there are no resolved swaps, never 0. P&L pairs each sell against the token's average buy cost (the `perExit` pairing). `null` under `?include=scorecard`, with `onChainNote` saying so |
 | `scorecard.staleness.fallback` | /scorecard, /traders?include=scorecard | `on_chain` when `staleness.state` is `stale` or `never` AND `onChain.swaps > 0`: draw `onChain` instead of the fomo figures. Otherwise `null`. Always `null` on the embedded scorecard, where `onChain` is not computed |
 
+## Added 17 Sep 2026, creators and linked wallets
+
+| Field | Route | Contract |
+|---|---|---|
+| `entries[].creator.ledger` | /tokens/:address | `{ launches, bestPeakMcapUsd, bestToken, stillHoldingCount, soldCount, honeypotCount, lastLaunchAt }` for this token's creator across every token we hold GMGN info for; rebuilt nightly (`creators`). `null` until the ledger has a row — the rest of `creator` is unaffected. `launches` is a real count; `bestPeakMcapUsd`, `bestToken` (an address key) and `lastLaunchAt` are `null` when unknown. `lastLaunchAt` is when we first saw the token, not its mint time |
+| `GET /creators/:address` | new route | `{ creator, asOf, ledger, tokens: [{ chain, tokenAddress, symbol, status, isHoneypot, marketCapUsd }], tier: third_party, source: gmgn }`. `?chain=` optional; without it an EVM address sums across chains. `tokens[].status` is GMGN's own word, `creator_hold` or `creator_close`, `null` when GMGN was silent. 404 `not_found` for an address the ledger has never seen; 503 `unavailable` when the database is down |
+

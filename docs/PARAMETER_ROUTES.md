@@ -2131,6 +2131,24 @@ read as "their best token peaked at $0" rather than "there isn't one".
 **`communityTakeover`** is GMGN's `cto_flag`: the original dev walked away and holders took the
 project over. Different from a dev who never left, and worth reading next to `stillHolding`.
 
+### The dev ledger (gap 5a, W-C) — added 17 Sep 2026
+
+`entries[].creator.ledger` is the same creator across **every** token we hold GMGN info for,
+rebuilt nightly by `scripts/refresh_creators.mjs` into `creators` / `token_creators`:
+`{ launches, bestPeakMcapUsd, bestToken, stillHoldingCount, soldCount, honeypotCount, lastLaunchAt }`.
+`null` until the ledger has a row for that creator. `launches` counts tokens a tracked leader
+holds, not everything the address ever minted; `lastLaunchAt` is when *we* first saw the newest
+of them (`tokens.first_seen_at`), not the mint time; `bestToken` is an address key.
+
+```bash
+curl -s "$B/creators/0x1c9ebbc3231645d283e88e50988d0202c15ecadc" | jq '{ledger, tokens: .tokens[:3]}'
+```
+
+`GET /creators/:address` (`?chain=` optional; without it EVM ledgers sum across chains) answers
+`{ creator, asOf, ledger, tokens: [{ chain, tokenAddress, symbol, status, isHoneypot, marketCapUsd }] }`.
+`tokens[].status` is GMGN's word (`creator_hold` / `creator_close`) or `null` when it was silent.
+404 `not_found` for an address the ledger has never seen.
+
 ---
 
 ## 6. Chain

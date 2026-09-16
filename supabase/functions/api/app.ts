@@ -119,6 +119,7 @@ export async function handle(req: Request): Promise<Response> {
           "GET /tokens/momentum",
           "GET /tokens/:address",
           "GET /tokens/:address/activity",
+          "GET /creators/:address",
           "GET /chains",
           "GET /fields",
           "POST /traders/positions   { ids: [...] }",

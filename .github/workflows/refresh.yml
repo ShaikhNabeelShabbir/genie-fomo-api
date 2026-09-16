@@ -160,6 +160,15 @@ jobs:
         # the contract checks. Two requests per token at GMGN's 1/s, so ~35 min for a full
         # refresh of the ~1,100 held tokens.
 
+      # ---------------------------------------------------------------- 6d. dev ledger
+      # Derived from the token_info just refreshed (workflow gap 5a): token_creators and
+      # creators, so /creators/:address and creator.ledger run one night behind GMGN.
+      - name: Refresh dev ledger
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: node scripts/refresh_creators.mjs
+
       # ---------------------------------------------------------------- 7. webhook
       # A trader entering the top 100 is invisible to the live feed until their wallet is
       # registered with Helius — every other route would show them while transactions stayed
