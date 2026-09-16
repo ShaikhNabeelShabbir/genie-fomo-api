@@ -29,9 +29,10 @@ get("/v1/chains", async () => {
            count(*) filter (where t.status = 'closed')::int as closed,
            coalesce(sum(t.realized_pnl_usd) filter (where t.status = 'closed'), 0) as realized
     from trades t group by t.network_id`;
-  const byNet = new Map(profit.filter((r) => r.network_id !== null)
-    .map((r) => [Number(r.network_id), r]));
-  const orphan = profit.find((r) => r.network_id === null);
+  type ProfitRow = { network_id: number | null; closed: number; realized: unknown };
+  const byNet = new Map<number, ProfitRow>(profit.filter((r: ProfitRow) => r.network_id !== null)
+    .map((r: ProfitRow) => [Number(r.network_id), r]));
+  const orphan = profit.find((r: ProfitRow) => r.network_id === null);
 
   const top = rows[0];
   return {
@@ -41,7 +42,7 @@ get("/v1/chains", async () => {
     vocabulary: {
       closed: true,
       version: 1,
-      words: rows.map((r) => String(r.name)).sort(),
+      words: rows.map((r: Record<string, unknown>) => String(r.name)).sort(),
       note: "one word per network id, one network id per word. Ask with these verbatim; " +
             "a word not in this list is not a chain this service indexes",
     },
@@ -57,7 +58,7 @@ get("/v1/chains", async () => {
       ? `${top.traders} of ${traderCount} leaders trade ${top.name}, which carries ` +
         `${top.positions} of ${total} positions on the board.`
       : "No positions in the directory.",
-    entries: rows.map((r) => {
+    entries: rows.map((r: Record<string, unknown>) => {
       const positions = Number(r.positions);
       const priced = Number(r.priced);
       const pricedShare = positions ? Number((priced / positions).toFixed(4)) : null;

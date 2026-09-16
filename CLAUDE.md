@@ -62,7 +62,7 @@ The consumer's build fails on an unpublished word, so this order is a contract.
 ## Verify
 
 ```bash
-deno task check      # typecheck gate: no NEW errors vs scripts/typecheck_baseline.txt (90 known, postgres.js row typing)
+deno task check      # typecheck gate: no NEW errors vs scripts/typecheck_baseline.txt (baseline is empty: keep it so)
 deno task test       # pure-function tests
 npx tsc -p worker/tsconfig.json                    # the Worker; `cd worker && npx wrangler deploy --dry-run --outdir dist` bundles it
 ./scripts/smoke.sh   # 8 checks against production

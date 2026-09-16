@@ -266,7 +266,7 @@ Deno.serve(async (req) => {
      * slice of ten does not earn that: scoping both queries to the handles in hand keeps an
      * invocation's database cost proportional to the work it was asked to do.
      */
-    const handles = targets.map((t) => String(t.handle));
+    const handles = targets.map((t: Record<string, unknown>) => String(t.handle));
     const traded = await sql`
       select handle, network_id::bigint, token_key, min(token_address) as address
       from trades
@@ -280,7 +280,7 @@ Deno.serve(async (req) => {
       a.push({ token_key: String(r.token_key), address: String(r.address) });
       tradedByNet.set(k, a);
     }
-    const tokenKeys = [...new Set(traded.map((r) => String(r.token_key)))];
+    const tokenKeys = [...new Set(traded.map((r: Record<string, unknown>) => String(r.token_key)))];
     const decimals = new Map<string, number>();
     if (tokenKeys.length) {
       for (const r of await sql`

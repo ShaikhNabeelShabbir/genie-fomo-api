@@ -154,7 +154,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
         String(rows[rows.length - 1].transfer_key),
       ])
       : null,
-    transfers: rows.map((r) => ({
+    transfers: rows.map((r: Record<string, unknown>) => ({
       chain: r.chain,
       networkId: Number(r.network_id),
       /** `txHash` is the name every other route uses -- /trades has always spelled it that way. See docs/DECISIONS.md#d114 */

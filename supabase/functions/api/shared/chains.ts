@@ -17,7 +17,7 @@ export async function resolveChain(chainKey: string): Promise<{ network_id: numb
   if (!c) {
     const all = await sql`select name from chains order by name`;
     throw badRequest(
-      `'chain' must be one of ${all.map((r) => r.name).join(", ")} — got '${chainKey}'`,
+      `'chain' must be one of ${all.map((r: { name: string }) => r.name).join(", ")} — got '${chainKey}'`,
       { parameter: "chain" },
     );
   }

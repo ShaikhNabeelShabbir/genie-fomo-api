@@ -45,7 +45,7 @@ Deno.serve(async (req) => {
   // removed from the directory should stop producing rows rather than accumulate orphans.
   const watched = new Set<string>(
     (await sql`select lower(sol_address) as a from wallets where sol_address is not null`)
-      .map((r) => r.a as string),
+      .map((r: { a: string }) => r.a),
   );
 
   type Cell = string | number | null;

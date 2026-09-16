@@ -734,7 +734,7 @@ async function aumFor(
   const traders = await sql`
     select handle, display_handle from traders where handle = any(${handles})`;
   if (!traders.length) return out;
-  const present = traders.map((r) => String(r.handle));
+  const present = traders.map((r: Record<string, unknown>) => String(r.handle));
 
   /*
    * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
@@ -834,7 +834,7 @@ async function aumFor(
            bool_or(network_id <> ${SOLANA_NET}) as on_evm
     from holdings_current where handle = any(${present}) and human_amount > 0
     group by handle`;
-  const presBy = new Map(presenceRows.map((r) => [String(r.handle), {
+  const presBy = new Map<string, { chains: number; on_solana: boolean; on_evm: boolean }>(presenceRows.map((r: Record<string, unknown>) => [String(r.handle), {
     chains: Number(r.chains), on_solana: r.on_solana === true, on_evm: r.on_evm === true,
   }]));
 
@@ -994,7 +994,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
   if (Number(b?.contractVersion) !== 1) {
     const idRows = await sql`
       select handle, id from traders where handle = any(${handles})`;
-    const idBy = new Map(idRows.map((r) => [String(r.handle), r.id ? String(r.id) : null]));
+    const idBy = new Map<string, string | null>(idRows.map((r: Record<string, unknown>) => [String(r.handle), r.id ? String(r.id) : null]));
 
     const rowsOut = requested.map((req, i) => {
       const h = handles[i];
