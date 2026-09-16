@@ -5,23 +5,23 @@
 > ### 45 verified passing · 3 closed by decision · 1 self-resolving · 1 waiting upstream
 > *(baseline was 28 pass · 8 partial · 12 fail · 2 not run)*
 >
-> **All fifty are closed or accounted for. No work is outstanding on any of them.**
->
 > | | Status | |
 > |---|---|---|
 > | **45 tests** | **verified passing** against the deployed service | |
-> | **B1** | **closed** — workflow re-enabled. Confirm at the next 06:00 UTC run: `traders` and `wallets` should read `current` | owner |
+> | **B1** | **closed** — workflow re-enabled; confirm at the next 06:00 UTC run | owner |
 > | **G1** | **closed** — 240/min production ramp, deferred by decision | owner |
-> | **F9** | **closed** — this run is the published v10 field baseline, and `/v1/fields` ships the field inventory with every release | shipped |
-> | **C2** | **self-resolving.** The sampler records chain coverage from 16 September; the 30-day window fills one aligned day per day — visible in a week, complete in about a month | no work |
-> | **A2** | **7 → 3, waiting on the source.** Four delisted; the remaining three are `resolving` at fomoapi and close themselves when it finishes | upstream |
+> | **F9** | **closed** — this run is the published v10 field baseline; `/v1/fields` ships the inventory | shipped |
+> | **C2** | **self-resolving** — chain coverage recorded from 16 Sep; already moved from 6.4% to 9.7% | no work |
+> | **A2** | **7 → 3.** Four delisted; three are `resolving` at fomoapi | upstream |
 >
-> **A2, measured rather than assumed.** Both sources were asked directly: fomoapi lists three
-> with `wallets.status: "resolving"` and has dropped four from every window; a scan of 377 GMGN
-> KOL and smart-money entries matched none of them. There was never an address to fetch. The
-> four the source abandoned are now **delisted — flagged, not deleted** — so the board no longer
-> carries a trader nobody can price, while their holdings, trades and history stay intact and
-> `/traders/:handle` still answers for them.
+> **C6 and F4 now pass.** Both were open because of field defects found by reconciling against
+> `Field_Contracts.md` — `gaps[]` lacked `from`/`to`, and `capturedAt` shipped as an epoch
+> integer while our own published unit table said ISO-8601. Both fixed and deployed.
+>
+> **All 150 fields in `Field_Contracts.md` are now correct** — see
+> [Field_Contracts_Mapping.md](Field_Contracts_Mapping.md). Nine defects were found and all nine
+> are fixed, including `startCapitalUsd`, which was null for every trader and left the
+> consumer's fourth verdict test unanswerable; it is now populated for 366 traders.
 >
 > The body of this report is the **baseline measurement** taken before any of this work, kept
 > as written so the two runs can be compared.

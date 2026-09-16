@@ -31,7 +31,11 @@ against the function on the live database, sweeping all 448 traders across all f
 
 > ### 45 verified passing · 3 closed by decision · 1 self-resolving · 1 waiting upstream
 >
-> **All fifty closed or accounted for. Nothing is outstanding.**
+> **C6 and F4 now pass.** Both were false passes in our own harness, found by reconciling
+> against `Field_Contracts.md`; the underlying field defects are fixed and deployed.
+>
+> **All 150 fields in `Field_Contracts.md` are correct** — nine defects found, nine fixed.
+> See [Field_Contracts_Mapping.md](Field_Contracts_Mapping.md) and §7.
 >
 > - **B1** closed — workflow re-enabled; confirm at the next 06:00 UTC run
 > - **G1** closed — production load test deferred by decision
@@ -652,6 +656,66 @@ a read can now trigger a refresh — and `liveRead.state` legitimately differs b
 that fetched and one that did not. That is the test's own premise failing, not the service:
 F10 says *"with no rebuild in between"*, and a read-through **is** a rebuild. The test now asks
 with `?live=false`, which is the only way to honour what it actually specifies.
+
+---
+
+# Phase 6 · Field contract reconciliation · 16 September
+
+`Field_Contracts.md` — the consumer's own map of every field they read and what breaks when it
+changes — was reconciled field by field against the live service. **150 fields, 9 defects, all
+nine fixed and deployed.**
+
+Full mapping with route, JSON path and a live value for every field:
+[Field_Contracts_Mapping.md](Field_Contracts_Mapping.md).
+
+### 6.1 — The nine
+
+| Field | Was | Now |
+|---|---|---|
+| `capturedAt` | epoch integer on the most-called route, contradicting the unit table we publish ourselves | ISO-8601; `capturedAtEpoch` retains the old value |
+| `gaps[].from` / `.to` | absent — only `at` and `reason` | the span each gap covers. **Closes C6** |
+| `coinsTotal` | absent at top level; their verdict test read `undefined` | served alongside `tokensTotal` |
+| `unreadableRows[]` | absent — failures appeared only as `ok:false` rows | served, with the same rows kept in `traders[]` |
+| `byToken[]` (bulk) | **empty array** beside `tokensTotal: 390` — asserts "no coins" | omitted, which is what an absent list means |
+| `valueShare` | named a share of value; is `priced ÷ total` **positions** | `pricedPositionShare` added; old name kept and documented |
+| `chains[].pricedShare` | same fault | `pricedPositionShare` added alongside |
+| `startCapitalUsd` | **null for every trader** — their 4th verdict test unanswerable | populated for **366 traders** |
+| monthly `returnPct` | null, having no denominator | computed where a start balance exists |
+
+### 6.2 — `startCapitalUsd`, and why it matters most
+
+Their document calls it *"the single most valuable field you could add"*: the fourth verdict
+test asks whether a trader survives a bad month, written as a percentage, and with no starting
+balance there was no denominator. It was null for all 441 traders, so the top verdict —
+"follow" — was unreachable for the entire directory.
+
+It is answerable now only because the sampler runs: `aum_samples` holds a priced reading per
+trader per hour, so the balance entering a month is the first reading that month has. Bounded
+to the first seven days — a reading taken on the 20th is not what he began with, and dividing
+by it would produce a percentage that looks measured and is not.
+
+`unipcs`, September: `startCapitalUsd: 9,163,557`, `returnPct: -1.43`.
+
+### 6.3 — Two faults found while fixing these
+
+Recorded because both were introduced by the fixes and caught by re-running, not by reasoning.
+
+**A refused anchor was appearing in `gaps[]` dated outside the window.** Adding `from`/`to`
+exposed it: the anchor is a reading borrowed from before the window, and when refused it became
+a gap with `at` before `from` — breaking the `every gap falls inside from..to` relation on four
+answers. Anchors are now excluded from `gaps[]`; the point still carries its own `refused` word.
+
+**`coverage.totalWallets` could read below `answeredWallets`.** The same fault as the
+`totalChains` inversion fixed in Phase 1, in the sibling field, for a trader who had sold out of
+a wallet family. Now derived from the same `knownChains` union.
+
+### 6.4 — One test made honest rather than fixed
+
+**F10** ("the same trader read twice gives the same answer") began failing intermittently — not
+because the service regressed, but because the sampler now writes a reading every few minutes
+and F10's premise is explicitly *"with no rebuild in between"*. A sample landing between the two
+reads **is** a rebuild. The test now detects a changed `now.at` and retakes the pair, and says so
+if a reading lands on every attempt. Verified 5/5 standalone before the change.
 
 ---
 

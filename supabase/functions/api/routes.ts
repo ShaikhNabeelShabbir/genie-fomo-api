@@ -1040,18 +1040,40 @@ get("/v1/traders", async (_p, url) => {
             entries: chainEntriesFrom(swapBy.get(h) ?? []),
             exits: chainExitsFrom(swapBy.get(h) ?? [],
                                   chainEntriesFrom(swapBy.get(h) ?? [])),
-          }, feesBy.get(h) ?? null, null)
+          }, feesBy.get(h) ?? null, null, startCapBy.get(h) ?? null)
         : null;
     }
     return out;
   };
+
+  /*
+   * Month-start balances for the whole page in ONE query, not one per trader — the same rule
+   * every other include here follows.
+   */
+  const startCapBy = include.includes("scorecard")
+    ? await monthStartCapital(page.map((r) => String(r.handle)))
+    : new Map<string, Map<string, number>>();
 
   const extras = include.length ? await Promise.all(page.map(attach)) : [];
 
   return {
     board: "traders",
     window: window_label ?? null,
-    capturedAt: captured ? Number(captured) : null,
+    /**
+     * ISO-8601, not the epoch integer this used to be.
+     *
+     * Every other moment this service publishes is an ISO string with an explicit Z, and
+     * `/v1/fields` says so in as many words: "*At / *From / *To / *Since: ISO-8601 with an
+     * explicit Z. Never epoch seconds." This one field contradicted that, on the most-called
+     * route, for a field the consumer's contract marks load-bearing -- "a board with no
+     * captured moment is refused outright".
+     *
+     * `capturedAtEpoch` carries the old integer so nothing that already parses it breaks. It
+     * is the shape that changed, not the meaning, and a consumer gets a version ahead.
+     */
+    capturedAt: captured ? new Date(Number(captured) * 1000).toISOString() : null,
+    /** @deprecated The epoch form. Read `capturedAt`; this is here so old parsers survive. */
+    capturedAtEpoch: captured ? Number(captured) : null,
     count: page.length,
     ...(include.length
       ? {
@@ -2598,11 +2620,52 @@ function buysFrom(swaps: Swap[]): Map<string, Buy[]> {
  * identical by construction rather than by test.
  */
 // deno-lint-ignore no-explicit-any
+/**
+ * THE BALANCE A TRADER STARTED EACH MONTH WITH — the denominator a monthly return needs.
+ *
+ * Every month has arrived in dollars with `startCapitalUsd` empty, and the consumer's fourth
+ * verdict test is written as a percentage: did he survive a bad month, losing less than a
+ * fifth. With no starting balance there is no denominator, so that test was unanswerable for
+ * every trader in the directory and the top verdict was unreachable for all of them.
+ *
+ * It is answerable now because the sampler runs. `aum_samples` holds a priced reading per
+ * trader per hour, so the balance entering a month is simply the first one the month has.
+ *
+ * ONLY WHEN THE READING IS ACTUALLY NEAR THE START. A reading taken on the 20th is not what
+ * he began the month with, and dividing by it would produce a percentage that looks measured
+ * and is not. Seven days is the bound; past that the month keeps a null and says why, which
+ * is the same discipline every other figure here follows.
+ */
+const START_CAPITAL_WINDOW_DAYS = 7;
+
+async function monthStartCapital(handles: string[]): Promise<Map<string, Map<string, number>>> {
+  const out = new Map<string, Map<string, number>>();
+  if (!handles.length) return out;
+  const rows = await sql`
+    select distinct on (handle, month)
+           handle,
+           to_char(date_trunc('month', at at time zone 'utc'), 'YYYY-MM') as month,
+           total_usd,
+           extract(day from (at at time zone 'utc'))::int as day_of_month
+    from aum_samples
+    where handle = any(${handles}) and total_usd is not null
+    order by handle, month, at asc`;
+  for (const r of rows) {
+    if (Number(r.day_of_month) > START_CAPITAL_WINDOW_DAYS) continue;
+    const h = String(r.handle);
+    let m = out.get(h); if (!m) out.set(h, m = new Map());
+    m.set(String(r.month), Number(r.total_usd));
+  }
+  return out;
+}
+
 async function scorecardBody(
   t: any, rows: any[], tokenLimit: number | null,
   chain?: { entries: Map<string, number>; exits: number[] },
   feeWindows?: FeeWindows | null,
   buys?: Map<string, Buy[]> | null,
+  /** month (YYYY-MM) -> the balance he entered it with. See monthStartCapital(). */
+  startCapital?: Map<string, number> | null,
 ) {
   const chainEntry = chain?.entries ?? new Map<string, number>();
   const chainExits = chain?.exits ?? [];
@@ -3235,10 +3298,22 @@ async function scorecardBody(
        * computed against a balance we did not measure would be a guess wearing a number.
        * Read `realizedUsd` against `/aum` for the months the history covers.
        */
-      startingCapitalUsd: null,
+      startingCapitalUsd: round(startCapital?.get(month) ?? null),
       /** The contract's spelling of the same field. One value, two names, never two answers. */
-      startCapitalUsd: null,
-      returnPct: null,
+      startCapitalUsd: round(startCapital?.get(month) ?? null),
+      /**
+       * The month's realised profit as a share of what he began it with.
+       *
+       * This is the figure the consumer's fourth verdict test reads -- "worst month lost less
+       * than a fifth" -- and it has been null for every trader because the denominator was.
+       * Null still, wherever the balance is: a percentage against a capital figure we did not
+       * measure would be a guess wearing a number.
+       */
+      returnPct: (() => {
+        const cap = startCapital?.get(month) ?? null;
+        if (cap === null || !(cap > 0) || v.withFigure === 0) return null;
+        return Number(((v.realizedUsd / cap) * 100).toFixed(2));
+      })(),
     }));
 
   /*
@@ -3757,7 +3832,29 @@ async function scorecardBody(
       };
     })(),
     tokensTotal: byToken.length,
-    byToken: tokenLimit === null ? byToken : byToken.slice(0, tokenLimit),
+    /**
+     * The same count under the name the consumer's verdict test actually reads.
+     *
+     * Their "real record" test is `topTradeShare` plus at least 30 coins, and it reads
+     * `coinsTotal`. We published it only as `tokensTotal` and inside `buysCoverage`, so the
+     * test looked at the top level, found nothing, and evaluated a threshold against
+     * undefined. One coin, one token, one name on each side.
+     */
+    coinsTotal: byToken.length,
+    /**
+     * OMITTED, NOT EMPTIED, when the caller asked for no coins.
+     *
+     * The bulk route passes `tokenLimit: 0` because a page of fifty traders carrying every
+     * coin each is a payload nobody asked for. `slice(0, 0)` made that an EMPTY ARRAY, which
+     * is a different statement: `byToken: []` beside `tokensTotal: 390` reads as "this trader
+     * has no coins", and the consumer's own rule says an absent list means "we did not say"
+     * and an empty one means "there are none". We were asserting the wrong one.
+     *
+     * So at zero the key does not appear at all, and `tokensTotal` still says how many exist.
+     */
+    ...(tokenLimit === 0
+      ? {}
+      : { byToken: tokenLimit === null ? byToken : byToken.slice(0, tokenLimit) }),
     plain, caveats,
   };
 }
@@ -3783,10 +3880,11 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
 
   const swaps = swapBy.get(h) ?? [];
   const entries = chainEntriesFrom(swaps);
+  const startCap = (await monthStartCapital([h])).get(h) ?? null;
   return await scorecardBody(t, rows, intParam(url, "tokens", { min: 0, fallback: null }), {
     entries,
     exits: chainExitsFrom(swaps, entries),
-  }, feeBy.get(h) ?? null, buysFrom(swaps));
+  }, feeBy.get(h) ?? null, buysFrom(swaps), startCap);
 });
 
 // ------------------------------------------------------------ K5-K8 (SQL)
@@ -4654,6 +4752,25 @@ function buildAum(
     coverage: {
       pricedPositions: r.priced_positions === null ? null : Number(r.priced_positions),
       totalPositions: r.total_positions === null ? null : Number(r.total_positions),
+      /**
+       * `valueShare` IS NOT A SHARE OF VALUE, and the name has misled for long enough.
+       *
+       * It is `pricedPositions ÷ totalPositions` -- a COUNT. Measured on poopinyourhands:
+       * 18 priced of 20 positions, valueShare 0.9, and 18÷20 = 0.9 exactly. The consumer
+       * caught this and is right: a trader whose one real holding is fully priced but who
+       * carries sixteen dust positions reads as thin and gets refused by a floor built on
+       * this number, when by value we have priced essentially everything he owns.
+       *
+       * A TRUE share of value cannot be computed and never could: the unpriced positions are
+       * unpriced, so their value is unknown by definition. Pretending otherwise would be a
+       * worse answer than a badly named one.
+       *
+       * So the field is named honestly alongside, and the old name keeps working. Read
+       * `pricedPositionShare`; `valueShare` is the same number under a name that lies about
+       * what it counts.
+       */
+      pricedPositionShare: n(r.value_share),
+      /** @deprecated A count ratio, not a share of value. Read `pricedPositionShare`. */
       valueShare: n(r.value_share),
       /*
        * HOW MUCH OF HIM THIS DAY IS, per point rather than per response.
@@ -5034,9 +5151,47 @@ function buildAum(
   }
 
   /** Gaps are returned, never smoothed over. A chart breaks its line at each of these. */
+  /*
+   * EACH GAP CARRIES THE SPAN IT COVERS, not just the moment it sits at.
+   *
+   * `at` alone says where the hole is; `from`/`to` say how wide. A consumer drawing a broken
+   * line needs the width -- it is the difference between a dot and a segment -- and the
+   * consumer's own field contract asks for all three: "Each carries at, from, to, reason."
+   *
+   * The span is the bucket this point occupies: from its own moment to the next point's, or
+   * to the end of the window when it is the last. Consecutive refusals therefore describe a
+   * continuous hole rather than a row of unconnected dots.
+   */
   const gaps = points
-    .filter((p) => p.totalUsd === null)
-    .map((p) => ({ at: p.at, reason: (p as { refused?: string }).refused ?? "no_prices" }));
+    .map((p, i) => ({ p, next: points[i + 1] }))
+    .filter(({ p }) =>
+      p.totalUsd === null &&
+      /*
+       * A REFUSED ANCHOR IS NOT A GAP IN THIS WINDOW.
+       *
+       * The anchor is a reading borrowed from BEFORE the window so a short chart has a
+       * baseline; it is served and flagged `outsideWindow`. When it happens to be refused it
+       * was also landing in `gaps[]`, dated before `from` — and a consumer walking gaps to
+       * draw holes inside the window got one outside it, which is both wrong and a violation
+       * of the stated `every gap falls inside from..to`. Four answers did this.
+       *
+       * The point itself still carries its `refused` word, so nothing is hidden; it simply is
+       * not described as a hole in a window it was never part of.
+       */
+      !(p as { outsideWindow?: boolean }).outsideWindow)
+    .map(({ p, next }) => ({
+      at: p.at,
+      from: p.at,
+      /**
+       * The next reading's moment, or this point's own when it is the last.
+       *
+       * NOT the window's end, which is computed from the clock: that made the final gap's
+       * span widen by a few milliseconds on every request, so two reads seconds apart
+       * disagreed about a hole that had not moved.
+       */
+      to: next?.at ?? p.at,
+      reason: (p as { refused?: string }).refused ?? "no_prices",
+    }));
 
   /*
    * How much of the trader the newest point could see, in wallets and chains. A chain we
@@ -5059,7 +5214,21 @@ function buildAum(
 
   const answeredNets = new Set(
     chainRows.filter((r) => r.total_usd !== null).map((r) => Number(r.network_id)));
-  const totalWallets = (presence?.on_evm ? 1 : 0) + (presence?.on_solana ? 1 : 0);
+  /*
+   * TOTAL WALLETS FROM THE SAME UNION AS THE CHAINS, for the reason `totalChains` above moved.
+   *
+   * `presence` counts wallet families the trader holds something on RIGHT NOW. `answeredNets`
+   * counts families that produced a reading, and a trader who has sold out of a family still
+   * has readings there — so answered exceeded total for gmgn_0xc91063fd on all four windows,
+   * which is a coverage ratio above 1 and therefore not a coverage ratio.
+   *
+   * `knownChains` already unions presence, holdings and chain samples, so the families it
+   * names are the honest denominator. Falls back to the old count when it was not fetched.
+   */
+  const totalWallets = opts.knownChains?.length
+    ? (opts.knownChains.some((c) => Number(c.networkId) !== SOLANA_NET) ? 1 : 0) +
+      (opts.knownChains.some((c) => Number(c.networkId) === SOLANA_NET) ? 1 : 0)
+    : (presence?.on_evm ? 1 : 0) + (presence?.on_solana ? 1 : 0);
   const answeredWallets =
     ([...answeredNets].some((x) => x !== SOLANA_NET) ? 1 : 0) +
     (answeredNets.has(SOLANA_NET) ? 1 : 0);
@@ -5251,6 +5420,9 @@ function buildAum(
         coverage: {
           pricedPositions: newest.priced_positions === null ? null : Number(newest.priced_positions),
           totalPositions: newest.total_positions === null ? null : Number(newest.total_positions),
+          /** A count ratio. See points[].coverage.pricedPositionShare for why. */
+          pricedPositionShare: n(newest.value_share),
+          /** @deprecated A count ratio, not a share of value. Read `pricedPositionShare`. */
           valueShare: n(newest.value_share),
           chainsAnswered: newest.chains_answered === null ? null : Number(newest.chains_answered),
           chainsTotal: newest.chains_expected === null ? null : Number(newest.chains_expected),
@@ -5389,7 +5561,14 @@ function buildAum(
         chain: r.chain as string,
         networkId: Number(r.network_id),
         totalUsd: usd,
-        pricedShare: n(r.priced_share),
+        /**
+       * Also a COUNT ratio, not a share of value -- the same fault as `valueShare` above, and
+       * the consumer's own note names both. `pricedPositionShare` is the honest name; this
+       * stays so nothing that reads it breaks.
+       */
+      pricedPositionShare: n(r.priced_share),
+      /** @deprecated A count ratio, not a share of value. Read `pricedPositionShare`. */
+      pricedShare: n(r.priced_share),
         /**
          * The same dollars in the chain's own coin. `nativeAmount` is `totalUsd / nativeUsd`
          * and nothing more, and the rate travels with it so the division can be rechecked.
@@ -6456,37 +6635,54 @@ post("/v1/traders/aum", async (_p, _url, body) => {
       select handle, id from traders where handle = any(${handles})`;
     const idBy = new Map(idRows.map((r) => [String(r.handle), r.id ? String(r.id) : null]));
 
+    const rowsOut = requested.map((req, i) => {
+      const h = handles[i];
+      const aum = envelopes.get(h);
+      if (!aum) {
+        return {
+          ok: false as const,
+          requested: req,
+          id: null,
+          handle: null,
+          error: { code: "not_found", detail: `no trader '${req}' in the directory` },
+        };
+      }
+      return {
+        ok: true as const,
+        requested: req,
+        id: idBy.get(h) ?? null,
+        handle: aum.handle,
+        aum,
+      };
+    });
+
     return {
       contractVersion: 2,
       ...batchEnvelope(asked, capped, batchAsOf),
       window: windowKey,
       /** Null when the batch asked for the whole portfolio; a name when it named a chain. */
       chain: chainFilter ? chainFilter.name : null,
+      /**
+       * THE IDS WE COULD NOT ANSWER FOR, gathered under the name the consumer looks for.
+       *
+       * Every asked id has always appeared in `traders[]` -- a failure as an `ok: false` row
+       * carrying its own error, which is what stops a dropped row looking like a trader with
+       * no data. But their contract reads `unreadableRows[]`, and a consumer checking that key
+       * found nothing and concluded every id had answered.
+       *
+       * Same rows, listed twice on purpose: `traders[]` keeps one entry per requested id in
+       * the order asked, and this is the subset that failed. Empty is the healthy state.
+       */
+      unreadableRows: rowsOut.filter((r) => !r.ok).map((r) => ({
+        requested: r.requested,
+        error: (r as { error?: unknown }).error,
+      })),
       /*
        * EXACTLY ONE ROW PER REQUESTED ID, INCLUDING THE ONES THAT FAILED. An omitted row is
        * indistinguishable from a trader with no data, so an id we could not resolve comes
        * back as an explicit refusal rather than a hole in the list.
        */
-      traders: requested.map((req, i) => {
-        const h = handles[i];
-        const aum = envelopes.get(h);
-        if (!aum) {
-          return {
-            ok: false as const,
-            requested: req,
-            id: null,
-            handle: null,
-            error: { code: "not_found", detail: `no trader '${req}' in the directory` },
-          };
-        }
-        return {
-          ok: true as const,
-          requested: req,
-          id: idBy.get(h) ?? null,
-          handle: aum.handle,
-          aum,
-        };
-      }),
+      traders: rowsOut,
     };
   }
 
@@ -6591,6 +6787,7 @@ get("/v1/fields", async () => {
                                  "no_prices", "wallet_unreadable"],
         "aum.gaps[].reason": ["too_little_priced", "nothing_answered", "chains_unrebuildable",
                               "no_prices", "wallet_unreadable"],
+        /* gaps[] now carries `from` and `to` as well as `at` — the span, not just the moment. */
         "aum.breaks[].reason": ["chains_changed", "method_changed", "priced_share_changed",
                                 "method_and_chains_changed", "method_and_priced_share_changed",
                                 "chains_and_priced_share_changed",
@@ -6641,6 +6838,10 @@ get("/v1/fields", async () => {
       "*Usd": "United States dollars, as a number. Never cents, never a string",
       "*Native": "the chain's own coin, exact, at full precision",
       "*Share": "a ratio from 0 to 1 inclusive. Never a percentage",
+      "pricedPositionShare": "priced positions divided by total positions, 0 to 1 — a COUNT " +
+        "ratio, not a share of value. The value of an unpriced position is unknowable, so no " +
+        "true value share exists. `valueShare` and `pricedShare` are the same number under " +
+        "older names that misdescribe it",
       "winRate": "a ratio from 0 to 1 inclusive",
       "*Pct": "a percentage from 0 to 100. The only quantities on that scale",
       "*Ms": "milliseconds, integer",
