@@ -961,8 +961,26 @@ mechanical `Deno.env.get` → `env` change across 26 call sites plus threading `
 `routes.ts`.
 
 **Phase status (17 Sep 2026):** Phase 3 done — `worker/` builds, `/webhook` is ported (not
-deployed: no credentials yet, Hyperdrive id is a placeholder). Phases 1, 2, 4 and 5 not started:
+deployed: no credentials yet, Hyperdrive id is a placeholder). Phases 1, 4 and 5 not started:
 `/sample` and `/v1/*` answer 501.
+
+The pre-migration fixes (`TO-DO-BEFORE-MIGRATION.md` P0 items 1–8, P1 items 9–15, and R4 / R6
+from P2) are all merged on `Junaid-deve-starts` and not deployed. They change `aum-sample`,
+both `chain_reads` twins and the `api` routes, and publish vocabulary v4. Two consequences for
+this plan:
+
+- **Phase 2 is no longer "run twice, expect an empty diff".** Production still runs the
+  pre-fix code (`main`), and the branch serves different figures on purpose — refused
+  readings served as partial, native ETH/BNB priced, `price_suspect` and `no_tokens_known`
+  where `$0` and a verified $101B used to be. Capture the baseline **from `main`** (what
+  production answers today), capture again from the branch once it is deployed, and read
+  that diff as the list of intended behaviour changes — every difference must trace to a
+  row of the to-do's tracking table, and anything that does not is a regression. The
+  post-fix capture is then the baseline Phase 6 diffs the Worker against. The
+  determinism check (two runs of the same deployment, empty diff) still applies to each side.
+- **Phase 4 ports the corrected sampler.** `aum-sample/index.ts` and `_shared/chain_reads.ts`
+  on the branch are the files to port; porting `main`'s copy would carry the $0-native and
+  whole-trader-refusal defects into the Worker and require fixing them twice.
 
 Option B adds four to eight weeks for the SQL rewrite, and should be scheduled as its own
 project with the acceptance suite as the gate.
