@@ -352,15 +352,24 @@ document it in `PARAMETER_ROUTES.md` as the unbucketed form.
 
 ## Where this touches the migration
 
-- P0 items 1–4 change `aum-sample/index.ts` and both `chain_reads` twins. Land them and
-  deploy on Supabase **before** porting the sampler (`CLOUDFLARE_MIGRATION.md` §15 phase 4),
-  then port the corrected file once.
-- Items 5–8, 12, 13 and 15 change `routes.ts` only. They are safe to land before the
-  `Ctx` threading of the port; do them first so the mechanical edit is done once on the
-  final logic.
-- After P0: re-run `scripts/acceptance_capture.sh` twice against Supabase with both the
-  five acceptance traders and the defect list above, diff, and keep those captures as the
-  migration baseline. `Field_Contracts.md` count goes up by the number of new words.
+Status 17 Sep 2026: P0 (items 1–8), P1 (items 9–15) and R4 / R6 from the P2 table are all
+merged on `Junaid-deve-starts` and **not deployed**; production (`main`) still serves the
+pre-fix behaviour. Vocabulary is at version 4.
+
+- Items 1–4 changed `aum-sample/index.ts` and both `chain_reads` twins on the branch. Deploy
+  them on Supabase **before** porting the sampler (`CLOUDFLARE_MIGRATION.md` §15 phase 4),
+  and port the branch's copy, not `main`'s, so the corrected file is ported once.
+- Items 5–15 changed the `api` routes (`routes/*.ts`, `shared/*.ts`) only, before the `Ctx`
+  threading of the port, so the mechanical edit lands once on the final logic.
+- **The migration baseline is now a `main`-versus-branch diff, not an empty one.** Run
+  `scripts/acceptance_capture.sh` against production (`main`, pre-fix) with both the five
+  acceptance traders and the defect list above; run it again against the branch once
+  deployed (post-fix). That diff is expected to be non-empty, and every difference must
+  trace to a row of the tracking table below — a served partial where a refusal was, a
+  priced native coin, `price_suspect` / `no_tokens_known` where `$0` was. Anything that does
+  not trace is a regression. The post-fix capture is the baseline the Worker is diffed
+  against (§15 phase 6). `Field_Contracts.md` carries the new words in its two "Added 17 Sep
+  2026" sections.
 
 ## Tracking
 
