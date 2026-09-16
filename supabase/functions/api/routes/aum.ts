@@ -495,7 +495,10 @@ function buildAum(
     ? null
     : (to.getTime() - lastSuccess.getTime()) / 3_600_000;
 
-  const samplerState = ownAgeH === null
+  /** F3. No row at all is its own word: nothing is filling, nothing was refused. */
+  const samplerState = rows.length === 0
+    ? "never_read"
+    : ownAgeH === null
     ? "warming"
     : (ownAgeH > STALE_AFTER_H ? "stale" : "current");
 
@@ -509,7 +512,7 @@ function buildAum(
     staleAfterHours: STALE_AFTER_H,
     reason: samplerState === "stale"
       ? `this trader's newest reading is ${ownAgeH!.toFixed(1)}h old — it is true, but old`
-      : null,
+      : (samplerState === "never_read" ? "the sampler has never covered this trader" : null),
     /**
      * The pipeline's own clock, for telling "my reading is old" from "the job has stopped".
      * A fresh `pipelineLastSuccessAt` beside a stale `state` means the sampler ran and did
