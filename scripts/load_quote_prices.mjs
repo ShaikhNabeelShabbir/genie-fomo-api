@@ -136,7 +136,9 @@ async function main() {
            on t.network_id = q.network_id and t.token_key = q.token_key and t.tx_type = 'SWAP'
         where q.pegged_usd is null
         group by 1,2,3
-        ${ALL ? "" : "having count(t.*) > 0"}
+        -- The chain's own coin is always priced: a wallet holds it without ever swapping it.
+        ${ALL ? "" : `having count(t.*) > 0 or exists (select 1 from chains c
+                       where c.network_id = q.network_id and upper(c.native_symbol) = upper(q.symbol))`}
         order by swap_rows desc`,
     );
 
