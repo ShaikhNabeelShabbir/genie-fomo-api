@@ -2150,6 +2150,13 @@ the label is a floor and `observedStepMs` carries the truth.
 { "step": "1d", "bucketMs": 3600000, "observedStepMs": 302400000, "stepUnderstated": true }
 ```
 
+**`?step=1h` is the unbucketed form of `window=1w`.** The week's default 6 h buckets keep the
+last reading per bucket, so a same-day retry replaces the reading it retried and the earlier
+one is not shown. Ask `?window=1w&step=1h` and every reading in the week comes back
+(verified 16 Sep: readings are never closer than an hour, so the 1 h bucket holds one each);
+`count` rises to the number held and `bucketMs` reads `3600000`. Use it to see a retry
+beside the reading it replaced; use the default when a chart only needs the shape.
+
 ### One chain at a time — `?chain=`
 
 ```bash
