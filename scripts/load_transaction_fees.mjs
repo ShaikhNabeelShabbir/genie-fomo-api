@@ -58,6 +58,8 @@ const LIMIT = Number(opt("limit", "0")) || 0;
 const BATCH = Number(opt("batch", "100")) || 100;
 /** Narrow to one directory's traders, e.g. `--source=gmgn`. Omitted means every transaction. */
 const SOURCE = opt("source");
+/** Scope to traders that have no fee rows yet, whichever directory they came from. */
+const NEEDS_FEES = flag("needs-fees");
 
 const db = new pg.Client({ connectionString: DB, ssl: { rejectUnauthorized: false } });
 await db.connect();
@@ -98,12 +100,22 @@ async function pending(net, limit) {
    * index that already exists.
    */
   let addrs = null;
-  if (SOURCE) {
+  if (SOURCE || NEEDS_FEES) {
+    /*
+     * `--needs-fees` scopes to the traders who have NO fee rows at all, whichever directory
+     * they came from. `--source` scopes by directory. The first is the one to reach for when
+     * closing a gap: it targets exactly the traders whose scorecards still answer
+     * `not_yet_calculated`, and it shrinks on its own as they fill.
+     */
     const { rows: a } = await db.query(
       `select lower(x.addr) as addr
        from traders t join wallets w on w.handle = t.handle,
        lateral (values (w.evm_address_key), (lower(w.sol_address))) x(addr)
-       where t.source = $1 and x.addr is not null`, [SOURCE]);
+       where x.addr is not null
+         and ($1::text is null or t.source = $1)
+         and ($2::bool is false
+              or not exists (select 1 from trader_fees_daily f where f.handle = t.handle))`,
+      [SOURCE, NEEDS_FEES]);
     addrs = [...new Set(a.map((r) => r.addr))];
     if (!addrs.length) return [];
   }

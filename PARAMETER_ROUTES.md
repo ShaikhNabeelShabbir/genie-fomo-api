@@ -157,6 +157,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 448
 | **A8** | [The buys themselves, and version 8 closed](#appendix-a8-the-buys-themselves-and-version-8-closed-2026-09-14) | 19 of 19 |
 | **A9** | [The version 9 report — A1, A2, A3 re-tested](#appendix-a9-the-version-9-report-a1-a2-a3-re-tested-2026-09-15) | measured on all 448 |
 | **A10** | [Trades on four chains, and a directory that refreshes](#appendix-a10-trades-on-four-chains-and-a-directory-that-refreshes-2026-09-15) | two selectors, one decoder |
+| **A11** | [Fees, swaps and entry prices](#appendix-a11-fees-swaps-and-entry-prices-2026-09-16) | the last three, with coverage |
 | **A** | [What the bug report found, and what changed](#appendix-a-what-the-bug-report-found-and-what-changed) | all 10 fixes |
 | **B** | [Where each figure comes from](#appendix-b-where-each-figure-comes-from) | `reported` / `verified` / `third_party` |
 ---
@@ -2850,6 +2851,43 @@ curl -sD - -o /dev/null -X POST "$B/traders/aum" -H 'content-type: application/j
 
 ---
 
+## Appendix A11 · Fees, swaps and entry prices (2026-09-16)
+
+The last three asks from the version 9 list, and what each one answers today.
+
+| | what it does | coverage |
+| --- | --- | --- |
+| **A7** · fees | every transaction's cost read from chain — `gas_used x effective_gas_price` on the four Ethereum-style chains, `meta.fee` on Solana — rolled into per-trader daily buckets and served per window and per trade | **402 of 448** traders · 105,966 transactions priced |
+| **A5** · buys and sells | each swap resolved from the wallet's own net balance change, then FIFO-paired so a sell carries the buy it closed: `positionId`, `openedAt`, `closedAt`, `holdSeconds` | **28,300** swaps · **352** wallets · 10,733 carrying a dollar value |
+| **A4** · entry prices | the directory's figure where it has one, and a price derived from the wallet's own resolved buys where it does not — `entryPriceSource` names which | **57,339 of 75,010** coins priced |
+
+### Why each figure is a coverage figure and not a total
+
+**A trader with no stored transactions has no fee to read.** That is the whole of the 46 not
+counted above: nothing was skipped, there was nothing to price. `fees.coverage` says so on the
+answer and `fieldReasons.feesUsd` names it.
+
+**A wallet appears in far more transactions than it trades in.** Measured on the resolver's own
+population, roughly 7 in 10 Solana transactions tagged as swaps are the wallet receiving tokens
+inside somebody else's trade. Only a transaction where the wallet's own balance moved in two
+directions is written as its swap — which is why a chain can hold tens of thousands of a
+wallet's transactions and a few hundred of its trades.
+
+**An entry price needs a buy that can be valued.** A swap paid for in a coin we hold no market
+price for resolves correctly and still yields no entry price. `entryPriceSource: "chain"`
+appears only where both conditions hold; where neither source has it, `fieldReasons` says
+`historical_input_missing` rather than leaving a bare null.
+
+### The one number that governs all three
+
+Every figure above is drawn from transactions the service already holds. The limit on all of
+them is the same: **a wallet's own trades are a small share of the transactions it appears in**,
+and a figure is only published where the evidence for it is in hand. That is why each of these
+carries its coverage beside it rather than a total — the same rule the rest of this document
+follows.
+
+---
+
 ## Appendix A10 · Trades on four chains, and a directory that refreshes (2026-09-15)
 
 Three faults, each one a piece of code that could only ever do half its job while reporting
@@ -3101,7 +3139,7 @@ All nineteen asks are answered, verified against the live service:
 | | Asks |
 | --- | --- |
 | **Answered in full** | A1, A2, A3, A5, A6, A8, A9, A10, A11, A12, A13.1, A13.2, A13.3, A13.4, A13.5, A13.6, A13.7 |
-| **Answered to the limit of the data, with coverage stated** | A4 — 2,070 buys across 139 of 448 traders; A7 — fees on four of five chains, native-only on bsc |
+| **Answered, with coverage stated on every answer** | A4 — entry prices on 57,339 of 75,010 coins; A5 — 28,300 resolved swaps across 352 wallets; A7 — fees for 402 of 448 traders |
 
 Nothing here is a partial answer presented as a whole. Every figure that covers part of a trader
 says which part: `buysCoverage`, `fees.coverage`, `costCoverage`, `volumeCoverage`,

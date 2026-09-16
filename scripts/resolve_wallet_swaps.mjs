@@ -116,8 +116,32 @@ function deltas(tx, owner) {
   return out;
 }
 
+/**
+ * ONE CONNECTION HELD FOR HOURS IS ONE CONNECTION THE POOLER WILL EVENTUALLY DROP.
+ *
+ * This run checked out a single client and kept it for the whole pass. Eleven hours is far
+ * longer than a pooled connection is meant to live, and it died at 32,004 of 221,592 with
+ * "Connection terminated unexpectedly" -- the same way the fee loader died earlier.
+ *
+ * `q()` goes through the pool for each statement instead, so a dropped connection costs one
+ * retry rather than the run. The work is resumable by anti-join either way, but losing two
+ * and a half hours of progress to a socket is avoidable, and re-running it wastes the RPC
+ * calls already spent.
+ */
+const nap2 = (ms) => new Promise((r) => setTimeout(r, ms));
+async function q(text, params, tries = 4) {
+  for (let i = 1; ; i++) {
+    try { return await pool.query(text, params); }
+    catch (e) {
+      const retryable = /terminated|ECONNRESET|timeout|EPIPE|Connection/i.test(String(e?.message));
+      if (!retryable || i >= tries) throw e;
+      await nap2(Math.min(1000 * 2 ** (i - 1), 10_000));
+    }
+  }
+}
+
 async function main() {
-  const c = await pool.connect();
+  const c = { query: q };
   try {
     const { rows: quotes } = await c.query(
       `select token_key, pegged_usd from quote_assets where network_id = $1`, [SOLANA],
@@ -242,7 +266,6 @@ async function main() {
       `\n       ${stored} stored · ${priced} valued in USD · ${failed} rpc failures`,
     );
   } finally {
-    c.release();
     await pool.end();
   }
 }

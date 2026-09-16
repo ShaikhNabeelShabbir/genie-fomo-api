@@ -194,6 +194,25 @@ get("/v1/chains", async () => {
   return {
     board: "chains",
     asOf: await asOfHoldings(),
+    /**
+     * THE CHAIN VOCABULARY IS CLOSED, AND SAYS SO.
+     *
+     * Chain words are this service's own -- a consumer takes them off this block and asks
+     * with them verbatim, because a word they invented is a read spent on nothing. That only
+     * works if the set is known to be complete: today there are five words, each with exactly
+     * one network id and no collisions, but nothing said whether a sixth was a new chain or a
+     * typo. `closed: true` means this list is the whole set; `vocabularyVersion` changes when
+     * a word is added or retired, so a diff is a release note rather than a surprise.
+     *
+     * A word is never renamed in place. A rename is a retirement and an addition.
+     */
+    vocabulary: {
+      closed: true,
+      version: 1,
+      words: rows.map((r) => String(r.name)).sort(),
+      note: "one word per network id, one network id per word. Ask with these verbatim; " +
+            "a word not in this list is not a chain this service indexes",
+    },
     traders: Number(traderCount),
     totalPositions: Number(total),
     count: rows.length,
@@ -3311,6 +3330,30 @@ async function scorecardBody(
       return d.toISOString();
     })(),
     /**
+     * A VERDICT ON THIS RECORD'S AGE, not just the date it was loaded.
+     *
+     * `loadedAt` and `nextLoadAt` were both already here and a consumer could in principle
+     * subtract one from the clock. Nobody did. Measured across the directory: the oldest
+     * scorecard was 208 hours old and sixteen were past 72, every one of them served without
+     * qualification beside a live balance -- which reads as one moment's truth and is not.
+     *
+     * The allowance matches the one /health judges scorecards by, so the two cannot disagree
+     * about which traders are stale. `never` is not `stale`: a record that has never loaded
+     * has a different cause and a different fix.
+     */
+    staleness: (() => {
+      const t = loadedAtIso ? Date.parse(loadedAtIso) : NaN;
+      const ageSeconds = Number.isFinite(t) ? Math.max(0, Math.round((Date.now() - t) / 1000)) : null;
+      const staleAfterHours = 72;
+      return {
+        state: ageSeconds === null
+          ? "never"
+          : (ageSeconds > staleAfterHours * 3600 ? "stale" : "current"),
+        ageSeconds,
+        staleAfterHours,
+      };
+    })(),
+    /**
      * FEES, ANSWERED HONESTLY RATHER THAN ASSUMED EITHER WAY.
      *
      * The profile's headline says "made, after fees". Nothing here is after fees, and saying
@@ -3374,6 +3417,24 @@ async function scorecardBody(
       perWindow: "see windows[].volumeUsd and windows[].volumeCoverage",
     },
     winRate, wins, losses, breakeven,
+    /**
+     * WHAT `winRate` IS A RATE OF — named, not left to be inferred.
+     *
+     * The denominator is NOT `closedTrades`. It is the closed positions that carry a
+     * realized figure, and for 61 traders those are different numbers: 702 closed positions
+     * across the directory have a null `realized_pnl_usd`. They are counted by
+     * `windows[].closedTrades` and excluded from `wins`, `losses` and from this rate.
+     *
+     * That gap is not small where it exists. One trader serves 0.6222 here and 0.4308 over
+     * his closed trades; thirteen traders sit on opposite sides of a 30% copy floor
+     * depending on which denominator is used. Both figures are defensible and only one of
+     * them is on the page, so the page has to be able to say which.
+     *
+     * `winRateCoverage.of` is this rate's denominator; `.total` is `closedTrades`. Equal for
+     * the 387 traders whose record is complete, and visibly unequal for the 61 where it is not.
+     */
+    winRateBasis: "closed_positions_with_realized_figure",
+    winRateCoverage: cov(realized.length, closed.length),
     bestTradeUsd: round(best), worstTradeUsd: round(worst),
     topTradeShare, meanToMedian,
     meanTradeUsd: round(meanTrade), medianTradeUsd: round(medTrade),
@@ -3450,6 +3511,35 @@ async function scorecardBody(
       }
       if (bet.value === null) why.typicalBetUsd = "historical_input_missing";
       if (spanDays === null) why.trackRecordDays = "historical_input_missing";
+      /*
+       * THE SPREAD FIGURES, which go null for two different reasons and said neither.
+       *
+       * `worstTradeUsd` and `medianTradeUsd` are null when no closed position carries a
+       * realized figure -- the same population `winRateBasis` names. `topTradeShare` has its
+       * own cause: it is the best trade over GROSS GAINS, so a trader whose every closed trade
+       * lost money has no denominator and the share is not a number. Serving 0 there would
+       * read as "none of his profit came from one trade" about a man with no profit.
+       *
+       * Eight absences across the directory carried no reason before this. Small, and exactly
+       * the class of hole the six axes are drawn from.
+       */
+      if (worst === null) {
+        why.worstTradeUsd = noClosed ? "not_applicable" : "no_realized_figure";
+      }
+      if (medTrade === null) {
+        why.medianTradeUsd = noClosed ? "not_applicable" : "no_realized_figure";
+      }
+      if (topTradeShare === null) {
+        why.topTradeShare = noClosed
+          ? "not_applicable"
+          : (realized.length === 0 ? "no_realized_figure" : "no_winning_trade");
+      }
+      if (best === null) {
+        why.bestTradeUsd = noClosed ? "not_applicable" : "no_realized_figure";
+      }
+      if (meanToMedian === null && realized.length > 0) {
+        why.meanToMedian = "sign_discipline_not_both_positive";
+      }
       /* Only when no fee has been read for this trader yet -- it is now a loadable fact. */
       if (!fw || fw.chainsPriced === 0) why.feesUsd = "not_yet_calculated";
       why.startCapitalUsd = "historical_input_missing";
@@ -4343,8 +4433,25 @@ function buildAum(
    * 0.20 halves the residual for the cost of eight traders. Of the 158 that remain, 66 have
    * both sides pricing over half the wallet -- those are most likely real moves, and marking
    * them would be a false alarm rather than a fix.
+   *
+   * RAISED TO 0.25 for the v10 acceptance tests, which ask for a quarter rather than a fifth.
+   * Measured at 0.20: 341 points were served as a balance on a value share between 20.0% and
+   * 24.6%, and none below 20%. Those 341 are exactly what this move converts into refusals.
+   *
+   * A MINIMUM PRICED-POSITION COUNT BELONGS HERE TOO, and cannot be added yet.
+   *
+   * Measured on unipcs, 18 August: the whole book was refused at a 0.32% priced share, and so
+   * were robinhood and solana on the same reading. `bsc` was SERVED, at a 50% share, because
+   * bsc held two positions and one of them was priced -- so a consumer summing chains built a
+   * $0.44 chart for a man the service itself refused to price. A share alone cannot catch
+   * that; it needs the count behind the share.
+   *
+   * `aum_chain_samples` does not carry one. The chain query below selects
+   * `null::int as priced_positions` because the column does not exist, so a count-based guard
+   * would silently never fire on exactly the path that needs it. Adding it is a migration
+   * plus a rebuild, not a read-path change.
    */
-  const PRICED_FLOOR = 0.20;
+  const PRICED_FLOOR = 0.25;
   rows = rows.map((r) => {
     const share = n(r.value_share);
     if (n(r.total_usd) === null || share === null || share >= PRICED_FLOOR) return r;
@@ -4734,8 +4841,26 @@ function buildAum(
   const firstAt = points.length ? Date.parse(points[0].at) : null;
   const lastAt  = points.length ? Date.parse(points[points.length - 1].at) : null;
   const requestedDays = span === null ? null : Math.round(span / 86_400_000);
-  const coveredDays = firstAt !== null && lastAt !== null
-    ? Math.max(0, Math.round((lastAt - firstAt) / 86_400_000))
+  /*
+   * ANCHOR POINTS ARE EXCLUDED FROM `coveredDays`, because they were not asked for.
+   *
+   * A 1d window keeps one real reading from just BEFORE the window so a single-point chart
+   * has something to compare against (see the anchor block above), and marks it
+   * `outsideWindow: true`. Counting it made `coveredDays: 2` against `requestedDays: 1` on
+   * 431 of 448 one-day answers -- a consumer testing the documented
+   * `coveredDays <= requestedDays` relation failed on 96% of them.
+   *
+   * The anchor is still SERVED and still flagged; it is simply not counted as coverage of a
+   * window it sits outside. `reach.anchorPoints` says how many were borrowed, so the
+   * difference between what is drawn and what was requested stays visible.
+   */
+  const inWindowPoints = points.filter((p) => !(p as { outsideWindow?: boolean }).outsideWindow);
+  const anchorPoints = points.length - inWindowPoints.length;
+  const covFirst = inWindowPoints.length ? Date.parse(inWindowPoints[0].at) : firstAt;
+  const covLast = inWindowPoints.length
+    ? Date.parse(inWindowPoints[inWindowPoints.length - 1].at) : lastAt;
+  const coveredDays = covFirst !== null && covLast !== null
+    ? Math.max(0, Math.round((covLast - covFirst) / 86_400_000))
     : 0;
 
   /*
@@ -4850,13 +4975,63 @@ function buildAum(
    * How much of the trader the newest point could see, in wallets and chains. A chain we
    * hold no row for did not contribute zero dollars -- it contributed nothing at all.
    */
-  const totalChains = Number(presence?.chains ?? 0);
+  /*
+   * TOTAL CHAINS COMES FROM THE SAME UNION `knownChains` DOES, not from what is held today.
+   *
+   * `presence` counts `holdings_current where human_amount > 0` -- chains the trader holds
+   * something on RIGHT NOW. `answeredNets` below counts chains that produced a reading. A
+   * trader who has sold out of a chain still has readings there, so answered exceeded total
+   * for twelve traders: RunningClam reported 5 of 4, gundam 4 of 3, 0xkuidian 3 of 2. A
+   * coverage ratio above 1 is not a coverage ratio.
+   *
+   * `opts.knownChains` is already built from the union of wallet_chain_presence,
+   * holdings_current and aum_chain_samples, and is already carried on this envelope, so this
+   * costs no query. Falls back to the old count when it was not fetched.
+   */
+  const totalChains = opts.knownChains?.length ?? Number(presence?.chains ?? 0);
+
   const answeredNets = new Set(
     chainRows.filter((r) => r.total_usd !== null).map((r) => Number(r.network_id)));
   const totalWallets = (presence?.on_evm ? 1 : 0) + (presence?.on_solana ? 1 : 0);
   const answeredWallets =
     ([...answeredNets].some((x) => x !== SOLANA_NET) ? 1 : 0) +
     (answeredNets.has(SOLANA_NET) ? 1 : 0);
+  /*
+   * IS THE NEWEST READING SHORT OF A CHAIN -- asked of the ENVELOPE when the reading cannot say.
+   *
+   * `partial` used to be computed from the reading's own `chains_answered` / `chains_expected`
+   * alone. Those are frequently null, and when they are, only the pricing share is left -- so
+   * an answer missing a whole chain reported `partial: false`. 268 answers did exactly that.
+   * ethersole: `coverage` said 3 chains of 4 and 1 wallet of 2, while `now.partial` said false
+   * and `status` said ready. Two blocks of one answer disagreeing about whether it is complete.
+   *
+   * The envelope's own counts are computed just above and know better, so they are the
+   * fallback. The reading's own numbers still win when it has them -- they describe that
+   * reading, where the envelope describes the trader.
+   */
+  const newestPartial = (() => {
+    const r = newest;
+    if (!r) return { partial: null as boolean | null, reason: null as string | null };
+    const ownCover = cover(r), ownWanted = wanted(r);
+    const hasOwn = ownCover >= 0 && ownWanted >= 0;
+    const chainsShort = hasOwn
+      ? ownCover < ownWanted
+      : (totalChains > 0 && answeredNets.size < totalChains);
+    const share = n(r.value_share);
+    const priceShort = share !== null && share < 1;
+    const known = hasOwn || totalChains > 0 || share !== null;
+    if (!known) return { partial: null as boolean | null, reason: null as string | null };
+    return {
+      partial: chainsShort || priceShort,
+      reason: chainsShort && priceShort
+        ? "chains_missing_and_unpriced_positions"
+        : chainsShort
+        ? "chains_missing"
+        : priceShort
+        ? "unpriced_positions"
+        : null,
+    };
+  })();
 
   const warming = drawable === false && (reason === "warming" || reason === "short_coverage");
   const nextRun = new Date();
@@ -4978,23 +5153,8 @@ function buildAum(
          * True when this figure covers only part of the trader — a missing chain, unpriced
          * positions, or both. `partialReason` names which.
          */
-        partial: (() => {
-          const chainsShort = cover(newest) >= 0 && wanted(newest) >= 0 &&
-            cover(newest) < wanted(newest);
-          const share = n(newest.value_share);
-          const priceShort = share !== null && share < 1;
-          return cover(newest) < 0 && share === null ? null : (chainsShort || priceShort);
-        })(),
-        partialReason: (() => {
-          const chainsShort = cover(newest) >= 0 && wanted(newest) >= 0 &&
-            cover(newest) < wanted(newest);
-          const share = n(newest.value_share);
-          const priceShort = share !== null && share < 1;
-          if (chainsShort && priceShort) return "chains_missing_and_unpriced_positions";
-          if (chainsShort) return "chains_missing";
-          if (priceShort) return "unpriced_positions";
-          return null;
-        })(),
+        partial: newestPartial.partial,
+        partialReason: newestPartial.reason,
         /*
          * ON `now` ITSELF, not only inside `coverage`.
          *
@@ -5019,10 +5179,19 @@ function buildAum(
     /** What the stored data covers, as opposed to what was requested. */
     reach: {
       requestedFrom: from ? from.toISOString() : null,
-      coveredFrom: points.length ? points[0].at : null,
-      coveredTo: points.length ? points[points.length - 1].at : null,
+      /*
+       * The span INSIDE the window. An anchor borrowed from before it is served and flagged,
+       * but reporting it here would contradict `coveredDays`, which excludes it -- a consumer
+       * subtracting these two dates must get the same answer the day count gives.
+       * Falls back to the full range when every point we hold is an anchor.
+       */
+      coveredFrom: (inWindowPoints[0] ?? points[0])?.at ?? null,
+      coveredTo: (inWindowPoints[inWindowPoints.length - 1]
+                  ?? points[points.length - 1])?.at ?? null,
       requestedDays,
       coveredDays,
+      /** Real readings borrowed from before the window so a short chart has a baseline. */
+      anchorPoints,
       complete: reachesBack,
     },
 
@@ -5058,9 +5227,33 @@ function buildAum(
 
     /** When measurement last succeeded, and when it is next due. */
     sampler: samplerBlock,
-    progress: warming
-      ? { coveredDays, targetDays: requestedDays ?? coveredDays, nextRunAt: nextRun.toISOString() }
-      : null,
+    /**
+     * HOW MUCH OF THE ASKED-FOR WINDOW IS ACTUALLY BEHIND THIS ANSWER, always.
+     *
+     * This used to be populated only while `warming`, so every settled answer served null --
+     * and `window=all` therefore said nothing at all about what "all" meant. Measured: the ten
+     * longest records run 1,131 to 1,685 days and `window=all` covers 35 or 36 of them, which
+     * is the full extent of the stored readings rather than any statement about the trader.
+     *
+     * It is not a backfill that is missing. Balance history is rebuilt from stored
+     * transactions, and for those ten traders the earliest transaction held is 5-11 September
+     * -- there is nothing behind that date to rebuild from. So the honest answer is not a
+     * promise that more is coming; it is to say what bounds the series and stop implying the
+     * window covers a career.
+     *
+     * `boundedBy` is the load-bearing field: `window` means the answer covers what was asked,
+     * `history` means the stored readings ran out first.
+     */
+    progress: {
+      coveredDays,
+      targetDays: requestedDays ?? coveredDays,
+      /** Where the readings themselves begin, regardless of the window asked for. */
+      historyStartsAt: trackedSince,
+      boundedBy: requestedDays !== null && coveredDays >= requestedDays ? "window" : "history",
+      /** Only meaningful while filling; null once the series is as long as it will get. */
+      nextRunAt: warming ? nextRun.toISOString() : null,
+      warming,
+    },
 
     gaps,
 
@@ -5739,10 +5932,40 @@ async function batchIds(
       select id, handle from traders where id = any(${bare}::uuid[])`;
     for (const r of found) byId.set(String(r.id).toLowerCase(), String(r.handle));
   }
-  const handles = wanted.map((k) => {
+  let handles = wanted.map((k) => {
     const bare = k.trim().replace(/^trd_/, "").toLowerCase();
     return byId.get(bare) ?? k.trim().toLowerCase();
   });
+
+  /*
+   * THE `display_handle` FALLBACK, which the single routes have had and this one did not.
+   *
+   * resolveTrader() tries the stored handle, then `display_handle`, because for one trader
+   * they differ: `yeon__ (gmgn)` is published under that name and stored as `gmgn_yeon__`.
+   * Lowercasing the published name therefore matched nothing here, so the SAME trader
+   * answered 200 with a full envelope on /traders/:handle/aum and `not_found` in the batch.
+   * One trader of 448, resolvable by id, and the only one whose two routes disagreed about
+   * whether he exists -- which is precisely the failure the batch contract forbids.
+   *
+   * Only the handles that missed are looked up, so the ordinary batch pays nothing: the
+   * query runs at all only when a name did not match a stored handle.
+   */
+  const missed = [...new Set(handles)];
+  if (missed.length) {
+    const known = await sql`
+      select handle from traders where handle = any(${missed})`;
+    const have = new Set(known.map((r) => String(r.handle)));
+    const unknown = missed.filter((h) => !have.has(h));
+    if (unknown.length) {
+      const byDisplay = await sql`
+        select lower(display_handle) as display, handle from traders
+         where lower(display_handle) = any(${unknown})`;
+      if (byDisplay.length) {
+        const dmap = new Map(byDisplay.map((r) => [String(r.display), String(r.handle)]));
+        handles = handles.map((h) => dmap.get(h) ?? h);
+      }
+    }
+  }
 
   const resolved = new Set<string>();
   for (const [i, h] of handles.entries()) {
@@ -5808,7 +6031,17 @@ const batchEnvelope = (asked: number, capped: boolean, asOf: string | null = nul
  */
 post("/v1/traders/positions", async (_p, _url, body) => {
   const { requested, handles, asked, capped } = await batchIds(body);
-  const v2 = Number((body as { contractVersion?: number })?.contractVersion) === 2;
+  /*
+   * THE FULL ENVELOPE IS THE DEFAULT. `contractVersion: 1` opts back into the short shape.
+   *
+   * The short projection omits the per-row `ok` / `requested` / `id` and the explicit
+   * not-found refusal, so an id that could not be resolved is indistinguishable from a trader
+   * with no data. A consumer's bulk pass is the one place that shape does the most damage --
+   * measured on the sibling route, 435 of 435 warmed traders were stored chainless, while the
+   * same trader spot-checked one at a time carried five chains. Defaulting to the complete
+   * answer means a caller has to ASK for the lossy one rather than discover it.
+   */
+  const v2 = Number((body as { contractVersion?: number })?.contractVersion) !== 1;
 
   const rows = await sql`
     select h.handle, ch.name as chain, h.network_id, h.token_key,
@@ -5984,7 +6217,15 @@ post("/v1/traders/aum", async (_p, _url, body) => {
     return at !== null && (best === null || at > best) ? at : best;
   }, null);
 
-  if (Number(b?.contractVersion) === 2) {
+  /*
+   * THE FULL ENVELOPE IS THE DEFAULT here too, for the reason above and one measurement:
+   * without it this route answers a handle, a count, a newest figure and the points, and
+   * nothing else -- no chains, no reach, no status, no drawable decision. Every consumer's
+   * bulk pass uses this route, so that shape became the stored copy of the world.
+   *
+   * `contractVersion: 1` still returns the old projection, unchanged, for anyone parsing it.
+   */
+  if (Number(b?.contractVersion) !== 1) {
     const idRows = await sql`
       select handle, id from traders where handle = any(${handles})`;
     const idBy = new Map(idRows.map((r) => [String(r.handle), r.id ? String(r.id) : null]));
@@ -6046,6 +6287,170 @@ post("/v1/traders/aum", async (_p, _url, body) => {
         })),
       };
     }),
+  };
+});
+
+// ------------------------------------------------------------------ fields
+
+/**
+ * WHAT EVERY FIELD MEANS, WHAT IT CAN SAY, AND HOW OFTEN IT SAYS ANYTHING.
+ *
+ * Three questions a consumer has had to answer by observation, one refusal and one empty
+ * screen at a time:
+ *
+ *   1. Which words can this field hold?  Every enumerated value was discovered the hard way --
+ *      `chains_unrebuildable`, `too_little_priced`, `no_chains_answered` each arrived as an
+ *      unexplained blank on somebody's screen first. Four more break reasons appeared between
+ *      one report and the next. A word nobody published is a word with no sentence behind it.
+ *   2. What unit is this in?  A unit change under a stable name is undetectable and
+ *      catastrophic: every figure stays plausible and every one is wrong by a thousand.
+ *   3. Is this field actually populated?  Every screen built on a field that turned out to be
+ *      mostly empty was built because a spot check of two or three traders showed it filled.
+ *      An entry-size figure good enough to rank on existed for 11 of 144 traders, and that was
+ *      discovered after shipping.
+ *
+ * The fill rates are counted live over the whole directory, not sampled -- 227ms measured, so
+ * it costs about what /health does.
+ */
+get("/v1/fields", async () => {
+  const [f] = await sql`
+    with sc as (
+      select t.handle,
+        count(*) filter (where t.status = 'closed')::int as closed,
+        count(*) filter (where t.status = 'closed' and t.realized_pnl_usd is not null)::int as realized,
+        count(*) filter (where t.avg_entry_price is not null and t.avg_entry_price > 0)::int as entry_px,
+        count(distinct to_char(t.closed_at, 'YYYY-MM')) filter (where t.status = 'closed')::int as months,
+        count(*) filter (where t.status <> 'closed' and t.unrealized_pnl_usd is not null)::int as unreal
+      from trades t group by t.handle),
+    w as (select handle from wallets where evm_address is not null or sol_address is not null),
+    a as (select handle, count(*) filter (where total_usd is not null)::int as pts
+          from aum_samples group by handle)
+    select
+      (select count(*) from traders)::int                                as traders,
+      (select count(*) from w)::int                                      as with_wallet,
+      (select count(*) from sc where closed > 0)::int                    as with_closed,
+      (select count(*) from sc where realized > 0)::int                  as with_realized,
+      (select count(*) from sc where closed > 0 and realized = closed)::int as realized_complete,
+      (select count(*) from sc where entry_px > 0)::int                  as with_entry_px,
+      (select count(*) from sc where entry_px >= 20)::int                as entry_px_20,
+      (select count(*) from sc where months >= 3)::int                   as months_3,
+      (select count(*) from sc where unreal > 0)::int                    as with_unrealized,
+      (select count(*) from a where pts > 0)::int                        as with_reading`;
+
+  const N = Number(f.traders);
+  const rate = (of: unknown, why: string | null = null) => ({
+    of: Number(of), total: N, share: N ? Number((Number(of) / N).toFixed(4)) : null,
+    commonestAbsence: why,
+  });
+
+  return {
+    board: "fields",
+    asOf: new Date().toISOString(),
+    traders: N,
+
+    /**
+     * EVERY ENUMERATED FIELD, AND ITS COMPLETE SET.
+     *
+     * `closed: true` means this is the whole set and a value outside it is a bug, not a new
+     * feature. Adding a word bumps `version` and is a release note.
+     */
+    vocabulary: {
+      closed: true,
+      version: 1,
+      fields: {
+        "aum.status": ["ready", "warming", "stale", "no_reading"],
+        "aum.points[].basis": ["sampled", "rebuilt"],
+        "aum.points[].tier": ["verified", "reported"],
+        "aum.points[].refused": ["too_little_priced", "nothing_answered", "chains_unrebuildable",
+                                 "no_prices", "wallet_unreadable"],
+        "aum.gaps[].reason": ["too_little_priced", "nothing_answered", "chains_unrebuildable",
+                              "no_prices", "wallet_unreadable"],
+        "aum.breaks[].reason": ["chains_changed", "method_changed", "priced_share_changed",
+                                "method_and_chains_changed", "method_and_priced_share_changed",
+                                "chains_and_priced_share_changed",
+                                "method_and_chains_and_priced_share_changed"],
+        "aum.drawing.reason": ["too_few_points", "nothing_answered", "warming", "short_coverage"],
+        "aum.chains[].reason": ["no_prices"],
+        /* `none` is a chain we know he uses and hold no balance history for at all. */
+        "aum.knownChains[].historyState": ["ready", "warming", "none"],
+        "aum.sampler.state": ["current", "stale", "warming"],
+        "aum.coverage.partialReason": ["chains_missing", "unpriced_positions",
+                                       "chains_missing_and_unpriced_positions"],
+        "aum.progress.boundedBy": ["window", "history"],
+        "aum.comparability.reason": ["coverage_differs_by_method"],
+        "scorecard.winRateBasis": ["closed_positions_with_realized_figure"],
+        /* Why a named figure is null. `not_applicable` means the question does not arise. */
+        "scorecard.fieldReasons.*": ["not_applicable", "historical_input_missing",
+                                     "not_yet_calculated", "no_realized_figure",
+                                     "no_winning_trade", "sign_discipline_not_both_positive",
+                                     "source_unavailable"],
+        "scorecard.staleness.state": ["current", "stale", "never"],
+        "scorecard.meanToMedianBasis": ["per_token"],
+        "pnl.realizedShareReason": ["no_trades_on_record", "nothing_banked_or_on_paper",
+                                    "sign_discipline_not_both_positive"],
+        "health.feeds.*.state": ["current", "stale", "never"],
+        "health.dataState": ["current", "degraded"],
+        "error.code": ["not_found", "bad_request", "duplicate_identifier", "rate_limited",
+                       "timeout", "internal"],
+      },
+    },
+
+    /**
+     * THE UNIT OF EVERY QUANTITY, by naming convention.
+     *
+     * The suffix IS the unit and always has been; publishing it is what makes that a contract
+     * rather than a habit. A unit change gets a NEW FIELD NAME -- never a new meaning under
+     * the old one, because that is the one change no test and no screen can detect.
+     */
+    units: {
+      "*Usd": "United States dollars, as a number. Never cents, never a string",
+      "*Native": "the chain's own coin, exact, at full precision",
+      "*Share": "a ratio from 0 to 1 inclusive. Never a percentage",
+      "winRate": "a ratio from 0 to 1 inclusive",
+      "*Pct": "a percentage from 0 to 100. The only quantities on that scale",
+      "*Ms": "milliseconds, integer",
+      "*Seconds": "seconds, integer",
+      "*Hours": "hours, may be fractional",
+      "*Days": "days, may be fractional",
+      "*At / *From / *To / *Since": "ISO-8601 with an explicit Z. Never epoch seconds",
+      "day": "a calendar date, YYYY-MM-DD",
+      "month": "a calendar month, YYYY-MM",
+      "coverage{of,total,share}": "counts as integers; share is of/total from 0 to 1",
+      note: "absence is always null. Zero is a claim and null is an absence — no string ever " +
+            "stands in for a missing number, and no number for a missing fact",
+    },
+
+    /**
+     * HOW MUCH OF THE DIRECTORY ACTUALLY CARRIES EACH FIELD.
+     *
+     * Counted over every trader, every time this is called. A field below a rate you are
+     * willing to build a screen on is one to treat as not generally available.
+     */
+    fillRates: {
+      "wallets.evmAddress or solanaAddress":
+        rate(f.with_wallet, "no wallet has been resolved for this trader"),
+      "aum.now.totalUsd (any reading at all)":
+        rate(f.with_reading, "the sampler has not reached this trader yet"),
+      "scorecard.winRate / wins / losses":
+        rate(f.with_realized, "no closed position carries a realized figure"),
+      "scorecard.winRate over a COMPLETE record":
+        rate(f.realized_complete,
+             "some closed positions carry no realized figure, so winRateCoverage.of is " +
+             "below closedTrades — see winRateBasis"),
+      "scorecard.windows[].closedTrades":
+        rate(f.with_closed, "no position has closed on record"),
+      "scorecard.entryPriceCoverage (any priced token)":
+        rate(f.with_entry_px, "no position carries an entry price"),
+      "scorecard.entryPriceCoverage (20+, enough to rank on)":
+        rate(f.entry_px_20, "fewer than twenty tokens carry an entry price"),
+      "scorecard.realizedByMonth (3+ months)":
+        rate(f.months_3, "the record does not span three calendar months of closes"),
+      "pnl.onPaperUsd":
+        rate(f.with_unrealized, "no open position carries an unrealized figure"),
+    },
+
+    plain: "Every enumerated field with its complete set, every quantity with its unit, and " +
+           "how much of the directory carries each field. Counted live, not sampled.",
   };
 });
 
@@ -6251,9 +6656,64 @@ get("/v1/health", async () => {
     rows: Object.fromEntries(Object.entries(c).map(([k, v]) => [k, Number(v)])),
     /** Which entries in `rows` are planner estimates rather than counted. */
     estimatedRows: ["transactions"],
-    // Every route here answers from Postgres. Nothing in the request path calls fomoapi,
-    // Helius, Bitquery or Etherscan — those keys belong to the scheduled loaders.
-    externalCallsPerRequest: 0,
+    /**
+     * WHICH CAPABILITIES ARE STILL DELIVERING, by name, judged on evidence.
+     *
+     * A consumer checks health once and routes thousands of times, so a capability that only
+     * reveals itself on the thousandth call is one every consumer discovers the expensive way.
+     *
+     * THE FIRST VERSION OF THIS BLOCK WAS WRONG, and deploying it is what showed that. It
+     * reported whether each provider's KEY was set in this process, which read correctly on a
+     * laptop -- where .env is loaded -- and reported all five providers degraded on the
+     * deployed function, where none of those keys exists. They are not supposed to: the keys
+     * belong to the scheduled loaders, which run in GitHub Actions and never inside this
+     * function. `externalCallsPerRequest` is 0 precisely because of that. So key presence here
+     * is evidence of nothing, and publishing it as `degraded` was a permanent false alarm on
+     * exactly the field a consumer would page on.
+     *
+     * What CAN be answered from here is the question that actually matters: is this
+     * capability's data still arriving? Every provider is judged by the feeds it fills.
+     * A capability whose feeds have all gone stale is degraded whatever its key says, and one
+     * whose feeds are current is working whatever this process can see.
+     */
+    capabilities: (() => {
+      type FeedName = keyof typeof feeds;
+      const caps: { name: string; supplies: FeedName[]; key: string }[] = [
+        { name: "solana history and balances", key: "HELIUS_SOLANA_KEY",
+          supplies: ["transactions", "positions", "aum"] },
+        { name: "evm history", key: "ETHERSCAN_KEY", supplies: ["transactions"] },
+        { name: "evm address resolution", key: "BITQUERY_KEY", supplies: ["wallets"] },
+        { name: "trader directory and trades", key: "FOMOAPI_KEY", supplies: ["traders", "trades"] },
+        { name: "gmgn directory", key: "GMGN_API_KEY", supplies: ["traders"] },
+      ];
+      const judged = caps.map((c) => {
+        const states = c.supplies.map((f) => feeds[f].state);
+        /* Any feed still arriving means the loader ran; only all-stale is a stopped capability. */
+        const state = states.includes("current")
+          ? "current"
+          : (states.every((x) => x === "never") ? "never" : "stale");
+        return {
+          name: c.name,
+          state,
+          /** The feeds this capability fills — check them in `feeds` for dates. */
+          supplies: c.supplies,
+          staleFeeds: c.supplies.filter((f) => feeds[f].state !== "current"),
+          /**
+           * Presence of the key IN THIS PROCESS, which is normally false and is not a fault.
+           * The loaders hold these keys and run elsewhere. Never the value, only presence.
+           */
+          keyInThisProcess: (Deno.env.get(c.key) ?? "").trim().length > 0,
+        };
+      });
+      return {
+        /** Capabilities whose data has stopped arriving. Empty is the healthy state. */
+        degraded: judged.filter((x) => x.state !== "current").map((x) => x.name),
+        providers: judged,
+        basis: "judged on whether each capability's feeds are still arriving, not on key " +
+               "presence — the keys belong to the scheduled loaders and this function holds " +
+               "none of them by design",
+      };
+    })(),
   };
 });
 
@@ -6587,6 +7047,23 @@ function pnlBody(t: any, r: any | undefined) {
     onPaperUsd: any ? round(unrealized) : null,
     openPositions: open,
     realizedShare: share,
+    /**
+     * WHY `realizedShare` IS NULL, as a machine word rather than only in `plain`.
+     *
+     * It is withheld on purpose and the sign discipline above explains why: a trader who lost
+     * $10,000 would otherwise render as "80% banked". That reasoning was sound and completely
+     * invisible to a machine -- 391 of 448 traders serve a null here, and not one carried a
+     * stated reason, which made this field alone 386 of the 425 silent absences across the
+     * six axes. A hollow axis is honest; a hollow axis with no reason is a hole a person reads
+     * as a judgement about the trader.
+     */
+    realizedShareReason: share !== null
+      ? null
+      : (!any
+        ? "no_trades_on_record"
+        : (realized <= 0 && unrealized <= 0
+          ? "nothing_banked_or_on_paper"
+          : "sign_discipline_not_both_positive")),
     // Same value under both names. `asOf` is the convention every other money route uses;
     // `capturedAt` predates it and is kept so existing consumers do not break.
     asOf: r?.captured ? new Date(String(r.captured)).toISOString() : null,
