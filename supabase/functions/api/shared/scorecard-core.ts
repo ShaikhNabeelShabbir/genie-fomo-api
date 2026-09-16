@@ -270,6 +270,90 @@ export function coinMultiples(c: CoinLegs) {
   };
 }
 
+/**
+ * C2 (composite badges). Recency windows against the career, from the closes and the per-coin
+ * rows the scorecard already built. `recent` is the 20 most recent closes; `closes4w` and
+ * `green4w` are the last 28 days. Every figure is null, never 0, when its inputs are missing.
+ */
+export type CloseRow = {
+  closedMs: number; openedMs: number | null; realizedUsd: number | null; entryMcapUsd: number | null;
+};
+export type CoinRow = {
+  betUsd: number | null; multipleRealized: number | null; closedMonth: string | null;
+  lastClosedMs: number | null;
+};
+export const BLEEDING_RED_SHARE_FLOOR = 0.6;
+export function compositeWindows(closes: CloseRow[], coins: CoinRow[], nowMs: number) {
+  const isNum = (x: number | null): x is number => x !== null;
+  const dated = closes.filter((c) => Number.isFinite(c.closedMs)).sort((a, b) => a.closedMs - b.closedMs);
+  const realized = dated.map((c) => c.realizedUsd).filter(isNum);
+  const typicalBetPerCoinUsd = round(median(coins.map((c) => c.betUsd).filter(isNum)));
+  const multiples = coins.filter((c) => c.multipleRealized !== null);
+  const bigWinAt = multiples.filter((c) => c.multipleRealized! >= 5 && c.lastClosedMs !== null)
+    .map((c) => c.lastClosedMs!);
+  const closes4w = dated.filter((c) => c.closedMs > nowMs - 28 * 86_400_000);
+
+  const stats = (xs: CloseRow[]) => {
+    const rz = xs.map((c) => c.realizedUsd).filter(isNum);
+    const holds = xs.filter((c) => c.openedMs !== null && c.closedMs >= c.openedMs!)
+      .map((c) => c.closedMs - c.openedMs!);
+    const medHold = median(holds);
+    const spanDays = xs.length ? (xs[xs.length - 1].closedMs - xs[0].closedMs) / 86_400_000 : null;
+    return {
+      avgRealizedUsd: rz.length ? round(rz.reduce((a, b) => a + b, 0) / rz.length) : null,
+      redShare: rz.length ? Number((rz.filter((v) => v < 0).length / rz.length).toFixed(4)) : null,
+      entryMcapMedianUsd: round(median(xs.map((c) => c.entryMcapUsd).filter(isNum))),
+      holdHoursMedian: medHold === null ? null : Number((medHold / 3_600_000).toFixed(2)),
+      // Closes per day over the window's own span, floored at one day so a burst is not infinite.
+      tradesPerDay: spanDays === null ? null : Number((xs.length / Math.max(spanDays, 1)).toFixed(2)),
+    };
+  };
+  const career = stats(dated);
+  const last = stats(dated.slice(-20));
+  const floor = typicalBetPerCoinUsd;
+  // The team's floor: fires only when the recent average trails the career average by more
+  // than a typical bet, or when 60 % or more of the last 20 closes are red.
+  const bleeding = last.redShare === null ? null
+    : (career.avgRealizedUsd !== null && floor !== null &&
+       career.avgRealizedUsd - last.avgRealizedUsd! > floor) ||
+      last.redShare >= BLEEDING_RED_SHARE_FLOOR;
+  return {
+    typicalBetPerCoinUsd,
+    medianWinUsd: round(median(realized.filter((v) => v > 0))),
+    medianLossUsd: round(median(realized.filter((v) => v < 0))),
+    bigWinMonths: multiples.length
+      ? new Set(multiples.filter((c) => c.multipleRealized! >= 10 && c.closedMonth !== null)
+          .map((c) => c.closedMonth)).size
+      : null,
+    recent: {
+      lastBigWinAt: bigWinAt.length ? new Date(Math.max(...bigWinAt)).toISOString() : null,
+      closes4w: closes4w.length,
+      green4w: closes4w.filter((c) => (c.realizedUsd ?? 0) > 0).length,
+      last20: { avgRealizedUsd: last.avgRealizedUsd, redShare: last.redShare },
+      entryMcapMedianUsd: last.entryMcapMedianUsd,
+      holdHoursMedian: last.holdHoursMedian,
+      tradesPerDay: last.tradesPerDay,
+      basis: "last20, entryMcapMedianUsd, holdHoursMedian and tradesPerDay: the 20 most recent " +
+             "closes; closes4w and green4w: closes in the last 28 days",
+    },
+    career: {
+      avgRealizedUsd: career.avgRealizedUsd,
+      entryMcapMedianUsd: career.entryMcapMedianUsd,
+      holdHoursMedian: career.holdHoursMedian,
+      tradesPerDay: career.tradesPerDay,
+      basis: "every closed position with a close time",
+    },
+    bleeding,
+    bleedingBasis: {
+      floorUsd: floor,
+      redShareFloor: BLEEDING_RED_SHARE_FLOOR,
+      plain: "true only when career.avgRealizedUsd minus recent.last20.avgRealizedUsd exceeds " +
+             "typicalBetUsd.perCoinUsd (the floor), or recent.last20.redShare is 0.6 or more; " +
+             "false otherwise; null with no dated close",
+    },
+  };
+}
+
 /** Everything the scorecard computes, over rows already fetched. See docs/DECISIONS.md#d142 */
 // deno-lint-ignore no-explicit-any
 /** THE BALANCE A TRADER STARTED EACH MONTH WITH — the denominator a monthly return needs. See docs/DECISIONS.md#d143 */
@@ -794,6 +878,22 @@ export async function scorecardBody(
   const lifetimeRealized = closedDated
     .reduce((a, r) => a + (n(r.realized_pnl_usd) ?? 0), 0);
 
+  /** C2. Over the closes and coins already built above; `nowMs` is the same clock `windows` uses. */
+  const composite = compositeWindows(
+    closedDated.map((r) => {
+      const px = n(r.avg_entry_price), supply = n(r.total_supply);
+      return {
+        closedMs: r.closedMs, openedMs: ms(r.opened_at), realizedUsd: n(r.realized_pnl_usd),
+        entryMcapUsd: px !== null && px > 0 && supply !== null && supply > 0 ? px * supply : null,
+      };
+    }),
+    byToken.map((c) => ({
+      betUsd: c.betUsd, multipleRealized: c.multipleRealized, closedMonth: c.closedMonth,
+      lastClosedMs: c.lastClosedAt === null ? null : Date.parse(c.lastClosedAt),
+    })),
+    nowMs,
+  );
+
   const windows = {
     basis: "realized profit only — closed trades, summed by closed_at. Unrealised movement " +
            "is not included; see /pnl for banked versus on paper. Gross of fees: see `fees`.",
@@ -992,7 +1092,15 @@ export async function scorecardBody(
     moneyOut: { usd: exitRows.length ? round(exitRows.reduce((s, r) => s + r.amount * r.px, 0)) : null, coverage: outCov },
     returnPct: { value: basis > 0 ? Number(((closedPnl / basis) * 100).toFixed(2)) : null,
                  coverage: cov(closedPriced.length, closed.length) },
-    typicalBetUsd: bet,
+    /** C2: `perCoinUsd` is the median of `byToken[].betUsd`, the composite floor. `value` is unchanged. */
+    typicalBetUsd: { ...bet, perCoinUsd: composite.typicalBetPerCoinUsd },
+    medianWinUsd: composite.medianWinUsd,
+    medianLossUsd: composite.medianLossUsd,
+    bigWinMonths: composite.bigWinMonths,
+    recent: composite.recent,
+    career: composite.career,
+    bleeding: composite.bleeding,
+    bleedingBasis: composite.bleedingBasis,
     /** THE SAME VOCABULARY, SUMMARISED FOR THE WHOLE ANSWER. See docs/DECISIONS.md#d171 */
     fieldReasons: (() => {
       const why: Record<string, string> = {};

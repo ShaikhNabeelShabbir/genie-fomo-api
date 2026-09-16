@@ -56,3 +56,47 @@ Deno.test("C1: coinMultiples divides by the weighted entry; the peak counts only
   assertEquals(coinMultiples({ ...base, exitQty: 150 }).realizedShare, 1);
   assertEquals(coinMultiples({ ...base, exitQty: null }).realizedShare, 0);
 });
+
+const { compositeWindows } = await import("../supabase/functions/api/shared/scorecard-core.ts");
+const DAY = 86_400_000;
+const NOW = Date.parse("2026-09-17T00:00:00.000Z");
+type Close = Parameters<typeof compositeWindows>[0][number];
+const close = (daysAgo: number, realizedUsd: number | null, o: Partial<Close> = {}): Close =>
+  ({ closedMs: NOW - daysAgo * DAY, openedMs: NOW - (daysAgo + 1) * DAY, realizedUsd, entryMcapUsd: null, ...o });
+
+Deno.test("C2: medians, windows and bigWinMonths from closes and coins", () => {
+  const closes = [close(1, 100), close(2, -50), close(3, 300), close(40, -10), close(60, null)];
+  const coins = [
+    { betUsd: 100, multipleRealized: 12, closedMonth: "2026-09", lastClosedMs: NOW - DAY },
+    { betUsd: 300, multipleRealized: 6, closedMonth: "2026-08", lastClosedMs: NOW - 40 * DAY },
+    { betUsd: null, multipleRealized: null, closedMonth: null, lastClosedMs: null },
+  ];
+  const w = compositeWindows(closes, coins, NOW);
+  assertEquals([w.typicalBetPerCoinUsd, w.medianWinUsd, w.medianLossUsd, w.bigWinMonths], [200, 200, -30, 1]);
+  assertEquals([w.recent.closes4w, w.recent.green4w], [3, 2]);
+  assertEquals(w.recent.lastBigWinAt, new Date(NOW - DAY).toISOString());
+  assertEquals(w.career.avgRealizedUsd, 85);
+  assertEquals([w.career.holdHoursMedian, w.career.tradesPerDay], [24, 0.08]);
+  assertEquals(w.recent.last20.redShare, 0.5);
+  assertEquals(w.bleeding, false);
+});
+
+Deno.test("C2: bleeding fires on the floor only: a red streak, or recent trailing career by more than a typical bet", () => {
+  // 25 closes: the 5 oldest made $1,000 each, the last 20 made $10 each. Career avg $208,
+  // recent avg $10: the $198 gap clears a $100 floor and not a $300 one.
+  const closes = [...Array(5)].map((_, i) => close(30 + i, 1000))
+    .concat([...Array(20)].map((_, i) => close(i, 10)));
+  const coin = (betUsd: number) => [{ betUsd, multipleRealized: null, closedMonth: null, lastClosedMs: null }];
+  assertEquals(compositeWindows(closes, coin(100), NOW).bleeding, true);
+  assertEquals(compositeWindows(closes, coin(300), NOW).bleeding, false);
+  // No floor known: the gap test cannot run, and green closes are not bleeding.
+  assertEquals(compositeWindows(closes, [], NOW).bleeding, false);
+  // 12 of 20 red (60 %) fires whatever the floor; 11 does not.
+  const red = (k: number) => [...Array(20)].map((_, i) => close(i, i < k ? -1 : 1));
+  assertEquals(compositeWindows(red(12), coin(1e9), NOW).bleeding, true);
+  assertEquals(compositeWindows(red(11), coin(1e9), NOW).bleeding, false);
+  // No dated close at all: null, not false.
+  const w = compositeWindows([], [], NOW);
+  assertEquals([w.bleeding, w.medianWinUsd, w.bigWinMonths, w.recent.closes4w, w.career.avgRealizedUsd],
+               [null, null, null, 0, null]);
+});
