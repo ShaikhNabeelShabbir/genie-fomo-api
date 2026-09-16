@@ -10,7 +10,7 @@
 #   scripts/acceptance_capture.sh <base_url> <out_dir> [handle ...]
 #
 #   scripts/acceptance_capture.sh https://<ref>.supabase.co/functions/v1/api captures/before
-#   scripts/acceptance_capture.sh https://genie-fomo.<sub>.workers.dev      captures/after
+#   scripts/acceptance_capture.sh https://genie-copy-trading-api.<subdomain>.workers.dev      captures/after
 #   diff -r captures/before captures/after
 #
 # Run it TWICE against the same deployment first and diff those. That diff must be empty; if

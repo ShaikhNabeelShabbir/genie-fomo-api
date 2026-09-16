@@ -1,12 +1,12 @@
 # The one Worker. See docs/CLOUDFLARE_MIGRATION.md §11.
-name = "genie-fomo"
+name = "genie-copy-trading-api"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
 
 # PARKED until the database password is available (17 Sep): the first deploy proves the
 # pipeline without a database. Uncomment and paste the id that
-# `npx wrangler hyperdrive create genie-fomo-db --connection-string=… --caching-disabled` prints (§8.0).
+# `npx wrangler hyperdrive create genie-copy-trading-db --connection-string=… --caching-disabled` prints (§8.0).
 # Until then /webhook answers 503 not_configured.
 # [[hyperdrive]]
 # binding = "HYPERDRIVE"

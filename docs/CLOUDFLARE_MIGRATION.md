@@ -197,7 +197,7 @@ Option A, and §6 covers Option B.
 
 | Today | On Cloudflare | Notes |
 |---|---|---|
-| Supabase Edge Function `api` | **one Worker** `genie-fomo`, `fetch` on `/v1/*` | §5, §11 |
+| Supabase Edge Function `api` | **one Worker** `genie-copy-trading-api`, `fetch` on `/v1/*` | §5, §11 |
 | Supabase Edge Function `aum-sample` | the same Worker: `scheduled` handler plus `fetch` on `/sample` | §5, §7 |
 | Supabase Edge Function `helius-webhook` | the same Worker: `fetch` on `/webhook` | §9 |
 | Supabase Postgres | **unchanged**, reached through Hyperdrive (A′); external host later if wanted (A) | §4 |
@@ -256,7 +256,7 @@ Hyperdrive is Cloudflare's connection pooler. It sits between the Worker and Pos
 warm connections, which is what makes Postgres usable from an edge runtime at all.
 
 ```bash
-npx wrangler hyperdrive create genie-fomo-db \
+npx wrangler hyperdrive create genie-copy-trading-db \
   --connection-string="postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres" \
   --caching-disabled
 ```
@@ -672,14 +672,14 @@ npx wrangler whoami            # must print the account, not "not authenticated"
 gh secret set CLOUDFLARE_API_TOKEN
 gh secret set CLOUDFLARE_ACCOUNT_ID
 gh variable set CLOUDFLARE_DEPLOY --body true          # turns the deploy job on
-gh variable set WORKER_URL --body https://genie-fomo.<subdomain>.workers.dev
+gh variable set WORKER_URL --body https://genie-copy-trading-api.<subdomain>.workers.dev
 ```
 
 **The first credentialed commands**, in order:
 
 ```bash
 cd worker
-npx wrangler hyperdrive create genie-fomo-db \
+npx wrangler hyperdrive create genie-copy-trading-db \
   --connection-string="postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres" \
   --caching-disabled
 # paste the printed id over REPLACE_WITH_HYPERDRIVE_ID in worker/wrangler.toml
@@ -745,7 +745,7 @@ optional.
 **After deploying, re-point Helius at the new URL:**
 
 ```bash
-WEBHOOK_URL="https://genie-fomo.<subdomain>.workers.dev/webhook" \
+WEBHOOK_URL="https://genie-copy-trading-api.<subdomain>.workers.dev/webhook" \
   node scripts/register_webhook.mjs
 ```
 
@@ -802,7 +802,7 @@ worker/
 
 ```toml
 # worker/wrangler.toml
-name = "genie-fomo"
+name = "genie-copy-trading-api"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
@@ -872,7 +872,7 @@ the field-contract harness is rebuilt and committed.
 diff -r captures/before captures/before2
 
 # 2. same suite against the Worker
-./scripts/acceptance_capture.sh https://genie-fomo.<subdomain>.workers.dev captures/after
+./scripts/acceptance_capture.sh https://genie-copy-trading-api.<subdomain>.workers.dev captures/after
 
 # 3. the migration is correct when this is empty
 diff -r captures/before captures/after

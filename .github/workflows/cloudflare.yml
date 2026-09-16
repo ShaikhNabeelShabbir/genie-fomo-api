@@ -6,7 +6,7 @@ name: cloudflare worker
 #   secrets:   CLOUDFLARE_API_TOKEN     "Edit Cloudflare Workers" template + Hyperdrive Edit + Account Settings Read
 #              CLOUDFLARE_ACCOUNT_ID    Workers & Pages overview sidebar
 #   variables: CLOUDFLARE_DEPLOY        "true" turns the deploy job on (a secret cannot gate a job, see below)
-#              WORKER_URL               https://genie-fomo.<subdomain>.workers.dev, for the post-deploy smoke
+#              WORKER_URL               https://genie-copy-trading-api.<subdomain>.workers.dev, for the post-deploy smoke
 
 on:
   push:
