@@ -2,7 +2,7 @@ import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
 import {
   SOLANA_NETWORK_ID, solanaBalances, evmBalances,
 } from "../_shared/chain_reads.ts";
-import { value } from "./value.ts";
+import { concentrationSuspect, value } from "./value.ts";
 
 /** AUM sampler, as a Supabase Edge Function. See docs/DECISIONS.md#d188 */
 
@@ -44,13 +44,14 @@ type Position = { network_id: number; token_key: string; address: string; amount
 /** Chains the current trader's read actually asked. Reset per trader by readBalances(). */
 const attempted = new Set<number>();
 
-/** Prices for a set of (network, token) pairs, from what this service already holds. See docs/DECISIONS.md#d191 */
-async function pricesFor(pairs: Position[]): Promise<Map<string, number>> {
-  const m = new Map<string, number>();
+/** Prices (and total supply, for the implied-cap check) for a set of (network, token) pairs, from what this service already holds. See docs/DECISIONS.md#d191 */
+async function pricesFor(pairs: Position[]): Promise<Map<string, { px: number; supply: number | null }>> {
+  const m = new Map<string, { px: number; supply: number | null }>();
   if (!pairs.length) return m;
   const rows = await sql`
     select u.n as network_id, u.k as token_key,
-           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px
+           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px,
+           tk.total_supply::float8 as supply
     from unnest(${pairs.map((p) => p.network_id)}::bigint[],
                 ${pairs.map((p) => p.token_key)}::text[]) as u(n, k)
     left join quote_assets qa on qa.network_id = u.n and qa.token_key = u.k
@@ -58,8 +59,14 @@ async function pricesFor(pairs: Position[]): Promise<Map<string, number>> {
     left join lateral (
       select usd from token_prices p
       where p.network_id = u.n and p.token_key = u.k order by day desc limit 1
-    ) tp on true`;
-  for (const r of rows) if (r.px !== null) m.set(`${r.network_id}:${r.token_key}`, Number(r.px));
+    ) tp on true
+    left join tokens tk on tk.network_id = u.n and tk.token_key = u.k`;
+  for (const r of rows) {
+    if (r.px !== null) {
+      m.set(`${r.network_id}:${r.token_key}`,
+            { px: Number(r.px), supply: r.supply === null ? null : Number(r.supply) });
+    }
+  }
   return m;
 }
 
@@ -247,16 +254,25 @@ Deno.serve(async (req) => {
         total = positions.length;
         const px = await pricesFor(positions);
         let sum = 0;
+        /** The largest priced position, and whether its implied cap could be checked (V1). */
+        const top = { usd: 0, capKnown: false };
         for (const p of positions) {
           const c = perChain.get(p.network_id) ?? { usd: 0, priced: 0, total: 0 };
           c.total++;
-          const v = value(p.amount, px.get(`${p.network_id}:${p.token_key}`) ?? null);
+          const q = px.get(`${p.network_id}:${p.token_key}`);
+          const v = value(p.amount, q?.px ?? null, q?.supply ?? null);
           if (v.rejected) rejected++;
-          else if (v.usd !== undefined) { sum += v.usd; priced++; c.usd += v.usd; c.priced++; }
+          else if (v.usd !== undefined) {
+            sum += v.usd; priced++; c.usd += v.usd; c.priced++;
+            if (v.usd > top.usd) { top.usd = v.usd; top.capKnown = (q?.supply ?? 0) > 0; }
+          }
           perChain.set(p.network_id, c);
         }
-        if (priced > 0) totalUsd = sum;
-        else if (total === 0) {
+        if (priced > 0) {
+          /* One coin is most of him and cannot be believed: a price fault, not a balance. */
+          if (concentrationSuspect(top.usd, sum, top.capKnown)) reason = "price_suspect";
+          else totalUsd = sum;
+        } else if (total === 0) {
           /*
            * Every wallet answered and held nothing. The one place a zero is the TRUE value
            * rather than a stand-in for a missing one -- reporting null here would hide a real
@@ -303,13 +319,14 @@ Deno.serve(async (req) => {
                 ${totalUsd === null ? (reason ?? "wallet_unreadable") : null},
                 ${positions === null ? null : priced},
                 ${positions === null ? null : total},
-                ${valueShare}, 'sampled', 'verified',
+                ${valueShare}, 'sampled',
+                ${reason === "price_suspect" ? "reported" : "verified"},
                 ${chainsAnswered}, ${chainsExpected})
         on conflict (handle, at, basis) do update set
           total_usd = excluded.total_usd, refused_reason = excluded.refused_reason,
           priced_positions = excluded.priced_positions,
           total_positions = excluded.total_positions,
-          value_share = excluded.value_share,
+          value_share = excluded.value_share, tier = excluded.tier,
           chains_answered = excluded.chains_answered,
           chains_expected = excluded.chains_expected,
           sampled_at = now()`;
@@ -322,9 +339,9 @@ Deno.serve(async (req) => {
           from unnest(${nets}::bigint[],
                       ${nets.map((n) => {
                         const c = perChain.get(n)!;
-                        /* Held nothing: a true zero, not a gap. Priced something: the sum. */
+                        /* Held nothing: a true zero, not a gap. Priced something: the sum, unless the reading is a price fault. */
                         if (c.total === 0) return 0;
-                        return c.priced > 0 ? c.usd : null;
+                        return c.priced > 0 && reason !== "price_suspect" ? c.usd : null;
                       })}::numeric[],
                       ${nets.map((n) => {
                         const c = perChain.get(n)!;
@@ -334,7 +351,8 @@ Deno.serve(async (req) => {
                       ${nets.map((n) => {
                         const c = perChain.get(n)!;
                         if (c.total === 0) return null;          // read, empty — not a fault
-                        return c.priced > 0 ? null : "no_prices";
+                        if (c.priced === 0) return "no_prices";
+                        return reason === "price_suspect" ? "price_suspect" : null;
                       })}::text[]
                      ) as u(n, v, s, r)
           on conflict (handle, at, basis, network_id) do update set

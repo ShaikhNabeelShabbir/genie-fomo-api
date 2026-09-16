@@ -31,6 +31,7 @@ import pg from "pg";
 import {
   SOLANA_NETWORK_ID, SOL_MINT, solanaBalances, evmBalances,
 } from "./lib/chain_reads.mjs";
+import { value } from "./lib/value.mjs";
 
 const DB  = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 const KEY = (process.env.HELIUS_SOLANA_KEY ?? "").trim();
@@ -181,39 +182,46 @@ async function main() {
      * it from `totalValueUsd` and reports the gap as `pricedShare`. Dropping it instead would
      * understate how many coins they hold and flatter `concentration`.
      */
+    const { rows: priced } = await client.query(`
+      select i.handle, i.network_id, i.token_key, i.human_amount,
+             coalesce(qa.pegged_usd, ti.price_usd, tp.usd) as price,
+             tk.total_supply::float8 as supply
+      from unnest($1::text[], $2::bigint[], $3::text[], $4::numeric[])
+           as i(handle, network_id, token_key, human_amount)
+      -- pegged_usd FIRST and deliberately. A dollar-pegged asset is a dollar by
+      -- definition, and it is the one thing cashShare actually measures -- neither
+      -- token_info nor token_prices carries a row for any stablecoin, so consulting
+      -- them first left every USDC balance unpriced and cashShare reading near zero
+      -- for exactly the traders holding cash.
+      left join quote_assets qa
+             on qa.network_id = i.network_id and qa.token_key = i.token_key
+      left join token_info ti
+             on ti.network_id = i.network_id and ti.token_key = i.token_key and ti.price_usd is not null
+      left join lateral (
+        select usd from token_prices p
+        where p.network_id = i.network_id and p.token_key = i.token_key
+        order by day desc limit 1
+      ) tp on true
+      left join tokens tk on tk.network_id = i.network_id and tk.token_key = i.token_key`,
+      [rowsOut.map((r) => r[0]), rowsOut.map((r) => r[1]), rowsOut.map((r) => r[2]), rowsOut.map((r) => r[4])]);
+
+    // The sampler's value(): the same ceilings, so /positions cannot show a figure a reading
+    // would refuse. A refused price stays on the row (it is what /positions flags as
+    // priceSuspect); only its value is withheld.
+    const values = priced.map((r) =>
+      value(Number(r.human_amount), r.price === null ? null : Number(r.price), r.supply).usd ?? null);
+
     const ins = await client.query(`
-      with incoming as (
-        select * from unnest($1::text[], $2::bigint[], $3::text[], $4::numeric[])
-                 as t(handle, network_id, token_key, human_amount)
-      ),
-      priced as (
-        select i.*,
-               coalesce(qa.pegged_usd, ti.price_usd, tp.usd) as price
-        from incoming i
-        -- pegged_usd FIRST and deliberately. A dollar-pegged asset is a dollar by
-        -- definition, and it is the one thing cashShare actually measures -- neither
-        -- token_info nor token_prices carries a row for any stablecoin, so consulting
-        -- them first left every USDC balance unpriced and cashShare reading near zero
-        -- for exactly the traders holding cash.
-        left join quote_assets qa
-               on qa.network_id = i.network_id and qa.token_key = i.token_key
-        left join token_info ti
-               on ti.network_id = i.network_id and ti.token_key = i.token_key and ti.price_usd is not null
-        left join lateral (
-          select usd from token_prices p
-          where p.network_id = i.network_id and p.token_key = i.token_key
-          order by day desc limit 1
-        ) tp on true
-      )
       insert into holdings (handle, network_id, token_key, captured_at, human_amount, price, value, source)
-      select handle, network_id, token_key, $5, human_amount, price,
-             case when price is null then null else human_amount * price end, 'chain'
-      from priced
+      select handle, network_id, token_key, $5, human_amount, price, value, 'chain'
+      from unnest($1::text[], $2::bigint[], $3::text[], $4::numeric[], $6::numeric[], $7::numeric[])
+           as t(handle, network_id, token_key, human_amount, price, value)
       on conflict (handle, network_id, token_key, captured_at) do update
         set human_amount = excluded.human_amount, price = excluded.price,
             value = excluded.value, source = excluded.source
       returning value`,
-      [rowsOut.map((r) => r[0]), rowsOut.map((r) => r[1]), rowsOut.map((r) => r[2]), rowsOut.map((r) => r[4]), capturedAt]);
+      [priced.map((r) => r.handle), priced.map((r) => r.network_id), priced.map((r) => r.token_key),
+       priced.map((r) => r.human_amount), capturedAt, priced.map((r) => r.price), values]);
 
     await client.query("commit");
     const withValue = ins.rows.filter((r) => r.value !== null).length;

@@ -10,10 +10,17 @@ import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import { CostBasis, costBasisFor, costBlock, sellFlags, unsellable } from "../shared/positions-core.ts";
 import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
+import { priceSuspectReason } from "../../aum-sample/value.ts";
 
 /** The chain's own coin: EVM native under the sentinel, SOL under the system-program key. */
 const NATIVE_KEYS = new Set([ZERO_ADDRESS, SOL_MINT.toLowerCase()]);
 const isNative = (tokenKey: unknown): boolean => NATIVE_KEYS.has(String(tokenKey));
+
+/** A row's gross amount x price, before any ceiling withheld its `value` (V1). */
+const gross = (r: Record<string, unknown>): number | null => {
+  const a = n(r.human_amount), p = n(r.price);
+  return a !== null && p !== null ? a * p : null;
+};
 
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
@@ -211,7 +218,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            -- are not the same claim.
            h.price_source, h.priced_at, h.captured_at, h.source as balance_source,
            (q.token_key is not null) as is_quote,
-           ti.is_honeypot, ti.can_not_sell
+           ti.is_honeypot, ti.can_not_sell,
+           tk.total_supply::float8 as total_supply
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
@@ -243,9 +251,11 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const valued = (r: Record<string, unknown>) => ((n(r.value) ?? 0) > 0 ? n(r.value)! : 0);
   const total = rows.reduce((s, r) => s + (unsellable(r) ? 0 : valued(r)), 0);
   const unsellableUsd = round(rows.reduce((s: number, r: Record<string, unknown>) => s + (unsellable(r) ? valued(r) : 0), 0))!;
+  const grossTotal = rows.reduce((s: number, r: Record<string, unknown>) => s + (gross(r) ?? 0), 0);
   const all = rows.map((r) => {
     const tm = timeBy.get(`${r.network_id}:${r.token_key}`);
     const v = (n(r.value) ?? 0) > 0 ? n(r.value) : null;
+    const suspect = priceSuspectReason(n(r.price), n(r.total_supply), gross(r), grossTotal);
     return {
       tokenAddress: r.address,
       networkId: Number(r.network_id),
@@ -269,7 +279,12 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       // null, never 0 — 0 would imply we checked and found the position worthless.
       valueUsd: v === null ? null : round(v),
       /** Why there is no value, rather than an unexplained null. */
-      whyNoPrice: v === null ? "no price for this token in any source we hold" : null,
+      whyNoPrice: v !== null ? null
+        : n(r.price) !== null ? "price refused by the valuation ceilings; see priceSuspectReason"
+        : "no price for this token in any source we hold",
+      /** V1: the price fails a check a consumer cannot run alone (price x supply, concentration). */
+      priceSuspect: suspect !== null,
+      priceSuspectReason: suspect,
       share: v !== null && total > 0 && !unsellable(r) ? Number((v / total).toFixed(4)) : null,
       isQuoteAsset: !!r.is_quote,
       ...sellFlags(r),
@@ -363,7 +378,8 @@ post("/v1/traders/positions", async (_p, _url, body) => {
            tk.address as token_address,
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
-           h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell
+           h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell,
+           tk.total_supply::float8 as total_supply
     from holdings_current h
     join chains ch using (network_id)
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
@@ -390,7 +406,13 @@ post("/v1/traders/positions", async (_p, _url, body) => {
   /** Same cost basis the individual route serves, from the same function. */
   const costByHandle = await costBasisFor(handles);
 
-  const position = (r: Record<string, unknown>) => ({
+  /** Per-trader gross totals, for the concentration check on each row. */
+  const grossBy = new Map<string, number>();
+  for (const r of rows) grossBy.set(String(r.handle), (grossBy.get(String(r.handle)) ?? 0) + (gross(r) ?? 0));
+
+  const position = (r: Record<string, unknown>) => {
+    const suspect = priceSuspectReason(n(r.price), n(r.total_supply), gross(r), grossBy.get(String(r.handle)) ?? 0);
+    return {
     chain: r.chain, networkId: Number(r.network_id),
     tokenAddress: r.token_address, symbol: r.symbol,
     isNative: isNative(r.token_key),
@@ -405,10 +427,15 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
     valueUsd: n(r.value),
     /** null, never 0 — an unpriceable coin is not a worthless one. */
-    whyNoPrice: n(r.value) === null ? "no price for this token in any source we hold" : null,
+    whyNoPrice: n(r.value) !== null ? null
+      : n(r.price) !== null ? "price refused by the valuation ceilings; see priceSuspectReason"
+      : "no price for this token in any source we hold",
+    priceSuspect: suspect !== null,
+    priceSuspectReason: suspect,
     tier: r.source === "chain" ? "verified" : "reported",
     ...sellFlags(r),
-  });
+    };
+  };
 
   if (v2) {
     const known = await sql`

@@ -82,14 +82,18 @@ async function evmSupply(networkId, address) {
 }
 
 async function main() {
-  // Only tokens where a supply would actually be used: something has an entry price for it.
+  // Only tokens where a supply would actually be used: something has an entry price for it,
+  // or somebody holds it (V1: the sampler checks price x supply on every held coin, and the
+  // coins that produced the impossible readings were held, never traded).
   let sql = `
     select tk.network_id, tk.address, tk.token_key
     from tokens tk
     where tk.total_supply is null
-      and exists (select 1 from trades t
-                  where t.network_id = tk.network_id and t.token_key = tk.token_key
-                    and t.avg_entry_price > 0)
+      and (exists (select 1 from trades t
+                   where t.network_id = tk.network_id and t.token_key = tk.token_key
+                     and t.avg_entry_price > 0)
+           or exists (select 1 from holdings_current h
+                      where h.network_id = tk.network_id and h.token_key = tk.token_key))
     order by tk.network_id, tk.address`;
   if (LIMIT) sql += ` limit ${Number(LIMIT)}`;
   const { rows } = await pool.query(sql);

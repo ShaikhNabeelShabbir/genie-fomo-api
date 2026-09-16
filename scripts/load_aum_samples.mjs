@@ -25,6 +25,7 @@
  */
 import pg from "pg";
 import { SOLANA_NETWORK_ID, solanaBalances, evmBalances } from "./lib/chain_reads.mjs";
+import { concentrationSuspect, value } from "./lib/value.mjs";
 
 const DB  = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 const KEY = (process.env.HELIUS_SOLANA_KEY ?? "").trim();
@@ -44,55 +45,11 @@ const DRY = flag("dry-run");
 const pool = new pg.Pool({ connectionString: DB, ssl: { rejectUnauthorized: false }, max: 3 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/*
- * Price ceilings, applied BEFORE any multiplication.
- *
- * Not theoretical: one Orca pool quoted STONK at $3,110 against 29 pools at $0.187, and a
- * deepest-pool rule turned that into a $26.7 BILLION portfolio for one trader. A number that
- * large is not a rich trader, it is a broken pool, and it must never reach a chart.
- *
- * The PRD also asks to refuse a price more than 50x off the median of the coin's other pools.
- * That needs PER-POOL prices; every source we hold returns one price per token, so there is
- * nothing to take a median of. The two absolute ceilings below are what is buildable today —
- * see AUM_PLAN.md §4.2.
- */
-const MAX_PRICE_PER_TOKEN = 1_000_000;
-/*
- * MAX_POSITION_USD WAS $1 TRILLION, WHICH CAUGHT NOTHING.
- *
- * Measured 16 September: four readings over $1bn had been written, topping out at
- * cupseyy $473,460,243,525. The cause is not a price over the per-token ceiling -- the
- * offending tokens price at $28,159 and $8,923, which is plausible beside BTC at $79,035 and
- * sails through. It is 10.4 MILLION units of an unnamed token multiplied by that price.
- *
- * Seventeen held positions price at $1bn or more and every one is a token we cannot even
- * name. The real ones stop far below: 78 positions between $1m and $10m, 21 between $10m and
- * $100m, and the largest genuine PORTFOLIO in the directory is unipcs at $16.5m.
- *
- * $1bn therefore leaves a position sixty times larger than the biggest real portfolio and
- * still refuses every broken one. A number that large is not a rich trader, it is a broken
- * price, and it must never reach a chart.
- */
-const MAX_POSITION_USD    = 1_000_000_000;
+/* The price ceilings and value() live in scripts/lib/value.mjs, shared with load_chain_balances.mjs. */
 
 /**
- * Value one position, or refuse it.
- *
- * Returns `{ usd }` when it can be valued, `{ rejected: true }` when a price exists but is
- * not believable, and `{}` when we simply have no price. The three are different states and
- * the caller reports them differently — an unpriced coin is a coverage gap, a rejected one
- * is a finding.
- */
-function value(amount, price) {
-  if (price === null || !Number.isFinite(price) || price <= 0) return {};
-  if (price > MAX_PRICE_PER_TOKEN) return { rejected: true };
-  const usd = amount * price;
-  if (!Number.isFinite(usd) || usd > MAX_POSITION_USD) return { rejected: true };
-  return { usd };
-}
-
-/**
- * Prices for a set of (network, token) pairs, from what this service already holds.
+ * Prices (and total supply, for the implied-cap check) for a set of (network, token) pairs,
+ * from what this service already holds.
  *
  * Order is deliberate and matches the holdings loader, so an AUM point and a /portfolio total
  * cannot disagree on which price they used:
@@ -111,16 +68,23 @@ async function pricesFor(client, pairs) {
   const keys = pairs.map((p) => p.token_key);
   const { rows } = await client.query(`
     select u.n as network_id, u.k as token_key,
-           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px
+           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px,
+           tk.total_supply::float8 as supply
     from unnest($1::bigint[], $2::text[]) as u(n, k)
     left join quote_assets qa on qa.network_id = u.n and qa.token_key = u.k
     left join token_info  ti on ti.network_id = u.n and ti.token_key = u.k and ti.price_usd is not null
     left join lateral (
       select usd from token_prices p
       where p.network_id = u.n and p.token_key = u.k order by day desc limit 1
-    ) tp on true`, [nets, keys]);
+    ) tp on true
+    left join tokens tk on tk.network_id = u.n and tk.token_key = u.k`, [nets, keys]);
   const m = new Map();
-  for (const r of rows) if (r.px !== null) m.set(`${r.network_id}:${r.token_key}`, Number(r.px));
+  for (const r of rows) {
+    if (r.px !== null) {
+      m.set(`${r.network_id}:${r.token_key}`,
+            { px: Number(r.px), supply: r.supply === null ? null : Number(r.supply) });
+    }
+  }
   return m;
 }
 
@@ -227,16 +191,24 @@ async function main() {
         total = positions.length;
         const px = await pricesFor(client, positions);
         let sum = 0;
+        // The largest priced position, and whether its implied cap could be checked (V1).
+        const top = { usd: 0, capKnown: false };
         for (const p of positions) {
           const c = perChain.get(p.network_id) ?? { usd: 0, priced: 0, total: 0 };
           c.total++;
-          const v = value(p.amount, px.get(`${p.network_id}:${p.token_key}`) ?? null);
+          const q = px.get(`${p.network_id}:${p.token_key}`);
+          const v = value(p.amount, q?.px ?? null, q?.supply ?? null);
           if (v.rejected) rejected++;
-          else if (v.usd !== undefined) { sum += v.usd; priced++; c.usd += v.usd; c.priced++; }
+          else if (v.usd !== undefined) {
+            sum += v.usd; priced++; c.usd += v.usd; c.priced++;
+            if (v.usd > top.usd) { top.usd = v.usd; top.capKnown = (q?.supply ?? 0) > 0; }
+          }
           perChain.set(p.network_id, c);
         }
         if (priced > 0) {
-          totalUsd = sum;
+          // One coin is most of him and cannot be believed: a price fault, not a balance.
+          if (concentrationSuspect(top.usd, sum, top.capKnown)) reason = "price_suspect";
+          else totalUsd = sum;
         } else if (total === 0) {
           /*
            * Every wallet answered and held nothing. This is the one place a zero is the
@@ -280,13 +252,14 @@ async function main() {
         insert into aum_samples
           (handle, at, total_usd, refused_reason, priced_positions, total_positions,
            value_share, basis, tier)
-        values ($1, $2, $3, $4, $5, $6, $7, 'sampled', 'verified')
+        values ($1, $2, $3, $4, $5, $6, $7, 'sampled', $8)
         on conflict (handle, at, basis) do update set
           total_usd = excluded.total_usd, refused_reason = excluded.refused_reason,
           priced_positions = excluded.priced_positions, total_positions = excluded.total_positions,
-          value_share = excluded.value_share, sampled_at = now()`,
+          value_share = excluded.value_share, tier = excluded.tier, sampled_at = now()`,
         [t.handle, at, totalUsd, totalUsd === null ? (reason ?? "wallet_unreadable") : null,
-         positions === null ? null : priced, positions === null ? null : total, valueShare]);
+         positions === null ? null : priced, positions === null ? null : total, valueShare,
+         reason === "price_suspect" ? "reported" : "verified"]);
 
       if (perChain.size) {
         const nets = [...perChain.keys()];
@@ -298,9 +271,9 @@ async function main() {
             total_usd = excluded.total_usd, priced_share = excluded.priced_share,
             reason = excluded.reason`,
           [t.handle, at, nets,
-           nets.map((n) => (perChain.get(n).priced > 0 ? perChain.get(n).usd : null)),
+           nets.map((n) => (perChain.get(n).priced > 0 && reason !== "price_suspect" ? perChain.get(n).usd : null)),
            nets.map((n) => Number((perChain.get(n).priced / perChain.get(n).total).toFixed(4))),
-           nets.map((n) => (perChain.get(n).priced > 0 ? null : "no_prices"))]);
+           nets.map((n) => (perChain.get(n).priced > 0 ? (reason === "price_suspect" ? "price_suspect" : null) : "no_prices"))]);
       }
       await sleep(120);
     }
