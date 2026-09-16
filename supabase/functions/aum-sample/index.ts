@@ -325,6 +325,27 @@ Deno.serve(async (req) => {
       const perChain = new Map<number, { usd: number; priced: number; total: number }>();
 
       if (positions !== null) {
+        /*
+         * SEED EVERY CHAIN THIS READ ASKED, before counting what came back.
+         *
+         * `perChain` used to be built only from positions FOUND, so a chain that answered
+         * and held nothing never got an entry, never got an `aum_chain_samples` row, and
+         * became byte-identical to a chain nobody read. Downstream that reads as
+         * `historyState: "none"`, `answeredChains: 0 of 1` and `partialReason:
+         * "chains_missing"` — three statements that a wallet was not looked at, about a
+         * wallet that was.
+         *
+         * Measured on gmgn_0xf80d7961: his Ethereum wallet is read every pass and holds none
+         * of the 33 tokens he traded. A live eth_call against all 33 returns zero balances.
+         * The chain works; the wallet is empty; the service said it had never been read.
+         *
+         * An empty chain is a real answer — his balance there is zero — so it gets a row
+         * saying so. A chain that could NOT be read never reaches here: it throws, and the
+         * whole trader-hour is refused above.
+         */
+        for (const net of attempted) {
+          if (!perChain.has(net)) perChain.set(net, { usd: 0, priced: 0, total: 0 });
+        }
         total = positions.length;
         const px = await pricesFor(positions);
         let sum = 0;
@@ -381,9 +402,12 @@ Deno.serve(async (req) => {
        * answered, because it was.
        */
       const chainsExpected = positions === null ? null : attemptedCount;
-      const chainsAnswered = positions === null
-        ? null
-        : [...perChain.values()].filter((c) => c.priced > 0).length;
+      /*
+       * A chain ANSWERED if it returned — including returning "he holds nothing here".
+       * Counting only chains that produced a priced position made an empty wallet look
+       * half-read, which is the same fault as the one fixed above, one field along.
+       */
+      const chainsAnswered = positions === null ? null : perChain.size;
 
       await sql`
         insert into aum_samples
@@ -410,9 +434,22 @@ Deno.serve(async (req) => {
           insert into aum_chain_samples (handle, at, basis, network_id, total_usd, priced_share, reason)
           select ${trader.handle}, ${at}, 'sampled', u.n, u.v, u.s, u.r
           from unnest(${nets}::bigint[],
-                      ${nets.map((n) => (perChain.get(n)!.priced > 0 ? perChain.get(n)!.usd : null))}::numeric[],
-                      ${nets.map((n) => Number((perChain.get(n)!.priced / perChain.get(n)!.total).toFixed(4)))}::numeric[],
-                      ${nets.map((n) => (perChain.get(n)!.priced > 0 ? null : "no_prices"))}::text[]
+                      ${nets.map((n) => {
+                        const c = perChain.get(n)!;
+                        /* Held nothing: a true zero, not a gap. Priced something: the sum. */
+                        if (c.total === 0) return 0;
+                        return c.priced > 0 ? c.usd : null;
+                      })}::numeric[],
+                      ${nets.map((n) => {
+                        const c = perChain.get(n)!;
+                        /* No positions means nothing to price — a share of nothing is null. */
+                        return c.total === 0 ? null : Number((c.priced / c.total).toFixed(4));
+                      })}::numeric[],
+                      ${nets.map((n) => {
+                        const c = perChain.get(n)!;
+                        if (c.total === 0) return null;          // read, empty — not a fault
+                        return c.priced > 0 ? null : "no_prices";
+                      })}::text[]
                      ) as u(n, v, s, r)
           on conflict (handle, at, basis, network_id) do update set
             total_usd = excluded.total_usd, priced_share = excluded.priced_share,
