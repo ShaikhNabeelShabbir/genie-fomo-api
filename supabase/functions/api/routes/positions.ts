@@ -221,13 +221,14 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            -- are not the same claim.
            h.price_source, h.priced_at, h.captured_at, h.source as balance_source,
            (q.token_key is not null) as is_quote,
-           ti.is_honeypot, ti.can_not_sell,
+           ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
            tk.total_supply::float8 as total_supply
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
+    left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
     where h.handle = ${t.handle}
     -- Priced rows first, descending. Unpriced rows TRAIL rather than being dropped: they
     -- are real holdings we simply cannot value, and hiding them would misstate the count.
@@ -282,6 +283,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       priceSource: (r.price_source as string) ?? null,
       /** When that price was true. A reported entry price can be weeks old and says so. */
       pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
+      /** Gap 1: 1 - last / ATH over our hourly samples (token_price_stats); null when never sampled. */
+      drawdownShare: n(r.drawdown_share),
       // null, never 0 — 0 would imply we checked and found the position worthless.
       valueUsd: v === null ? null : round(v),
       /** Why there is no value, rather than an unexplained null. */
@@ -385,12 +388,13 @@ post("/v1/traders/positions", async (_p, _url, body) => {
            tk.address as token_address,
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
-           h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell,
+           h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
            tk.total_supply::float8 as total_supply
     from holdings_current h
     join chains ch using (network_id)
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
+    left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
     where h.handle = any(${handles})
     order by h.handle, h.value desc nulls last`;
 
@@ -432,6 +436,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     priceUsd: n(r.price),
     priceSource: (r.price_source as string) ?? null,
     pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
+    drawdownShare: n(r.drawdown_share),
     valueUsd: n(r.value),
     /** null, never 0 — an unpriceable coin is not a worthless one. */
     whyNoPrice: n(r.value) !== null ? null
