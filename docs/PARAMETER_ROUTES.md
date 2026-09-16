@@ -502,6 +502,20 @@ from `GET /traders` and from `/wallets`. The older `trd_`-prefixed form is still
 `/wallets`, `/trades` — all ten answer to the id and to the handle, and both return the same
 trader. This is the contract `GENIE_FOMO_V7_BATCH_AUM_AND_COVERAGE_PRD.md` §1 requires.
 
+### Linked wallets (gap 5b, W-J) — added 17 Sep 2026
+
+`/wallets` also carries `linked: [{ chain, address, linkedFrom, kind, firstSeenAt, evidenceTx, watch }]`
+— wallets the trader funded from his known Solana wallet, found nightly by
+`scripts/link_wallets.mjs` from native SOL transfers out to an address that is not tracked,
+not a known program or exchange, and has since been used (a second transfer, or ≥ 0.05 SOL).
+`kind` is `funded_by` today; `submitted` is reserved. `evidenceTx` is the funding signature.
+`watch: true` rows are registered with the Helius webhook alongside `wallets`, so their
+transfers land in `transactions` like a primary wallet's. `[]` when nothing has been linked.
+
+```bash
+curl -s "$B/traders/unipcs/wallets" | jq '.linked'
+```
+
 ### How to test
 
 ```bash

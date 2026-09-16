@@ -11,6 +11,26 @@ export const walletRows = (handles: string[]) => sql`
   from traders t left join wallets w using (handle)
   where t.handle = any(${handles})`;
 
+/** Gap 5b. Wallets this trader funded from his known one (`linked_wallets`), watched by the webhook. */
+export const linkedRows = (handle: string) => sql`
+  select c.name as chain, lw.address, lw.address_key, lw.linked_from_address_key, lw.link_kind,
+         lw.first_seen_at, lw.evidence_tx, lw.watch
+  from linked_wallets lw join chains c on c.network_id = lw.network_id
+  where lw.handle = ${handle}
+  order by lw.first_seen_at nulls last, lw.address_key`;
+
+/** One `linked_wallets` row. `address` is the case-preserved spelling when resolved, else the key. */
+export const linkedBody = (r: Record<string, unknown>) => ({
+  chain: String(r.chain),
+  address: String(r.address ?? r.address_key),
+  linkedFrom: String(r.linked_from_address_key),
+  // funded_by (seen funding it from the known wallet) | submitted (claimed via POST /wallets).
+  kind: String(r.link_kind),
+  firstSeenAt: r.first_seen_at ? new Date(String(r.first_seen_at)).toISOString() : null,
+  evidenceTx: (r.evidence_tx as string | null) ?? null,
+  watch: Boolean(r.watch),
+});
+
 /** W1. How an address was found: a straight mapping of `wallets.*_source` (fomoapi's own `src_*`). */
 export const resolvedBy = (source: unknown): string | null =>
   source === "fomoapi.io" ? "fomoapi" : (source ? String(source) : null);

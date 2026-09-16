@@ -117,6 +117,15 @@ jobs:
         if: '!cancelled()'
         run: node scripts/backfill_transactions.mjs --pages 5 --fanout 3
 
+      # ---------------------------------------------------------------- 6a. linked wallets
+      # Wallets a tracked trader funded from his known one, from the native SOL transfers
+      # just loaded (workflow gap 5b). Before step 7, so the webhook picks them up tonight.
+      - name: Link funded wallets
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: node scripts/link_wallets.mjs
+
       # ---------------------------------------------------------------- 6b. prices
       # Must follow the transfer step, not precede it: it prices whatever was just ingested,
       # and the webhook keeps adding rows all day, so running it earlier would leave the

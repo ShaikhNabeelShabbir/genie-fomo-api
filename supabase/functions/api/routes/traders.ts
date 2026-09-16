@@ -10,7 +10,7 @@ import { KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { trustHoldings, trustBody } from "../shared/trust-core.ts";
-import { walletRows, walletsBody } from "../shared/wallets-core.ts";
+import { linkedBody, linkedRows, walletRows, walletsBody } from "../shared/wallets-core.ts";
 import { scorecardRows, FeeWindows, feesFor, Swap, swapsFor, chainEntriesFrom, chainExitsFrom, monthStartCapital, scorecardBody, latestLoad } from "../shared/scorecard-core.ts";
 import { pnlAgg, pnlBody } from "../shared/pnl-core.ts";
 
@@ -642,10 +642,11 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
   const [t] = await walletRows([h]);
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
-  const [presence, knownBy] = await Promise.all([
+  const [presence, knownBy, linked] = await Promise.all([
     sql`select chain, network_id, trades_seen, last_active_at
         from wallet_chain_presence where handle = ${h} order by trades_seen desc`,
     knownChainsFor([h]),
+    linkedRows(h),
   ]);
 
   const seen = presence.map((p: any) => ({
@@ -691,6 +692,8 @@ get("/v1/traders/:handle/wallets", async ({ handle }) => {
      * have no address.
      */
     wallets,
+    /** Gap 5b. Wallets he funded from a known one; `[]` when none has been linked. */
+    linked: linked.map(linkedBody),
     /** A wallet with no observed chain says so rather than implying it is idle. */
     presence: wallets.every((w) => w.chains.length === 0) && wallets.length
       ? "not_yet_scanned" : "observed",
