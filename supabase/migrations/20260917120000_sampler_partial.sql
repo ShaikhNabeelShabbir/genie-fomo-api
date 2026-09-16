@@ -19,7 +19,9 @@ alter table aum_samples add constraint aum_samples_refused_reason_check
      'price_suspect',
      -- No chain could be asked: the sampler holds no token list for any of his EVM chains
      -- and he has no Solana wallet. Unread, not empty.
-     'no_tokens_known'));
+     'no_tokens_known',
+     -- No chain could be asked at all: none of his known chains is reached by a wallet he has.
+     'nothing_answered'));
 
 comment on column aum_chain_samples.reason is
   'Why total_usd is NULL on this chain: no_prices, wallet_unreadable, service_timeout, '

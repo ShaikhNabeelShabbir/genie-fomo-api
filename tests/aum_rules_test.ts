@@ -33,18 +33,18 @@ Deno.test("applyFloor: below the priced floor AND below $100 is refused with the
   assertEquals(thin.total_usd, null);
   assertEquals(thin.refused_reason, "too_little_priced");
   assertEquals(thin.partial_usd, 99.99);
-  assertEquals(thin.partial, undefined);
   const ok = { total_usd: "100", value_share: "0.25" };
   assertEquals(applyFloor(ok), ok);
   const refused = { total_usd: null, value_share: "0.1", refused_reason: "no_prices" };
   assertEquals(applyFloor(refused), refused);
 });
 
-Deno.test("applyFloor: below the priced floor but >= $100 is served as partial, figure kept", () => {
+Deno.test("applyFloor: below the priced floor but >= $100 is served, figure kept, nothing refused", () => {
   const served = applyFloor({ total_usd: String(PARTIAL_SERVE_FLOOR_USD), value_share: "0.2" });
-  assertEquals(served.total_usd, String(PARTIAL_SERVE_FLOOR_USD));
-  assertEquals(served.partial, true);
-  assertEquals(served.partial_reason, "unpriced_positions");
-  assertEquals(served.refused_reason, undefined);
-  assertEquals(served.partial_usd, undefined);
+  assertEquals(served, { total_usd: String(PARTIAL_SERVE_FLOOR_USD), value_share: "0.2" });
+  const row = { total_usd: "150", value_share: "0.2" };
+  const kept = applyFloor(row);
+  assertEquals(kept.total_usd, "150");
+  assertEquals(kept.refused_reason, undefined);
+  assertEquals(kept.partial_usd, undefined);
 });

@@ -346,7 +346,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     nextCursor: more && last ? encodeCursor([rowId(last)]) : null,
     /** False whenever rows remain. A consumer must not call a `false` page a portfolio. */
     complete: !more,
-    totalValueUsd: total > 0 ? round(total) : null,
+    /** Null means we could not value ANY of what he holds; zero means read and holding nothing (mirrors POST /traders/positions). */
+    totalValueUsd: rows.length === 0 ? 0 : priced === 0 ? null : round(total),
     /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
     unsellableUsd,
     partial: unsellableUsd > 0 || coverageLow(chains),

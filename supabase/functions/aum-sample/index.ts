@@ -237,12 +237,14 @@ Deno.serve(async (req) => {
       ? await sql`
           select t.handle, w.sol_address, w.evm_address
           from traders t join wallets w on w.handle = t.handle
-          where lower(t.handle) = ${one} or lower(t.display_handle) = ${one}`
+          where (w.sol_address is not null or w.evm_address is not null)
+            and (lower(t.handle) = ${one} or lower(t.display_handle) = ${one})`
       : named
       ? await sql`
           select t.handle, w.sol_address, w.evm_address
           from traders t join wallets w on w.handle = t.handle
-          where lower(t.handle) = any(${named}) or lower(t.display_handle) = any(${named})`
+          where (w.sol_address is not null or w.evm_address is not null)
+            and (lower(t.handle) = any(${named}) or lower(t.display_handle) = any(${named}))`
       : await sql`
           select t.handle, w.sol_address, w.evm_address
           from traders t

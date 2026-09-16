@@ -67,9 +67,10 @@ get("/v1/health", async () => {
   /** PER-CHAIN SAMPLER HEALTH, so "bsc stopped answering on the 14th" needs no sweep. */
   /** `hist` mirrors `knownChainsFor` (shared/chains.ts): same `seen` set, same two-point rule. */
   const chainRows = await sql`
+    /* Only chain rows that answered with a figure: the sampler's definition of a known chain (aum-sample/index.ts). */
     with ah as (
-      select handle, network_id, count(*) filter (where total_usd is not null) as pts
-      from aum_chain_samples group by 1, 2),
+      select handle, network_id, count(*) as pts
+      from aum_chain_samples where total_usd is not null group by 1, 2),
     seen as (
       select handle, network_id from wallet_chain_presence
       union select handle, network_id from holdings_current where human_amount > 0

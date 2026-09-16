@@ -16,3 +16,12 @@ alter table aum_samples add constraint aum_samples_refused_reason_check
      'price_suspect'));
 
 update aum_samples set total_usd = null, refused_reason = 'price_suspect' where total_usd > 1e9;
+
+-- The re-classified parent's chain rows and tier follow it: a priced chain row carries the
+-- same word (the sampler stamps only chains that answered with a figure), and a refused
+-- reading is never `verified`.
+update aum_chain_samples c set total_usd = null, reason = 'price_suspect'
+  from aum_samples s
+  where c.handle = s.handle and c.at = s.at and c.basis = s.basis
+    and c.total_usd is not null and s.refused_reason = 'price_suspect';
+update aum_samples set tier = 'reported' where refused_reason = 'price_suspect';

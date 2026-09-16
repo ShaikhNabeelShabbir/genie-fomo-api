@@ -39,14 +39,17 @@ export function priceSuspectReason(
 
 /**
  * The parent total from what the chains answered. A zero is written only when at least one
- * chain was asked and every answer was empty; nothing asked is null with the failures' reason.
+ * chain was asked and every answer was empty; nothing asked is null with the most common failure word, or
+ * `nothing_answered` when no chain could even be asked (no wallet reaches any known chain).
  */
 export function decideTotal(
   answered: number, priced: number, sum: number, total: number, failures: string[],
 ): { totalUsd: number | null; reason: string | null } {
   if (answered === 0) {
-    const distinct = new Set(failures);
-    return { totalUsd: null, reason: distinct.size === 1 ? [...distinct][0] : "wallet_unreadable" };
+    const counts = new Map<string, number>();
+    for (const f of failures) counts.set(f, (counts.get(f) ?? 0) + 1);
+    const most = [...counts].sort((a, b) => b[1] - a[1])[0]?.[0];
+    return { totalUsd: null, reason: most ?? "nothing_answered" };
   }
   if (priced > 0) return { totalUsd: sum, reason: null };
   if (total === 0) return { totalUsd: 0, reason: null };
