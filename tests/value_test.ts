@@ -42,10 +42,16 @@ Deno.test("priceSuspectReason: names the failed check on a /positions row, or nu
   assertEquals(priceSuspectReason(1.18, 1e9, 27e6, 1.016e11), null);
 });
 
-Deno.test("decideTotal: nothing asked is null with the one reason, never 0", () => {
+Deno.test("decideTotal: nothing asked is null with the most common failure word, never 0", () => {
   assertEquals(decideTotal(0, 0, 0, 0, ["no_tokens_known"]), { totalUsd: null, reason: "no_tokens_known" });
-  assertEquals(decideTotal(0, 0, 0, 0, ["wallet_unreadable", "no_tokens_known"]),
-    { totalUsd: null, reason: "wallet_unreadable" });
+  assertEquals(decideTotal(0, 0, 0, 0, ["wallet_unreadable", "no_tokens_known", "no_tokens_known"]),
+    { totalUsd: null, reason: "no_tokens_known" });
+  assertEquals(decideTotal(0, 0, 0, 0, ["service_timeout", "no_tokens_known"]),
+    { totalUsd: null, reason: "service_timeout" });
+});
+
+Deno.test("decideTotal: no chain asked at all is nothing_answered, not wallet_unreadable", () => {
+  assertEquals(decideTotal(0, 0, 0, 0, []), { totalUsd: null, reason: "nothing_answered" });
 });
 
 Deno.test("decideTotal: 0 only when a chain answered and every answer was empty", () => {
