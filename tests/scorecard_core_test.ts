@@ -100,3 +100,14 @@ Deno.test("C2: bleeding fires on the floor only: a red streak, or recent trailin
   assertEquals([w.bleeding, w.medianWinUsd, w.bigWinMonths, w.recent.closes4w, w.career.avgRealizedUsd],
                [null, null, null, 0, null]);
 });
+
+const { exitTimingScoreFrom } = await import("../supabase/functions/api/shared/scorecard-core.ts");
+
+Deno.test("C5: exitTimingScoreFrom counts coins now below the weighted exit, null under five priced coins", () => {
+  const row = (exitPrice: number | null, currentPrice: number | null) => ({ exitPrice, currentPrice });
+  const five = [row(10, 5), row(10, 20), row(1, 0.5), row(2, 1), row(3, 3)];
+  assertEquals(exitTimingScoreFrom(five), 0.6);
+  // Unpriced coins do not count towards the five, and a zero exit is no exit.
+  assertEquals(exitTimingScoreFrom([...five.slice(0, 4), row(null, 1), row(4, null), row(0, 1)]), null);
+  assertEquals(exitTimingScoreFrom([]), null);
+});

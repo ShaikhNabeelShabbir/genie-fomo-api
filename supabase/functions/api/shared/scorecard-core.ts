@@ -354,6 +354,20 @@ export function compositeWindows(closes: CloseRow[], coins: CoinRow[], nowMs: nu
   };
 }
 
+/**
+ * C5 (composite badges). Share of closed coins whose price today sits below the trader's
+ * weighted exit: 1 means every coin he sold went on to fall. Null under five coins carrying
+ * both prices, so the figure never rests on a coin or two. Reused by /tokens/:address/activity.
+ */
+export const EXIT_TIMING_MIN_COINS = 5;
+export function exitTimingScoreFrom(
+  rows: { exitPrice: number | null; currentPrice: number | null }[],
+): number | null {
+  const priced = rows.filter((r) => r.exitPrice !== null && r.exitPrice > 0 && r.currentPrice !== null);
+  if (priced.length < EXIT_TIMING_MIN_COINS) return null;
+  return Number((priced.filter((r) => r.currentPrice! < r.exitPrice!).length / priced.length).toFixed(4));
+}
+
 /** Everything the scorecard computes, over rows already fetched. See docs/DECISIONS.md#d142 */
 // deno-lint-ignore no-explicit-any
 /** THE BALANCE A TRADER STARTED EACH MONTH WITH — the denominator a monthly return needs. See docs/DECISIONS.md#d143 */
@@ -1101,6 +1115,9 @@ export async function scorecardBody(
     career: composite.career,
     bleeding: composite.bleeding,
     bleedingBasis: composite.bleedingBasis,
+    /** C5: share of closed coins now priced below his weighted exit; null under 5 such coins. */
+    exitTimingScore: exitTimingScoreFrom(byToken.filter((c) => c.closed > 0)
+      .map((c) => ({ exitPrice: c.avgExitPrice, currentPrice: c.currentPriceUsd }))),
     /** THE SAME VOCABULARY, SUMMARISED FOR THE WHOLE ANSWER. See docs/DECISIONS.md#d171 */
     fieldReasons: (() => {
       const why: Record<string, string> = {};
