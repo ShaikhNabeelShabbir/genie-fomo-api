@@ -60,8 +60,8 @@ export function chooseStep(
 export function applyFloor(r: Record<string, unknown>): Record<string, unknown> {
   const share = n(r.value_share);
   const total = n(r.total_usd);
-  if (total === null || share === null || share >= PRICED_FLOOR) return r;
-  if (total >= PARTIAL_SERVE_FLOOR_USD) return { ...r, partial: true, partial_reason: "unpriced_positions" };
+  /* A served-partial row is returned as is: the route derives `partial` from `value_share`. */
+  if (total === null || share === null || share >= PRICED_FLOOR || total >= PARTIAL_SERVE_FLOOR_USD) return r;
   return {
     ...r,
     total_usd: null,
