@@ -4,7 +4,27 @@ import { get, requestVersion } from "../router.ts";
 
 // ------------------------------------------------------------------ health
 
+/** The body is the same for every caller, so one isolate computes it at most every 30 s. */
+const HEALTH_CACHE_MS = 30_000;
+let healthCache: { at: number; body: Record<string, unknown> } | null = null;
+
 get("/v1/health", async (_p, url) => {
+  const now = Date.now();
+  const hit = healthCache && now - healthCache.at < HEALTH_CACHE_MS ? healthCache : null;
+  const body = hit?.body ?? await healthBody();
+  if (!hit) healthCache = { at: now, body };
+  return {
+    status: "ok",
+    /** Which contract answered: `v1` on Supabase, `v2` on the Cloudflare Worker (same routes). */
+    apiVersion: requestVersion(url.pathname),
+    /** Whether this answer was computed for this call; `cacheAgeSeconds` says how old it is. */
+    cached: hit !== null,
+    cacheAgeSeconds: hit ? Math.round((now - hit.at) / 1000) : 0,
+    ...body,
+  };
+});
+
+async function healthBody(): Promise<Record<string, unknown>> {
   /** Exact counts everywhere except `transactions`, which is an estimate and says so. See docs/DECISIONS.md#d063 */
   /** FOUR SEQUENTIAL AWAITS, DELIBERATELY. See docs/DECISIONS.md#d064 */
   const [c] = await sql`
@@ -65,38 +85,40 @@ get("/v1/health", async (_p, url) => {
     from traders`;
 
   /** PER-CHAIN SAMPLER HEALTH, so "bsc stopped answering on the 14th" needs no sweep. */
-  /** `hist` mirrors `knownChainsFor` (shared/chains.ts): same `seen` set, same two-point rule. */
   const chainRows = await sql`
-    /* Only chain rows that answered with a figure: the sampler's definition of a known chain (aum-sample/index.ts). */
-    with ah as (
-      select handle, network_id, count(*) as pts
-      from aum_chain_samples where total_usd is not null group by 1, 2),
-    seen as (
-      select handle, network_id from wallet_chain_presence
-      union select handle, network_id from holdings_current where human_amount > 0
-      union select handle, network_id from ah),
-    hist as (
-      select s.network_id,
-             count(*) filter (where ah.pts >= 2)::int              as ready,
-             count(*) filter (where ah.pts = 1)::int               as warming,
-             count(*) filter (where coalesce(ah.pts, 0) = 0)::int  as none
-      from seen s
-      join traders t on t.handle = s.handle
-      left join ah on ah.handle = s.handle and ah.network_id = s.network_id
-      group by s.network_id)
+    /*
+     * Laterals so each chain is one range on aum_chain_samples_net_at_idx (network_id, at
+     * desc) where basis = 'sampled'; the history counts come from trader_chain_history, the
+     * one definition knownChainsFor also reads, aggregated once for all chains.
+     */
     select c.name,
-           count(*) filter (where s.total_usd is not null
-                              and s.at >= now() - interval '36 hours')::int as accepted_36h,
-           count(*) filter (where s.reason is not null
-                              and s.at >= now() - interval '24 hours')::int as failed_24h,
-           max(s.at) filter (where s.total_usd is not null)                  as newest_accepted_at,
-           coalesce(h.ready, 0)   as hist_ready,
-           coalesce(h.warming, 0) as hist_warming,
-           coalesce(h.none, 0)    as hist_none
+           coalesce(r.accepted_36h, 0) as accepted_36h,
+           coalesce(r.failed_24h, 0)   as failed_24h,
+           a.newest_accepted_at,
+           coalesce(h.ready, 0)        as hist_ready,
+           coalesce(h.warming, 0)      as hist_warming,
+           coalesce(h.none, 0)         as hist_none
     from chains c
-    left join aum_chain_samples s on s.network_id = c.network_id and s.basis = 'sampled'
-    left join hist h on h.network_id = c.network_id
-    group by c.name, h.ready, h.warming, h.none order by c.name`;
+    left join lateral (
+      select count(*) filter (where s.total_usd is not null
+                                and s.at >= now() - interval '36 hours')::int as accepted_36h,
+             count(*) filter (where s.reason is not null
+                                and s.at >= now() - interval '24 hours')::int as failed_24h
+      from aum_chain_samples s
+      where s.network_id = c.network_id and s.basis = 'sampled'
+        and s.at >= now() - interval '36 hours') r on true
+    left join lateral (
+      select s.at as newest_accepted_at
+      from aum_chain_samples s
+      where s.network_id = c.network_id and s.basis = 'sampled' and s.total_usd is not null
+      order by s.at desc limit 1) a on true
+    left join (
+      select network_id,
+             count(*) filter (where history_state = 'ready')::int   as ready,
+             count(*) filter (where history_state = 'warming')::int as warming,
+             count(*) filter (where history_state = 'none')::int    as none
+      from trader_chain_history group by network_id) h on h.network_id = c.network_id
+    order by c.name`;
   const histOf = (r: Record<string, unknown>) => ({
     ready: Number(r.hist_ready), warming: Number(r.hist_warming), none: Number(r.hist_none),
   });
@@ -164,9 +186,6 @@ get("/v1/health", async (_p, url) => {
    */
 
   return {
-    status: "ok",
-    /** Which contract answered: `v1` on Supabase, `v2` on the Cloudflare Worker (same routes). */
-    apiVersion: requestVersion(url.pathname),
     runtime: (globalThis as { Deno?: unknown }).Deno ? "supabase edge function (deno)" : "cloudflare worker",
     source: "postgres",
     build: { capturedAt: b?.captured_at ?? null, window: b?.window_label ?? null },
@@ -274,4 +293,4 @@ get("/v1/health", async (_p, url) => {
       };
     })(),
   };
-});
+}
