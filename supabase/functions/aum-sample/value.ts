@@ -12,3 +12,19 @@ export function value(amount: number, price: number | null): { usd?: number; rej
   if (!Number.isFinite(usd) || usd > MAX_POSITION_USD) return { rejected: true };
   return { usd };
 }
+
+/**
+ * The parent total from what the chains answered. A zero is written only when at least one
+ * chain was asked and every answer was empty; nothing asked is null with the failures' reason.
+ */
+export function decideTotal(
+  answered: number, priced: number, sum: number, total: number, failures: string[],
+): { totalUsd: number | null; reason: string | null } {
+  if (answered === 0) {
+    const distinct = new Set(failures);
+    return { totalUsd: null, reason: distinct.size === 1 ? [...distinct][0] : "wallet_unreadable" };
+  }
+  if (priced > 0) return { totalUsd: sum, reason: null };
+  if (total === 0) return { totalUsd: 0, reason: null };
+  return { totalUsd: null, reason: "no_prices" };
+}
