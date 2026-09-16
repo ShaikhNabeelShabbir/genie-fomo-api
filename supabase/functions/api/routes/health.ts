@@ -1,4 +1,5 @@
 import { sql, n, round } from "../db.ts";
+import { cfg } from "../config.ts";
 import { get } from "../router.ts";
 
 // ------------------------------------------------------------------ health
@@ -225,9 +226,9 @@ get("/v1/health", async () => {
       note: "0 on every route except /traders/:handle/aum, which fetches a live reading when " +
             "the stored one is past the freshness floor. Pass ?live=false to forbid it",
       liveAum: {
-        enabled: (Deno.env.get("AUM_SAMPLE_URL") ?? "").trim() !== "" &&
-                 (Deno.env.get("AUM_SAMPLE_SECRET") ?? "").trim() !== "",
-        freshnessFloorMinutes: Number(Deno.env.get("AUM_LIVE_AFTER_MINUTES") ?? 5),
+        enabled: (cfg("AUM_SAMPLE_URL") ?? "").trim() !== "" &&
+                 (cfg("AUM_SAMPLE_SECRET") ?? "").trim() !== "",
+        freshnessFloorMinutes: Number(cfg("AUM_LIVE_AFTER_MINUTES") ?? 5),
       },
     },
     /** WHICH CAPABILITIES ARE STILL DELIVERING, by name, judged on evidence. See docs/DECISIONS.md#d070 */
@@ -257,7 +258,7 @@ get("/v1/health", async () => {
            * Presence of the key IN THIS PROCESS, which is normally false and is not a fault.
            * The loaders hold these keys and run elsewhere. Never the value, only presence.
            */
-          keyInThisProcess: (Deno.env.get(c.key) ?? "").trim().length > 0,
+          keyInThisProcess: (cfg(c.key) ?? "").trim().length > 0,
         };
       });
       return {

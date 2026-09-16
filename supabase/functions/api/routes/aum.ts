@@ -1,4 +1,5 @@
 import { sql, n, round } from "../db.ts";
+import { cfg } from "../config.ts";
 import { get, post } from "../router.ts";
 import { notFound, badRequest } from "../errors.ts";
 import { median, money } from "../shared/format.ts";
@@ -856,25 +857,25 @@ async function aumFor(
 }
 
 /** READ-THROUGH REFRESH: when the stored reading is old, go and get a new one. See docs/DECISIONS.md#d053 */
-const LIVE_AFTER_MS = Number(Deno.env.get("AUM_LIVE_AFTER_MINUTES") ?? 5) * 60_000;
+const liveAfterMs = () => Number(cfg("AUM_LIVE_AFTER_MINUTES") ?? 5) * 60_000;
 /** SHORT ON PURPOSE. See docs/DECISIONS.md#d054 */
-const LIVE_WAIT_MS = Number(Deno.env.get("AUM_LIVE_WAIT_MS") ?? 3_000);
-const SAMPLE_URL = (Deno.env.get("AUM_SAMPLE_URL") ?? "").trim();
-const SAMPLE_SECRET = (Deno.env.get("AUM_SAMPLE_SECRET") ?? "").trim();
+const liveWaitMs = () => Number(cfg("AUM_LIVE_WAIT_MS") ?? 3_000);
+const sampleUrl = () => (cfg("AUM_SAMPLE_URL") ?? "").trim();
+const sampleSecret = () => (cfg("AUM_SAMPLE_SECRET") ?? "").trim();
 /** Per instance. Edge Functions scale out, so this thins the stampede rather than ending it. */
 const inFlight = new Map<string, Promise<void>>();
 
 /** True when a live read is configured and possible at all. */
-const liveReadable = () => SAMPLE_URL !== "" && SAMPLE_SECRET !== "";
+const liveReadable = () => sampleUrl() !== "" && sampleSecret() !== "";
 
 async function refreshNow(handle: string): Promise<void> {
   const running = inFlight.get(handle);
   if (running) return running;
   const task = (async () => {
     try {
-      const r = await fetch(SAMPLE_URL, {
+      const r = await fetch(sampleUrl(), {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-sample-secret": SAMPLE_SECRET },
+        headers: { "Content-Type": "application/json", "x-sample-secret": sampleSecret() },
         body: JSON.stringify({ handle }),
         /* Its own ceiling, above our wait, so a fetch we stopped waiting for still completes. */
         signal: AbortSignal.timeout(60_000),
@@ -909,7 +910,7 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
       select max(sampled_at) as at from aum_samples
       where handle = ${h} and basis = 'sampled' and total_usd is not null`;
     const ageMs = newest?.at ? Date.now() - Date.parse(String(newest.at)) : Infinity;
-    if (liveParam === "true" || ageMs > LIVE_AFTER_MS) {
+    if (liveParam === "true" || ageMs > liveAfterMs()) {
       const fetching = refreshNow(h);
       /*
        * Wait, but not forever. Whichever finishes first decides what this caller gets, and
@@ -917,7 +918,7 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
        */
       const won = await Promise.race([
         fetching.then(() => true),
-        new Promise<boolean>((r) => setTimeout(() => r(false), LIVE_WAIT_MS)),
+        new Promise<boolean>((r) => setTimeout(() => r(false), liveWaitMs())),
       ]);
       refreshed = won ? "fetched" : "still_running";
     } else {
@@ -937,8 +938,8 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
     /** WHAT THIS REQUEST DID ABOUT FRESHNESS, so `now.ageSeconds` can be read in context. See docs/DECISIONS.md#d056 */
     liveRead: {
       state: refreshed,
-      freshnessFloorMinutes: LIVE_AFTER_MS / 60_000,
-      waitedMs: refreshed === "fetched" || refreshed === "still_running" ? LIVE_WAIT_MS : null,
+      freshnessFloorMinutes: liveAfterMs() / 60_000,
+      waitedMs: refreshed === "fetched" || refreshed === "still_running" ? liveWaitMs() : null,
     },
   };
 });

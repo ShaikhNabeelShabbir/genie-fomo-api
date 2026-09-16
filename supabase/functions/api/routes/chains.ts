@@ -24,7 +24,7 @@ get("/v1/chains", async () => {
   const [{ total }] = await sql`select count(*)::int as total from holdings_current`;
 
   /** C3 — realized profit per chain. See docs/DECISIONS.md#d060 */
-  const profit = await sql`
+  const profit = await sql<ProfitRow[]>`
     select t.network_id,
            count(*) filter (where t.status = 'closed')::int as closed,
            coalesce(sum(t.realized_pnl_usd) filter (where t.status = 'closed'), 0) as realized

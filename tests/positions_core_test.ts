@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1";
 
-// db.ts reads DB_URL at import; `deno task test` sets a dummy so the pure helpers load.
+// db.ts no longer touches the database at import; the pure helpers load with no env at all.
 const { sellFlags, unsellable, chainCoverage, coverageLow, positionsPartialReason } =
   await import("../supabase/functions/api/shared/positions-core.ts");
 

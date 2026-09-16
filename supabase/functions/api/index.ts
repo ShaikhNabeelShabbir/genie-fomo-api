@@ -1,164 +1,33 @@
-import { match } from "./router.ts";
-import { ApiError, classify, unauthorized, checkRate } from "./errors.ts";
-import type { RateState } from "./errors.ts";
-import "./routes.ts";
+import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
+import { setDefaultSql } from "./db.ts";
+import { handle } from "./app.ts";
 
+/** The Deno entry: one client for the instance, then serve. The handler is app.ts. */
 /**
- * genie-fomo API as a Supabase Edge Function.
- *
- * Serves the PARAMETERS.md parameters straight from Postgres. Nothing here calls fomoapi,
- * Helius, Bitquery or Etherscan — those keys belong to the scheduled loaders, so a request
- * costs a query and nothing else, and a thousand visitors cost what one does.
+ * Supabase injects SUPABASE_DB_URL into every Edge Function automatically, pointing at the
+ * direct connection — which resolves IPv6-only. That is fine from inside Supabase's own
+ * network and unreachable from a laptop, so DB_URL (a secret we set ourselves, pointing at
+ * the IPv4 pooler) takes precedence when present. Same file runs in both places.
  */
-const KEY = (Deno.env.get("GENIE_API_KEY") ?? "").trim();
-const RATE_LIMIT = Number(Deno.env.get("RATE_LIMIT_PER_MINUTE") ?? 240);
-const port = Number(Deno.env.get("PORT") ?? 8000);
-/** No route may hang. See docs/DECISIONS.md#d010 */
-const ROUTE_TIMEOUT_MS = Number(Deno.env.get("ROUTE_TIMEOUT_MS") ?? 15000);
-/** A batch is capped at 50, so a single call can never cost more than that. */
-const BATCH_MAX_COST = 50;
+const url = Deno.env.get("DB_URL") ?? Deno.env.get("SUPABASE_DB_URL") ??
+            Deno.env.get("DATABASE_URL") ?? "";
+if (!url) throw new Error("SUPABASE_DB_URL is not set");
 
-const headers = (extra: Record<string, string> = {}) => ({
-  "Content-Type": "application/json",
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-api-key, content-type",
-  // A browser client cannot read these unless they are exposed.
-  "Access-Control-Expose-Headers":
-    "Retry-After, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, RateLimit-Scope, x-request-id",
-  ...extra,
-});
+/** One Postgres connection for the whole function instance. See docs/DECISIONS.md#d003 */
+setDefaultSql(postgres(url, {
+  /**
+   * Deliberately small. Edge Functions scale HORIZONTALLY — every warm instance holds its
+   * own pool, so `max` multiplies by instance count. Pointed at the session pooler (5432)
+   * with max: 3, five instances exhausted the 15-client limit and every route began
+   * returning 500 `EMAXCONNSESSION`. DB_URL is now the transaction pooler (6543), which
+   * multiplexes, and this stays low so the same mistake cannot repeat as cheaply.
+   */
+  max: 2,
+  idle_timeout: 20,
+  connect_timeout: 15,
+  prepare: false,
+  /** Deno verifies TLS against its own trust store and rejects the Supabase pooler's chain with… See docs/DECISIONS.md#d004 */
+  ssl: "require",
+}));
 
-const rateHeaders = (r: RateState | null): Record<string, string> =>
-  r
-    ? {
-        "RateLimit-Limit": String(r.limit),
-        "RateLimit-Remaining": String(r.remaining),
-        "RateLimit-Reset": String(r.reset),
-        // Per instance, not global — see RateState. Without this a client would pace against
-        // a budget that appears to reset whenever it reaches a different instance.
-        "RateLimit-Scope": r.scope,
-      }
-    : {};
-
-const json = (body: unknown, status = 200, extra: Record<string, string> = {}) =>
-  new Response(JSON.stringify(body, null, 2), { status, headers: headers(extra) });
-
-/**
- * A per-request id, echoed on every error and in the `x-request-id` header.
- *
- * Without one, "it failed around 3pm" is the whole bug report. A consumer can now quote an
- * id and we can find that exact request. Generated per request, never reused.
- */
-const requestId = () => `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-
-const fail = (e: ApiError, extra: Record<string, string> = {}, rid = requestId()) =>
-  json(
-    {
-      error: {
-        // Stable and machine-readable. Status alone cannot tell "no such trader" from
-        // "no such route", and both are 404.
-        code: e.code,
-        detail: e.message,
-        /** Quote this when reporting a failure; it identifies the exact request. */
-        requestId: rid,
-        ...(e.retryAfterSeconds ? { retryAfterSeconds: e.retryAfterSeconds } : {}),
-        ...(e.extra ?? {}),
-      },
-    },
-    e.status,
-    { ...extra, "x-request-id": rid,
-      ...(e.retryAfterSeconds ? { "Retry-After": String(e.retryAfterSeconds) } : {}) },
-  );
-
-/** The bucket key for a caller. See docs/DECISIONS.md#d011 */
-const callerKey = (req: Request): string => {
-  const apiKey = req.headers.get("x-api-key");
-  if (apiKey) return `key:${apiKey}`;
-  const fwd = req.headers.get("x-forwarded-for") ?? "";
-  const client = fwd.split(",")[0].trim();
-  return client ? `ip:${client}` : "anon";
-};
-
-Deno.serve({ port }, async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
-
-  const url = new URL(req.url);
-  let rate: RateState | null = null;
-  try {
-    // Rate limit before auth so a flood of bad keys cannot be used to hammer the database.
-    rate = await checkRate(callerKey(req));
-
-    if (KEY && req.headers.get("x-api-key") !== KEY) throw unauthorized();
-
-    const hit = match(req.method, url.pathname);
-    if (!hit) {
-      // A 404 that lists what DOES exist. Both 404s reported in review were URL shape,
-      // not a missing feature — an error that names the alternatives ends that class.
-      throw new ApiError(404, "not_found", `no route for ${req.method} ${url.pathname}`, {
-        hint: "the handle is a parameter, not the first segment: /traders/<handle>/wallets",
-        routes: [
-          "GET /health",
-          "GET /traders",
-          "GET /traders/:handle",
-          "GET /traders/:handle/pnl",
-          "GET /traders/:handle/scorecard",
-          "GET /traders/:handle/portfolio",
-          "GET /traders/:handle/positions",
-          "GET /traders/:handle/trust",
-          "GET /traders/:handle/wallets",
-          "GET /traders/:handle/transactions",
-          "GET /traders/:handle/trades",
-          "GET /traders/:handle/aum",
-          "GET /tokens",
-          "GET /tokens/momentum",
-          "GET /tokens/:address",
-          "GET /tokens/:address/activity",
-          "GET /chains",
-          "GET /fields",
-          "POST /traders/positions   { ids: [...] }",
-          "POST /traders/aum        { ids: [...], window, step }",
-          "POST /traders/:handle/wallets   { secret, evmAddress?, solanaAddress? }",
-        ],
-      });
-    }
-
-    // POST carries a JSON body; GET never does.
-    let body: unknown = null;
-    if (req.method === "POST") {
-      try { body = await req.json(); }
-      catch { throw new ApiError(400, "bad_request", "body must be JSON"); }
-    }
-
-    /*
-     * Every route is bounded.
-     *
-     * A 30-second hang with no body is indistinguishable from a slow success, and a
-     * consumer cannot tell whether to wait, retry or give up. Losing the race returns a
-     * 503 with `code: "timeout"` -- an answer, and an actionable one.
-     */
-    const answered = await Promise.race([
-      Promise.resolve(hit.handler(hit.params, url, body)),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new ApiError(503, "timeout",
-          `this route did not answer within ${ROUTE_TIMEOUT_MS / 1000}s — retry`,
-          undefined, 5)), ROUTE_TIMEOUT_MS)),
-    ]);
-    /** COST IS WHAT THE CALL ACTUALLY ASKED FOR, not a flat 1. See docs/DECISIONS.md#d012 */
-    const asked = (answered as { asked?: unknown } | null)?.asked;
-    const cost = typeof asked === "number" && Number.isFinite(asked) && asked > 0
-      ? Math.min(asked, BATCH_MAX_COST)
-      : 1;
-    return json(answered, 200, { ...rateHeaders(rate), "x-cost-units": String(cost) });
-  } catch (e) {
-    const err = classify(e);
-    if (err.status >= 500) console.error(`${url.pathname}: ${err.code} ${err.message}`);
-    // Errors carry the budget too — a 404 while nearly exhausted is worth knowing about
-    // before the next call turns into a 429. On a 429 `rate` is null, because checkRate
-    // threw instead of returning: reconstruct the state so the response that most needs
-    // the budget is not the one response missing it.
-    if (!rate && err.status === 429) {
-      rate = { limit: RATE_LIMIT, remaining: 0, reset: err.retryAfterSeconds ?? 60, scope: "global" };
-    }
-    return fail(err, rateHeaders(rate));
-  }
-});
+Deno.serve({ port: Number(Deno.env.get("PORT") ?? 8000) }, handle);
