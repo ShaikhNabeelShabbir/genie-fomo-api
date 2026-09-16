@@ -1,3 +1,5 @@
+import { badRequest } from "./errors.ts";
+
 /** Tiny path router — Deno has no Express, and one function serves every route. */
 export type Handler = (
   params: Record<string, string>,
@@ -44,6 +46,12 @@ export function rewriteVersion(text: string, version: ApiVersion): string {
   return version === "v1" ? text : text.replace(/\/v1\//g, `/${version}/`);
 }
 
+/** A malformed `%` sequence is the caller's error, not ours: 400, not the 500 `URIError` gave. */
+const decodeSegment = (segment: string): string => {
+  try { return decodeURIComponent(segment); }
+  catch { throw badRequest(`malformed percent-encoding in path segment '${segment}'`); }
+};
+
 export function match(method: string, pathname: string) {
   // Strip the function name Supabase prefixes onto the path (/api/v1/... -> /v1/...).
   const parts = pathname.split("/").filter(Boolean);
@@ -62,7 +70,7 @@ export function match(method: string, pathname: string) {
     let ok = true, score = 0;
     for (let i = 0; i < r.parts.length; i++) {
       const p = r.parts[i];
-      if (p.startsWith(":")) params[p.slice(1)] = decodeURIComponent(parts[i]);
+      if (p.startsWith(":")) params[p.slice(1)] = decodeSegment(parts[i]);
       else if (p === parts[i]) score++;
       else { ok = false; break; }
     }
