@@ -15,6 +15,7 @@
  *   node scripts/load_token_supply.mjs --limit 20
  */
 import { EVM_CHAINS, SOLANA_NETWORK_ID } from "./lib/dist/settings.js";
+import { rpc } from "./lib/chain_reads.mjs";
 import { Pool } from "pg";
 
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i > -1 ? process.argv[i+1] : d; };
@@ -41,25 +42,21 @@ async function batches(items, n, work) {
   return out;
 }
 
+/*
+ * Every call goes through chain_reads' rpc(): the same per-host throttle and 429 backoff the
+ * AUM sampler uses, so this job cannot spend a host's rate limit that the sampler needs.
+ * FANOUT still overlaps different hosts; same-host calls queue.
+ */
 async function solanaSupply(mint) {
-  const r = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS}`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getTokenSupply", params: [mint] }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const j = await r.json();
+  const j = await rpc(`https://mainnet.helius-rpc.com/?api-key=${HELIUS}`,
+    { jsonrpc: "2.0", id: 1, method: "getTokenSupply", params: [mint] });
   const v = j?.result?.value;
   if (!v || v.uiAmount === null || v.uiAmount === undefined) return null;
   return { supply: Number(v.uiAmount), decimals: Number(v.decimals), source: "helius" };
 }
 
-async function evmCall(rpc, to, data) {
-  const r = await fetch(rpc, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to, data }, "latest"] }),
-    signal: AbortSignal.timeout(20_000),
-  });
-  const j = await r.json();
+async function evmCall(url, to, data) {
+  const j = await rpc(url, { jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to, data }, "latest"] });
   return typeof j?.result === "string" && j.result !== "0x" ? j.result : null;
 }
 
@@ -114,14 +111,11 @@ async function main() {
   });
 
   if (found.length) {
-    const c = await pool.connect();
-    try {
-      for (const f of found) {
-        await c.query(
-          `update tokens set total_supply=$1, decimals=$2, supply_source=$3, supply_read_at=now()
-           where network_id=$4 and token_key=$5`, f);
-      }
-    } finally { c.release(); }
+    await pool.query(`
+      update tokens t set total_supply = u.s, decimals = u.d, supply_source = u.src, supply_read_at = now()
+      from unnest($1::numeric[], $2::integer[], $3::text[], $4::bigint[], $5::text[]) as u(s, d, src, n, k)
+      where t.network_id = u.n and t.token_key = u.k`,
+      [0, 1, 2, 3, 4].map((i) => found.map((f) => f[i])));
   }
   const { rows: [tot] } = await pool.query("select count(total_supply)::int n from tokens");
   console.log(`\nresolved ${ok} · unknown ${miss} · tokens with a supply now: ${tot.n}`);
