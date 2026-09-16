@@ -573,7 +573,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
            coalesce(sum(realized_pnl_usd)
                     filter (where status = 'closed'), 0)            as realized,
            coalesce(sum(unrealized_pnl_usd)
-                    filter (where status <> 'closed'), 0)           as unrealized,
+                    filter (where status not in ('closed', 'closed_by_balance')), 0) as unrealized,
            coalesce(
              sum(avg_entry_price * qty) filter (where avg_entry_price > 0 and qty is not null)
                / nullif(sum(qty) filter (where avg_entry_price > 0 and qty is not null), 0),

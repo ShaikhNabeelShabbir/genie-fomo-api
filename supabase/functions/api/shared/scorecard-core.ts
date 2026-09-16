@@ -375,7 +375,8 @@ export async function scorecardBody(
         rec.lastClosedMs  = rec.lastClosedMs  === null ? cms : Math.max(rec.lastClosedMs, cms);
       }
     }
-    else rec.unrealizedPnlUsd += n(r.unrealized_pnl_usd) ?? 0;
+    // closed_by_balance (close_stale_trades.mjs): no longer held, so no paper P&L either.
+    else if (r.status !== "closed_by_balance") rec.unrealizedPnlUsd += n(r.unrealized_pnl_usd) ?? 0;
 
     const openedAt = ms(r.opened_at);
     if (openedAt !== null && (rec.firstOpenedMs === null || openedAt < rec.firstOpenedMs)) {

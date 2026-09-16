@@ -14,9 +14,14 @@ import { scorecardBody } from "../shared/scorecard-core.ts";
 export const pnlAgg = (handles: string[]) => sql`
   select handle,
          count(*) filter (where status = 'closed')::int  as closed,
-         count(*) filter (where status <> 'closed')::int as open,
+         count(*) filter (where status not in ('closed', 'closed_by_balance'))::int as open,
+         -- Item 10: open trade records whose token the wallet still holds per holdings_current.
+         count(*) filter (where status not in ('closed', 'closed_by_balance') and exists (
+           select 1 from holdings_current hc
+           where hc.handle = trades.handle and hc.network_id = trades.network_id
+             and hc.token_key = trades.token_key and hc.human_amount > 0))::int as open_held,
          coalesce(sum(realized_pnl_usd)   filter (where status = 'closed'), 0)  as realized,
-         coalesce(sum(unrealized_pnl_usd) filter (where status <> 'closed'), 0) as unrealized,
+         coalesce(sum(unrealized_pnl_usd) filter (where status not in ('closed', 'closed_by_balance')), 0) as unrealized,
          max(captured_at) as captured
   from trades where handle = any(${handles}) group by handle`;
 
@@ -26,7 +31,7 @@ export const pnlAgg = (handles: string[]) => sql`
  */
 // deno-lint-ignore no-explicit-any
 export function pnlBody(t: any, r: any | undefined) {
-  const closed = Number(r?.closed ?? 0), open = Number(r?.open ?? 0);
+  const closed = Number(r?.closed ?? 0), open = Number(r?.open ?? 0), openHeld = Number(r?.open_held ?? 0);
   const realized = (r ? n(r.realized) : 0) ?? 0, unrealized = (r ? n(r.unrealized) : 0) ?? 0;
   const any = closed + open > 0;
 
@@ -62,6 +67,8 @@ export function pnlBody(t: any, r: any | undefined) {
     closedTrades: closed,
     onPaperUsd: any ? round(unrealized) : null,
     openPositions: open,
+    openPositionsHeld: openHeld,
+    openPositionsBasis: { openPositions: "trade_records", openPositionsHeld: "trade_records_still_held_on_chain" },
     realizedShare: share,
     /** WHY `realizedShare` IS NULL, as a machine word rather than only in `plain`. See docs/DECISIONS.md#d135 */
     realizedShareReason: share !== null
