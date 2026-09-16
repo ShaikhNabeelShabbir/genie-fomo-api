@@ -8,7 +8,8 @@
     "noEmit": true,
     "allowImportingTsExtensions": true,
     "skipLibCheck": true,
-    "types": ["@cloudflare/workers-types", "node"]
+    "types": ["@cloudflare/workers-types", "node"],
+    "paths": { "https://deno.land/x/postgresjs@v3.4.4/mod.js": ["../node_modules/postgres/types/index.d.ts"] }
   },
   "include": ["src/**/*.ts"]
 }
