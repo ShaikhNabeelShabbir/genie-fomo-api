@@ -256,7 +256,9 @@ get("/v1/tokens/:address", async ({ address }, url) => {
            -- GMGN's false for a check that chain does not have.
            ti.is_honeypot, ti.buy_tax, ti.sell_tax, ti.is_open_source, ti.is_renounced,
            ti.renounced_mint, ti.renounced_freeze, ti.rug_ratio, ti.burn_ratio,
-           ti.is_blacklisted, ti.can_not_sell, ti.security_fetched_at
+           ti.is_blacklisted, ti.can_not_sell, ti.security_fetched_at,
+           -- Gap 1: hourly DexScreener sample with a rolling ATH (scripts/load_token_prices.mjs).
+           ps.last_usd as ps_usd, ps.last_at as ps_at, ps.ath_usd, ps.ath_at, ps.drawdown_share, ps.source as ps_source
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
@@ -274,6 +276,8 @@ get("/v1/tokens/:address", async ({ address }, url) => {
     left join trader_stats_current st on st.handle = h.handle
     left join token_info ti
       on ti.network_id = h.network_id and ti.token_key = h.token_key
+    left join token_price_stats ps
+      on ps.network_id = h.network_id and ps.token_key = h.token_key
     where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}
     order by (case when h.value > 0 then h.value else null end) desc nulls last,
              t.display_handle`;
@@ -334,6 +338,15 @@ get("/v1/tokens/:address", async ({ address }, url) => {
         estimatedValueBasis: n(group[0].price_usd) !== null
           ? "sum(holdings.amount) x GMGN price — third-party, not our stored value"
           : null,
+        /** Gap 1. Latest hourly sample and the ATH since we started sampling; null fields, never 0, when unknown. */
+        price: {
+          usd: n(group[0].ps_usd),
+          asOf: group[0].ps_at ? new Date(String(group[0].ps_at)).toISOString() : null,
+          athUsd: n(group[0].ath_usd),
+          athAt: group[0].ath_at ? new Date(String(group[0].ath_at)).toISOString() : null,
+          drawdownShare: n(group[0].drawdown_share),
+          source: (group[0].ps_source as string | null) ?? null,
+        },
         /** T3a. See docs/DECISIONS.md#d084 */
         security: group[0].security_fetched_at
           ? (() => {
