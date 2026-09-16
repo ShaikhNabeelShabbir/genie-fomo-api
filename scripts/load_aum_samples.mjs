@@ -24,7 +24,7 @@
  *   node scripts/load_aum_samples.mjs                       # the whole board
  */
 import pg from "pg";
-import { SOLANA_NETWORK_ID, solanaBalances, evmBalances } from "./lib/chain_reads.mjs";
+import { SOLANA_NETWORK_ID, solanaBalances, evmBalances, evmTxCount } from "./lib/chain_reads.mjs";
 import { concentrationSuspect, value } from "./lib/value.mjs";
 
 const DB  = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
@@ -118,7 +118,8 @@ async function readChain(t, c, decimals, tradedByNet) {
     if (!tokens.length) return { positions: null, reason: "no_tokens_known" };
     const view = { get: (k) => decimals.get(`${net}:${k}`), set: (k, v) => decimals.set(`${net}:${k}`, v) };
     const res = await evmBalances(c.rpc, t.evm_address, tokens, view);
-    return { positions: res.balances.map(pos), reason: null };
+    // R6: the wallet's tx count on an EVM chain that answered; null when the node will not say.
+    return { positions: res.balances.map(pos), reason: null, nonce: await evmTxCount(c.rpc, t.evm_address) };
   } catch (e) {
     console.error(`  ${t.handle} ${c.name}: ${e.message}`);
     return { positions: null, reason: "wallet_unreadable" };
@@ -168,8 +169,23 @@ async function settle(client, reads) {
 }
 
 /** The parent row and one row per chain asked, answered or not. */
-async function write(client, handle, at, expected, reads, s) {
+async function write(client, t, at, expected, reads, s) {
+  const handle = t.handle;
   const answered = s.perChain.size;
+  // R6: the chain's nonce against the rows the indexer holds, per EVM chain that answered.
+  const covered = [...reads].filter(([, r]) => r.nonce != null);
+  if (covered.length && t.evm_address) {
+    const addr = t.evm_address.toLowerCase();
+    await client.query(`
+      insert into chain_coverage (handle, network_id, address_key, chain_nonce, rows_held, read_at)
+      select $1, u.n, $2, u.c,
+             (select count(*) from transactions x where x.address_key = $2 and x.network_id = u.n), now()
+      from unnest($3::bigint[], $4::bigint[]) as u(n, c)
+      on conflict (handle, network_id) do update set
+        address_key = excluded.address_key, chain_nonce = excluded.chain_nonce,
+        rows_held = excluded.rows_held, read_at = excluded.read_at`,
+      [handle, addr, covered.map(([n]) => n), covered.map(([, r]) => r.nonce)]);
+  }
   const valueShare = s.total > 0 ? Number((s.priced / s.total).toFixed(4)) : null;
   await client.query(`
     insert into aum_samples
@@ -269,7 +285,7 @@ async function main() {
         ? `${label} refused — ${s.reason}  ${cover}`
         : `${label} $${Math.round(s.totalUsd).toLocaleString().padStart(14)}  ${s.priced}/${s.total} priced  ${cover}` +
           (s.rejected ? `  ${s.rejected} price_rejected` : ""));
-      if (!DRY) await write(client, job.trader.handle, at, job.expected.size, job.reads, s);
+      if (!DRY) await write(client, job.trader, at, job.expected.size, job.reads, s);
     };
 
     for (const [i, t] of targets.entries()) {

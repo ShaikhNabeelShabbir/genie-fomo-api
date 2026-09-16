@@ -174,3 +174,17 @@ export async function evmBalances(
   if (wei !== null && wei > 0n) out.push({ address: ZERO_ADDRESS, amount: scale(wei, 18) });
   return { balances: out, learned };
 }
+
+/**
+ * The wallet's outgoing-transaction count (its nonce): what the chain says he did, to set
+ * against the rows the indexer holds (R6). Null when the node will not say; never a 0 by default.
+ */
+export async function evmTxCount(rpcUrl: string, wallet: string): Promise<number | null> {
+  try {
+    const j = await rpc(rpcUrl, { jsonrpc: "2.0", id: 1, method: "eth_getTransactionCount", params: [wallet, "latest"] });
+    const w = word(j?.result);
+    return w === null ? null : Number(w);
+  } catch {
+    return null;
+  }
+}
