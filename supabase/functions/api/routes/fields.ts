@@ -1,6 +1,7 @@
 import { sql } from "../db.ts";
 import { get } from "../router.ts";
 import { VOCABULARY } from "../shared/vocabulary.ts";
+import { MIN_DRAWABLE_POINTS, PARTIAL_SERVE_FLOOR_USD, PRICED_FLOOR } from "../shared/aum-rules.ts";
 
 // ------------------------------------------------------------------ fields
 
@@ -72,6 +73,16 @@ get("/v1/fields", async () => {
             "stands in for a missing number, and no number for a missing fact",
     },
 
+    /** THE THRESHOLDS THE RULES APPLY, published so a consumer can explain a refusal (R2). */
+    constants: {
+      /** Count share of priced positions below which a reading is partial or refused. */
+      pricedFloor: PRICED_FLOOR,
+      /** A figure below the count floor is served as partial at or above this; refused below. */
+      partialServeFloorUsd: PARTIAL_SERVE_FLOOR_USD,
+      /** Dated figures needed before an /aum series is drawable. */
+      drawableMinPoints: MIN_DRAWABLE_POINTS,
+    },
+
     /**
      * HOW MUCH OF THE DIRECTORY ACTUALLY CARRIES EACH FIELD.
      *
@@ -102,6 +113,8 @@ get("/v1/fields", async () => {
     },
 
     plain: "Every enumerated field with its complete set, every quantity with its unit, and " +
-           "how much of the directory carries each field. Counted live, not sampled.",
+           "how much of the directory carries each field. Counted live, not sampled. " +
+           "POST /v1/traders/aum accepts and ignores `live`; its rows carry liveRead: skipped. " +
+           "RateLimit-Remaining is per X-API-Key; RateLimit-Scope says whether the counter is global.",
   };
 });

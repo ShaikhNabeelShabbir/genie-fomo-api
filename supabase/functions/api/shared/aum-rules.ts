@@ -32,22 +32,41 @@ export const AUM_STEPS: { name: string; ms: number }[] = [
 ];
 
 export const PRICED_FLOOR = 0.25;
+/** A partial figure at least this large is served as partial rather than refused (R1). */
+export const PARTIAL_SERVE_FLOOR_USD = 100;
+/** Two dated figures are a line; fewer is not drawable. */
+export const MIN_DRAWABLE_POINTS = 2;
 
-/** The coarsest step that still leaves >= 24 buckets over the span; `all` (null span) takes the coarsest. */
-export function chooseStep(span: number | null): { name: string; ms: number } {
-  return [...AUM_STEPS].reverse().find((s) => span === null || Math.floor(span / s.ms) >= 24) ?? AUM_STEPS[0];
+export type StepChosenFrom = "window" | "tracked_span" | "fallback";
+
+/**
+ * The coarsest step that still leaves >= 24 buckets over the span; `all` (null span) takes the
+ * coarsest. Given `trackedSpan` (now − trackedSince), the shorter of the two decides, so a
+ * short record is not folded into one daily point (S1).
+ */
+export function chooseStep(
+  span: number | null,
+  trackedSpan: number | null = null,
+): { name: string; ms: number; chosenFrom: StepChosenFrom } {
+  const useTracked = trackedSpan !== null && (span === null || trackedSpan < span);
+  const eff = useTracked ? trackedSpan : span;
+  const step = [...AUM_STEPS].reverse().find((s) => eff === null || Math.floor(eff / s.ms) >= 24) ?? AUM_STEPS[0];
+  return { ...step, chosenFrom: useTracked ? "tracked_span" : "window" };
 }
 
 /** A FIGURE BUILT FROM ALMOST NONE OF A WALLET IS NOT A BALANCE. See docs/DECISIONS.md#d016 */
 /** THE REFUSED FIGURE IS KEPT, not discarded. See docs/DECISIONS.md#d017 */
+/** A LARGE FIGURE BELOW THE COUNT FLOOR IS SERVED AS PARTIAL, not refused: the floor counts positions, not value (R1). */
 export function applyFloor(r: Record<string, unknown>): Record<string, unknown> {
   const share = n(r.value_share);
-  if (n(r.total_usd) === null || share === null || share >= PRICED_FLOOR) return r;
+  const total = n(r.total_usd);
+  if (total === null || share === null || share >= PRICED_FLOOR) return r;
+  if (total >= PARTIAL_SERVE_FLOOR_USD) return { ...r, partial: true, partial_reason: "unpriced_positions" };
   return {
     ...r,
     total_usd: null,
     refused_reason: "too_little_priced",
     /** What `total_usd` would have been. Not a balance — see the note above. */
-    partial_usd: n(r.total_usd),
+    partial_usd: total,
   };
 }
