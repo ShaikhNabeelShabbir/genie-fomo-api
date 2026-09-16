@@ -10,3 +10,4 @@ import "./routes/aum.ts";
 import "./routes/fields.ts";
 import "./routes/health.ts";
 import "./routes/events.ts";
+import "./routes/market.ts";
