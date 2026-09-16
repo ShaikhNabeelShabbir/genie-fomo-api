@@ -1,5 +1,7 @@
 # Migrating genie-fomo from Supabase to Cloudflare
 
+> **Line references in this document predate the 17 Sep 2026 split of `routes.ts` into `supabase/functions/api/routes/*.ts` and `shared/*.ts`.** Use `CLAUDE.md` for the route-to-file map; the long comments cited here now live in `docs/DECISIONS.md`.
+
 A complete plan for rebuilding this service on Cloudflare — Workers instead of Supabase Edge
 Functions, Cron Triggers instead of `pg_cron`, Workers Secrets instead of Vault, and a decision
 to make about the database.

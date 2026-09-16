@@ -1,5 +1,7 @@
 # Acceptance test plan · genie-fomo v10
 
+> **Line references in this document predate the 17 Sep 2026 split of `routes.ts` into `supabase/functions/api/routes/*.ts` and `shared/*.ts`.** Use `CLAUDE.md` for the route-to-file map; the long comments cited here now live in `docs/DECISIONS.md`.
+
 Working document for closing the 20 open items in [ACCEPTANCE_TEST_REPORT.md](ACCEPTANCE_TEST_REPORT.md) — the 8 partials and 12 failures from the 16 September run.
 
 **Order of work is fixed:** Phase 1 code, then Phase 2 data and external calls, then Phase 3 operational. Nothing in a later phase starts until the phase above it is done or explicitly parked.

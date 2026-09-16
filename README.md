@@ -288,12 +288,18 @@ npm install
 node scripts/load_chain_balances.mjs --help
 ```
 
-Typecheck before deploying — the whole service is one file and `deno check` catches what a
-smoke test will not:
+Typecheck and test before deploying. The gate compares `deno check` against a recorded
+baseline (90 postgres.js row-typing errors that predate this branch) and fails on any new one;
+the tests cover the pure rules without a database:
 
 ```bash
-deno check supabase/functions/api/routes.ts
+deno task check
+deno task test
 ```
+
+The API is split by route family under `supabase/functions/api/routes/`, with helpers in
+`shared/`. `CLAUDE.md` maps every route to its file, and `docs/DECISIONS.md` holds the long
+rationale comments that used to sit in the code.
 
 Node 20+, Deno 2+.
 

@@ -1,5 +1,7 @@
 # To do before the Cloudflare migration
 
+> **Line references in this document predate the 17 Sep 2026 split of `routes.ts` into `supabase/functions/api/routes/*.ts` and `shared/*.ts`.** Use `CLAUDE.md` for the route-to-file map; the long comments cited here now live in `docs/DECISIONS.md`.
+
 Written 16 September 2026 from the Genie app team's fix request v2
 (`genie-fomo-fix-request-v2-16-sep.md`, copied into this repo unchanged), read against the
 code on branch `Junaid-deve-starts`. Every item names the ask ids from that document, the

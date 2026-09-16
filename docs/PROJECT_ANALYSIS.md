@@ -1,5 +1,7 @@
 # genie-fomo-api — project analysis and review of the Cloudflare migration plan
 
+> **Line references in this document predate the 17 Sep 2026 split of `routes.ts` into `supabase/functions/api/routes/*.ts` and `shared/*.ts`.** Use `CLAUDE.md` for the route-to-file map; the long comments cited here now live in `docs/DECISIONS.md`.
+
 ## Context
 
 The user asked for an analysis of the whole project and of `CLOUDFLARE_MIGRATION.md`, the plan
