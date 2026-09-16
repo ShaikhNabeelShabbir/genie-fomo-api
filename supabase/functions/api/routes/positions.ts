@@ -360,7 +360,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
  */
 /** Positions for many traders in one call. See docs/DECISIONS.md#d076 */
 post("/v1/traders/positions", async (_p, _url, body) => {
-  const { requested, handles, asked, capped } = await batchIds(body);
+  const { requested, handles, asked, capped, traders: known } = await batchIds(body);
   /** THE FULL ENVELOPE IS THE DEFAULT. See docs/DECISIONS.md#d077 */
   const v2 = Number((body as { contractVersion?: number })?.contractVersion) !== 1;
 
@@ -427,17 +427,13 @@ post("/v1/traders/positions", async (_p, _url, body) => {
   };
 
   if (v2) {
-    const known = await sql`
-      select handle, display_handle, id from traders where handle = any(${handles})`;
-    const metaBy = new Map<string, Record<string, unknown>>(known.map((r: Record<string, unknown>) => [String(r.handle), r]));
-
     return {
       contractVersion: 2,
       ...batchEnvelope(asked, capped, positionsAsOf),
       /* One row per requested id, successes and failures alike. */
       traders: requested.map((req, i) => {
         const h = handles[i];
-        const meta = metaBy.get(h);
+        const meta = known.get(h);
         if (!meta) {
           return {
             ok: false as const,
@@ -466,8 +462,8 @@ post("/v1/traders/positions", async (_p, _url, body) => {
         return {
           ok: true as const,
           requested: req,
-          id: meta.id ? String(meta.id) : null,
-          handle: String(meta.display_handle),
+          id: meta.id,
+          handle: meta.display_handle,
           positions: own.map(position),
           positionCount: own.length,
           pricedPositionCount: priced.length,
