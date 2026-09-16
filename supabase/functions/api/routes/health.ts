@@ -55,6 +55,18 @@ get("/v1/health", async () => {
              as measurable
     from traders`;
 
+  /** PER-CHAIN SAMPLER HEALTH, so "bsc stopped answering on the 14th" needs no sweep. */
+  const chainRows = await sql`
+    select c.name,
+           count(*) filter (where s.total_usd is not null
+                              and s.at >= now() - interval '36 hours')::int as accepted_36h,
+           count(*) filter (where s.reason is not null
+                              and s.at >= now() - interval '24 hours')::int as failed_24h,
+           max(s.at) filter (where s.total_usd is not null)                  as newest_accepted_at
+    from chains c
+    left join aum_chain_samples s on s.network_id = c.network_id and s.basis = 'sampled'
+    group by c.name order by c.name`;
+
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
 
   /** EVERY FEED SAYS WHETHER IT IS STILL ARRIVING, NOT ONLY WHEN IT LAST DID. See docs/DECISIONS.md#d067 */
@@ -86,6 +98,12 @@ get("/v1/health", async () => {
                     traders: Number(f.aum_traders),
                     newestReadingAt: iso(f.aum_at),
                     lastSuccessAt: iso(f.aum_success_at),
+                    /** accepted = a chain row with a figure; failed = one carrying a reason. */
+                    chains: Object.fromEntries(chainRows.map((r: Record<string, unknown>) => [String(r.name), {
+                      accepted36h: Number(r.accepted_36h),
+                      failed24h: Number(r.failed_24h),
+                      newestAcceptedAt: iso(r.newest_accepted_at),
+                    }])),
                   }),
   };
   const staleFeeds = Object.entries(feeds)
