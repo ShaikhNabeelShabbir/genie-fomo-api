@@ -88,8 +88,15 @@ get("/v1/health", async () => {
                     lastSuccessAt: iso(f.aum_success_at),
                   }),
   };
+  /**
+   * T2. A feed is stale when its clock is old OR any trader is past the feed's own
+   * `staleAfterHours`. The `trades` clock moves whenever anyone loads, so 16 traders sat
+   * 221 h old under `dataState: current`; `scorecards` names them (count and age are in
+   * `staleTraders.scorecardStale` / `oldestScorecardHours`).
+   */
   const staleFeeds = Object.entries(feeds)
-    .filter(([, v]) => v.state !== "current").map(([k]) => k).sort();
+    .filter(([, v]) => v.state !== "current").map(([k]) => k)
+    .concat(Number(st?.scorecard_stale ?? 0) > 0 ? ["scorecards"] : []).sort();
 
   /*
    * The share of traders carrying a usable rhythm figure (§5) is fetched above, with the
