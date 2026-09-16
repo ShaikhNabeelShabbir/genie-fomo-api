@@ -6,6 +6,15 @@ import { NativePrice } from "../shared/prices.ts";
 // ------------------------------------------------ T2, T3, T5-T10, T15-T20
 
 /**
+ * T1. The newest `trade_loads` row per trader, as the two columns `scorecardBody` reads
+ * (`load_attempted_at`, `load_outcome`). Join after `from traders t`; select `ld.*`.
+ */
+export const latestLoad = () => sql`
+  left join lateral (
+    select attempted_at as load_attempted_at, outcome as load_outcome
+    from trade_loads l where l.handle = t.handle order by attempted_at desc limit 1) ld on true`;
+
+/**
  * The trade rows a scorecard is computed from. One statement, so the bulk route can ask for
  * every trader at once instead of once per trader — measured, 137 traders cost 614ms against
  * 152ms for one, because Postgres groups them in a single pass.
@@ -243,6 +252,13 @@ export async function scorecardBody(
       .filter((x): x is number => x !== null && Number.isFinite(x));
     return times.length ? new Date(Math.max(...times)).toISOString() : null;
   })();
+  /**
+   * T1. `loadedAt` is fomo's snapshot time (`captured_at`); it cannot say whether WE asked
+   * since, nor what fomo answered. `trade_loads` can: the newest attempt and its outcome,
+   * `null` when never attempted. `nextLoadAt` is the nightly slot, not a per-trader schedule.
+   */
+  const loadAttemptedAt = t.load_attempted_at ? new Date(String(t.load_attempted_at)).toISOString() : null;
+  const loadOutcome = t.load_outcome ?? null;
 
   const closed = rows.filter((r) => r.status === "closed");
   const realized = closed.map((r) => n(r.realized_pnl_usd)).filter((x): x is number => x !== null);
@@ -748,12 +764,15 @@ export async function scorecardBody(
        * the balance series, on the store that actually feeds this route.
        */
       loadedAt: loadedAtIso,
+      loadAttemptedAt,
+      loadOutcome,
       nextLoadAt: (() => {
         const d = new Date();
         d.setUTCHours(6, 0, 0, 0);
         if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
         return d.toISOString();
       })(),
+      nextLoadBasis: "nightly_slot",
       note: "no cap is applied: every position stored for this trader is used. `returned` " +
             "counts positions, `reportedTrades` counts fills, and they are not comparable.",
     },
@@ -768,12 +787,15 @@ export async function scorecardBody(
     tradesKnown: rows.length,
     tradesUsed: rows.length,
     loadedAt: loadedAtIso,
+    loadAttemptedAt,
+    loadOutcome,
     nextLoadAt: (() => {
       const d = new Date();
       d.setUTCHours(6, 0, 0, 0);
       if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
       return d.toISOString();
     })(),
+    nextLoadBasis: "nightly_slot",
     /** A VERDICT ON THIS RECORD'S AGE, not just the date it was loaded. See docs/DECISIONS.md#d166 */
     staleness: (() => {
       const t = loadedAtIso ? Date.parse(loadedAtIso) : NaN;

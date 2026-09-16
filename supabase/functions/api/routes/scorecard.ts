@@ -6,13 +6,13 @@ import { intParam } from "../shared/params.ts";
 import { cov, money } from "../shared/format.ts";
 import { nativePrices } from "../shared/prices.ts";
 import { resolveTrader } from "../shared/traders.ts";
-import { scorecardRows, feesFor, swapsFor, chainEntriesFrom, chainExitsFrom, buysFrom, monthStartCapital, scorecardBody } from "../shared/scorecard-core.ts";
+import { scorecardRows, feesFor, swapsFor, chainEntriesFrom, chainExitsFrom, buysFrom, monthStartCapital, scorecardBody, latestLoad } from "../shared/scorecard-core.ts";
 import { pnlAgg, pnlBody } from "../shared/pnl-core.ts";
 
 get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   const [t] = await sql`
-    select t.handle, t.display_handle, t.name, t.source, s.volume_usd, s.trade_count
-    from traders t left join trader_stats_current s using (handle)
+    select t.handle, t.display_handle, t.name, t.source, s.volume_usd, s.trade_count, ld.*
+    from traders t left join trader_stats_current s using (handle) ${latestLoad()}
     where t.handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 

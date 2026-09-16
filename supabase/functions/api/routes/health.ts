@@ -38,15 +38,19 @@ get("/v1/health", async () => {
       from aum_samples group by handle
     ), loads as (
       select handle, max(captured_at) as scorecard_at from trades group by handle
+    ), attempts as (
+      select distinct on (handle) handle, outcome from trade_loads order by handle, attempted_at desc
     )
     select
       count(*) filter (where n.reading_at is null)::int                       as no_reading,
       count(*) filter (where n.reading_at < now() - interval '36 hours')::int as reading_stale,
       count(*) filter (where l.scorecard_at < now() - interval '72 hours')::int
                                                                              as scorecard_stale,
+      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
+                         and a.outcome <> 'loaded')::int                     as scorecard_load_failed,
       max(extract(epoch from (now() - n.reading_at)) / 3600.0)::int           as oldest_reading_h,
       max(extract(epoch from (now() - l.scorecard_at)) / 3600.0)::int         as oldest_scorecard_h
-    from newest n full join loads l using (handle)`;
+    from newest n full join loads l using (handle) left join attempts a using (handle)`;
 
   /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
   const [m] = await sql`
@@ -153,6 +157,8 @@ get("/v1/health", async () => {
         ? null : Number(st.oldest_reading_h),
       scorecardStale: Number(st?.scorecard_stale ?? 0),
       scorecardStaleAfterHours: 72,
+      /** T1. Of the stale, how many the loader last asked about and did not get back. */
+      scorecardLoadFailed: Number(st?.scorecard_load_failed ?? 0),
       oldestScorecardHours: st?.oldest_scorecard_h === null || st?.oldest_scorecard_h === undefined
         ? null : Number(st.oldest_scorecard_h),
       of: Number(c.traders),
