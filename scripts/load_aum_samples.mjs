@@ -25,7 +25,7 @@
  */
 import pg from "pg";
 import { SOLANA_NETWORK_ID, solanaBalances, evmBalances, evmTxCount } from "./lib/chain_reads.mjs";
-import { concentrationSuspect, value } from "./lib/value.mjs";
+import { concentrationSuspect, decideTotal, value } from "./lib/value.mjs";
 
 const DB  = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 const KEY = (process.env.HELIUS_SOLANA_KEY ?? "").trim();
@@ -128,17 +128,6 @@ async function readChain(t, c, decimals, tradedByNet) {
 
 const hasWallet = (t, net) => (net === SOLANA_NETWORK_ID ? t.sol_address !== null : t.evm_address !== null);
 
-/** Twin of decideTotal() in supabase/functions/aum-sample/value.ts. */
-function decideTotal(answered, priced, sum, total, failures) {
-  if (answered === 0) {
-    const distinct = new Set(failures);
-    return { totalUsd: null, reason: distinct.size === 1 ? [...distinct][0] : "wallet_unreadable" };
-  }
-  if (priced > 0) return { totalUsd: sum, reason: null };
-  if (total === 0) return { totalUsd: 0, reason: null };
-  return { totalUsd: null, reason: "no_prices" };
-}
-
 /** Price what the chains answered and decide the parent total. */
 async function settle(client, reads) {
   const perChain = new Map();
@@ -226,7 +215,8 @@ async function main() {
     const { rows: targets } = await client.query(`
       select t.handle, w.sol_address, w.evm_address
       from traders t join wallets w on w.handle = t.handle
-      where ($1::text is null or t.handle = $1)
+      where (w.sol_address is not null or w.evm_address is not null)
+        and ($1::text is null or t.handle = $1)
       order by t.handle ${LIMIT ? `limit ${LIMIT}` : ""}`, [ONLY_HANDLE]);
 
     // The hour this sample describes. Truncated so a run at :07 and one at :52 do not

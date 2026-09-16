@@ -31,3 +31,29 @@ export function value(amount, price, supply = null) {
 export function concentrationSuspect(usd, total, capKnown) {
   return total > 0 && usd > CONCENTRATION_SHARE * total && (!capKnown || total > CONCENTRATION_TOTAL_USD);
 }
+
+/** Why a /positions row's price is not to be trusted, or null. `usd`/`total` are the row's and the trader's gross amount x price. */
+export function priceSuspectReason(price, supply, usd, total) {
+  if (price === null) return null;
+  const capKnown = supply !== null && supply > 0;
+  if (capKnown && price * supply > IMPLIED_MCAP_CEILING_USD) return "implied_mcap_over_ceiling";
+  if (usd !== null && concentrationSuspect(usd, total, capKnown)) return "concentration_over_ceiling";
+  return null;
+}
+
+/**
+ * The parent total from what the chains answered. A zero is written only when at least one
+ * chain was asked and every answer was empty; nothing asked is null with the most common failure word, or
+ * `nothing_answered` when no chain could even be asked (no wallet reaches any known chain).
+ */
+export function decideTotal(answered, priced, sum, total, failures) {
+  if (answered === 0) {
+    const counts = new Map();
+    for (const f of failures) counts.set(f, (counts.get(f) ?? 0) + 1);
+    const most = [...counts].sort((a, b) => b[1] - a[1])[0]?.[0];
+    return { totalUsd: null, reason: most ?? "nothing_answered" };
+  }
+  if (priced > 0) return { totalUsd: sum, reason: null };
+  if (total === 0) return { totalUsd: 0, reason: null };
+  return { totalUsd: null, reason: "no_prices" };
+}
