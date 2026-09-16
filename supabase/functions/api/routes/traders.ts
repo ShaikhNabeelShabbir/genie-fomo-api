@@ -470,6 +470,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
       trust: `/v1/traders/${t.display_handle}/trust`,
       wallets: `/v1/traders/${t.display_handle}/wallets`,
       transactions: `/v1/traders/${t.display_handle}/transactions`,
+      events: `/v1/events?handle=${t.display_handle}`,
     },
   };
 });
