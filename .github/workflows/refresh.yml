@@ -117,6 +117,15 @@ jobs:
         if: '!cancelled()'
         run: node scripts/backfill_transactions.mjs --pages 5 --fanout 3
 
+      # ---------------------------------------------------------------- 6a. linked wallets
+      # Wallets a tracked trader funded from his known one, from the native SOL transfers
+      # just loaded (workflow gap 5b). Before step 7, so the webhook picks them up tonight.
+      - name: Link funded wallets
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: node scripts/link_wallets.mjs
+
       # ---------------------------------------------------------------- 6b. prices
       # Must follow the transfer step, not precede it: it prices whatever was just ingested,
       # and the webhook keeps adding rows all day, so running it earlier would leave the
@@ -169,6 +178,14 @@ jobs:
         env:
           HELIUS_SOLANA_KEY: ${{ secrets.HELIUS_SOLANA_KEY }}
         run: node scripts/load_token_launch.mjs
+      # ---------------------------------------------------------------- 6d. dev ledger
+      # Derived from the token_info just refreshed (workflow gap 5a): token_creators and
+      # creators, so /creators/:address and creator.ledger run one night behind GMGN.
+      - name: Refresh dev ledger
+        if: '!cancelled()'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: node scripts/refresh_creators.mjs
 
       # ---------------------------------------------------------------- 7. webhook
       # A trader entering the top 100 is invisible to the live feed until their wallet is

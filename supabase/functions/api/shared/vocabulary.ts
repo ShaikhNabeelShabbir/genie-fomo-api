@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 5,
+  version: 6,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -43,6 +43,17 @@ export const VOCABULARY = {
     /* 17 Sep 2026, v5: T3 bounded on-chain scorecard fallback. */
     "scorecard.staleness.fallback": ["on_chain"],
     "scorecard.onChain.basis": ["wallet_swaps"],
+    /* 17 Sep 2026, v6: workflow gaps 1-5 (price history, events, launch metadata, live holdings, creators, linked wallets). */
+    "events[].kind": ["transfer", "swap", "reading"],
+    "events[].direction": ["in", "out"],
+    "events[].traderSource": ["fomoapi.io", "gmgn"],
+    "tokens[].launchpad": ["pump.fun"],
+    "positions.liveBasis.solana": ["rolled_forward_from_transfers"],
+    "positions.liveBasis.evm": ["nightly_read"],
+    "positions[].tier": ["verified", "reported", "rolled_forward"],
+    "flow.basis": ["transactions"],
+    "wallets.linked[].kind": ["funded_by", "submitted"],
+    "creators.tokens[].status": ["creator_hold", "creator_close"],
     "wallets.walletState": ["on_record", "unresolved_upstream"],
     "traders.delisted.reason": ["absent_from_source"],
     "aum.comparability.reason": ["coverage_differs_by_method"],

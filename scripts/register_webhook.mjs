@@ -58,8 +58,12 @@ if (process.argv.includes("--list")) {
  */
 const url = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 const pool = new Pool({ connectionString: url, max: 2, ssl: { rejectUnauthorized: false } });
+// Plus the wallets a trader funded from a known one (gap 5b), where the case-preserved
+// spelling is known: Helius refuses the lowercased key linked_wallets is keyed on.
 const { rows } = await pool.query(
-  "select sol_address from wallets where sol_address is not null order by handle");
+  `select sol_address from wallets where sol_address is not null
+   union select address from linked_wallets where watch and address is not null
+   order by 1`);
 const addresses = rows.map((r) => r.sol_address);
 await pool.end();
 

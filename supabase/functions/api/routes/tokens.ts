@@ -6,6 +6,7 @@ import { intParam, numParam, sortParam, nonEmpty } from "../shared/params.ts";
 import { cov, money } from "../shared/format.ts";
 import { chainWhere } from "../shared/chains.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
+import { ledgerBody } from "../shared/creators-core.ts";
 
 // ------------------------------------------------------- K1/K3/K4/K9 board
 
@@ -259,6 +260,9 @@ get("/v1/tokens/:address", async ({ address }, url) => {
            ti.raw->'dev'->>'cto_flag'                     as cto_flag,
            ti.raw->'dev'->>'creator_open_count'           as creator_open_count,
            ti.raw->'dev'->'ath_token_info'                as creator_ath,
+           -- Gap 5a. The nightly dev ledger for this token's creator (null columns: no row yet).
+           cr.launches, cr.best_peak_mcap_usd, cr.best_token_key, cr.still_holding_count,
+           cr.sold_count, cr.honeypot_count, cr.last_launch_at,
            -- T3a. Contract safety. Which of these are meaningful depends on the chain, and
            -- the loader has already nulled the ones that do not apply rather than storing
            -- GMGN's false for a check that chain does not have.
@@ -286,6 +290,10 @@ get("/v1/tokens/:address", async ({ address }, url) => {
       on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps
       on ps.network_id = h.network_id and ps.token_key = h.token_key
+    left join token_creators tc
+      on tc.network_id = h.network_id and tc.token_key = h.token_key
+    left join creators cr
+      on cr.network_id = tc.network_id and cr.creator_address_key = tc.creator_address_key
     where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}
     order by (case when h.value > 0 then h.value else null end) desc nulls last,
              t.display_handle`;
@@ -518,6 +526,8 @@ get("/v1/tokens/:address", async ({ address }, url) => {
                 peakMarketCapUsd: peak !== null && peak > 0 ? round(peak) : null,
               };
             })(),
+            /** Gap 5a. Across every launch we hold info for; null until the nightly ledger has a row. */
+            ledger: ledgerBody(group[0]),
             tier: "third_party",
             source: group[0].info_source ?? "gmgn",
           }
@@ -823,5 +833,59 @@ get("/v1/tokens/momentum", async (_p, url) => {
       ? `${moved.filter((r) => r.change > 0).length} tokens gained holders and ` +
         `${moved.filter((r) => r.change < 0).length} lost them since the previous snapshot.`
       : "No holder changes between the two most recent generations.",
+  };
+});
+
+// ------------------------------------------------------------ dev ledger (gap 5a)
+
+get("/v1/creators/:address", async ({ address }, url) => {
+  const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
+  const net = await chainWhere(chainQ);
+  const key = address.toLowerCase();
+
+  // One EVM address is the same creator on every EVM chain, so without ?chain= the ledger
+  // sums across networks; (network, token) pairs are distinct, so launches do not double.
+  const [ledger] = await sql`
+    select sum(launches)::int as launches,
+           max(best_peak_mcap_usd) as best_peak_mcap_usd,
+           (array_agg(best_token_key order by best_peak_mcap_usd desc nulls last))[1] as best_token_key,
+           sum(still_holding_count)::int as still_holding_count,
+           sum(sold_count)::int as sold_count,
+           sum(honeypot_count)::int as honeypot_count,
+           max(last_launch_at) as last_launch_at,
+           max(updated_at) as updated_at
+    from creators
+    where creator_address_key = ${key} ${net === null ? sql`` : sql`and network_id = ${net}`}
+    group by creator_address_key`;
+  if (!ledger) {
+    throw notFound(`no creator '${address}' on record${chainQ ? ` on ${chainQ}` : ""}`);
+  }
+
+  const tokens = await sql`
+    select c.name as chain, tk.address, ti.symbol, tc.creator_status, ti.is_honeypot,
+           ti.market_cap_usd
+    from token_creators tc
+    join tokens tk on tk.network_id = tc.network_id and tk.token_key = tc.token_key
+    join chains c on c.network_id = tc.network_id
+    left join token_info ti on ti.network_id = tc.network_id and ti.token_key = tc.token_key
+    where tc.creator_address_key = ${key} ${net === null ? sql`` : sql`and tc.network_id = ${net}`}
+    order by ti.market_cap_usd desc nulls last, tk.address`;
+
+  return {
+    creator: address,
+    /** When the nightly ledger last rebuilt this creator. */
+    asOf: ledger.updated_at ? new Date(String(ledger.updated_at)).toISOString() : null,
+    ledger: ledgerBody(ledger),
+    tokens: tokens.map((t: Record<string, unknown>) => ({
+      chain: t.chain as string,
+      tokenAddress: t.address as string,
+      symbol: nonEmpty(t.symbol as string | null),
+      // creator_hold / creator_close as GMGN said it; null when it did not say.
+      status: (t.creator_status as string | null) ?? null,
+      isHoneypot: t.is_honeypot === null ? null : Boolean(t.is_honeypot),
+      marketCapUsd: round(n(t.market_cap_usd)),
+    })),
+    tier: "third_party",
+    source: "gmgn",
   };
 });

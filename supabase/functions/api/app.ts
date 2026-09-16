@@ -120,6 +120,7 @@ export async function handle(req: Request): Promise<Response> {
           "GET /tokens/momentum",
           "GET /tokens/:address",
           "GET /tokens/:address/activity",
+          "GET /creators/:address",
           "GET /chains",
           "GET /events?since=&cursor=&kind=&chain=&handle=",
           "GET /fields",
