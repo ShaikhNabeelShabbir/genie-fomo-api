@@ -28,6 +28,8 @@ get("/v1/health", async () => {
            (select max(at)          from aum_samples)                    as aum_at,
            (select max(sampled_at)  from aum_samples
               where basis = 'sampled')                                   as aum_success_at,
+           (select max(at)          from aum_samples
+              where basis = 'sampled' and total_usd is not null)         as aum_accepted_at,
            (select max(last_seen_at) from wallets)                       as wallets_at,
            (select count(*) from aum_samples)::int                       as aum_rows,
            (select count(distinct handle) from aum_samples)::int         as aum_traders`;
@@ -46,7 +48,8 @@ get("/v1/health", async () => {
                                                                              as scorecard_stale,
       max(extract(epoch from (now() - n.reading_at)) / 3600.0)::int           as oldest_reading_h,
       max(extract(epoch from (now() - l.scorecard_at)) / 3600.0)::int         as oldest_scorecard_h
-    from newest n full join loads l using (handle)`;
+    from traders t left join newest n using (handle) left join loads l using (handle)
+    where t.listed`;
 
   /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
   const [m] = await sql`
@@ -56,16 +59,42 @@ get("/v1/health", async () => {
     from traders`;
 
   /** PER-CHAIN SAMPLER HEALTH, so "bsc stopped answering on the 14th" needs no sweep. */
+  /** `hist` mirrors `knownChainsFor` (shared/chains.ts): same `seen` set, same two-point rule. */
   const chainRows = await sql`
+    with ah as (
+      select handle, network_id, count(*) filter (where total_usd is not null) as pts
+      from aum_chain_samples group by 1, 2),
+    seen as (
+      select handle, network_id from wallet_chain_presence
+      union select handle, network_id from holdings_current where human_amount > 0
+      union select handle, network_id from ah),
+    hist as (
+      select s.network_id,
+             count(*) filter (where ah.pts >= 2)::int              as ready,
+             count(*) filter (where ah.pts = 1)::int               as warming,
+             count(*) filter (where coalesce(ah.pts, 0) = 0)::int  as none
+      from seen s
+      join traders t on t.handle = s.handle
+      left join ah on ah.handle = s.handle and ah.network_id = s.network_id
+      group by s.network_id)
     select c.name,
            count(*) filter (where s.total_usd is not null
                               and s.at >= now() - interval '36 hours')::int as accepted_36h,
            count(*) filter (where s.reason is not null
                               and s.at >= now() - interval '24 hours')::int as failed_24h,
-           max(s.at) filter (where s.total_usd is not null)                  as newest_accepted_at
+           max(s.at) filter (where s.total_usd is not null)                  as newest_accepted_at,
+           coalesce(h.ready, 0)   as hist_ready,
+           coalesce(h.warming, 0) as hist_warming,
+           coalesce(h.none, 0)    as hist_none
     from chains c
     left join aum_chain_samples s on s.network_id = c.network_id and s.basis = 'sampled'
-    group by c.name order by c.name`;
+    left join hist h on h.network_id = c.network_id
+    group by c.name, h.ready, h.warming, h.none order by c.name`;
+  const histOf = (r: Record<string, unknown>) => ({
+    ready: Number(r.hist_ready), warming: Number(r.hist_warming), none: Number(r.hist_none),
+  });
+  const sumHist = (k: "ready" | "warming" | "none") =>
+    chainRows.reduce((acc: number, r: Record<string, unknown>) => acc + histOf(r)[k], 0);
 
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
 
@@ -93,16 +122,20 @@ get("/v1/health", async () => {
     positions:    feed(f.holdings_at, 36),
     transactions: feed(f.transactions_at, 36),
     tokenInfo:    feed(f.token_info_at, 24 * 14),
-    aum:          feed(f.aum_success_at ?? f.aum_at, 36, {
+    /** F2. The clock is the newest ACCEPTED reading; a refused row moves only `samplerLastRunAt`. */
+    aum:          feed(f.aum_accepted_at, 36, {
                     rowCount: Number(f.aum_rows),
                     traders: Number(f.aum_traders),
                     newestReadingAt: iso(f.aum_at),
-                    lastSuccessAt: iso(f.aum_success_at),
+                    samplerLastRunAt: iso(f.aum_success_at),
+                    /** A1. Trader-chains by `knownChains[].historyState`, summed over chains. */
+                    historyState: { ready: sumHist("ready"), warming: sumHist("warming"), none: sumHist("none") },
                     /** accepted = a chain row with a figure; failed = one carrying a reason. */
                     chains: Object.fromEntries(chainRows.map((r: Record<string, unknown>) => [String(r.name), {
                       accepted36h: Number(r.accepted_36h),
                       failed24h: Number(r.failed_24h),
                       newestAcceptedAt: iso(r.newest_accepted_at),
+                      historyState: histOf(r),
                     }])),
                   }),
   };
