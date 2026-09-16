@@ -113,7 +113,7 @@ which is whether the database needs to move at all.
 | 43 `Deno.env.get()` calls | 26 | wrong |
 | `aum-sample/index.ts` 449 lines; total 9,093 | 486; 9,130 | stale |
 | `= any(` ×40, `filter (where` ×59, `at time zone` ×5, `lateral` ×3, `to_char` ×2, `interval` ×2, `distinct on` ×1 | match | correct |
-| `unnest` ×1 | 2 (one more in `aum-sample`) | minor |
+| `unnest` ×1 in `routes.ts` | 1 (plus one in `aum-sample`) | correct |
 | code relies on `gen_random_uuid()` | 0 uses in functions; only a column default in a migration | overstated |
 | `errors.ts` "unchanged" | imports the module-level `sql` singleton and reads env at load (`errors.ts:13,109`) | wrong |
 | `router.ts`, `chain_reads.ts` port unchanged | true | correct |

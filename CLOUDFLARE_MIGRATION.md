@@ -7,6 +7,11 @@ to make about the database.
 Written 16 September 2026, measured against the running system. Every number here came from the
 live database or the deployed code, not from memory.
 
+Revised the same day after a second pass: the code counts in §1 and §5 were re-measured against
+the tree, and every Cloudflare limit was re-checked against developers.cloudflare.com. The
+driver guidance in §4.3 and the subrequest numbers in §7 changed as a result, and §2 gained a
+cheaper first step (Option A′) that the first draft did not consider.
+
 > **Verify the platform limits before you start.** Cloudflare's quotas (subrequests, CPU time,
 > D1 size) change. Everything in this document about *our* system is measured; everything about
 > *their* limits is as of writing and should be re-checked against current docs.
@@ -46,14 +51,19 @@ Measured 16 September 2026.
 | `supabase/functions/api/index.ts` | 189 | Deno |
 | `supabase/functions/api/errors.ts` | 160 | Deno |
 | `supabase/functions/api/router.ts` | 58 | Deno |
-| `supabase/functions/aum-sample/index.ts` | 449 | Deno |
+| `supabase/functions/aum-sample/index.ts` | 486 | Deno |
 | `supabase/functions/helius-webhook/index.ts` | 155 | Deno |
 | `supabase/functions/_shared/chain_reads.ts` | 192 | Deno |
-| **Total** | **9,093** | |
+| `supabase/functions/api/db.ts` | 63 | Deno |
+| **Total** | **9,130** | |
 
-Plus ~20 Node loader scripts in `scripts/` and 4 Python loaders, which run in GitHub Actions and
+Plus ~20 Node loader scripts in `scripts/` and 3 Python loaders, which run in GitHub Actions and
 are **not affected by this migration** — they talk to Postgres over a normal connection and can
 keep doing so.
+
+Not in the table, and not part of this migration: the Express app under `src/` (5,498 lines).
+It has not served production since the Edge Functions went live, and survives only because three
+loaders import from its compiled `dist/` output. Whether to retire it is a separate decision.
 
 ### Database
 
@@ -109,19 +119,37 @@ Counted in `routes.ts`:
 
 Everything else in this migration is mechanical. This is not.
 
-### Option A — Workers + Hyperdrive + external Postgres  ✅ recommended
+### Option A′ — Workers + Hyperdrive + the Postgres you already have  ✅ recommended first step
 
-Keep the database exactly as it is. Move it off Supabase to any Postgres host (Neon, Crunchy,
-RDS, self-hosted). Put Cloudflare **Hyperdrive** in front for connection pooling, and point
-Workers at it.
+Keep the database exactly where it is, on Supabase. Stop deploying Edge Functions and drop the
+`pg_cron` job; point Cloudflare **Hyperdrive** at Supabase's *direct* Postgres connection and
+run the three functions as Workers. Cloudflare documents this combination specifically
+(<https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/supabase/>).
 
-**What changes:** the runtime only. Every SQL query, every migration, every loader script keeps
-working unchanged.
+**What changes:** the runtime only. No dump, no restore, no second database. Both the old
+functions and the new Workers read and write the same rows throughout the cutover, so rollback
+is "stop using the Worker" at every phase, and the acceptance diff is exact.
 
-**What you give up:** Postgres is not hosted by Cloudflare, so "everything on Cloudflare" is
-true of compute and false of storage.
+**What you give up:** Supabase still hosts storage, and you keep paying for it. If cost is the
+motive, moving the host is a separate, later step (Option A below).
 
-**Effort:** roughly a week. §5 is the whole job.
+**One thing to test before anything else:** Supabase's direct host is IPv6-only unless the
+project has the IPv4 add-on (see §4.2). `wrangler hyperdrive create` against it is the first
+command of this migration, because its result decides whether the add-on is needed.
+
+**Effort:** about a week for the port, plus the acceptance harness (§12).
+
+### Option A — Workers + Hyperdrive + external Postgres
+
+Same as A′, then move the database to another Postgres host (Neon, Crunchy, RDS, self-hosted).
+
+**What changes:** the runtime, and one `DATABASE_URL` in the loaders. Every SQL query and every
+migration keeps working unchanged.
+
+**What it adds:** the dump/restore in §4.1, the data gap between dump and cutover (the webhook
+writes ~290,000 rows a week into whichever database it is pointed at), and a new hosting bill.
+
+**Effort:** A′ plus a day of transfer and a cutover window.
 
 ### Option B — Workers + D1
 
@@ -151,15 +179,15 @@ whether the rewrite preserved behaviour.
 
 ### Recommendation
 
-**Take Option A.** Take it even if the goal is "all Cloudflare", because it gets you off
-Supabase's compute immediately and lets you evaluate D1 separately, with the API already
-running on Workers and the full acceptance suite available to prove any query rewrite.
+**Take Option A′, then decide about A.** It gets you off Supabase's compute immediately with
+nothing irreversible, and lets you evaluate moving the host, or D1, separately, with the API
+already running on Workers and the full acceptance suite available to prove any later change.
 
 Option B is a rewrite wearing a migration's clothes. Doing both at once means that when
 something returns a wrong number you will not know whether it was the runtime or the SQL.
 
-The rest of this document assumes **Option A**, and §6 covers what changes if you later take
-Option B.
+The rest of this document assumes **Option A′**. §4.1 covers the extra work if you later take
+Option A, and §6 covers Option B.
 
 ---
 
@@ -167,11 +195,11 @@ Option B.
 
 | Today | On Cloudflare | Notes |
 |---|---|---|
-| Supabase Edge Function `api` | **Worker** `genie-fomo-api` | §5 |
-| Supabase Edge Function `aum-sample` | **Worker** `genie-fomo-sampler` | §5, §7 |
-| Supabase Edge Function `helius-webhook` | **Worker** `genie-fomo-webhook` | §9 |
-| Supabase Postgres | **external Postgres + Hyperdrive** | §4 |
-| Supabase connection pooler (6543) | **Hyperdrive** | §4 |
+| Supabase Edge Function `api` | **one Worker** `genie-fomo`, `fetch` on `/v1/*` | §5, §11 |
+| Supabase Edge Function `aum-sample` | the same Worker: `scheduled` handler plus `fetch` on `/sample` | §5, §7 |
+| Supabase Edge Function `helius-webhook` | the same Worker: `fetch` on `/webhook` | §9 |
+| Supabase Postgres | **unchanged**, reached through Hyperdrive (A′); external host later if wanted (A) | §4 |
+| Supabase connection pooler (6543) | **Hyperdrive**, pointed at the direct port | §4 |
 | `pg_cron` + `pg_net` | **Cron Triggers** (`scheduled` handler) | §7 |
 | `supabase_vault` | **Workers Secrets** | §8 |
 | `gen_random_uuid()` | `crypto.randomUUID()` in JS | |
@@ -183,7 +211,7 @@ Option B.
 
 ## 4. The database
 
-### 4.1 Moving Postgres off Supabase
+### 4.1 Moving Postgres off Supabase (Option A only — not part of the first cutover)
 
 ```bash
 # 1. dump — schema and data separately, so a schema problem is visible before the data moves
@@ -213,6 +241,13 @@ transactions, 46,205 holdings_current, ~14,000 aum_samples.
 The 1.7 GB `transactions` table dominates the transfer. Budget an hour and do it during a window
 where the nightly loader is not running.
 
+**The copy is stale the moment it finishes.** The Helius webhook writes ~290,000 rows a week and
+the sampler writes every five minutes, all into whichever database they are pointed at. The
+first draft of this document said the two databases "diverge" only when the writers move; in
+fact the new database is behind from the dump onward. Either move the writers in the same
+window as the restore, or plan a second, incremental copy of `transactions`, `aum_samples` and
+`aum_chain_samples` (keyed on `ingested_at` / `sampled_at`) immediately before the writers move.
+
 ### 4.2 Hyperdrive
 
 Hyperdrive is Cloudflare's connection pooler. It sits between the Worker and Postgres and keeps
@@ -220,8 +255,11 @@ warm connections, which is what makes Postgres usable from an edge runtime at al
 
 ```bash
 npx wrangler hyperdrive create genie-fomo-db \
-  --connection-string="postgresql://user:pass@host:5432/dbname"
+  --connection-string="postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres" \
+  --caching-disabled
 ```
+
+`--caching-disabled` is deliberate; see "Query caching" below.
 
 That prints an ID. Put it in `wrangler.toml`:
 
@@ -236,12 +274,44 @@ In the Worker, the connection string arrives as `env.HYPERDRIVE.connectionString
 **Point Hyperdrive at the DIRECT Postgres port, not another pooler.** Today `DATABASE_URL`
 points at Supabase's transaction pooler on 6543 because Edge Functions needed it. Hyperdrive *is*
 that layer now; stacking two poolers causes prepared-statement failures that appear
-intermittently under load rather than immediately — the worst kind.
+intermittently under load rather than immediately — the worst kind. Cloudflare's Supabase guide
+says the same: use the direct connection string, not the pooled ones.
+
+**The direct host is IPv6-only** unless the project has Supabase's IPv4 add-on. `db.ts:16-19`
+already records that it is unreachable from a laptop for this reason. Cloudflare's guide does
+not say whether Hyperdrive reaches IPv6 origins, so test it first: if `wrangler hyperdrive
+create` cannot connect, buy the IPv4 add-on (a few dollars a month) rather than falling back to
+the pooler.
+
+**Connection budget.** Hyperdrive keeps roughly 100 origin connections per configuration on the
+paid plan and may briefly exceed that. Supabase's direct `max_connections` is 60 on Nano/Micro,
+90 on Small, 120 on Medium, and the nightly loaders (`max: 3` each) share it. The failure mode is
+`remaining connection slots are reserved`, which `classify()` maps to a 429. Check the compute
+tier before cutover; upsizing for the cutover week is cheaper than debugging it.
+
+**Query caching.** Hyperdrive caches the result of any read-only query that contains no
+volatile function, for 60 seconds by default, and there is no per-query bypass. Two places here
+care:
+
+- `/traders/:handle/aum` reads `aum_samples` immediately after the sampler writes it. With
+  caching on, that read can return the previous row for up to a minute, so `liveRead.state`
+  would say `fetched` while `now` carried the old reading. Queries using `now()` are never
+  cached, so this would differ route by route, silently.
+- `select * from bump_rate_limit(...)` is uncached only because plpgsql functions default to
+  VOLATILE. That is fine, but it is a property nobody will remember.
+
+Create the configuration with `--caching-disabled` so the acceptance diff in §12 compares the
+runtime and nothing else. A second, cached binding for the heavy read-only routes is a
+follow-up once the port is proven.
+
+**Query duration.** Hyperdrive caps a single query at 60 seconds. Nothing here comes near that
+in normal operation, but the `/health` pathology recorded in the README (90 seconds when its
+queries were parallelised) would now fail at Hyperdrive rather than at `ROUTE_TIMEOUT_MS`.
 
 ### 4.3 The driver
 
-`postgres.js` is imported today from `deno.land/x`. On Workers, use the npm package with Node
-compatibility:
+`postgres.js` is imported today from `deno.land/x` at 3.4.4. On Workers, use the npm package
+(**3.4.5 or later** — Hyperdrive's documented minimum) with Node compatibility:
 
 ```toml
 # wrangler.toml
@@ -254,29 +324,49 @@ import postgres from "postgres";
 
 export function db(env: Env) {
   return postgres(env.HYPERDRIVE.connectionString, {
-    // Hyperdrive pools for you. One connection per isolate is correct here — the old `max: 2`
-    // existed to stop Edge Function instances exhausting Supabase's pooler, and that problem
-    // moves to Hyperdrive.
-    max: 1,
-    // Still required: Hyperdrive multiplexes, and transaction-mode pooling cannot carry
-    // prepared statements between statements.
-    prepare: false,
+    // Cloudflare's own example uses 5: Workers allow six simultaneous outbound connections,
+    // and a route that does `Promise.all` over several queries wants more than one of them.
+    // `max: 1` would serialise those. The old `max: 2` existed to protect Supabase's pooler
+    // from horizontally-scaled instances; Hyperdrive owns that problem now.
+    max: 5,
+    // Leave `prepare` at its default (true). Hyperdrive over a DIRECT connection supports
+    // named prepared statements and caches them; `prepare: false` costs a round-trip per
+    // query. The first draft of this document said the opposite — that was true of the 6543
+    // transaction pooler and is exactly why Hyperdrive must not be pointed at it (§4.2).
     fetch_types: false,
   });
 }
 ```
 
-**A connection cannot be shared across requests.** In Deno the `sql` client was a module-level
-singleton. In Workers, bindings only exist inside the handler, so the client must be created per
-request (or per isolate, lazily, keyed off `env`). This is the single most common migration bug:
-a module-level client compiles fine and throws at runtime because `env` is not in scope.
+**Create the client per request, and close it after the response.** In Deno the `sql` client
+was a module-level singleton. In Workers, bindings only exist inside the handler, and an I/O
+object created in one request and reused in another throws `Cannot perform I/O on behalf of a
+different request`. Cloudflare's guidance is that creating a client per request is fast and is
+the recommended pattern:
+
+```ts
+async fetch(req, env, ctx) {
+  const sql = db(env);
+  try {
+    return await handle(req, { sql, env });
+  } finally {
+    ctx.waitUntil(sql.end({ timeout: 5 }));
+  }
+}
+```
+
+A module-level client is the single most common migration bug: it compiles fine and throws at
+runtime because `env` is not in scope. Today `errors.ts` imports that singleton for the rate
+limiter (`errors.ts:13`), so `checkRate` must take `sql` as a parameter — it does not port
+unchanged.
 
 ---
 
 ## 5. Rewriting the runtime: Deno → Workers
 
-There are **47 `Deno.*` references** across the three functions. Every one has a direct
-equivalent.
+There are **29 `Deno.*` references** across the three functions: 9 in `routes.ts`, 5 in
+`index.ts`, 2 in `db.ts`, 1 in `errors.ts`, 6 in `aum-sample`, 3 in `helius-webhook`
+(`grep -ro 'Deno\.' supabase/functions | wc -l`). Every one has a direct equivalent.
 
 ### 5.1 The entry point
 
@@ -319,7 +409,7 @@ There is no port. Cloudflare routes to the Worker.
 
 ### 5.2 Environment variables
 
-This is the largest mechanical change: **43 `Deno.env.get()` calls**, many at module scope.
+This is the largest mechanical change: **26 `Deno.env.get()` calls**, most at module scope.
 
 ```ts
 // today — module scope, evaluated once at import
@@ -339,7 +429,8 @@ function secret(env: Env) {
 | `LIVE_AFTER_MS`, `LIVE_WAIT_MS`, `SAMPLE_URL`, `SAMPLE_SECRET` | the `/aum` read-through |
 | `WALLET_SUBMIT_SECRET` | the wallet submission route |
 | `KEY`, `RATE_LIMIT`, `ROUTE_TIMEOUT_MS`, `BATCH_MAX_COST` | `index.ts` |
-| the `capabilities` block's key-presence checks | `/health` |
+| `MAX_PER_WINDOW`, plus the imported `sql` singleton | `errors.ts` — the rate limiter |
+| the `capabilities` block's key-presence checks (`Deno.env.get(c.key)`, a dynamic key — becomes `env[c.key]`) | `/health` |
 
 The cleanest shape: a `Ctx` object built once per request and threaded through, carrying `sql`
 and the config. It is a mechanical edit across ~7,800 lines but a shallow one.
@@ -371,7 +462,8 @@ All standard and available on Workers unchanged. `chain_reads.ts` uses only `fet
 
 ### 5.6 Background work after the response
 
-Deno has no equivalent of this and the current code works around it. Workers gives you:
+Supabase Edge Functions do expose `EdgeRuntime.waitUntil()`, but the current code does not use
+it and works around its absence instead. Workers gives you:
 
 ```ts
 ctx.waitUntil(somePromise);
@@ -406,8 +498,8 @@ const rows = await env.DB.prepare(
 ```
 
 This affects every batch route, every bulk include, and every set-based loader query — which is
-most of the performance work in this codebase. Note that a 50-id batch becomes a statement with
-50 placeholders, and D1 has a bound-parameter limit worth checking.
+most of the performance work in this codebase. D1 allows **100 bound parameters per statement**,
+so a 50-id batch fits, but any query that binds two arrays of 50 does not.
 
 ### 6.2 `unnest` — the multi-array insert
 
@@ -418,7 +510,9 @@ from unnest($2::text[], $3::text[], $4::text[], $5::text[]) as u(h, f, s, src)
 ```
 
 No SQLite equivalent. Rewrite as a multi-row `VALUES` list built in JS, or batched single-row
-inserts inside `env.DB.batch()`.
+inserts inside `env.DB.batch()`. With 5 columns and the 100-parameter cap, a `VALUES` list holds
+at most 20 rows per statement, so the webhook's batched insert (11 columns, often hundreds of
+rows) becomes many statements in one `batch()`.
 
 ### 6.3 `distinct on`
 
@@ -486,34 +580,31 @@ On Cloudflare this collapses into one Worker with a `scheduled` handler — **no
 extension, no Vault, no HTTP hop.**
 
 ```toml
-# wrangler.toml — the sampler Worker
-name = "genie-fomo-sampler"
-main = "src/index.ts"
-compatibility_date = "2026-09-01"
-compatibility_flags = ["nodejs_compat"]
-
+# wrangler.toml — the one Worker (see §11)
 [triggers]
 crons = ["*/5 * * * *"]
-
-[[hyperdrive]]
-binding = "HYPERDRIVE"
-id = "<hyperdrive id>"
 ```
 
 ```ts
 export default {
   // the cron fires this
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(sampleSlice(env, 10));
+    // `await`, not `ctx.waitUntil`: a slice that throws should show up as a failed cron
+    // invocation in the dashboard, not as a silently dropped promise.
+    await sampleSlice(env, 10);
   },
-  // and keep fetch so it can still be driven by hand
-  async fetch(req: Request, env: Env) {
-    if (req.method !== "POST") return json({ error: "POST only" }, 405);
-    if ((req.headers.get("x-sample-secret") ?? "") !== env.AUM_SAMPLE_SECRET) {
-      return json({ error: "unauthorized" }, 401);
+  // and keep a POST path so it can still be driven by hand
+  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(req.url);
+    if (url.pathname === "/sample") {
+      if (req.method !== "POST") return json({ error: "POST only" }, 405);
+      if ((req.headers.get("x-sample-secret") ?? "") !== env.AUM_SAMPLE_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await req.json().catch(() => ({}));
+      return json(await sampleSlice(env, Math.min(25, Number(body.limit ?? 10))));
     }
-    const body = await req.json().catch(() => ({}));
-    return json(await sampleSlice(env, Math.min(25, Number(body.limit ?? 10))));
+    // … /v1/* and /webhook
   },
 };
 ```
@@ -521,24 +612,36 @@ export default {
 **What this removes:** the `pg_cron` job, the `pg_net` extension, `run_aum_sample()`, both Vault
 secrets, and the `AUM_SAMPLE_SECRET` round-trip for scheduled runs. Four moving parts become one.
 
-The secret is still needed for the `fetch` path — the `/aum` read-through calls the sampler over
-HTTP — but the schedule no longer authenticates over the network to itself.
+Because the sampler is in the same Worker as the API, the `/aum` read-through calls
+`sampleSlice()` **in-process** under `ctx.waitUntil` rather than over HTTP. `AUM_SAMPLE_SECRET`
+and `AUM_SAMPLE_URL` survive only for the manual `/sample` path.
 
 **Subrequest budget.** A 10-trader slice makes roughly 10 Helius calls plus ~30 batched EVM
-`eth_call` requests. Workers cap subrequests per invocation (50 on the free plan, higher on paid
-— check current values). If you hit the cap, reduce the slice and increase the cron frequency;
-the rotation logic is already oldest-sampled-first and does not care about slice size.
+`eth_call` requests. On the paid plan Workers allow **10,000 subrequests per invocation** by
+default (raised in February 2026; configurable higher via `limits.subrequests`), so this is not
+a constraint. On the free plan the cap is 50 external subrequests, which a 10-trader slice would
+touch. What *does* bind is **six simultaneous outbound connections** per invocation, so the
+batched `eth_call`s queue behind each other — latency, not failure.
+
+**Cron overlap.** Cloudflare does not serialise cron invocations. A slice that runs past five
+minutes (the budget is 100 s, but the chain reads have 45 s timeouts each) overlaps the next
+tick. The oldest-first rotation makes a double-sample mostly harmless, but a cheap guard is to
+`update traders set sample_claimed_at = now() where … returning handle` at the top of the slice
+and skip rows claimed inside the last five minutes.
+
+**Limits to know.** Cron Triggers are counted per account, not per Worker: 5 on the free plan,
+250 on paid. A scheduled invocation may run for up to 15 minutes of wall time.
 
 ---
 
 ## 8. Secrets
 
 ```bash
-npx wrangler secret put AUM_SAMPLE_SECRET     --name genie-fomo-api
-npx wrangler secret put AUM_SAMPLE_SECRET     --name genie-fomo-sampler
-npx wrangler secret put WALLET_SUBMIT_SECRET  --name genie-fomo-api
-npx wrangler secret put HELIUS_SOLANA_KEY     --name genie-fomo-sampler
-npx wrangler secret put HELIUS_WEBHOOK_SECRET --name genie-fomo-webhook
+npx wrangler secret put AUM_SAMPLE_SECRET
+npx wrangler secret put WALLET_SUBMIT_SECRET
+npx wrangler secret put HELIUS_SOLANA_KEY
+npx wrangler secret put HELIUS_WEBHOOK_SECRET
+npx wrangler secret put GENIE_API_KEY          # only if the API is to require X-API-Key
 ```
 
 Non-secret config goes in `wrangler.toml` as plain vars:
@@ -549,13 +652,12 @@ AUM_LIVE_AFTER_MINUTES = "5"
 AUM_LIVE_WAIT_MS = "3000"
 RATE_LIMIT_PER_MINUTE = "240"
 ROUTE_TIMEOUT_MS = "15000"
-AUM_SAMPLE_URL = "https://genie-fomo-sampler.<subdomain>.workers.dev"
 ```
 
-**Secrets are per Worker.** `AUM_SAMPLE_SECRET` must be set on both the API (which calls the
-sampler) and the sampler (which checks it), with the same value. A mismatch shows up as 401s in
-the sampler's logs and `liveRead.state: "still_running"` forever on the API — a quiet failure
-worth a deployment check.
+**Secrets are per Worker**, which is one of the reasons §11 uses a single Worker. The first
+draft had the API and the sampler as separate Workers, each needing `AUM_SAMPLE_SECRET` with the
+same value; a mismatch showed up as 401s in one log and `liveRead.state: "still_running"`
+forever in the other. With one Worker that failure cannot exist.
 
 ---
 
@@ -565,29 +667,30 @@ worth a deployment check.
 insert, with no Deno API beyond `Deno.env.get` and `Deno.serve`.
 
 ```ts
-export default {
-  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
-    if (req.method !== "POST") return json({ detail: "POST only" }, 405);
-    if (env.HELIUS_WEBHOOK_SECRET &&
-        req.headers.get("authorization") !== env.HELIUS_WEBHOOK_SECRET) {
-      return json({ detail: "unauthorized" }, 401);
-    }
-    const payload = await req.json();
-    // Answer fast: a non-2xx makes Helius retry, so slow work here becomes duplicate
-    // deliveries. Acknowledge, then insert.
-    ctx.waitUntil(insert(env, payload));
-    return json({ ok: true });
-  },
-};
+// inside the Worker's fetch, on pathname === "/webhook"
+if (req.method !== "POST") return json({ detail: "POST only" }, 405);
+if (env.HELIUS_WEBHOOK_SECRET &&
+    req.headers.get("authorization") !== env.HELIUS_WEBHOOK_SECRET) {
+  return json({ detail: "unauthorized" }, 401);
+}
+const payload = await req.json().catch(() => null);
+if (payload === null) return json({ ok: true, skipped: "unparseable body" });
+// Answer fast: a non-2xx makes Helius retry, so slow work here becomes duplicate
+// deliveries. Acknowledge, then insert.
+ctx.waitUntil(insert(env, payload).catch((e) => console.error("webhook insert:", e)));
+return json({ ok: true });
 ```
 
 `ctx.waitUntil` is a real improvement here — the current handler must finish its insert before
-responding, which is exactly the pressure the "answer fast" rule was written against.
+responding, which is exactly the pressure the "answer fast" rule was written against. Two things
+it changes: the response can no longer carry `inserted`/`skipped` counts (nothing reads them
+today), and a failed insert is now only visible in the log, so the `.catch` above is not
+optional.
 
 **After deploying, re-point Helius at the new URL:**
 
 ```bash
-WEBHOOK_URL="https://genie-fomo-webhook.<subdomain>.workers.dev" \
+WEBHOOK_URL="https://genie-fomo.<subdomain>.workers.dev/webhook" \
   node scripts/register_webhook.mjs
 ```
 
@@ -614,31 +717,33 @@ be the shape.
 
 ## 11. Project layout and wrangler config
 
+**One Worker, not three.** The first draft proposed separate `api`, `sampler` and `webhook`
+Workers. Nothing in the code needs that isolation, and it costs three secret sets, three
+Hyperdrive bindings, three deploys, an HTTP hop for the `/aum` read-through, and the
+`AUM_SAMPLE_SECRET` mismatch failure in §8. Split into `api` + `jobs` with a service binding
+later only if their deploy cadences diverge.
+
 ```
-workers/
-  api/
-    src/
-      index.ts          fetch handler, auth, rate limit, timeout race
-      router.ts         unchanged from today
-      routes.ts         the 21 routes
-      errors.ts         unchanged
-      db.ts             postgres client from env.HYPERDRIVE
-    wrangler.toml
-  sampler/
-    src/
-      index.ts          scheduled + fetch
-      chain_reads.ts    unchanged from today
-    wrangler.toml
-  webhook/
-    src/index.ts
-    wrangler.toml
-shared/
-  chain_reads.ts        one copy, imported by sampler
+worker/
+  src/
+    index.ts          fetch: auth, rate limit, timeout race, then routes by path:
+                        /v1/*     → routes.ts
+                        /sample   → sampler.ts (POST, secret-checked)
+                        /webhook  → webhook.ts
+                      scheduled: sampler.ts sliceOf(10)
+    router.ts         unchanged from today
+    routes.ts         the 21 routes, taking a Ctx { sql, env } instead of module globals
+    errors.ts         checkRate takes sql; MAX_PER_WINDOW read from env
+    db.ts             postgres client from env.HYPERDRIVE, created per request
+    sampler.ts        today's aum-sample/index.ts minus Deno.serve
+    webhook.ts        today's helius-webhook/index.ts minus Deno.serve
+    chain_reads.ts    unchanged from today
+  wrangler.toml
 ```
 
 ```toml
-# workers/api/wrangler.toml
-name = "genie-fomo-api"
+# worker/wrangler.toml
+name = "genie-fomo"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
@@ -646,6 +751,14 @@ compatibility_flags = ["nodejs_compat"]
 [[hyperdrive]]
 binding = "HYPERDRIVE"
 id = "<id>"
+# for `wrangler dev` without --remote: a direct connection string for local runs
+localConnectionString = "postgresql://…"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[limits]
+cpu_ms = 30000
 
 [vars]
 AUM_LIVE_AFTER_MINUTES = "5"
@@ -660,16 +773,15 @@ enabled = true
 Deploy:
 
 ```bash
-cd workers/api && npx wrangler deploy
-cd ../sampler && npx wrangler deploy
-cd ../webhook && npx wrangler deploy
+cd worker && npx wrangler deploy
 ```
 
-Local development runs the real thing, not a simulator:
-
-```bash
-npx wrangler dev --remote      # uses the real Hyperdrive binding
-```
+**Local development.** The first draft said `wrangler dev` "runs the real thing". It does not by
+default: `wrangler dev` runs locally and connects Hyperdrive bindings straight to
+`localConnectionString` (or `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE`), with
+**no pooling and no caching**, so it will not reproduce pool or cache behaviour. `wrangler dev
+--remote` runs on Cloudflare against the real binding, and every write it makes lands in the
+production database. Use local for iteration and `--remote` only for the shadow run in §13.
 
 ---
 
@@ -684,20 +796,27 @@ The repository carries two independent suites that run against a deployed URL:
 | **`Acceptance_Tests.md`** — 50 behavioural tests | currently **45 passing** |
 | **`Field_Contracts.md`** — every field a consumer reads | currently **150 of 150 correct** |
 
-Both are driven by harness scripts that take a base URL. Point them at the Worker and you get a
-direct, field-by-field comparison against the Supabase deployment.
+**The harness that produced those numbers is not in the repository.** `ACCEPTANCE_TEST_REPORT.md`
+§8 says so: `collect.py`, `an_sc.py`, `an_aum.py` and `targeted.py` lived in a session
+scratchpad. What the repo has is `scripts/acceptance_capture.sh`, which fetches every route in
+the suite for a fixed set of traders, strips the fields documented as live, and writes one
+normalised JSON file per call so two runs can be diffed. It is the gate for this migration until
+the field-contract harness is rebuilt and committed.
 
 ### The procedure
 
 ```bash
-# 1. baseline against Supabase, before anything changes
-BASE=https://<ref>.supabase.co/functions/v1/api  ./run_acceptance.sh > before.txt
+# 1. baseline against Supabase, before anything changes — run it twice and diff the two runs
+#    first; the diff must be empty or the harness is not deterministic enough to trust
+./scripts/acceptance_capture.sh https://<ref>.supabase.co/functions/v1/api captures/before
+./scripts/acceptance_capture.sh https://<ref>.supabase.co/functions/v1/api captures/before2
+diff -r captures/before captures/before2
 
 # 2. same suite against the Worker
-BASE=https://genie-fomo-api.<subdomain>.workers.dev  ./run_acceptance.sh > after.txt
+./scripts/acceptance_capture.sh https://genie-fomo.<subdomain>.workers.dev captures/after
 
 # 3. the migration is correct when this is empty
-diff before.txt after.txt
+diff -r captures/before captures/after
 ```
 
 ### Byte-level comparison
@@ -734,43 +853,49 @@ simultaneously, so there is no reason to guess.
 
 Run both in parallel. There is no need for a hard switch.
 
-**Phase 1 — shadow.** Deploy the Workers pointed at the *same* Supabase Postgres, before moving
-the database. Run the acceptance suite against both. Nothing in production changes.
+Under Option A′ there is one database throughout, so every phase is reversible.
 
-**Phase 2 — move the database.** Restore to the new Postgres, point Hyperdrive at it, and run
-the suite against the Workers again. Supabase keeps serving from the old database.
+**Phase 1 — shadow.** Deploy the Worker with Hyperdrive pointed at Supabase's direct connection.
+Run the acceptance capture against both URLs and diff. Nothing in production changes; the
+Worker's `scheduled` handler stays **disabled** (no `[triggers]` yet) so only `pg_cron` samples.
 
-**Phase 3 — move the writers.** Point the GitHub Actions loaders at the new `DATABASE_URL`, and
-re-point the Helius webhook at the new Worker. **From here the two databases diverge** — this is
-the point of no easy return, so verify Phase 2 thoroughly first.
+**Phase 2 — move the writers.** Enable the Worker's cron and unschedule `aum-sample-rotate`
+(`select cron.unschedule('aum-sample-rotate')`), then re-point Helius at `/webhook` and confirm
+with `register_webhook.mjs --list`. Both write the same tables in the same database; if anything
+looks wrong, reverse the two steps.
 
-**Phase 4 — move readers.** Switch consumers to the Worker URL. Keep Supabase deployed and
-readable.
+**Phase 3 — move readers.** Switch consumers to the Worker URL. Keep the Supabase functions
+deployed and readable.
 
-**Phase 5 — decommission.** After a week of clean running, remove the Supabase functions and
-the cron job.
+**Phase 4 — decommission.** After a week of clean running, delete the Supabase functions, the
+`run_aum_sample()` function and the two Vault secrets.
 
-**Rollback:** trivial in Phases 1–2 (just stop using the Worker). After Phase 3, rollback means
-pointing the loaders back and accepting the gap in the old database — so the window between
-Phase 3 and confidence should be short.
+**Rollback:** at every phase, "point it back". There is no point of no return.
+
+**If you later take Option A (move the host):** insert the dump/restore from §4.1 after Phase 4,
+and do the restore and the `DATABASE_URL` switch for the loaders, the webhook and Hyperdrive in
+one window, because of the data gap described there. That step, and only that step, has a
+window where rollback means losing rows.
 
 ---
 
 ## 14. Cost
 
-Cloudflare's paid Workers plan covers Workers, Cron Triggers and Hyperdrive. Check current
-pricing; the shape of our usage:
+Cloudflare's paid Workers plan ($5/month, 10M requests and 30M CPU-ms included, then $0.30 per
+million requests and $0.02 per million CPU-ms as of writing) covers Workers, Cron Triggers and
+Hyperdrive. The shape of our usage:
 
 | | Volume |
 |---|---|
 | API requests | a consumer sync is ~160 calls; the acceptance suite ~180 |
 | Sampler invocations | 288/day at `*/5`, each ~40 subrequests |
 | Webhook invocations | ~290,000 rows/week, batched per payload |
-| Hyperdrive | one origin, one pool |
-| Postgres hosting | a new line item — Neon or similar, sized for 2 GB and growing |
+| Hyperdrive | one origin, one pool; no separate charge |
 
-The likely surprise is **Postgres hosting**, which Supabase currently bundles. Size it against
-`transactions` growing at roughly 300,000 rows a week.
+At this volume the Workers bill is the $5 floor. Under Option A′ the Supabase bill is unchanged
+apart from a possible IPv4 add-on (§4.2). Under Option A, **Postgres hosting** becomes a new line
+item, which Supabase currently bundles; size it against `transactions` growing at roughly
+300,000 rows a week.
 
 ---
 
@@ -778,16 +903,18 @@ The likely surprise is **Postgres hosting**, which Supabase currently bundles. S
 
 | Phase | Work | Rough effort |
 |---|---|---|
-| **0** | Read this document. Decide Option A or B (§2) | — |
-| **1** | Port `helius-webhook` — smallest, isolated, proves the toolchain | 1 day |
-| **2** | Port `aum-sample`, including `scheduled`. `chain_reads.ts` ports unchanged | 2 days |
-| **3** | Port `api`: `index.ts`, `router.ts`, `errors.ts`, then the env plumbing through `routes.ts` | 3–5 days |
-| **4** | Stand up the new Postgres, dump/restore, create Hyperdrive | 1 day |
-| **5** | Run both suites against both deployments and diff | 1 day |
-| **6** | Cutover per §13 | 1 week, mostly waiting |
+| **0** | Read this document. Decide A′ / A / B (§2) | — |
+| **1** | `wrangler hyperdrive create` against Supabase's direct host, `--caching-disabled`. This settles the IPv6 question (§4.2) before any code is written | ½ day |
+| **2** | Run `scripts/acceptance_capture.sh` twice against Supabase and diff; fix the harness until the diff is empty | ½–1 day |
+| **3** | Port `helius-webhook` as `/webhook` — smallest, isolated, proves the toolchain | 1 day |
+| **4** | Port `aum-sample` as `/sample` + `scheduled`. `chain_reads.ts` ports unchanged | 2 days |
+| **5** | Port `api`: `index.ts`, `router.ts`, `errors.ts` (takes `sql`), `db.ts` (per request), then the `Ctx` plumbing through `routes.ts` | 3–5 days |
+| **6** | Capture against the Worker and diff against Phase 2 | ½ day |
+| **7** | Cutover per §13 | 1 week, mostly waiting |
 
-**About a fortnight for Option A**, most of it in Phase 3 and most of *that* being the
-mechanical `Deno.env.get` → `env` change across 43 call sites.
+**About a fortnight for Option A′**, most of it in Phase 5 and most of *that* being the
+mechanical `Deno.env.get` → `env` change across 26 call sites plus threading `sql` through
+`routes.ts`.
 
 Option B adds four to eight weeks for the SQL rewrite, and should be scheduled as its own
 project with the acceptance suite as the gate.
@@ -805,13 +932,19 @@ not exist at module scope. The most common Workers migration bug by a distance.
 PgBouncer, produces intermittent prepared-statement errors under load — not at deploy time.
 Point Hyperdrive at the direct Postgres port.
 
-**3. `prepare: false` dropped.** It is in the current config for a reason recorded in `db.ts`:
-transaction-mode pooling cannot carry prepared statements between statements, and with it left
-on, queries fail *intermittently* under load rather than immediately.
+**3. `prepare: false` kept.** The current config has it for a reason recorded in `db.ts`:
+transaction-mode pooling cannot carry prepared statements. That reason goes away with #2 — over
+a direct connection Hyperdrive caches prepared statements and `prepare: false` only adds a
+round-trip per query. Carry it forward only if you ignored #2.
 
-**4. Subrequest limits on the sampler.** A 10-trader slice is ~40 subrequests. The limit is per
-invocation and the failure mode is a partial slice, which looks like a trader being skipped
-rather than an error.
+**4. Hyperdrive's query cache.** On by default, 60 seconds, no per-query bypass. It turns the
+`/aum` read-through into "fetched, but showing you the previous reading" for up to a minute and
+nothing downstream can tell. Create the config with `--caching-disabled` (§4.2).
+
+**4a. Shared egress IPs.** Workers' outbound `fetch` leaves from Cloudflare's shared ranges. The
+keyless public EVM RPCs the sampler uses rate-limit by IP, so throttling becomes a function of
+what every other Worker on the same range is doing. `chain_reads.ts` already treats Robinhood's
+403 as a 429; expect more of them, and put a key on every EVM endpoint that offers one.
 
 **5. CPU time versus wall clock.** `/traders/:handle` takes ~12 s today, almost all of it waiting
 on Postgres. That is fine under a CPU-time limit and alarming under a wall-clock one. Measure
@@ -846,6 +979,8 @@ suite.
 | `supabase/functions/api/db.ts` | Every connection decision, with the reason it was made |
 | `supabase/functions/api/index.ts` | Auth, rate limiting, the timeout race, cost accounting |
 | `supabase/functions/api/router.ts` | Ports unchanged; read it to see why it scores specificity |
+| `supabase/functions/api/errors.ts` | Does NOT port unchanged: `checkRate` uses the module-level `sql`, and `classify()` matches pg wire text, not Hyperdrive's error codes (2012 TLS, 2015 connect) — extend it or every Hyperdrive outage is a 500 instead of a 503 |
+| `scripts/acceptance_capture.sh` | The diff gate in §12 |
 | `supabase/functions/_shared/chain_reads.ts` | Ports unchanged; the batch sizes and throttles are measured, not guessed |
 | `README.md` | What the service is and how the pieces fit |
 | `PARAMETER_ROUTES.md` | Every route and parameter in detail |
