@@ -10,9 +10,13 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `Jun
       Worker (`worker/src/sampler.ts`, `/sample` + `scheduled`, shares chain_reads/value.ts);
       PARAMETER_ROUTES documented, `docs/consumer/reply-to-genie-17-sep.md` drafted, phase
       status updated. Pushed as 3840085.
-- [ ] Wave 3 (1 agent): make the api modules runtime-agnostic (AsyncLocalStorage-backed `sql`
-      and config instead of the module singleton and `Deno.env`) so the Worker serves `/v1/*`.
-- [ ] Re-run the comment extractor over the new code; regenerate DECISIONS pointers.
+- [x] Wave 3 (1 agent): api modules are runtime-agnostic (`db.ts` Proxy over an
+      AsyncLocalStorage store, `config.ts` `cfg()`, `app.ts` handle, Deno entry `index.ts`);
+      the Worker serves `/v1/*` from the SAME modules (`worker/src/api.ts`). Verified under
+      workerd with a dead DB: 404 route list and 503 unavailable both correct. Pushed 0b3ac30.
+- [x] Comment extractor re-run: nothing new to move (agents kept comments short).
+- [ ] Wave 4 (2 agents): T3 bounded (on-chain scorecard fallback block); read-only bug review of
+      the whole branch diff → fixes applied by me afterwards.
 - [ ] Final: gate + tests + worker tsc + dry-run; push; status summary here.
 
 Blocked on the user (not attempted): Cloudflare token `Workers Scripts: Edit`; database password

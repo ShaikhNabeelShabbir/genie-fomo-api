@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 4,
+  version: 5,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -40,6 +40,9 @@ export const VOCABULARY = {
     "scorecard.nextLoadBasis": ["nightly_slot"],
     "pnl.openPositionsBasis.*": ["trade_records", "trade_records_still_held_on_chain"],
     "trades.status": ["open", "closed", "closed_by_balance"],
+    /* 17 Sep 2026, v5: T3 bounded on-chain scorecard fallback. */
+    "scorecard.staleness.fallback": ["on_chain"],
+    "scorecard.onChain.basis": ["wallet_swaps"],
     "wallets.walletState": ["on_record", "unresolved_upstream"],
     "traders.delisted.reason": ["absent_from_source"],
     "aum.comparability.reason": ["coverage_differs_by_method"],
