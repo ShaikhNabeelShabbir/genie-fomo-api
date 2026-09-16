@@ -122,6 +122,7 @@ export async function handle(req: Request): Promise<Response> {
           "GET /tokens/:address/activity",
           "GET /creators/:address",
           "GET /chains",
+          "GET /market/regime",
           "GET /events?since=&cursor=&kind=&chain=&handle=",
           "GET /fields",
           "POST /traders/positions   { ids: [...] }",

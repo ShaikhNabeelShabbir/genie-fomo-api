@@ -373,3 +373,13 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `GET /creators/:address` | new route | `{ creator, asOf, ledger, tokens: [{ chain, tokenAddress, symbol, status, isHoneypot, marketCapUsd }], tier: third_party, source: gmgn }`. `?chain=` optional; without it an EVM address sums across chains. `tokens[].status` is GMGN's own word, `creator_hold` or `creator_close`, `null` when GMGN was silent. 404 `not_found` for an address the ledger has never seen; 503 `unavailable` when the database is down |
 | `linked[]` | /wallets | `[{ chain, address, linkedFrom, kind, firstSeenAt, evidenceTx, watch }]`, wallets the trader funded from his known Solana wallet (`linked_wallets`, nightly). `kind` is `funded_by`; `submitted` is reserved and not yet written. `address` is the case-preserved spelling when resolved, otherwise the lowercased key. `watch: true` means the Helius webhook is registered for it, so its transfers appear under this trader's `/transactions`. `[]` when none, never absent |
 
+## Added 17 Sep 2026, market regime
+
+| Field | Route | Contract |
+|---|---|---|
+| `regime` | GET /market/regime | `open` \| `caution` \| `closed` \| `null`. `closed` when `leaders.greenShare7d < 0.25`, `caution` when `< 0.5`, else `open`; `launches.survival7d < 0.1` moves it one step down. `null` when no tracked leader closed a trade in the window. A cohort reading, not advice |
+| `rule` | GET /market/regime | `{ closedBelow: 0.25, cautionBelow: 0.5, survivalDowngradeBelow: 0.1, basis }`, the thresholds above, published |
+| `leaders` | GET /market/regime | `{ total, green7d, greenShare7d, basis }`: traders with ≥ 1 `closed_at` in the last 7 days; green = `sum(realized_pnl_usd) > 0` over those closes. `greenShare7d` `null` when `total = 0` |
+| `launches` | GET /market/regime | `{ seen7d, graduated7d, survival7d, chains: ["solana"], basis }`: `tokens.created_at` in the last 7 days, `graduated = true`. `survival7d` `null` when `seen7d = 0`. Nightly, Solana only |
+| `rotation` | GET /market/regime | `{ tokensMoved7d, topShare7d, basis }` from `transactions` in the last 7 days across tracked wallets: distinct tokens, and the share of transfers in the 10 most-moved tokens. `topShare7d` `null` when nothing moved |
+| `asOf`, `window`, `cachedForSeconds` | GET /market/regime | `window` is always `7d`; the body is identical for every caller and served from a 60 s per-instance cache, so `asOf` is the compute time |

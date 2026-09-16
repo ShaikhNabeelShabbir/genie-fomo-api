@@ -151,6 +151,7 @@ curl -s "$B/traders?limit=500" | jq '.entries | length'   # 448
 | **10** | [Trades, both sides](#10-trades-both-sides) | valued from the money side |
 | **11** | [Batch reads](#11-batch-reads) | the whole board in a bounded number of calls |
 | **12** | [Events feed](#12-events-feed) | transfers, swaps and readings, one cursor |
+| **13** | [Market regime](#13-market-regime) | the cohort's week, one word, published thresholds |
 | **C** | [What the plugin team asked for](#appendix-c-what-the-plugin-team-asked-for) | § by §, and where each landed |
 | **A4** | [The version 8 report, and what changed](#appendix-a4-the-version-8-report-and-what-changed-2026-09-14) | freshness, `now`, and the seam |
 | **A5** | [The version 8 report, the rest of the asks](#appendix-a5-the-version-8-report-the-rest-of-the-asks-2026-09-14) | ten more, measured |
@@ -3257,6 +3258,42 @@ always `null` on this feed (the price check lives on `/positions`).
 **`traderSource`** is `traders.source` (`fomoapi.io` or `gmgn`): the only class the cohort has.
 
 **`reading.totalUsd: null` means refused**, and `refusedReason` says why — never zero.
+
+---
+
+## 13. Market regime
+
+Added 17 Sep 2026 for the "Casino Closed" workflow (composite C4,
+`docs/consumer/composite-workflows-coverage-17-sep.md`). One cohort-wide reading, identical for
+every caller, computed at most once a minute per instance. **It is a reading of the tracked
+cohort's week, not advice.**
+
+### `GET /market/regime`
+
+```json
+{
+  "board": "market", "asOf": "…", "window": "7d",
+  "regime": "caution",
+  "rule": { "closedBelow": 0.25, "cautionBelow": 0.5, "survivalDowngradeBelow": 0.1, "basis": "…" },
+  "leaders":  { "total": 84, "green7d": 31, "greenShare7d": 0.369, "basis": "…" },
+  "launches": { "seen7d": 40, "graduated7d": 3, "survival7d": 0.075, "chains": ["solana"], "basis": "…" },
+  "rotation": { "tokensMoved7d": 612, "topShare7d": 0.41, "basis": "…" },
+  "plain": "37% of tracked leaders are green this week (31 of 84); 8% of 40 Solana launches graduated; regime caution. A cohort reading, not advice.",
+  "cachedForSeconds": 60
+}
+```
+
+| Block | What |
+|---|---|
+| `leaders` | traders with ≥ 1 trade whose `closed_at` falls in the last 7 days; `green7d` = those whose `sum(realized_pnl_usd)` over that week's closes is > 0. `greenShare7d = green7d / total`, `null` when `total = 0` |
+| `launches` | Solana tokens with `tokens.created_at` in the last 7 days (the pump.fun curve read, `docs/LAUNCH_METADATA.md`); `graduated7d` = `graduated = true`. `survival7d = graduated7d / seen7d`, `null` when `seen7d = 0` |
+| `rotation` | `transactions` in the last 7 days across tracked wallets: `tokensMoved7d` distinct tokens, `topShare7d` the share of transfer count carried by the 10 most-moved tokens (a concentration proxy: high = the cohort is piling into few names). `null` when nothing moved |
+| `regime` | `closed` when `greenShare7d < 0.25`, `caution` when `< 0.5`, else `open`; `survival7d < 0.1` moves the result one step down (never past `closed`). `null` when `greenShare7d` is `null` |
+| `rule` | the thresholds above, published so the app can show why |
+
+The rule is a pure function (`regimeFrom` in `routes/market.ts`, tested in `tests/market_test.ts`).
+Launch metadata is nightly and Solana-only, so `survival7d` lags a day and says nothing about
+EVM; the leaders figure moves with each trade load.
 
 ---
 
