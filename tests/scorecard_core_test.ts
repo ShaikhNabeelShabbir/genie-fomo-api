@@ -38,3 +38,21 @@ Deno.test("T3: no resolved swaps is null figures, never zero; swaps stays a real
   const open = onChain([swap({ tokenDelta: 3, quoteUsd: -30 })], 1);
   assertEquals([open.volumeUsd, open.realizedPnlUsd, open.winRate, open.wins], [30, null, null, null]);
 });
+
+const { coinMultiples } = await import("../supabase/functions/api/shared/scorecard-core.ts");
+
+Deno.test("C1: coinMultiples divides by the weighted entry; the peak counts only after the first open", () => {
+  const base = { entryPx: 2, exitPx: 10, currentPx: 1, athPx: 40, athAtMs: 200, firstOpenedMs: 100,
+                 entryQty: 100, exitQty: 60 };
+  assertEquals(coinMultiples(base),
+    { multipleRealized: 5, multipleCurrent: 0.5, multiplePeak: 20, realizedShare: 0.6 });
+  // High sampled before he bought: someone else's run, so no peak.
+  assertEquals(coinMultiples({ ...base, athAtMs: 50 }).multiplePeak, null);
+  // No entry price: nothing to divide by, and null is not 0.
+  assertEquals(coinMultiples({ ...base, entryPx: null }),
+    { multipleRealized: null, multipleCurrent: null, multiplePeak: null, realizedShare: 0.6 });
+  // No entry quantity: no share; sold more than bought clamps to 1; nothing sold is a real 0.
+  assertEquals(coinMultiples({ ...base, entryQty: null }).realizedShare, null);
+  assertEquals(coinMultiples({ ...base, exitQty: 150 }).realizedShare, 1);
+  assertEquals(coinMultiples({ ...base, exitQty: null }).realizedShare, 0);
+});

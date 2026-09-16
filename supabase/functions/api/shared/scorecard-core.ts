@@ -49,10 +49,13 @@ export const scorecardRows = (handles: string[]) => sql`
          -- Axis 5 wants the token's age at entry, which needs its creation time. GMGN carries
          -- it and we already store the whole document, so this is a read rather than a fetch.
          -- 0 means "they did not tell us" and is nulled here, not published as 1970.
-         nullif((ti.raw->>'creation_timestamp')::bigint, 0) as token_created_unix
+         nullif((ti.raw->>'creation_timestamp')::bigint, 0) as token_created_unix,
+         -- C1/C5 (composite badges): the coin now, and its high since we began sampling it.
+         tk.created_at as token_created_at, ti.market_cap_usd, ti.price_usd, ps.ath_usd, ps.ath_at
   from trades tr
   left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
   left join token_info ti on ti.network_id = tr.network_id and ti.token_key = tr.token_key
+  left join token_price_stats ps on ps.network_id = tr.network_id and ps.token_key = tr.token_key
   where tr.handle = any(${handles})`;
 
 
@@ -244,6 +247,29 @@ export function buysFrom(swaps: Swap[]): Map<string, Buy[]> {
   return out;
 }
 
+/**
+ * C1 (composite badges). Per-coin multiples against the weighted entry, and how much of the
+ * entry quantity has been sold. Null, never 0, whenever a leg is missing; the peak counts only
+ * when the sampled high post-dates the first open, otherwise it is someone else's run.
+ */
+export type CoinLegs = {
+  entryPx: number | null; exitPx: number | null; currentPx: number | null;
+  athPx: number | null; athAtMs: number | null; firstOpenedMs: number | null;
+  entryQty: number | null; exitQty: number | null;
+};
+export function coinMultiples(c: CoinLegs) {
+  const over = (px: number | null) =>
+    px !== null && c.entryPx !== null && c.entryPx > 0 ? Number((px / c.entryPx).toFixed(4)) : null;
+  const peakSeen = c.athAtMs !== null && c.firstOpenedMs !== null && c.athAtMs >= c.firstOpenedMs;
+  return {
+    multipleRealized: over(c.exitPx),
+    multipleCurrent: over(c.currentPx),
+    multiplePeak: peakSeen ? over(c.athPx) : null,
+    realizedShare: c.entryQty !== null && c.entryQty > 0
+      ? Number(Math.min(1, Math.max(0, (c.exitQty ?? 0) / c.entryQty)).toFixed(4)) : null,
+  };
+}
+
 /** Everything the scorecard computes, over rows already fetched. See docs/DECISIONS.md#d142 */
 // deno-lint-ignore no-explicit-any
 /** THE BALANCE A TRADER STARTED EACH MONTH WITH — the denominator a monthly return needs. See docs/DECISIONS.md#d143 */
@@ -403,6 +429,11 @@ export async function scorecardBody(
     tokenCreatedUnix: number | null; firstOpenedMs: number | null;
     /* When this coin was first and last closed, so a per-coin row carries its own dates. */
     firstClosedMs: number | null; lastClosedMs: number | null;
+    /* C1: the coin now (token_info) and its sampled high (token_price_stats). */
+    currentPriceUsd: number | null; currentMcapUsd: number | null;
+    athUsd: number | null; athAtMs: number | null;
+    /* Launch time: tokens.created_at (read on chain) first, GMGN's creation_timestamp after. */
+    launchMs: number | null;
     chainKey: string;
   }>();
   for (const r of rows) {
@@ -417,6 +448,9 @@ export async function scorecardBody(
       // Earliest position opened in this token, so age-at-entry can be derived per token.
       firstOpenedMs: null as number | null,
       firstClosedMs: null as number | null, lastClosedMs: null as number | null,
+      currentPriceUsd: n(r.price_usd), currentMcapUsd: n(r.market_cap_usd),
+      athUsd: n(r.ath_usd), athAtMs: ms(r.ath_at),
+      launchMs: ms(r.token_created_at) ?? (n(r.token_created_unix) !== null ? n(r.token_created_unix)! * 1000 : null),
       // Chain AND token, because one token_key can exist on two chains and their prices
       // have nothing to do with each other.
       chainKey: `${r.network_id}:${r.token_key}`,
@@ -473,7 +507,8 @@ export async function scorecardBody(
              sum: a.sum, weight: a.weight };
   };
   const byToken = [...byTokenMap.values()]
-    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, firstClosedMs, lastClosedMs, chainKey, ...r }) => {
+    .map(({ entry, exit, tokenCreatedUnix, firstOpenedMs, firstClosedMs, lastClosedMs, chainKey,
+            athUsd, athAtMs, launchMs, ...r }) => {
       const e = resolve(entry), x = resolve(exit);
       /** Axis 5. See docs/DECISIONS.md#d148 */
       const chainPx = e.value === null ? (chainEntry.get(chainKey) ?? null) : null;
@@ -520,6 +555,21 @@ export async function scorecardBody(
       /** DOLLARS IN AND DOLLARS OUT on this coin, which is what "how much a bet" and the profit ban… See docs/DECISIONS.md#d153 */
       costUsd: e.legsWeighted > 0 ? round(e.sum) : null,
       proceedsUsd: x.legsWeighted > 0 ? round(x.sum) : null,
+      /** C1 (composite badges). `exitMcapUsd` and `betUsd` are `avgExitMarketCapUsd` and `costUsd` under the names the badge note uses: one value, two names. */
+      exitMcapUsd: x.value !== null && r.totalSupply !== null && r.totalSupply > 0
+        ? Number((x.value * r.totalSupply).toPrecision(10)) : null,
+      /** The sampled high since this trader first opened the coin, as a market cap. Null before hourly sampling reached it or when the high pre-dates his entry. */
+      peakMcapSinceEntryUsd: athUsd !== null && athAtMs !== null && firstOpenedMs !== null &&
+          athAtMs >= firstOpenedMs && r.totalSupply !== null && r.totalSupply > 0
+        ? Number((athUsd * r.totalSupply).toPrecision(10)) : null,
+      ...coinMultiples({
+        entryPx, exitPx: x.value, currentPx: r.currentPriceUsd, athPx: athUsd, athAtMs, firstOpenedMs,
+        entryQty: e.legsWeighted > 0 ? e.weight : null, exitQty: x.legsWeighted > 0 ? x.weight : null,
+      }),
+      betUsd: e.legsWeighted > 0 ? round(e.sum) : null,
+      closedMonth: lastClosedMs !== null ? new Date(lastClosedMs).toISOString().slice(0, 7) : null,
+      entryHoursAfterLaunch: launchMs !== null && firstOpenedMs !== null
+        ? Number(((firstOpenedMs - launchMs) / 3_600_000).toFixed(2)) : null,
       /** The quantity each sum was taken over, so the division can be rechecked. */
       costQuantity: e.legsWeighted > 0 ? e.weight : null,
       proceedsQuantity: x.legsWeighted > 0 ? x.weight : null,
