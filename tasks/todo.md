@@ -2,13 +2,17 @@
 
 Goal: finish every to-do that needs no user input; nothing deployed. Branch `Junaid-deve-starts`.
 
-- [ ] Wave 1 (5 agents, parallel, worktrees): P1 (#10), T1 (#11), A1/F2/F3 remainder (#12),
-      R6 indexer coverage, R4 Robinhood prices + refresh.yml reorder + rebuild twins.
-- [ ] Merge wave 1; publish words in `shared/vocabulary.ts` (v4); update Field_Contracts.
-- [ ] Wave 2 (1 agent): clear the 90 baseline type errors (postgres.js row typing).
-- [ ] Wave 3 (parallel): port `aum-sample` into the Worker (`/sample` + `scheduled`); thread a
-      `Ctx { sql, env }` through the api modules so the Worker serves `/v1/*`; docs agent
-      (PARAMETER_ROUTES, TO-DO tracker, DECISIONS pointers).
+- [x] Wave 1 (5 agents, parallel, worktrees): P1 (#10), T1 (#11), A1/F2/F3 remainder (#12),
+      R6 indexer coverage, R4 Robinhood prices (DexScreener) + refresh.yml reorder + rebuild twins.
+      Merged with 2 small conflicts; 29 tests; pushed as 67ef909.
+- [x] Merge wave 1; publish words in `shared/vocabulary.ts` (v4); update Field_Contracts.
+- [x] Wave 2 (3 agents, parallel): typecheck baseline 90 → 0; `aum-sample` ported into the
+      Worker (`worker/src/sampler.ts`, `/sample` + `scheduled`, shares chain_reads/value.ts);
+      PARAMETER_ROUTES documented, `docs/consumer/reply-to-genie-17-sep.md` drafted, phase
+      status updated. Pushed as 3840085.
+- [ ] Wave 3 (1 agent): make the api modules runtime-agnostic (AsyncLocalStorage-backed `sql`
+      and config instead of the module singleton and `Deno.env`) so the Worker serves `/v1/*`.
+- [ ] Re-run the comment extractor over the new code; regenerate DECISIONS pointers.
 - [ ] Final: gate + tests + worker tsc + dry-run; push; status summary here.
 
 Blocked on the user (not attempted): Cloudflare token `Workers Scripts: Edit`; database password
