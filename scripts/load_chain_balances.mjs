@@ -31,7 +31,7 @@ import pg from "pg";
 import {
   SOLANA_NETWORK_ID, SOL_MINT, solanaBalances, evmBalances,
 } from "./lib/chain_reads.mjs";
-import { value } from "./lib/value.mjs";
+import { IMPLIED_MCAP_CEILING_USD, MAX_POSITION_USD, MAX_PRICE_PER_TOKEN, value } from "./lib/value.mjs";
 
 const DB  = (process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim();
 const KEY = (process.env.HELIUS_SOLANA_KEY ?? "").trim();
@@ -250,7 +250,7 @@ async function main() {
     update holdings h
        set price = p.px, value = h.human_amount * p.px
       from (
-        select t.network_id, t.token_key,
+        select t.network_id, t.token_key, t.total_supply,
                coalesce(qa.pegged_usd, ti.price_usd, tp.usd) as px
         from tokens t
         left join quote_assets qa on qa.network_id = t.network_id and qa.token_key = t.token_key
@@ -261,7 +261,13 @@ async function main() {
                            order by day desc limit 1) tp on true
       ) p
      where h.source = 'chain' and h.value is null and h.human_amount is not null
-       and p.network_id = h.network_id and p.token_key = h.token_key and p.px is not null`);
+       and p.network_id = h.network_id and p.token_key = h.token_key and p.px is not null
+       -- The same ceilings value() applies at insert time: a row whose price was REFUSED
+       -- (price stored, value withheld) must not be re-priced past them here.
+       and p.px <= $1
+       and h.human_amount * p.px <= $2
+       and (p.total_supply is null or p.total_supply = 0 or p.px * p.total_supply <= $3)`,
+     [MAX_PRICE_PER_TOKEN, MAX_POSITION_USD, IMPLIED_MCAP_CEILING_USD]);
   if (repriced) console.log(`re-priced ${repriced} previously unvalued chain rows`);
 
   const { rows: [after] } = await pool.query(`
