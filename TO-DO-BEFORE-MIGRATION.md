@@ -50,6 +50,11 @@ mint, 11.4M units at $8,923.86, 99.93% of the total; on-chain supply 999.9M, so 
 market cap is $8.9 trillion. `shahh`: $14.7M from one coin at $1,019 a unit, 99.5% of the
 total, $2.5K banked.
 
+Checked at 18:5x UTC while writing this: `luckedhub`'s newest reading (16:00) is now
+`totalUsd: 67,743,594`, still `tier: verified`, against $329 banked. The $1B ceiling
+deployed on 16 Sep removed the $101B figure and let a $67.7M one through. A ceiling on the
+total is not the check; the check is on the price.
+
 **Root cause.**
 - The sampler's only guards are `MAX_PRICE_PER_TOKEN = 1_000_000` and
   `MAX_POSITION_USD = 1_000_000_000` (`aum-sample/index.ts:56,73`, twin
