@@ -55,7 +55,7 @@ Waiting on you, in order:
 2. Database password (from the dev): `wrangler hyperdrive create … --caching-disabled`, paste the id
    into `worker/wrangler.toml` (uncomment the block), `wrangler secret put HELIUS_WEBHOOK_SECRET`,
    `AUM_SAMPLE_SECRET`, `HELIUS_SOLANA_KEY`, `WALLET_SUBMIT_SECRET`; redeploy; shadow diff.
-3. Supabase: `supabase db push` (15 migrations dated 20260917), deploy `api` + `aum-sample`;
+3. Supabase: `supabase db push` (14 migrations dated 20260917), deploy `api` + `aum-sample`;
    re-sample `luckedhub`/`shahh`; run `scripts/acceptance_capture.sh` on main-vs-branch.
 4. Send the reply draft to the Genie team (vocabulary v7 will fail their build until they add
    the words).
