@@ -78,3 +78,7 @@ drawableMinPoints: 2 }`. Full contracts are in `Field_Contracts.md`, the two sec
 
 All of the above is on the branch and verified there; the deployment date is pending and will
 be sent with the `/v1/fields` version bump so your build check can gate on it.
+
+## Versioning note
+
+The Cloudflare deployment will serve these same routes under `/v2/*`; the Supabase deployment stays `/v1/*`. Links inside responses are spelled for whichever version you call, and `/health.apiVersion` says which answered. No field changes between the two.
