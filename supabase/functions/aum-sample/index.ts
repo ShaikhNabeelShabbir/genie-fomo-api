@@ -2,7 +2,7 @@ import postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
 import {
   SOLANA_NETWORK_ID, solanaBalances, evmBalances,
 } from "../_shared/chain_reads.ts";
-import { concentrationSuspect, value } from "./value.ts";
+import { concentrationSuspect, decideTotal, value } from "./value.ts";
 
 /** AUM sampler, as a Supabase Edge Function. See docs/DECISIONS.md#d188 */
 
@@ -40,18 +40,23 @@ const json = (body: unknown, status = 200) =>
 
 
 type Position = { network_id: number; token_key: string; address: string; amount: number };
+type Chain = { network_id: number; name: string; rpc: string };
+type Trader = { handle: string; sol_address: string | null; evm_address: string | null };
+/** One chain's answer: what it held, or why it could not be asked. Never both. */
+type ChainRead = { positions: Position[] | null; reason: string | null };
+type Tally = { usd: number; priced: number; total: number };
+type Settled = {
+  totalUsd: number | null; reason: string | null;
+  priced: number; total: number; rejected: number; perChain: Map<number, Tally>;
+};
 
-/** Chains the current trader's read actually asked. Reset per trader by readBalances(). */
-const attempted = new Set<number>();
-
-/** Prices (and total supply, for the implied-cap check) for a set of (network, token) pairs, from what this service already holds. See docs/DECISIONS.md#d191 */
-async function pricesFor(pairs: Position[]): Promise<Map<string, { px: number; supply: number | null }>> {
-  const m = new Map<string, { px: number; supply: number | null }>();
+/** Prices for a set of (network, token) pairs, from what this service already holds. See docs/DECISIONS.md#d191 */
+async function pricesFor(pairs: Position[]): Promise<Map<string, number>> {
+  const m = new Map<string, number>();
   if (!pairs.length) return m;
   const rows = await sql`
     select u.n as network_id, u.k as token_key,
-           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px,
-           tk.total_supply::float8 as supply
+           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px
     from unnest(${pairs.map((p) => p.network_id)}::bigint[],
                 ${pairs.map((p) => p.token_key)}::text[]) as u(n, k)
     left join quote_assets qa on qa.network_id = u.n and qa.token_key = u.k
@@ -59,75 +64,129 @@ async function pricesFor(pairs: Position[]): Promise<Map<string, { px: number; s
     left join lateral (
       select usd from token_prices p
       where p.network_id = u.n and p.token_key = u.k order by day desc limit 1
-    ) tp on true
-    left join tokens tk on tk.network_id = u.n and tk.token_key = u.k`;
-  for (const r of rows) {
-    if (r.px !== null) {
-      m.set(`${r.network_id}:${r.token_key}`,
-            { px: Number(r.px), supply: r.supply === null ? null : Number(r.supply) });
-    }
-  }
+    ) tp on true`;
+  for (const r of rows) if (r.px !== null) m.set(`${r.network_id}:${r.token_key}`, Number(r.px));
   return m;
 }
 
-/** Read every wallet this trader has, on every chain, from the chain itself. See docs/DECISIONS.md#d192 */
-async function readBalances(
-  t: { handle: string; sol_address: string | null; evm_address: string | null },
-  chains: { network_id: number; name: string; rpc: string }[],
-  decimals: Map<string, number>,
+/**
+ * Read ONE chain for one trader. Never throws: a chain that will not answer is a reason on
+ * its own row, and the other chains still count (Z2, R5). See docs/DECISIONS.md#d192
+ */
+async function readChain(
+  t: Trader, c: Chain, decimals: Map<string, number>,
   tradedByNet: Map<string, { token_key: string; address: string }[]>,
-): Promise<Position[]> {
-  const out: Position[] = [];
-
-  /*
-   * WHICH CHAINS THIS READ ACTUALLY WENT AND ASKED. Recorded on the trader, because the
-   * parent row has to say how much of him the reading covered and `perChain` below only
-   * knows about chains that came back holding something -- a chain asked and found empty is
-   * answered, not missing, and the two must not collapse.
-   */
-  attempted.clear();
-
-  if (t.sol_address) {
-    attempted.add(SOLANA_NETWORK_ID);
-    let bals;
-    try { bals = await solanaBalances(t.sol_address, HELIUS); }
-    catch (e) {
-      throw Object.assign(new Error(`solana: ${(e as Error).message}`), { reason: "wallet_unreadable" });
+): Promise<ChainRead> {
+  const net = Number(c.network_id);
+  const pos = (b: { address: string; amount: string }): Position => ({
+    network_id: net, token_key: b.address.toLowerCase(), address: b.address, amount: Number(b.amount),
+  });
+  try {
+    if (net === SOLANA_NETWORK_ID) {
+      const bals = await solanaBalances(t.sol_address ?? "", HELIUS);
+      if (bals === null) return { positions: null, reason: "service_timeout" };
+      return { positions: bals.map(pos), reason: null };
     }
-    if (bals === null) throw Object.assign(new Error("no helius key"), { reason: "service_timeout" });
-    for (const b of bals) {
-      out.push({
-        network_id: SOLANA_NETWORK_ID, token_key: b.address.toLowerCase(),
-        address: b.address, amount: Number(b.amount),
-      });
+    const tokens = tradedByNet.get(`${t.handle}|${net}`) ?? [];
+    /* Nothing to ask for is unread, not empty (Z1). Lift once evmBalances reads the native balance. */
+    if (!tokens.length) return { positions: null, reason: "no_tokens_known" };
+    const view = {
+      get: (k: string) => decimals.get(`${net}:${k}`),
+      set: (k: string, v: number) => { decimals.set(`${net}:${k}`, v); },
+    };
+    const res = await evmBalances(c.rpc, t.evm_address ?? "", tokens, view);
+    return { positions: res.balances.map(pos), reason: null };
+  } catch (e) {
+    console.error(`aum-sample: ${t.handle} ${c.name}: ${(e as Error).message}`);
+    return { positions: null, reason: "wallet_unreadable" };
+  }
+}
+
+const hasWallet = (t: Trader, net: number) =>
+  net === SOLANA_NETWORK_ID ? t.sol_address !== null : t.evm_address !== null;
+
+/** Price what the chains answered and decide the parent total. */
+async function settle(reads: Map<number, ChainRead>): Promise<Settled> {
+  const perChain = new Map<number, Tally>();
+  /** SEED EVERY CHAIN THAT ANSWERED, before counting what came back. See docs/DECISIONS.md#d194 */
+  for (const [net, r] of reads) if (r.positions) perChain.set(net, { usd: 0, priced: 0, total: 0 });
+  const positions = [...reads.values()].flatMap((r) => r.positions ?? []);
+  const px = await pricesFor(positions);
+  let sum = 0, priced = 0, rejected = 0;
+  /** The largest priced position, and whether its implied cap could be checked (V1). */
+  const top = { usd: 0, capKnown: false };
+  for (const p of positions) {
+    const c = perChain.get(p.network_id)!;
+    c.total++;
+    const q = px.get(`${p.network_id}:${p.token_key}`);
+    const v = value(p.amount, q?.px ?? null, q?.supply ?? null);
+    if (v.rejected) rejected++;
+    else if (v.usd !== undefined) {
+      sum += v.usd; priced++; c.usd += v.usd; c.priced++;
+      if (v.usd > top.usd) { top.usd = v.usd; top.capKnown = (q?.supply ?? 0) > 0; }
     }
   }
+  const failures = [...reads.values()].flatMap((r) => r.reason ? [r.reason] : []);
+  const decided = decideTotal(perChain.size, priced, sum, positions.length, failures);
+  /* One coin is most of him and cannot be believed: a price fault, not a balance (V1). */
+  const { totalUsd, reason } = decided.totalUsd !== null && concentrationSuspect(top.usd, sum, top.capKnown)
+    ? { totalUsd: null, reason: "price_suspect" }
+    : decided;
+  return { totalUsd, reason, priced, total: positions.length, rejected, perChain };
+}
 
-  if (t.evm_address) {
-    for (const c of chains) {
-      if (Number(c.network_id) === SOLANA_NETWORK_ID) continue;
-      const net = String(c.network_id);
-      const tokens = tradedByNet.get(`${t.handle}|${net}`) ?? [];
-      if (!tokens.length) continue;
-      attempted.add(Number(net));
-      const view = {
-        get: (k: string) => decimals.get(`${net}:${k}`),
-        set: (k: string, v: number) => { decimals.set(`${net}:${k}`, v); },
-      };
-      let res;
-      try { res = await evmBalances(c.rpc, t.evm_address, tokens, view); }
-      catch (e) {
-        throw Object.assign(new Error(`${c.name}: ${(e as Error).message}`), { reason: "wallet_unreadable" });
-      }
-      for (const b of res.balances) {
-        out.push({
-          network_id: Number(net), token_key: b.address.toLowerCase(),
-          address: b.address, amount: Number(b.amount),
-        });
-      }
-    }
-  }
-  return out;
+/** The parent row and one row per chain asked, answered or not. See docs/DECISIONS.md#d195 */
+async function write(
+  handle: string, at: Date, expected: number, reads: Map<number, ChainRead>, s: Settled,
+) {
+  const answered = s.perChain.size;
+  /* Share of his POSITIONS we could value — what makes a thin line legible as thin. */
+  const valueShare = s.total > 0 ? Number((s.priced / s.total).toFixed(4)) : null;
+  await sql`
+    insert into aum_samples
+      (handle, at, total_usd, refused_reason, priced_positions, total_positions,
+       value_share, basis, tier, chains_answered, chains_expected)
+    values (${handle}, ${at}, ${s.totalUsd}, ${s.totalUsd === null ? s.reason : null},
+            ${answered === 0 ? null : s.priced}, ${answered === 0 ? null : s.total},
+            ${valueShare}, 'sampled', ${s.reason === "price_suspect" ? "reported" : "verified"}, ${answered}, ${expected})
+    on conflict (handle, at, basis) do update set
+      total_usd = excluded.total_usd, refused_reason = excluded.refused_reason,
+      priced_positions = excluded.priced_positions,
+      total_positions = excluded.total_positions,
+      value_share = excluded.value_share, tier = excluded.tier,
+      chains_answered = excluded.chains_answered,
+      chains_expected = excluded.chains_expected,
+      sampled_at = now()`;
+
+  if (!reads.size) return;
+  const nets = [...reads.keys()];
+  const tally = (net: number) => s.perChain.get(net) ?? null;
+  await sql`
+    insert into aum_chain_samples (handle, at, basis, network_id, total_usd, priced_share, reason)
+    select ${handle}, ${at}, 'sampled', u.n, u.v, u.s, u.r
+    from unnest(${nets}::bigint[],
+                ${nets.map((n) => {
+                  const c = tally(n);
+                  /* Not asked: null. Held nothing: a true zero. Priced something: the sum. */
+                  if (!c) return null;
+                  if (c.total === 0) return 0;
+                  return c.priced > 0 && s.reason !== "price_suspect" ? c.usd : null;
+                })}::numeric[],
+                ${nets.map((n) => {
+                  const c = tally(n);
+                  return !c || c.total === 0 ? null : Number((c.priced / c.total).toFixed(4));
+                })}::numeric[],
+                ${nets.map((n) => {
+                  const c = tally(n);
+                  if (!c) return reads.get(n)!.reason;
+                  if (c.total === 0) return null;          // read, empty — not a fault
+                  if (c.priced === 0) return "no_prices";
+                  return s.reason === "price_suspect" ? "price_suspect" : null;
+                })}::text[]
+               ) as u(n, v, s, r)
+    on conflict (handle, at, basis, network_id) do update set
+      total_usd = excluded.total_usd, priced_share = excluded.priced_share,
+      reason = excluded.reason`;
 }
 
 Deno.serve(async (req) => {
@@ -219,147 +278,87 @@ Deno.serve(async (req) => {
     const at = new Date();
     at.setUTCMinutes(0, 0, 0);
 
-    const report: Record<string, unknown>[] = [];
-    let ok = 0, refused = 0, stoppedEarly = false;
+    /*
+     * EXPECTED CHAINS ARE THE ONES /aum PUBLISHES: presence ∪ holdings ∪ chain samples.
+     * Twin of the `seen` CTE in api/shared/chains.ts knownChainsFor(); change both.
+     */
+    const knownByHandle = new Map<string, Set<number>>();
+    for (const r of await sql`
+      select s.handle, s.network_id::bigint
+      from (select handle, network_id from wallet_chain_presence where handle = any(${handles})
+            union select handle, network_id from holdings_current
+                  where handle = any(${handles}) and human_amount > 0
+            union select handle, network_id from aum_chain_samples
+                  where handle = any(${handles}) and total_usd is not null) s
+      join chains using (network_id)`) {
+      const h = String(r.handle);
+      knownByHandle.set(h, (knownByHandle.get(h) ?? new Set<number>()).add(Number(r.network_id)));
+    }
+    const chainById = new Map<number, Chain>(
+      (chains as unknown as Chain[]).map((c) => [Number(c.network_id), c]));
+
+    const report = new Map<string, Record<string, unknown>>();
+    let stoppedEarly = false;
+    type Job = { trader: Trader; expected: Set<number>; reads: Map<number, ChainRead> };
+    const retry: Job[] = [];
+
+    const entry = (job: Job, s: Settled) => {
+      const failed: Record<string, string> = {};
+      for (const [net, r] of job.reads) if (r.reason) failed[chainById.get(net)?.name ?? String(net)] = r.reason;
+      report.set(job.trader.handle, {
+        handle: job.trader.handle,
+        totalUsd: s.totalUsd === null ? null : Number(s.totalUsd.toFixed(2)),
+        refused: s.totalUsd === null ? s.reason : null,
+        pricedPositions: s.perChain.size === 0 ? null : s.priced,
+        totalPositions: s.perChain.size === 0 ? null : s.total,
+        valueShare: s.total > 0 ? Number((s.priced / s.total).toFixed(4)) : null,
+        chains: { answered: s.perChain.size, expected: job.expected.size, failed },
+        ...(s.rejected ? { priceRejected: s.rejected } : {}),
+      });
+    };
+    const finish = async (job: Job) => {
+      const s = await settle(job.reads);
+      entry(job, s);
+      if (!dryRun) await write(job.trader.handle, at, job.expected.size, job.reads, s);
+    };
 
     for (const t of targets) {
       if (Date.now() - started > BUDGET_MS) { stoppedEarly = true; break; }
 
-      const trader = {
+      const trader: Trader = {
         handle: String(t.handle),
         sol_address: t.sol_address ? String(t.sol_address) : null,
         evm_address: t.evm_address ? String(t.evm_address) : null,
       };
+      /* Solana lists everything held, so it is always asked when he has that wallet. */
+      const expected = new Set(knownByHandle.get(trader.handle) ?? []);
+      if (trader.sol_address) expected.add(SOLANA_NETWORK_ID);
 
-      let positions: Position[] | null = null;
-      let reason: string | null = null;
-      let attemptedCount = 0;
-      try {
-        positions = await readBalances(trader, chains as never, decimals, tradedByNet);
-        attemptedCount = attempted.size;
-      } catch (e) {
-        reason = (e as { reason?: string }).reason ?? "wallet_unreadable";
-        positions = null;
+      const reads = new Map<number, ChainRead>();
+      for (const net of expected) {
+        const c = chainById.get(net);
+        /* Known without the wallet that reaches it: expected, not askable; the row says partial. */
+        if (!c || !hasWallet(trader, net)) continue;
+        reads.set(net, await readChain(trader, c, decimals, tradedByNet));
       }
-
-      let totalUsd: number | null = null;
-      let priced = 0, total = 0, rejected = 0;
-      const perChain = new Map<number, { usd: number; priced: number; total: number }>();
-
-      if (positions !== null) {
-        /** SEED EVERY CHAIN THIS READ ASKED, before counting what came back. See docs/DECISIONS.md#d194 */
-        for (const net of attempted) {
-          if (!perChain.has(net)) perChain.set(net, { usd: 0, priced: 0, total: 0 });
-        }
-        total = positions.length;
-        const px = await pricesFor(positions);
-        let sum = 0;
-        /** The largest priced position, and whether its implied cap could be checked (V1). */
-        const top = { usd: 0, capKnown: false };
-        for (const p of positions) {
-          const c = perChain.get(p.network_id) ?? { usd: 0, priced: 0, total: 0 };
-          c.total++;
-          const q = px.get(`${p.network_id}:${p.token_key}`);
-          const v = value(p.amount, q?.px ?? null, q?.supply ?? null);
-          if (v.rejected) rejected++;
-          else if (v.usd !== undefined) {
-            sum += v.usd; priced++; c.usd += v.usd; c.priced++;
-            if (v.usd > top.usd) { top.usd = v.usd; top.capKnown = (q?.supply ?? 0) > 0; }
-          }
-          perChain.set(p.network_id, c);
-        }
-        if (priced > 0) {
-          /* One coin is most of him and cannot be believed: a price fault, not a balance. */
-          if (concentrationSuspect(top.usd, sum, top.capKnown)) reason = "price_suspect";
-          else totalUsd = sum;
-        } else if (total === 0) {
-          /*
-           * Every wallet answered and held nothing. The one place a zero is the TRUE value
-           * rather than a stand-in for a missing one -- reporting null here would hide a real
-           * empty wallet behind "we could not tell". Only reachable because the reads
-           * SUCCEEDED; an unreadable wallet threw long before this.
-           */
-          totalUsd = 0;
-        } else {
-          /* He holds things and we could price none. A coverage failure, not a zero balance. */
-          reason = "no_prices";
-        }
-      }
-
-      /* Share of his POSITIONS we could value — what makes a thin line legible as thin. */
-      const valueShare = total > 0 ? Number((priced / total).toFixed(4)) : null;
-
-      if (totalUsd === null) refused++; else ok++;
-      report.push({
-        handle: trader.handle,
-        totalUsd: totalUsd === null ? null : Number(totalUsd.toFixed(2)),
-        refused: totalUsd === null ? (reason ?? "wallet_unreadable") : null,
-        pricedPositions: positions === null ? null : priced,
-        totalPositions: positions === null ? null : total,
-        valueShare,
-        ...(rejected ? { priceRejected: rejected } : {}),
-      });
-
-      if (dryRun) continue;
-
-      /** HOW MANY OF HIS CHAINS THIS READING COVERED, written onto the parent row. See docs/DECISIONS.md#d195 */
-      const chainsExpected = positions === null ? null : attemptedCount;
-      /*
-       * A chain ANSWERED if it returned — including returning "he holds nothing here".
-       * Counting only chains that produced a priced position made an empty wallet look
-       * half-read, which is the same fault as the one fixed above, one field along.
-       */
-      const chainsAnswered = positions === null ? null : perChain.size;
-
-      await sql`
-        insert into aum_samples
-          (handle, at, total_usd, refused_reason, priced_positions, total_positions,
-           value_share, basis, tier, chains_answered, chains_expected)
-        values (${trader.handle}, ${at}, ${totalUsd},
-                ${totalUsd === null ? (reason ?? "wallet_unreadable") : null},
-                ${positions === null ? null : priced},
-                ${positions === null ? null : total},
-                ${valueShare}, 'sampled',
-                ${reason === "price_suspect" ? "reported" : "verified"},
-                ${chainsAnswered}, ${chainsExpected})
-        on conflict (handle, at, basis) do update set
-          total_usd = excluded.total_usd, refused_reason = excluded.refused_reason,
-          priced_positions = excluded.priced_positions,
-          total_positions = excluded.total_positions,
-          value_share = excluded.value_share, tier = excluded.tier,
-          chains_answered = excluded.chains_answered,
-          chains_expected = excluded.chains_expected,
-          sampled_at = now()`;
-
-      if (perChain.size) {
-        const nets = [...perChain.keys()];
-        await sql`
-          insert into aum_chain_samples (handle, at, basis, network_id, total_usd, priced_share, reason)
-          select ${trader.handle}, ${at}, 'sampled', u.n, u.v, u.s, u.r
-          from unnest(${nets}::bigint[],
-                      ${nets.map((n) => {
-                        const c = perChain.get(n)!;
-                        /* Held nothing: a true zero, not a gap. Priced something: the sum, unless the reading is a price fault. */
-                        if (c.total === 0) return 0;
-                        return c.priced > 0 && reason !== "price_suspect" ? c.usd : null;
-                      })}::numeric[],
-                      ${nets.map((n) => {
-                        const c = perChain.get(n)!;
-                        /* No positions means nothing to price — a share of nothing is null. */
-                        return c.total === 0 ? null : Number((c.priced / c.total).toFixed(4));
-                      })}::numeric[],
-                      ${nets.map((n) => {
-                        const c = perChain.get(n)!;
-                        if (c.total === 0) return null;          // read, empty — not a fault
-                        if (c.priced === 0) return "no_prices";
-                        return reason === "price_suspect" ? "price_suspect" : null;
-                      })}::text[]
-                     ) as u(n, v, s, r)
-          on conflict (handle, at, basis, network_id) do update set
-            total_usd = excluded.total_usd, priced_share = excluded.priced_share,
-            reason = excluded.reason`;
-      }
+      const job = { trader, expected, reads };
+      await finish(job);
+      if ([...reads.values()].some((r) => r.reason === "wallet_unreadable")) retry.push(job);
     }
+
+    /* ONE MORE ASK for every chain that would not answer, after the other traders gave the RPC a rest. */
+    for (const job of retry) {
+      if (Date.now() - started > BUDGET_MS) { stoppedEarly = true; break; }
+      let flipped = false;
+      for (const [net, r] of job.reads) {
+        if (r.reason !== "wallet_unreadable") continue;
+        const again = await readChain(job.trader, chainById.get(net)!, decimals, tradedByNet);
+        if (again.positions) { job.reads.set(net, again); flipped = true; }
+      }
+      if (flipped) await finish(job);
+    }
+    const ok = [...report.values()].filter((e) => e.totalUsd !== null).length;
+    const refused = report.size - ok;
 
     /** How much of the roster is still waiting, so a scheduler can pace itself. */
     const [pending] = await sql`
@@ -381,7 +380,7 @@ Deno.serve(async (req) => {
       stoppedEarly,
       /** Traders with no reading for this hour yet. Zero means the roster is current. */
       pendingThisHour: Number(pending?.n ?? 0),
-      traders: report,
+      traders: [...report.values()],
     });
   } catch (e) {
     console.error("aum-sample:", (e as Error).message);
