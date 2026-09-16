@@ -19,7 +19,7 @@
 #   tail -f /tmp/solana_daemon.log
 #   pkill -f solana_backfill_daemon
 #
-cd /Users/nabeelshaikh/Desktop/api-ts || exit 1
+cd "$(dirname "$0")/.." || exit 1
 KEY=$(grep '^HELIUS_SOLANA_KEY=' .env | cut -d= -f2- | tr -d '"')
 TOTAL=170
 INTERVAL=${1:-600}

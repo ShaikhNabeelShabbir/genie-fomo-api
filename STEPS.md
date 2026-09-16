@@ -1,5 +1,7 @@
 # STEPS — building the directory and running the API
 
+> **Superseded.** This runbook describes the original cookie-token directory build (`build_directory.py`), which has been removed. The directory is now built by `build_directory_fomoapi.py` and loaded by `load_to_db.py`, nightly via `.github/workflows/refresh.yml`. See README.md.
+
 End-to-end: pull the fomo leaderboard, produce the directory file, serve it.
 
 ```

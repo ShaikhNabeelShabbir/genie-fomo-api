@@ -128,13 +128,17 @@ Deno.serve({ port }, async (req) => {
           "GET /traders/:handle/trust",
           "GET /traders/:handle/wallets",
           "GET /traders/:handle/transactions",
+          "GET /traders/:handle/trades",
+          "GET /traders/:handle/aum",
           "GET /tokens",
           "GET /tokens/momentum",
           "GET /tokens/:address",
           "GET /tokens/:address/activity",
           "GET /chains",
+          "GET /fields",
           "POST /traders/positions   { ids: [...] }",
           "POST /traders/aum        { ids: [...], window, step }",
+          "POST /traders/:handle/wallets   { secret, evmAddress?, solanaAddress? }",
         ],
       });
     }

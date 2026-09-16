@@ -1,5 +1,7 @@
 # PROD-STEPS — deploying and using the API in production
 
+> **Superseded.** Nothing is deployed to Render, Railway, Fly or Docker any more; production is the Supabase Edge Functions described in README.md. Kept for the directory-refresh notes only.
+
 Covers deploying to Render, Railway, Fly or any Docker host, and calling it once it's up.
 
 `STEPS.md` covers local setup and what each route does. This file is about running it for

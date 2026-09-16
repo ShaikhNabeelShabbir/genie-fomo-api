@@ -16,3 +16,9 @@ __pycache__/
 *.dump
 genie-fomo-schema-*.sql
 .cache/
+
+# Supabase CLI scratch state (project ref, pooler host). Not source.
+supabase/.temp/
+
+# Output of scripts/acceptance_capture.sh
+captures/
