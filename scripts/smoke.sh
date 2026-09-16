@@ -10,6 +10,7 @@
 # against production. Checks now go through jq so pretty-printed JSON and key order do not
 # matter.
 set -u
+V="${API_VERSION:-v1}"   # the contract: v1 on Supabase, v2 on the Cloudflare Worker
 BASE="${1:-https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api}"
 HANDLE="${2:-unipcs}"
 fail=0
@@ -26,14 +27,14 @@ check() {
 get() { curl -sf --max-time 60 "$BASE$1"; }
 
 echo "genie-fomo API smoke test -> $BASE"
-check "health responds"          "get /v1/health"
-check "directory has traders"    "get /v1/health | jq -e '.rows.traders > 0'"
-check "no feed is stale"         "get /v1/health | jq -e '.staleFeeds | length == 0'"
-check "trader list responds"     "get '/v1/traders?limit=1' | jq -e '.entries | length == 1'"
-check "unknown handle is 404"    "[ \$(curl -s -o /dev/null -w '%{http_code}' $BASE/v1/traders/__nope__/wallets) = 404 ]"
-check "wallets resolves $HANDLE" "get /v1/traders/$HANDLE/wallets | jq -e '.wallets and .walletState'"
-check "transactions responds"    "get '/v1/traders/$HANDLE/transactions?limit=5' | jq -e '.transfers | type == \"array\"'"
-check "fields vocabulary served" "get /v1/fields | jq -e 'keys | length > 0'"
+check "health responds"          "get /$V/health"
+check "directory has traders"    "get /$V/health | jq -e '.rows.traders > 0'"
+check "no feed is stale"         "get /$V/health | jq -e '.staleFeeds | length == 0'"
+check "trader list responds"     "get '/$V/traders?limit=1' | jq -e '.entries | length == 1'"
+check "unknown handle is 404"    "[ \$(curl -s -o /dev/null -w '%{http_code}' $BASE/$V/traders/__nope__/wallets) = 404 ]"
+check "wallets resolves $HANDLE" "get /$V/traders/$HANDLE/wallets | jq -e '.wallets and .walletState'"
+check "transactions responds"    "get '/$V/traders/$HANDLE/transactions?limit=5' | jq -e '.transfers | type == \"array\"'"
+check "fields vocabulary served" "get /$V/fields | jq -e 'keys | length > 0'"
 
 echo
 [ $fail -eq 0 ] && echo "all checks passed" || echo "some checks failed"

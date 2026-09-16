@@ -40,6 +40,13 @@ Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
 
 Router scores by literal-segment specificity, so registration order never matters.
 
+**Versions:** routes are registered under `v1`; the router also matches `v2` (`router.ts`
+`requestVersion`/`rewriteVersion`), and every response's `/v1/` links are rewritten to the
+requested version at serialisation in `app.ts`. v1 = Supabase, v2 = the Cloudflare Worker,
+which refuses `/v1/*` with a 404 pointing at `/v2`. `/health.apiVersion` says which answered.
+Scripts take `API_VERSION=v2` (`smoke.sh`, `acceptance_capture.sh`, which folds v2 links back
+to v1 so the two deployments diff).
+
 ## Constants that matter
 
 | Constant | Where |

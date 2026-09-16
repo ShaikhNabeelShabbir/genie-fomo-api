@@ -37,6 +37,8 @@ if [ $# -lt 2 ]; then
 fi
 
 BASE="${1%/}"
+# The contract to capture: v1 (Supabase) or v2 (the Cloudflare Worker, same routes).
+V="${API_VERSION:-v1}"
 OUT="$2"
 shift 2
 
@@ -62,6 +64,8 @@ fi
 NORMALISE='
   def is_iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T");
   (if type == "object" then del(.asOf, .liveRead) else . end)
+  # links are spelled for the requested version; fold v2 back to v1 so the two deployments diff
+  | walk(if type == "string" then gsub("/v2/"; "/v1/") else . end)
   | walk(
       if type == "object"
       then with_entries(select(
@@ -106,16 +110,16 @@ capture() {
 echo "capturing $BASE -> $OUT"
 
 # ---- global routes -------------------------------------------------------------------------
-capture chains            GET "/v1/chains"
-capture fields            GET "/v1/fields"
-capture tokens            GET "/v1/tokens?limit=25"
-capture tokens_momentum   GET "/v1/tokens/momentum"
-capture traders           GET "/v1/traders?limit=25"
-capture traders_included  GET "/v1/traders?limit=10&include=pnl,scorecard,wallets,trust"
-capture traders_search    GET "/v1/traders?q=${HANDLES[0]}"
+capture chains            GET "/$V/chains"
+capture fields            GET "/$V/fields"
+capture tokens            GET "/$V/tokens?limit=25"
+capture tokens_momentum   GET "/$V/tokens/momentum"
+capture traders           GET "/$V/traders?limit=25"
+capture traders_included  GET "/$V/traders?limit=10&include=pnl,scorecard,wallets,trust"
+capture traders_search    GET "/$V/traders?q=${HANDLES[0]}"
 
 # health: shape only
-if health=$(curl -sS --max-time 60 ${AUTH[@]+"${AUTH[@]}"} "$BASE/v1/health"); then
+if health=$(curl -sS --max-time 60 ${AUTH[@]+"${AUTH[@]}"} "$BASE/$V/health"); then
   printf '%s' "$health" | jq -S 'keys' > "$OUT/health_keys.json"
   printf '%-44s %s\n' health_keys ok
 else
@@ -124,7 +128,7 @@ fi
 
 # ---- per-trader routes ---------------------------------------------------------------------
 for h in "${HANDLES[@]}"; do
-  p="/v1/traders/$h"
+  p="/$V/traders/$h"
   capture "$h.profile"       GET "$p"
   capture "$h.wallets"       GET "$p/wallets"
   capture "$h.scorecard"     GET "$p/scorecard"
@@ -141,19 +145,19 @@ done
 
 # ---- batch routes --------------------------------------------------------------------------
 IDS=$(printf '%s\n' "${HANDLES[@]}" | jq -R . | jq -sc .)
-capture batch_positions POST "/v1/traders/positions" "{\"ids\":$IDS}"
-capture batch_aum_1m    POST "/v1/traders/aum"       "{\"ids\":$IDS,\"window\":\"1m\"}"
+capture batch_positions POST "/$V/traders/positions" "{\"ids\":$IDS}"
+capture batch_aum_1m    POST "/$V/traders/aum"       "{\"ids\":$IDS,\"window\":\"1m\"}"
 
 # ---- the refusals the suite checks ---------------------------------------------------------
-capture unknown_handle  GET "/v1/traders/__no_such_trader__/wallets"
-capture unknown_route   GET "/v1/nope"
+capture unknown_handle  GET "/$V/traders/__no_such_trader__/wallets"
+capture unknown_route   GET "/$V/nope"
 
 # A colliding wallet submission must answer 409 address_in_use. Only exercised when the
 # secret is available; the route is the service's one write and is refused without it.
 if [ -n "${WALLET_SUBMIT_SECRET:-}" ]; then
   first_evm=$(jq -r '.evmAddress // .resolved_wallets.evm // empty' "$OUT/${HANDLES[0]}.wallets.json" 2>/dev/null || true)
   if [ -n "$first_evm" ]; then
-    capture wallet_collision POST "/v1/traders/${HANDLES[1]}/wallets" \
+    capture wallet_collision POST "/$V/traders/${HANDLES[1]}/wallets" \
       "{\"secret\":\"$WALLET_SUBMIT_SECRET\",\"evmAddress\":\"$first_evm\"}"
   fi
 fi

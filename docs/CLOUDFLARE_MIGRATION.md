@@ -772,6 +772,10 @@ be the shape.
 
 ## 11. Project layout and wrangler config
 
+**The Worker is the v2 contract.** Paths are `/v2/…`; `/v1/…` on the Worker is a 404 with a
+pointer, so nobody mistakes the shadow deployment for the live one. The acceptance capture
+takes `API_VERSION=v2` and folds link spelling back to v1 before diffing.
+
 **One Worker, not three.** The first draft proposed separate `api`, `sampler` and `webhook`
 Workers. Nothing in the code needs that isolation, and it costs three secret sets, three
 Hyperdrive bindings, three deploys, an HTTP hop for the `/aum` read-through, and the
@@ -919,8 +923,10 @@ Worker's `scheduled` handler stays **disabled** (no `[triggers]` yet) so only `p
 with `register_webhook.mjs --list`. Both write the same tables in the same database; if anything
 looks wrong, reverse the two steps.
 
-**Phase 3 — move readers.** Switch consumers to the Worker URL. Keep the Supabase functions
-deployed and readable.
+**Phase 3 — move readers.** Switch consumers to the Worker URL **under `/v2/*`**: the Worker
+serves only v2 (`worker/src/api.ts` answers `/v1/*` with a 404 that says so), Supabase keeps
+serving v1, and the two are the same handlers behind different link spelling
+(`router.ts` `rewriteVersion`). Keep the Supabase functions deployed and readable.
 
 **Phase 4 — decommission.** After a week of clean running, delete the Supabase functions, the
 `run_aum_sample()` function and the two Vault secrets.

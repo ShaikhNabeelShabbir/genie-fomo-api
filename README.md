@@ -7,7 +7,9 @@ Solana.
 Every route answers from Postgres. The keys that cost money belong to scheduled loaders, so a
 thousand visitors cost what one does.
 
-**Live** `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`
+**Live, v1** `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`
+**v2** the same routes under `/v2/*` on the Cloudflare Worker (`worker/`), not yet deployed. v1 stays
+on Supabase; the Worker answers only `/v2`. See `docs/CLOUDFLARE_MIGRATION.md` §11.
 
 ---
 

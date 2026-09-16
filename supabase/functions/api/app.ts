@@ -1,4 +1,5 @@
-import { match } from "./router.ts";
+import { match, requestVersion, rewriteVersion } from "./router.ts";
+import type { ApiVersion } from "./router.ts";
 import { ApiError, classify, unauthorized, checkRate } from "./errors.ts";
 import type { RateState } from "./errors.ts";
 import { cfg } from "./config.ts";
@@ -38,8 +39,9 @@ const rateHeaders = (r: RateState | null): Record<string, string> =>
       }
     : {};
 
-const json = (body: unknown, status = 200, extra: Record<string, string> = {}) =>
-  new Response(JSON.stringify(body, null, 2), { status, headers: headers(extra) });
+/** Every response is serialised here, so the requested API version is applied to its links once. */
+const json = (body: unknown, status = 200, extra: Record<string, string> = {}, version: ApiVersion = "v1") =>
+  new Response(rewriteVersion(JSON.stringify(body, null, 2), version), { status, headers: headers(extra) });
 
 /**
  * A per-request id, echoed on every error and in the `x-request-id` header.
@@ -49,7 +51,7 @@ const json = (body: unknown, status = 200, extra: Record<string, string> = {}) =
  */
 const requestId = () => `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 
-const fail = (e: ApiError, extra: Record<string, string> = {}, rid = requestId()) =>
+const fail = (e: ApiError, extra: Record<string, string> = {}, version: ApiVersion = "v1", rid = requestId()) =>
   json(
     {
       error: {
@@ -66,6 +68,7 @@ const fail = (e: ApiError, extra: Record<string, string> = {}, rid = requestId()
     e.status,
     { ...extra, "x-request-id": rid,
       ...(e.retryAfterSeconds ? { "Retry-After": String(e.retryAfterSeconds) } : {}) },
+    version,
   );
 
 /** The bucket key for a caller. See docs/DECISIONS.md#d011 */
@@ -85,6 +88,7 @@ export async function handle(req: Request): Promise<Response> {
   const ROUTE_TIMEOUT_MS = Number(cfg("ROUTE_TIMEOUT_MS") ?? 15000);
 
   const url = new URL(req.url);
+  const version = requestVersion(url.pathname);
   let rate: RateState | null = null;
   try {
     // Rate limit before auth so a flood of bad keys cannot be used to hammer the database.
@@ -150,7 +154,7 @@ export async function handle(req: Request): Promise<Response> {
     const cost = typeof asked === "number" && Number.isFinite(asked) && asked > 0
       ? Math.min(asked, BATCH_MAX_COST)
       : 1;
-    return json(answered, 200, { ...rateHeaders(rate), "x-cost-units": String(cost) });
+    return json(answered, 200, { ...rateHeaders(rate), "x-cost-units": String(cost) }, version);
   } catch (e) {
     const err = classify(e);
     if (err.status >= 500) console.error(`${url.pathname}: ${err.code} ${err.message}`);
@@ -161,6 +165,6 @@ export async function handle(req: Request): Promise<Response> {
     if (!rate && err.status === 429) {
       rate = { limit: RATE_LIMIT, remaining: 0, reset: err.retryAfterSeconds ?? 60, scope: "global" };
     }
-    return fail(err, rateHeaders(rate));
+    return fail(err, rateHeaders(rate), version);
   }
 }

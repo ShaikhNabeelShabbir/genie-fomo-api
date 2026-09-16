@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { get, match, post } from "../supabase/functions/api/router.ts";
+import { get, match, post, requestVersion, rewriteVersion } from "../supabase/functions/api/router.ts";
 
 const { ApiError, classify } = await import("../supabase/functions/api/errors.ts");
 
@@ -27,4 +27,20 @@ Deno.test("router: the /api prefix is stripped and /v1 is optional", () => {
     assertEquals(match("GET", p)?.handler({}, new URL("http://x")), "pong", p);
   }
   assertEquals(match("GET", "/v1/nope"), null);
+});
+
+Deno.test("router: /v2 matches the same registrations and reports its version", () => {
+  get("/v1/echo", () => "v1-registered");
+  assertEquals(match("GET", "/v2/echo")?.handler({}, new URL("http://x")), "v1-registered");
+  assertEquals(match("GET", "/api/v2/echo")?.handler({}, new URL("http://x")), "v1-registered");
+  assertEquals(requestVersion("/v2/traders/x/aum"), "v2");
+  assertEquals(requestVersion("/api/v2/health"), "v2");
+  assertEquals(requestVersion("/traders/x"), "v1");
+  assertEquals(requestVersion("/v3/traders"), "v1");
+});
+
+Deno.test("rewriteVersion: v1 links are spelled for v2, nothing else changes", () => {
+  const body = '{"links":{"aum":"/v1/traders/x/aum"},"note":"use GET /v1/traders/:handle/aum","addr":"0xv1/nope"}';
+  assertEquals(rewriteVersion(body, "v1"), body);
+  assertEquals(rewriteVersion(body, "v2"), '{"links":{"aum":"/v2/traders/x/aum"},"note":"use GET /v2/traders/:handle/aum","addr":"0xv1/nope"}');
 });

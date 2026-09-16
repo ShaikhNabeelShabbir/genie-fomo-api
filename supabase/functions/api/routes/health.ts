@@ -1,10 +1,10 @@
 import { sql, n, round } from "../db.ts";
 import { cfg } from "../config.ts";
-import { get } from "../router.ts";
+import { get, requestVersion } from "../router.ts";
 
 // ------------------------------------------------------------------ health
 
-get("/v1/health", async () => {
+get("/v1/health", async (_p, url) => {
   /** Exact counts everywhere except `transactions`, which is an estimate and says so. See docs/DECISIONS.md#d063 */
   /** FOUR SEQUENTIAL AWAITS, DELIBERATELY. See docs/DECISIONS.md#d064 */
   const [c] = await sql`
@@ -165,7 +165,9 @@ get("/v1/health", async () => {
 
   return {
     status: "ok",
-    runtime: "supabase edge function (deno)",
+    /** Which contract answered: `v1` on Supabase, `v2` on the Cloudflare Worker (same routes). */
+    apiVersion: requestVersion(url.pathname),
+    runtime: (globalThis as { Deno?: unknown }).Deno ? "supabase edge function (deno)" : "cloudflare worker",
     source: "postgres",
     build: { capturedAt: b?.captured_at ?? null, window: b?.window_label ?? null },
     /** Per-feed freshness AND a verdict on it. See docs/DECISIONS.md#d068 */
