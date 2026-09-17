@@ -627,7 +627,7 @@ components:
           - verified
         source:
           type: string
-          description: Always `postgres · transactions (helius webhook)`.
+          description: Always `d1 · transactions (helius webhook)`.
         note:
           type: string
     TraderDailyTrade:
@@ -1601,6 +1601,7 @@ components:
           type: string
           enum:
           - postgres
+          - cloudflare d1
         build:
           $ref: '#/components/schemas/HealthBuild'
         feeds:
@@ -2664,6 +2665,7 @@ components:
             enum:
             - implied_mcap_over_ceiling
             - concentration_over_ceiling
+            - no_market_over_ceiling
             - null
           share:
             type: number
@@ -2970,6 +2972,7 @@ components:
             enum:
             - implied_mcap_over_ceiling
             - concentration_over_ceiling
+            - no_market_over_ceiling
             - null
           tier:
             type: string
@@ -4377,7 +4380,7 @@ components:
         source:
           type: string
           enum:
-          - postgres · trades
+          - d1 · trades
         bankedUsd:
           type: number
           nullable: true
@@ -4532,7 +4535,7 @@ components:
         source:
           type: string
           description: Where the rows came from.
-          example: postgres · transactions
+          example: d1 · transactions
         asOf:
           type: string
           format: date-time
@@ -4806,7 +4809,7 @@ components:
           $ref: '#/components/schemas/TradeCoverage'
         source:
           type: string
-          example: postgres · wallet_swaps (helius rpc pre/post balances)
+          example: d1 · wallet_swaps (helius rpc pre/post balances)
     TradeTokenLeg:
       type: object
       required:
@@ -5076,7 +5079,7 @@ components:
           type: string
         source:
           type: string
-          example: postgres · transactions, wallet_swaps, aum_samples, token_info
+          example: d1 · transactions, wallet_swaps, aum_samples, token_info
     EventFilters:
       type: object
       required:
@@ -8059,7 +8062,7 @@ components:
         source:
           type: string
           enum:
-          - postgres · trades
+          - d1 · trades
         coverage:
           $ref: '#/components/schemas/TokenActivityCoverage'
         everSold:
@@ -9025,7 +9028,7 @@ paths:
                   are the sampler's balance readings (basis sampled). `since` defaults to the last 24
                   hours; page forward with `nextCursor`. `?chain=` excludes readings, which are not per
                   chain.
-                source: postgres · transactions, wallet_swaps, aum_samples, token_info
+                source: d1 · transactions, wallet_swaps, aum_samples, token_info
         '400':
           description: A parameter was refused
           content:
@@ -10280,7 +10283,7 @@ paths:
                 holdersInDirectory: 58
                 asOf: '2026-09-17T06:12:44.000Z'
                 totalValueUsd: 184220.17
-                source: postgres · trades
+                source: d1 · trades
                 coverage:
                   holdersNow: 58
                   withTradeRecord: 121
@@ -11429,7 +11432,7 @@ paths:
                   firstSeenAt: '2026-07-03T09:12:44.000Z'
                   lastActiveAt: '2026-09-16T22:41:05.000Z'
                   tier: verified
-                  source: postgres · transactions (helius webhook)
+                  source: d1 · transactions (helius webhook)
                   note: counted from transfers we ingested, not from fomo's figures — and only from the
                     date on-chain ingestion began, so these are floors for older wallets
                 stored:
@@ -12673,7 +12676,7 @@ paths:
               example:
                 handle: '397397'
                 name: null
-                source: postgres · trades
+                source: d1 · trades
                 bankedUsd: 5231.05
                 closedTrades: 26
                 onPaperUsd: 6875
@@ -12698,7 +12701,7 @@ paths:
                   firstSwapAt: '2026-07-27T08:12:00.000Z'
                   lastSwapAt: '2026-09-16T09:41:07.000Z'
                   tier: verified
-                  source: postgres · wallet_swaps (helius rpc pre/post balances)
+                  source: d1 · wallet_swaps (helius rpc pre/post balances)
                   basis: both sides of each swap resolved from the wallet's net balance change, so a buy
                     and its matching sell reconcile on quantity. Solana only.
                   coverage:
@@ -13233,7 +13236,7 @@ paths:
               example:
                 handle: '397397'
                 name: null
-                source: postgres · trades (loaded from fomoapi)
+                source: d1 · trades (loaded from fomoapi)
                 traderSource: fomoapi.io
                 realizedByDay:
                 - day: '2026-09-14'
@@ -13893,7 +13896,7 @@ paths:
                     5 in 6 are the wallet receiving tokens inside someone else's trade — so a chain with
                     no rows here is one where we resolved none of this wallet's own trades, not one where
                     it made none
-                source: postgres · wallet_swaps (helius rpc pre/post balances)
+                source: d1 · wallet_swaps (helius rpc pre/post balances)
         '400':
           description: A parameter was refused
           content:
@@ -14060,7 +14063,7 @@ paths:
                 wallets:
                   evm: '0x7a250d5630b4cf539739df2c5dacb4c659f2488d'
                   solana: 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1
-                source: postgres · transactions
+                source: d1 · transactions
                 asOf: '2026-09-16T12:04:11.000Z'
                 feed: transfers
                 caveats:
@@ -14371,9 +14374,11 @@ paths:
 
         overwritten). Stored with source `submitted` and confidence `reported`: a claim, not a
 
-        verified fact, and every derived figure says so. Pricing happens on the next sampler
+        verified fact, and every derived figure says so. The balances loader reads the address on its
 
-        rotation, or immediately on the next GET /aum.
+        next sweep, and a Solana address joins the Helius watch list on the next transfers run, so
+
+        holdings and AUM follow within a few hours rather than instantly.
 
         '
       parameters:

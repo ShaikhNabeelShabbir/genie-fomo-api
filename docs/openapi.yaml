@@ -14374,9 +14374,11 @@ paths:
 
         overwritten). Stored with source `submitted` and confidence `reported`: a claim, not a
 
-        verified fact, and every derived figure says so. Pricing happens on the next sampler
+        verified fact, and every derived figure says so. The balances loader reads the address on its
 
-        rotation, or immediately on the next GET /aum.
+        next sweep, and a Solana address joins the Helius watch list on the next transfers run, so
+
+        holdings and AUM follow within a few hours rather than instantly.
 
         '
       parameters:
