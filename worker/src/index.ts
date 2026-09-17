@@ -28,17 +28,17 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "25 * * * *":   runAumHistory,   // after prices: build every trader-hour not yet built
   "40 * * * *":   runTransfers,    // on-chain transfers, stalest wallet first; Helius watch list
   "45 * * * *":   runQuotePrices,  // quote-asset transfer pricing; Robinhood-chain coins
-  "*/10 * * * *": runBalances,     // a slice of the stalest wallets' balances -> holdings
+  "*/30 * * * *": runBalances,   // brake 17 Sep 08:57: a 10 min cadence overlapped its own 9 min runs     // a slice of the stalest wallets' balances -> holdings
   "5 */2 * * *":  runTokens,       // chains, supply, fundamentals (GMGN 1 req/s)
   "10 */2 * * *": runFees,         // receipts per chain, then the per-trader rollup
-  "*/15 * * * *": runSwaps,        // Solana + EVM swaps, newest first (X1); budget-bounded so overlap is safe
+  "15,45 * * * *": runSwaps,        // Solana + EVM swaps, newest first (X1); budget-bounded so overlap is safe
   "0 */6 * * *":  runScorecards,   // stale fomoapi trade records
   "35 3 * * *":   runLaunches,     // pump.fun launch metadata, dev ledger
   "50 4 * * *":   runWallets,      // linked wallets
   "55 5 * * *":   runTiming,       // position timing (one aggregate)
   "15 2 * * *":   runGmgn,         // GMGN directory and its trades
   "0 1 * * *":    runDirectory,    // fomo leaderboard, wallets, fomo-reported holdings
-  "* * * * *":    runAumLiveFlush, // live value for traders whose wallet moved in the last minute
+  "*/5 * * * *":  runAumLiveFlush, // live value for traders whose wallet moved in the last minute
 };
 
 /** On-demand runs of the same jobs: `POST /jobs/<name>?budgetMs=&handles=&from=` with `x-job-secret`; only aum_history reads `handles`/`from`. */
