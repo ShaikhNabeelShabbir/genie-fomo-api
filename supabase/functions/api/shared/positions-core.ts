@@ -87,9 +87,10 @@ export const sellFlags = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) 
   canSell: r.can_not_sell === null || r.can_not_sell === undefined ? null : !r.can_not_sell,
 });
 
-/** R6. Per chain: the wallet's nonce against the transaction rows the indexer holds for it. */
+/** R6. Per chain: the wallet's sent-transaction count against the transaction rows the indexer holds for it. */
 export type ChainCoverage = {
   chainTxCount: number | null; rowsHeld: number | null; share: number | null; readAt: string | null;
+  basis: "bitquery_realtime";
 };
 export const COVERAGE_FLOOR = 0.5;
 
@@ -103,15 +104,18 @@ export const chainCoverage = (
     share: chainTxCount !== null && rowsHeld !== null && chainTxCount > 0
       ? Number((rowsHeld / chainTxCount).toFixed(4)) : null,
     readAt: r.read_at ? new Date(String(r.read_at)).toISOString() : null,
+    /* The count is Bitquery's realtime window, a LOWER bound on the wallet's nonce, so `share` is an upper bound. */
+    basis: "bitquery_realtime",
   };
 };
 
 export const coverageLow = (c: Record<string, ChainCoverage>): boolean =>
   Object.values(c).some((x) => x.share !== null && x.share < COVERAGE_FLOOR);
 
-/** Which of the two made the list partial; both, joined the way aum.coverage.partialReason is. */
-export const positionsPartialReason = (unsellable: boolean, low: boolean): string | null =>
-  [unsellable && "unsellable_positions", low && "indexer_coverage_low"].filter(Boolean).join("_and_") || null;
+/** Which of the three made the list partial; several, joined the way aum.coverage.partialReason is. */
+export const positionsPartialReason = (unsellable: boolean, low: boolean, suspect = false): string | null =>
+  [suspect && "price_suspect", unsellable && "unsellable_positions", low && "indexer_coverage_low"]
+    .filter(Boolean).join("_and_") || null;
 
 /** `{ handle -> { chainName -> coverage } }` from the sampler's chain_coverage rows. */
 export async function indexerCoverageFor(handles: string[]): Promise<Map<string, Record<string, ChainCoverage>>> {

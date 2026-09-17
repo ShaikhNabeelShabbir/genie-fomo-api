@@ -2374,6 +2374,11 @@ components:
           type: number
           minimum: 0
           description: Priced value in honeypot / sell-blocked coins, kept out of `totalValueUsd`.
+        suspectUsd:
+          type: number
+          minimum: 0
+          description: 'Priced value under a suspect price (`priceSuspect: true` rows), kept out of `totalValueUsd`,
+            `coverage.pricedPositions` and every `share`. The rows keep `priceUsd` and `valueUsd` so what was excluded is visible.'
         partial:
           type: boolean
         partialReason:
@@ -2383,6 +2388,10 @@ components:
           - unsellable_positions
           - indexer_coverage_low
           - unsellable_positions_and_indexer_coverage_low
+          - price_suspect
+          - price_suspect_and_unsellable_positions
+          - price_suspect_and_indexer_coverage_low
+          - price_suspect_and_unsellable_positions_and_indexer_coverage_low
           - null
         coverage:
           $ref: '#/components/schemas/PositionsCoverage'
@@ -2409,18 +2418,19 @@ components:
           - nightly_read
     PositionsChainCoverage:
       type: object
-      description: How much of one chain's activity the indexer holds, from one `eth_getTransactionCount`
-        per sampled EVM chain.
+      description: How much of one chain's activity the indexer holds, written by the balances job after each
+        EVM wallet read from one Bitquery `Transactions { count }` on the realtime dataset.
       required:
       - chainTxCount
       - rowsHeld
       - share
       - readAt
+      - basis
       properties:
         chainTxCount:
           type: integer
           nullable: true
-          description: The wallet's nonce on that chain.
+          description: Transactions the wallet sent within Bitquery's realtime window, a LOWER bound on its nonce.
         rowsHeld:
           type: integer
           nullable: true
@@ -2428,24 +2438,36 @@ components:
           type: number
           nullable: true
           description: '`rowsHeld / chainTxCount`; null when either side is unknown or the wallet never
-            sent. Below 0.5 makes the list partial.'
+            sent. An upper bound (the count is a lower bound) and may exceed 1. Below 0.5 makes the list partial.'
         readAt:
           type: string
           format: date-time
           nullable: true
+        basis:
+          type: string
+          enum:
+          - bitquery_realtime
+          description: What `chainTxCount` counts.
     PositionsCoverage:
       type: object
       required:
       - pricedPositions
+      - suspectPositions
       - unpricedPositions
       - chains
       properties:
         pricedPositions:
           type: integer
           minimum: 0
+          description: Valued rows whose price is not suspect.
+        suspectPositions:
+          type: integer
+          minimum: 0
+          description: 'Rows with `priceSuspect: true`; their value is `suspectUsd`.'
         unpricedPositions:
           type: integer
           minimum: 0
+          description: Rows with `valueUsd` null.
         chains:
           type: object
           description: Keyed by chain name. Empty when no coverage row exists for the trader.
@@ -2605,7 +2627,15 @@ components:
           priceSource:
             type: string
             nullable: true
-            description: pegged_usd | gmgn_token_info | token_prices_daily | fomo_reported_entry | wallet_swap_derived.
+            enum:
+            - pegged
+            - token_info
+            - token_prices
+            - fomo_reported_entry
+            - null
+            description: Which price ladder rung valued the holding (`pegged` = quote_assets.pegged_usd, `token_info` =
+              GMGN, `token_prices` = the newest daily row, `fomo_reported_entry` = the directory build's reported
+              price); null when unpriced.
           pricedAt:
             type: string
             format: date-time
@@ -2771,6 +2801,11 @@ components:
         pricedPositionCount:
           type: integer
           minimum: 0
+          description: Valued rows whose price is not suspect.
+        suspectPositionCount:
+          type: integer
+          minimum: 0
+          description: 'Rows with `priceSuspect: true`; their value is `suspectUsd`.'
         totalValueUsd:
           type: number
           nullable: true
@@ -2778,6 +2813,10 @@ components:
         unsellableUsd:
           type: number
           minimum: 0
+        suspectUsd:
+          type: number
+          minimum: 0
+          description: Priced value under a suspect price, kept out of `totalValueUsd`; the rows still show it.
         partial:
           type: boolean
           enum:
@@ -2789,6 +2828,10 @@ components:
           - unsellable_positions
           - indexer_coverage_low
           - unsellable_positions_and_indexer_coverage_low
+          - price_suspect
+          - price_suspect_and_unsellable_positions
+          - price_suspect_and_indexer_coverage_low
+          - price_suspect_and_unsellable_positions_and_indexer_coverage_low
           description: Present only when the row is partial.
         coverage:
           allOf:
@@ -2897,6 +2940,12 @@ components:
           priceSource:
             type: string
             nullable: true
+            enum:
+            - pegged
+            - token_info
+            - token_prices
+            - fomo_reported_entry
+            - null
           pricedAt:
             type: string
             format: date-time

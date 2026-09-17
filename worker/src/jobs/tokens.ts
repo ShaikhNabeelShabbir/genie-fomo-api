@@ -150,16 +150,21 @@ async function readSupply(key: string, t: SupplyTarget): Promise<Supply | null> 
 
 async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): Promise<Phase> {
   // Only tokens where a supply would actually be used: an entry price exists, or somebody holds it.
+  // The most valuable held position first (gross amount x price, ceilings or not): a supply is what
+  // lets /positions run the implied-cap check on exactly those rows (V1b).
   const rows = await sql<{ network_id: string; address: string; token_key: string }[]>`
     select tk.network_id, tk.address, tk.token_key
     from tokens tk
+    left join lateral (
+      select max(h.human_amount * h.price) as held from holdings_current h
+      where h.network_id = tk.network_id and h.token_key = tk.token_key) hv on true
     where tk.total_supply is null
       and (exists (select 1 from trades t
                    where t.network_id = tk.network_id and t.token_key = tk.token_key
                      and t.avg_entry_price > 0)
            or exists (select 1 from holdings_current h
                       where h.network_id = tk.network_id and h.token_key = tk.token_key))
-    order by tk.network_id, tk.address`;
+    order by hv.held desc nulls last, tk.network_id, tk.address`;
   const targets: SupplyTarget[] = rows.map((r) => ({ ...r, network_id: Number(r.network_id) }));
   let attempted = 0, ok = 0, errored = 0;
   for (let i = 0; i < targets.length && !outOfTime(); i += SUPPLY_FANOUT) {

@@ -1,7 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
   IMPLIED_MCAP_CEILING_USD, MAX_POSITION_USD, MAX_PRICE_PER_TOKEN,
-  concentrationSuspect, decideTotal, priceSuspectReason, value,
+  concentrationSuspect, decideTotal, priceSuspectReason, suspectRows, value,
 } from "../supabase/functions/aum-sample/value.ts";
 
 Deno.test("value: no price is a coverage gap, not a zero", () => {
@@ -40,6 +40,28 @@ Deno.test("priceSuspectReason: names the failed check on a /positions row, or nu
   assertEquals(priceSuspectReason(8923.86, 999_917_541, 1.015e11, 1.016e11), "implied_mcap_over_ceiling");
   assertEquals(priceSuspectReason(1019.42, null, 14.7e6, 14.8e6), "concentration_over_ceiling");
   assertEquals(priceSuspectReason(1.18, 1e9, 27e6, 1.016e11), null);
+  // V1b: no supply to check and the one position tops the USD ceiling: suspect whatever its share.
+  assertEquals(priceSuspectReason(8923.86, null, 291e9, 473e9), "concentration_over_ceiling");
+  assertEquals(priceSuspectReason(8923.86, null, 291e9, 291e9), "concentration_over_ceiling");
+});
+
+Deno.test("suspectRows: two absurd coins in one wallet are both flagged, the sane remainder is not (V1b)", () => {
+  const rows = [
+    { price: 8923.86, supply: null, usd: 291e9 },   // cupseyy's $291B coin, no supply row
+    { price: 1019.42, supply: null, usd: 182e9 },   // the second absurd one, 38 % of the gross
+    { price: 1.18, supply: 1e9, usd: 27e6 },
+    { price: null, supply: null, usd: null },
+  ];
+  assertEquals(suspectRows(rows), ["concentration_over_ceiling", "concentration_over_ceiling", null, null]);
+  // Under the USD ceiling the iteration alone catches the second: 95 of 100 with cap unknown, then 4.6 of 5.
+  assertEquals(suspectRows([{ price: 1, supply: null, usd: 95 }, { price: 1, supply: null, usd: 4.6 }, { price: 1, supply: 1e6, usd: 0.4 }]),
+    ["concentration_over_ceiling", "concentration_over_ceiling", null]);
+  // A known cap and a sane total: nothing is flagged, however concentrated.
+  assertEquals(suspectRows([{ price: 1, supply: 1e6, usd: 95 }, { price: 1, supply: 1e6, usd: 5 }]), [null, null]);
+  // An implied-cap failure is flagged first and leaves the base to the rest.
+  assertEquals(suspectRows([{ price: 100, supply: 1e9, usd: 10 }, { price: 1, supply: null, usd: 50 }, { price: 1, supply: 1e6, usd: 40 }]),
+    ["implied_mcap_over_ceiling", null, null]);
+  assertEquals(suspectRows([]), []);
 });
 
 Deno.test("decideTotal: nothing asked is null with the most common failure word, never 0", () => {

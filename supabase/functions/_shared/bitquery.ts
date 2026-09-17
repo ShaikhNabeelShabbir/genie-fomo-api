@@ -117,3 +117,34 @@ export async function evmBalancesBitquery(
   }`;
   return { balances: parseBalances(await bitquery(key, query, { wallet })) };
 }
+
+/**
+ * `EVM.Transactions[0].count` -> a number; null when the reply carries no count (never a made-up
+ * 0). No row at all is a count of zero: the cube answered and matched nothing.
+ */
+export function parseTxCount(data: unknown): number | null {
+  const evm = isRec(data) && isRec(data.EVM) ? data.EVM : null;
+  if (!evm || !Array.isArray(evm.Transactions)) return null;
+  if (evm.Transactions.length === 0) return 0;
+  const first = evm.Transactions[0];
+  const c = isRec(first) ? Number(first.count) : NaN;
+  return Number.isInteger(c) && c >= 0 ? c : null;
+}
+
+/**
+ * R6: how many transactions one wallet has SENT on one EVM chain, as the `count` metric over
+ * `Transactions` (https://docs.bitquery.io/docs/graphql/metrics/count/: "returns the total
+ * count of elements in each set of dimensions"; the cube and its `Transaction.From` filter per
+ * https://docs.bitquery.io/docs/evm/transactions/). `dataset: realtime` is a WINDOW, not the
+ * chain's history, so this is a lower bound on the nonce; /positions says so with
+ * `coverage.chains[].basis: bitquery_realtime`.
+ */
+export async function evmTxCount(key: string, network: string, wallet: string): Promise<number | null> {
+  if (!/^[a-z0-9_]+$/.test(network)) throw new Error(`Bitquery network word "${network}" is not one`);
+  const query = `query ($wallet: String!) {
+    EVM(network: ${network}, dataset: realtime) {
+      Transactions(where: { Transaction: { From: { is: $wallet } } }) { count }
+    }
+  }`;
+  return parseTxCount(await bitquery(key, query, { wallet }));
+}

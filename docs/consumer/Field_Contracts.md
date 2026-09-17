@@ -422,6 +422,20 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `error.code` | every route | One of `not_found`, `bad_request`, `duplicate_identifier`, `rate_limited`, `timeout`, `unavailable`, `include_unavailable`, `internal_error`, `not_configured`, `unauthorized`, `invalid_address`, `address_in_use`, `already_on_record`. v8 corrects the list: `internal` was published but the service emits `internal_error`; `unavailable` (503, Postgres not answering) and `include_unavailable` (503, `blocks[]` names the `?include=` blocks not produced) were emitted but unpublished. |
 
 ## Added 17 Sep 2026 — aum history
+## v3 fixes — positions
+
+Fix request v3 (17 Sep 2026), V1 / V1b / V1c / R6. Additive; no version bump on its own.
+
+| Field | Route | Contract |
+|---|---|---|
+| `suspectUsd` | /positions, POST /traders/positions v2 | Priced value in rows with `priceSuspect: true`, kept OUT of `totalValueUsd`, `coverage.pricedPositions` (`pricedPositionCount`) and every `share`. The rows keep `priceUsd` and `valueUsd` so what was excluded is visible. `totalValueUsd` is null when the only priced rows are suspect. |
+| `coverage.suspectPositions`, `suspectPositionCount` | same | How many rows are suspect. `unpricedPositions` stays "rows with `valueUsd` null". |
+| `partialReason` | same | New words: `price_suspect`, `price_suspect_and_unsellable_positions`, `price_suspect_and_indexer_coverage_low`, `price_suspect_and_unsellable_positions_and_indexer_coverage_low`. The suspect word leads. |
+| `positions[].priceSuspectReason` | same | Unchanged words, stronger rules: with no supply to check, one position over $1B is `concentration_over_ceiling` whatever its share; the concentration base is the sellable, not-yet-suspect remainder, judged largest row first, so two absurd prices in one wallet are both flagged. Supply is `tokens.total_supply` or, failing that, GMGN's. |
+| `positions[].priceSource` | same | Now written: `pegged` (quote_assets.pegged_usd), `token_info` (GMGN), `token_prices` (newest daily row), `fomo_reported_entry` (the directory build's reported price); null when unpriced. `pricedAt` is the write time of that price (the capture time for `fomo_reported_entry`). A GMGN price of 0 is no price. |
+| `coverage.chains.{chain}` | same | Written again, by the balances job after each EVM wallet read. `chainTxCount` is Bitquery's realtime-window count of transactions the wallet SENT: a lower bound on the nonce, so `share` is an upper bound and may exceed 1; `basis: bitquery_realtime` says so. `indexer_coverage_low` still fires below 0.5. |
+
+## Added 18 Sep 2026 — aum history
 
 Vocabulary v9. `GET /traders/:handle/aum/history` and `POST /traders/aum/history { ids, step?, window?, from?, to? }`: balance history BUILT from stored holdings and prices (table `aum_history`, hourly grain; daily / weekly / monthly rollup views), distinct from the sampled series on `/aum`.
 
