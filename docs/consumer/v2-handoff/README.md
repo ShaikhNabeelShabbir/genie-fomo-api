@@ -185,5 +185,5 @@ its threshold shows `stale` in `/health` before it shows in a chart.
 
 The machine-readable reference for every operation, parameter, status code and example is
 `openapi.yaml` next to this file (OpenAPI 3.0.3, the same file as `docs/openapi.yaml` in the API
-repository); `fields-v9.json` is the live `GET /v2/fields` answer at the time of writing. Import
-the spec into your client generator or hand all three files to your agent together.
+repository); `fields-v10.json` is the live `GET /v2/fields` answer at the time of writing. `v1-to-v2-diff.md` maps every v1 route to its v2 counterpart and lists every field and word added.
+Import the spec into your client generator or hand all four files to your agent together.

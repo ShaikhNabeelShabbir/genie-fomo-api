@@ -1,5 +1,7 @@
 # Migrating genie-fomo from Supabase to Cloudflare
 
+> **Status 18 Sep 2026: done.** v2 is live on the Worker with every loader as a cron job; v1 is frozen on Supabase until consumers move. The plan below is kept as the record of how and why; where it says "will", read "did". Deviations: Option A′ (Postgres stayed on Supabase), one Worker not three, balance history built (`aum_history`) instead of sampled, Bitquery for EVM instead of public RPC.
+
 > **Line references in this document predate the 17 Sep 2026 split of `routes.ts` into `supabase/functions/api/routes/*.ts` and `shared/*.ts`.** Use `CLAUDE.md` for the route-to-file map; the long comments cited here now live in `docs/DECISIONS.md`.
 
 A complete plan for rebuilding this service on Cloudflare — Workers instead of Supabase Edge

@@ -2,19 +2,19 @@
 
 A read API over ~450 crypto traders: who they are, what they hold, what they have made, and
 what their balance has done over time, across Robinhood Chain, Ethereum, BSC, Base and Solana.
-The directory started from fomo's leaderboard and now also carries GMGN traders; further
-sources are added as loaders, never as request-path calls.
+The directory started from fomo's leaderboard and also carries GMGN traders; more sources are
+added as loader jobs, never as request-path calls.
 
-Every route answers from Postgres. The keys that cost money belong to scheduled loaders, so a
-thousand visitors cost what one does.
+Every route answers from Postgres. Every table is filled by a scheduled job on Cloudflare, so
+a thousand visitors cost what one does and a request never waits on a third party.
 
 | Deployment | Base URL | Status |
 |---|---|---|
-| **v1** Supabase Edge Function | `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api` | live |
-| **v2** Cloudflare Worker `genie-copy-trading-api` | `https://genie-copy-trading-api.agent-73b.workers.dev/v2/…` | live in shadow since 17 Sep 2026, same database |
+| **v2** Cloudflare Worker `genie-copy-trading-api` | `https://genie-copy-trading-api.agent-73b.workers.dev/v2/…` | **the product**, live since 17 Sep 2026 |
+| v1 Supabase Edge Function | `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api` | frozen at the 16 Sep 2026 deploy; kept until consumers have moved |
 
-Both serve the same handlers. v2 exists so the Worker can be proven against v1 with a byte
-diff before consumers move; see [Deploying](#deploying) and `docs/CLOUDFLARE_MIGRATION.md`.
+The app team's migration bundle is [`docs/consumer/v2-handoff/`](docs/consumer/v2-handoff/):
+a guide, the OpenAPI spec, the v1-to-v2 diff and the live vocabulary snapshot.
 
 ---
 
@@ -27,9 +27,11 @@ diff before consumers move; see [Deploying](#deploying) and `docs/CLOUDFLARE_MIG
 - [Errors, rate limits and versions](#errors-rate-limits-and-versions)
 - [The rules every answer follows](#the-rules-every-answer-follows)
 - [The published vocabulary](#the-published-vocabulary)
-- [Balance history, and how it is kept fresh](#balance-history-and-how-it-is-kept-fresh)
+- [Balance history and the live value](#balance-history-and-the-live-value)
+- [Price history](#price-history)
 - [Submitting a wallet](#submitting-a-wallet)
-- [What loads the data](#what-loads-the-data)
+- [The jobs that fill the tables](#the-jobs-that-fill-the-tables)
+- [Data sources](#data-sources)
 - [The database](#the-database)
 - [Running it locally](#running-it-locally)
 - [Verification](#verification)
@@ -42,48 +44,37 @@ diff before consumers move; see [Deploying](#deploying) and `docs/CLOUDFLARE_MIG
 
 ## How it is put together
 
-Three Supabase Edge Functions and one Postgres database are live. One Cloudflare Worker,
-serving the same code through Hyperdrive, runs in shadow against the same database.
+One Cloudflare Worker and one Postgres database. The Worker serves the API, receives Solana
+pushes, and runs every loader as a cron job. Postgres stays on Supabase, reached through a
+Hyperdrive connection to the direct host with query caching off. GitHub Actions is CI/CD only.
 
 ```
-                          ┌──────────────────────────────────────────────┐
-  a consumer ──/v1/*─────▶│  api  (Supabase Edge Function, Deno)          │
-                          │  23 GET + 3 POST routes, answers from Postgres│
-             ──/v2/*─────▶│  genie-copy-trading-api  (Cloudflare Worker) │
-                          │  the SAME route modules, via Hyperdrive       │
-                          └────────────────────┬─────────────────────────┘
-                                               │
-                          ┌────────────────────▼─────────────────────────┐
-                          │  Postgres   traders · wallets · trades        │
-                          │             holdings · transactions           │
-                          │             aum_samples · token_info · …      │
-                          └────────▲──────────────────▲──────────────────┘
-                                   │                  │
-        ┌──────────────────────────┴───┐   ┌──────────┴─────────────────────┐
-        │ aum-sample                   │   │ helius-webhook                 │
-        │ reads balances off-chain     │   │ Helius pushes every watched    │
-        │ every 5 min via pg_cron      │   │ Solana wallet's transactions   │
-        │ (Worker twin: /sample)       │   │ (Worker twin: /webhook)        │
-        └──────────────────────────────┘   └────────────────────────────────┘
-                                   ▲
-                          ┌────────┴─────────────────────────────────────┐
-                          │ GitHub Actions                               │
-                          │ nightly 06:00 UTC · hourly prices            │
-                          │ 6-hourly scorecards · 09:00 staleness check  │
-                          └──────────────────────────────────────────────┘
+                     ┌──────────────────────────────────────────────────────┐
+  consumer ─/v2/*───▶│ genie-copy-trading-api  (Cloudflare Worker)          │
+                     │  fetch:     /v2/*  ·  /webhook (Helius)  ·  /jobs/* │
+  Helius ──/webhook─▶│  scheduled: 14 loader jobs on staggered crons        │
+                     └───────────────────────────┬──────────────────────────┘
+                                                 │ Hyperdrive (direct host, no cache)
+                     ┌───────────────────────────▼──────────────────────────┐
+                     │ Postgres (Supabase)  traders · wallets · trades       │
+                     │   holdings · transactions · token_price_hourly        │
+                     │   aum_history · aum_live · token_info · …            │
+                     └──────────────────────────────────────────────────────┘
+                                                 ▲
+                     ┌───────────────────────────┴──────────────────────────┐
+                     │ GitHub Actions: typecheck, tests, Worker build,       │
+                     │ deploy on push when CLOUDFLARE_DEPLOY=true            │
+                     └──────────────────────────────────────────────────────┘
 ```
 
-| Component | What it does |
+| Piece | What it does |
 |---|---|
-| **`api`** | Every read route. Makes no external call except one: the `/aum` live read-through to the sampler |
-| **`aum-sample`** | Reads a slice of traders' balances off-chain, prices them from tables already in Postgres, records a reading per trader and per chain. Fired every 5 minutes by `pg_cron` → `pg_net` |
-| **`helius-webhook`** | Receives Helius pushes when a watched Solana wallet transacts. Push, not polling: ~290k rows a week, idempotent on a computed transfer key |
-| **`worker/`** | The Cloudflare port. `fetch` routes `/v2/*` to the api modules, `/webhook` to the receiver, `/sample` to the sampler; `scheduled` is the sampler's cron. Bound to Hyperdrive `genie-copy-trading-db` (direct IPv6 host, caching disabled) |
-
-The api modules are runtime-agnostic: `db.ts` exposes `sql` as a Proxy over a per-request
-`AsyncLocalStorage` store, and `config.ts` reads configuration from the same store before it
-falls back to the process environment. `index.ts` (Deno) and `worker/src/api.ts` (Workers)
-are the only files that know which runtime they are on.
+| `worker/src/api.ts` | Routes `/v2/*` to the API modules under `supabase/functions/api/`, one Postgres client per request inside `runWith({ sql, env })` |
+| `worker/src/webhook.ts` | Helius push receiver. Upserts the transfers, then refreshes the live value of every trader whose wallet moved |
+| `worker/src/jobs/*.ts` | The loaders: one module per source, each a sliced, resumable job that stops inside its budget and reports a summary |
+| `worker/src/index.ts` | The cron table (`JOBS`) and the on-demand trigger `POST /jobs/<name>` behind `JOB_SECRET` |
+| `supabase/functions/api/` | The route modules and shared rules. Runtime-agnostic: `db.ts` exposes `sql` from a per-request store, `config.ts` reads configuration from the same store |
+| `supabase/functions/{api,aum-sample,helius-webhook}` as Deno entries | The frozen v1 deployment. Nothing new lands there |
 
 ### Why traders are found this way
 
@@ -101,147 +92,109 @@ two independent tokens, one address  →  confirmed
 ```
 
 Position sizes carry 12+ significant digits, so one match is nearly unique and two are
-certain. Resolution happens in the loaders and the result is stored; the API serves it and
-says how it was resolved (`resolvedBy` on `/wallets`).
+certain. Resolution happens in the directory job; `/wallets` says how (`resolvedBy`).
 
 ---
 
 ## Repository layout
 
+TypeScript and SQL only. The JavaScript and Python loaders, the shell tools and the nightly
+GitHub workflow were retired on 18 Sep 2026 when their ports landed in `worker/src/jobs/`.
+
 | Path | What lives there |
 |---|---|
-| `supabase/functions/api/` | The read API. `app.ts` (auth, rate limit, 15 s timeout race, version rewrite), `router.ts`, `errors.ts`, `db.ts`, `config.ts`, `index.ts` (Deno entry) |
-| `supabase/functions/api/routes/` | One module per route family: `traders`, `positions`, `scorecard`, `transactions`, `aum`, `tokens`, `events`, `flow`, `market`, `chains`, `fields`, `health` |
-| `supabase/functions/api/shared/` | Helpers used by two or more families. `vocabulary.ts` is the published word list; `aum-rules.ts`, `positions-core.ts`, `scorecard-core.ts`, `pnl-core.ts` hold the pure rules; `batch.ts`, `cursor.ts` the envelopes |
-| `supabase/functions/aum-sample/` | The balance sampler; `value.ts` holds the price ceilings |
-| `supabase/functions/helius-webhook/` | Solana transfer push receiver |
-| `supabase/functions/_shared/chain_reads.ts` | Balance reads with a per-host throttle. **Twin of `scripts/lib/chain_reads.mjs`: edit both** |
-| `supabase/migrations/` | 44 migrations. Check constraints are the only SQL-enforced vocabulary |
-| `worker/` | The Cloudflare Worker: `wrangler.toml`, `src/{index,api,db,env,webhook,helius,sampler}.ts`. `sampler.ts` is the twin of `aum-sample/index.ts` |
-| `scripts/*.mjs`, `loaders/*.py` | The loaders GitHub Actions runs; `scripts/lib/` holds their shared modules |
-| `scripts/*.sh` | `typecheck_gate.sh`, `smoke.sh`, `acceptance_capture.sh` |
-| `tests/` | 53 pure-function tests, no database (`deno task test`) |
-| `docs/` | Design docs and runbooks; `docs/openapi.yaml` is the API reference; `docs/DECISIONS.md` holds the long rationale moved out of the code (`See docs/DECISIONS.md#dNNN`) |
-| `docs/consumer/` | Acceptance suites, field contracts, the Genie app team's reports and our replies |
-| `.github/workflows/` | `refresh.yml` nightly, `prices.yml` hourly, `scorecards.yml` 6-hourly, `staleness.yml` daily check, `cloudflare.yml` verify + gated deploy |
-| `CLAUDE.md` | The index an agent reads first: route → file map, constants, verify commands |
+| `worker/` | The Worker: `wrangler.toml` (bindings, vars, the cron list), `src/index.ts` (cron table, job trigger), `src/api.ts`, `src/webhook.ts`, `src/helius.ts`, `src/sampler.ts` (manual `/sample` read), `src/db.ts`, `src/env.ts`, `src/jobs/*` |
+| `worker/src/jobs/` | `directory`, `gmgn`, `scorecards`, `tokens`, `launches`, `transfers`, `wallets`, `quote_prices`, `prices`, `balances`, `fees`, `swaps`, `timing`, `aum_history`; each with a `-core.ts` of pure, tested helpers |
+| `supabase/functions/api/` | The read API: `app.ts` (auth, rate limit, 15 s timeout race, version rewrite), `router.ts`, `errors.ts`, `db.ts`, `config.ts`, `routes/*.ts` (one module per family), `shared/*.ts` (rules, `vocabulary.ts`, batch and cursor envelopes) |
+| `supabase/functions/_shared/` | Providers and chain helpers used by the jobs: `bitquery.ts`, `transactions.ts`, `dexscreener.ts`, `pumpfun.ts`, `solana_pda.ts`, `settings.ts`, `chain_reads.ts` (legacy RPC readers, v1 only) |
+| `supabase/migrations/` | 49 migrations, all applied. Check constraints are the only SQL-enforced vocabulary |
+| `scripts/` | Deno tools: `smoke.ts`, `acceptance_capture.ts`, `typecheck_gate.ts`, `lib/normalise.ts` |
+| `tests/` | 166 pure-function tests, no database (`deno task test`) |
+| `docs/` | `openapi.yaml` (the reference), design docs, runbooks, `DECISIONS.md` (the long rationale the code points at) |
+| `docs/consumer/` | Acceptance suites, field contracts, the Genie app team's reports, our replies, and `v2-handoff/` |
+| `.github/workflows/cloudflare.yml` | The only workflow: verify on every push, deploy when `CLOUDFLARE_DEPLOY` is `true`, optional acceptance diff on dispatch |
+| `CLAUDE.md` | The index an agent reads first |
 
 ---
 
 ## Every route
 
-26 routes: 23 GET and 3 POST. All GET unless marked. `:handle` accepts the handle, the display
-name, a leading `@`, the stable UUID, or `trd_<uuid>`. Every path also resolves under `/v2/`.
+30 operations. All GET unless marked. `:handle` accepts the handle, the display name, a
+leading `@`, the stable UUID, or `trd_<uuid>`. Paths are shown with `/v2/`; v1 serves the
+26 that existed on 16 Sep under `/v1/`.
 
 ### Traders
 
 | Route | What it answers |
 |---|---|
-| `GET /v1/traders` | The directory. `?q=` search, `?limit=` `?offset=` `?cursor=`, `?sort=` and range filters, `?include=pnl,scorecard,wallets,trust`, `?updatedSince=` for incremental sync, `?includeDelisted=true` |
-| `GET /v1/traders/:handle` | One trader's profile: identity, source (`fomoapi.io` or `gmgn`), rank, on-chain activity, stored counts, links to every other route |
-| `GET /v1/traders/:handle/trust` | Internal-consistency checks, each one named |
-| `GET /v1/traders/:handle/wallets` | The resolved EVM and Solana addresses with `walletState`, `resolvedBy`, every chain they have been seen on, and linked wallets |
-| `POST /v1/traders/:handle/wallets` | Submit a wallet for a listed trader who has none. The only write in the service; see [Submitting a wallet](#submitting-a-wallet) |
+| `GET /v2/traders` | The directory. `?q=`, `?limit=` `?offset=` `?cursor=`, `?orderBy=` `?direction=` and range filters, `?include=pnl,scorecard,wallets,trust`, `?updatedSince=`, `?includeDelisted=true` |
+| `GET /v2/traders/:handle` | Profile: identity, source (`fomoapi.io` or `gmgn`), rank, on-chain activity, stored counts, links |
+| `GET /v2/traders/:handle/trust` | Internal-consistency checks, each named |
+| `GET /v2/traders/:handle/wallets` | Resolved addresses with `walletState`, `resolvedBy`, chains seen, linked wallets |
+| `POST /v2/traders/:handle/wallets` | Submit a wallet for a listed trader who has none. The only write; see [Submitting a wallet](#submitting-a-wallet) |
 
 ### Money
 
 | Route | What it answers |
 |---|---|
-| `GET /v1/traders/:handle/portfolio` | Current holdings, concentration, cash share, per-chain split with the chain's own coin priced |
-| `GET /v1/traders/:handle/positions` | Every open position, paged, with `priceSuspect`, the mint or contract on every row, sell flags and per-chain indexer coverage |
-| `POST /v1/traders/positions` | The same for up to 50 traders at once |
-| `GET /v1/traders/:handle/scorecard` | The full record: win rate with its denominator, best and worst trade, hold time, money in and out, fees, per-window realised P&L, monthly results, `byToken[]` per coin with entry, exit, peak and current multiples, `recent` and `career` windows, `bleeding`, `exitTimingScore`, honeypot and cohort facts |
-| `GET /v1/traders/:handle/pnl` | Banked versus on paper, with `openPositions` counting what `/positions` lists |
-| `GET /v1/traders/:handle/trades` | Resolved on-chain swaps, both sides, valued from the money side |
-| `GET /v1/traders/:handle/transactions` | Raw transfers. `?chain=` `?kind=swap` `?money=true` `?since=` `?until=`, keyset-paged |
+| `GET /v2/traders/:handle/portfolio` | Holdings, concentration, cash share, per-chain split with the chain's own coin priced |
+| `GET /v2/traders/:handle/positions` | Every open position, paged: mint or contract on every row, `priceSuspect`, sell flags, per-chain indexer coverage |
+| `POST /v2/traders/positions` | The same for up to 50 traders |
+| `GET /v2/traders/:handle/scorecard` | The record: win rate with denominator, best and worst trade, hold time, money in and out, fees, per-window and monthly P&L, `byToken[]` per coin with multiples and market caps, `recent` and `career` windows, `bleeding`, `exitTimingScore`, honeypot and cohort facts |
+| `GET /v2/traders/:handle/pnl` | Banked versus on paper; `openPositions` counts what `/positions` lists |
+| `GET /v2/traders/:handle/trades` | Resolved on-chain swaps, both sides, valued from the money side |
+| `GET /v2/traders/:handle/transactions` | Raw transfers. `?chain=` `?kind=swap` `?money=true`, keyset-paged |
 
-### Balance history
-
-| Route | What it answers |
-|---|---|
-| `GET /v1/traders/:handle/aum` | Balance over time. `?window=1d\|1w\|1m\|all`, `?chain=`, `?step=`, `?live=true\|false`. Every point carries its basis, tier, coverage, and a refusal word when it is refused |
-| `POST /v1/traders/aum` | The same for up to 50 traders at once, `live` defaulting to false |
-| `GET /v1/traders/:handle/flow` | Solana net flow since a time (`?since=`), from the live holdings view |
-| `POST /v1/traders/flow` | Flow for up to 50 traders at once |
-| `GET /v1/events` | Keyset feed of transfers, swaps and readings across the directory, for consumers that sync rather than poll |
-
-### Tokens, creators and the market
+### Balance history and live value
 
 | Route | What it answers |
 |---|---|
-| `GET /v1/tokens` | Tokens the directory holds, with holders and concentration; `?chain=`, `?excludeHoneypots=` |
-| `GET /v1/tokens/:address` | One token: price block with source, launch block (pump.fun curve), security flags with `honeypotSince`, who holds it and how much, cohort, creator ledger |
-| `GET /v1/tokens/:address/activity` | Who moved in and out of it recently, sellers weighted by their exit-timing score |
-| `GET /v1/tokens/momentum` | Tokens gaining or losing holders |
-| `GET /v1/creators/:address` | A token deployer's ledger across the coins they launched |
-| `GET /v1/market/regime` | A cohort reading: leaders' green share, launch survival, rotation, and a `regime` word (`open`, `caution`, `closed`) with published thresholds. Cached 60 s |
+| `GET /v2/traders/:handle/aum/history` | **The chart source.** `?window=1d\|1w\|1m\|3m\|1y\|all`, `?step=1h\|1d\|1w\|1mo`, `?from=` `?to=`. Hourly points carry basis and reason; rolled-up points carry high, low and valued hours. Includes the `now` block |
+| `POST /v2/traders/aum/history` | The same for up to 50 traders |
+| `GET /v2/traders/:handle/aum/now` | The live value alone: `{ at, totalUsd, pricedPositions, totalPositions, reason, source, ageSeconds }` |
+| `POST /v2/traders/aum/now` | The same for up to 50 traders |
+| `GET /v2/traders/:handle/aum`, `POST /v2/traders/aum` | Legacy: the sampled readings taken until 18 Sep 2026. They still answer; they do not grow |
+| `GET /v2/traders/:handle/flow?since=`, `POST /v2/traders/flow` | Solana net flow since a time, from the live holdings view |
+| `GET /v2/events` | Keyset feed of transfers, swaps and readings across the directory |
+
+### Tokens, prices, creators and the market
+
+| Route | What it answers |
+|---|---|
+| `GET /v2/tokens` | Tokens the directory holds, holders and concentration; `?chain=`, `?excludeHoneypots=`, range filters |
+| `GET /v2/tokens/:address` | One token: price block with source, launch block (pump.fun curve), security with `honeypotSince`, holders, cohort, creator ledger |
+| `GET /v2/tokens/:address/activity` | Who moved in and out recently, sellers weighted by exit-timing score |
+| `GET /v2/tokens/:address/prices` | **Price history.** Hourly with liquidity, or daily, weekly, monthly open, close, high, low; `latest` and running `ath` |
+| `POST /v2/tokens/prices` | The same for up to 50 addresses |
+| `GET /v2/tokens/momentum` | Tokens gaining or losing holders |
+| `GET /v2/creators/:address` | A deployer's ledger across the coins they launched |
+| `GET /v2/market/regime` | Cohort reading with a `regime` word and published thresholds, cached 60 s |
 
 ### Reference and health
 
 | Route | What it answers |
 |---|---|
-| `GET /v1/chains` | The five chains, with a **closed, versioned** chain vocabulary |
-| `GET /v1/fields` | Every enumerated field's complete value set, every quantity's unit, the constants the rules apply (the priced floor, the price ceilings), and live per-field fill rates |
-| `GET /v1/health` | Per-feed freshness with a verdict, per-trader staleness, per-chain accepted and failed readings, `historyState` counts, capability status, row counts, `apiVersion` |
-
-`/v1/fields` exists because a consumer should never have to discover a field's vocabulary by
-watching an unexplained blank appear on a screen.
+| `GET /v2/chains` | The five chains, closed and versioned vocabulary |
+| `GET /v2/fields` | Every enumerated field's value set, every unit, the constants the rules apply, live fill rates. Version 10. Heavy: call it at build time, not per request |
+| `GET /v2/health` | Per-feed freshness with a verdict, per-trader and per-chain staleness, `dataState`, capabilities, row counts, `apiVersion` |
 
 ---
 
 ## API reference (OpenAPI 3.0)
 
-The complete machine-readable reference is **[`docs/openapi.yaml`](docs/openapi.yaml)**
-(OpenAPI 3.0.3): every operation with its parameters, request schema, a response schema per
-status code, and an example request and response. It was generated from the route handlers
-and `docs/consumer/Field_Contracts.md`, so a field appears there only if the code emits it.
-
-View it:
-
-```bash
-# any of these; none is a dependency of the service
-npx @redocly/cli preview-docs docs/openapi.yaml
-npx @scalar/cli document serve docs/openapi.yaml
-docker run -p 8080:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/docs:/spec" swaggerapi/swagger-ui
-```
-
-Lint it after a change:
+**[`docs/openapi.yaml`](docs/openapi.yaml)** (OpenAPI 3.0.3) describes every operation with
+its parameters, request schema, a response schema per status code, and an example request and
+response. It is generated from the route handlers and `docs/consumer/Field_Contracts.md`, so
+a field appears there only if the code emits it. The copy in `docs/consumer/v2-handoff/` is
+the same file.
 
 ```bash
-npx @redocly/cli lint docs/openapi.yaml
+npx @redocly/cli preview-docs docs/openapi.yaml     # view
+npx @redocly/cli lint docs/openapi.yaml             # must stay clean
 ```
 
-Operation ids follow `getTrader`, `getTraderAum`, `batchTraderAum`, `getToken`,
-`getMarketRegime`, and so on; the `tags` group them as the tables above do.
-
-### Validation and error-handling flags
-
-Generating the spec meant reading every handler's inputs and throws. The full list, with
-`file:line` evidence, is **[`docs/API_VALIDATION_FLAGS_17_SEP.md`](docs/API_VALIDATION_FLAGS_17_SEP.md)**
-(64 items: 2 high, 20 medium of which four restate the vocabulary drift fixed today, the rest low). The ones that change an answer or lose data:
-
-| Severity | Where | Gap |
-|---|---|---|
-| high | `worker/src/webhook.ts`, `helius-webhook/index.ts` | The receiver answers `{ok:true}` before the insert runs and puts no cap on the events in one delivery. A delivery large enough to exceed Postgres's bind-parameter limit throws inside a fire-and-forget promise: logged, never retried, the whole batch of transfers silently dropped. Fix: chunk the multi-row insert (500 rows) and answer after it commits |
-| high | `GET /traders/:handle/trades` | `since` and `until` are cast in SQL without parsing; `?since=yesterday` is a Postgres cast error and answers 500 `internal_error` instead of 400. Every sibling route uses the shared ISO parser |
-| medium | `POST /traders/aum` | `window` and `chain` in the body are `.trim()`ed without a type check; a number or object answers 500 instead of 400 |
-| medium | `GET /traders`, `GET /tokens`, `GET /tokens/momentum` | `limit` has no maximum and no default: the whole directory or board ships, with every `include=` block, inside the 15 s budget. `intParam` applies `max` only when the caller remembers to pass one |
-| medium | `GET /events`, `GET /traders/:handle/flow`, `POST /traders/flow` | `since` has no lower bound and flow has no `limit`; `since=1970-01-01` walks the whole table, times 50 on the batch route |
-| medium | `GET /traders/:handle/trades` | `cursor` shape is not checked and `chain` is not validated against the chains table, so `?chain=sol` answers a confident empty `complete: true` |
-| medium | batch routes | `x-cost-units` reports the batch cost but the rate window is bumped once per request, so a 50-id batch costs one unit of the 240/min |
-| medium | `POST /traders/positions`, `POST /traders/aum` with `contractVersion: 1` | The legacy projection cannot tell an unknown id from a trader with nothing: both come back as an empty row |
-| medium | `GET /traders/:handle/positions` vs `POST /traders/positions` | The single route coerces a missing `amount` to `0`, the batch row keeps `null`. Same column, two answers |
-| medium | `POST /traders/:handle/wallets` | The address-clash check is a select-then-insert with no unique index behind it, so two concurrent submissions of one address can both succeed. The secret compare is not constant-time |
-| medium | `shared/batch.ts` | `ids[]` entries are stringified, not type-checked: `[1, null, {}]` becomes three unknown handles instead of a 400 |
-| medium | `app.ts`, `errors.ts` | `ROUTE_TIMEOUT_MS` and `RATE_LIMIT_PER_MINUTE` are `Number()`-parsed and never validated; a typo yields `NaN`, which makes every request lose the timeout race, or silently disables the limiter |
-| medium | `router.ts` | The version rewrite is a global replace of the text `/v1/` over the whole JSON body, so a handle or token name containing `/v1/` would be rewritten too |
-| medium | `GET /fields` | Fixed today: the published `error.code` list did not match the codes the service emits (vocabulary v8) |
-
-What the pipeline does guarantee, verified in the same pass: a malformed cursor is always a
-400, never a 500; driver and SQL text never reach the caller; the timeout race clears its
-timer on every path and the 14 s `statement_timeout` frees the connection; the limiter fails
-open and says so; batch bodies are refused, not truncated, before any query runs; the webhook
-upsert is idempotent on redelivery.
+Known validation gaps found while generating it are listed with `file:line` evidence in
+[`docs/API_VALIDATION_FLAGS_17_SEP.md`](docs/API_VALIDATION_FLAGS_17_SEP.md).
 
 ---
 
@@ -250,8 +203,8 @@ upsert is idempotent on redelivery.
 **Every non-2xx answer has one shape**, and driver or SQL text never reaches the caller:
 
 ```json
-{ "error": { "code": "not_found", "detail": "no route for GET /v1/nope",
-             "requestId": "req_2ec7c488bdf0413a", "hint": "routes: GET /v1/traders, …" } }
+{ "error": { "code": "not_found", "detail": "no route for GET /v2/nope",
+             "requestId": "req_2ec7c488bdf0413a", "hint": "routes: GET /v2/traders, …" } }
 ```
 
 | Status | `code` | When |
@@ -260,32 +213,28 @@ upsert is idempotent on redelivery.
 | 400 | `invalid_address` | a submitted wallet that is not an address on the chain it claims |
 | 400 | `duplicate_identifier` | the same id twice in a batch body |
 | 401 | `unauthorized` | `GENIE_API_KEY` is set and `X-API-Key` is missing or wrong |
-| 404 | `not_found` | no such route (the body lists what exists) or no such trader or token |
+| 404 | `not_found` | no such route (the body lists what exists), trader or token |
 | 409 | `address_in_use` | the submitted wallet already belongs to another trader, who is named |
 | 409 | `already_on_record` | the trader already has that wallet |
 | 429 | `rate_limited` | over 240 requests a minute; `Retry-After` says how long |
 | 503 | `timeout` | the route outran its 15 s budget; the query is cancelled at 14 s |
 | 503 | `unavailable` | Postgres is not answering; retry in a few seconds |
-| 503 | `include_unavailable` | `?include=` asked for blocks that could not be produced; `blocks[]` names them. Retry rather than reading "there is none" |
-| 503 | `not_configured` | the Worker has no Hyperdrive binding yet |
+| 503 | `include_unavailable` | `?include=` blocks that could not be produced; `blocks[]` names them |
+| 503 | `not_configured` | the Worker has no Hyperdrive binding |
 | 500 | `internal_error` | anything else; the `requestId` finds it in the logs |
 
-**Headers on every response:** `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`,
-`RateLimit-Scope`; `x-cost-units` on 200s; `x-request-id` on errors, matching `error.requestId`. The limiter is Postgres-backed so it is one counter
-across every isolate; `RateLimit-Scope: unlimited` means the counter could not be reached and
-the request was allowed through (logged server-side, never silent).
+**Headers:** `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, `RateLimit-Scope`
+on every response; `x-cost-units` on 200s (a batch of 50 spends 50 units); `x-request-id` on
+errors. The limiter is Postgres-backed, one counter across every isolate; `RateLimit-Scope:
+unlimited` means it could not be reached and the request was allowed through, logged.
 
-**Batch routes** (`POST /v1/traders/aum|positions|flow`) take up to 50 ids in one body and
-answer per id inside an envelope, so one unknown handle does not fail the other 49. The
-envelope's `asked` count becomes the `x-cost-units` header: a batch of 50 spends 50 units of
-the rate limit, not one.
+**Batch routes** take up to 50 ids and answer per id, `ok: false` for an unknown one, so one
+bad handle never fails the other 49. **Cursor routes** return an opaque `nextCursor`, `null`
+on the last page; a tampered cursor answers 400.
 
-**Cursor routes** (`/traders`, `/transactions`, `/events`, `/tokens`) return an opaque
-`nextCursor`, `null` on the last page. A tampered cursor answers 400.
-
-**Versions.** Handlers are registered once under `v1` and answer `v2` as well; only the links
-inside a response are rewritten for the requested version. The Worker refuses `/v1/*` with a
-404 pointing at `/v2`, and `/health.apiVersion` says which deployment answered.
+**Versions.** Handlers are registered once and answer both prefixes; only the links inside a
+response are spelled for the requested version. The Worker refuses `/v1/*` with a 404 pointing
+at `/v2`; `/health.apiVersion` says which deployment answered.
 
 ---
 
@@ -294,39 +243,33 @@ inside a response are rewritten for the requested version. The Worker refuses `/
 These are not style. Each one exists because its absence cost somebody a wrong number.
 
 **`null` means absent. Zero means zero.** A zero worst-trade reads as a trader who has never
-lost; a zero balance reads as a man who sold everything. No string ever stands in for a missing
-number. A reading that priced nothing, or listed nothing because the read failed, is `null`
-with a reason word; `0` only when the wallet was read and holds nothing.
+lost; a zero balance reads as a man who sold everything. A value that could not be computed
+is `null` with a reason word; `0` only when the wallet was read and holds nothing.
 
 **Coverage travels with the figure.** Any number that can be partial carries how much of the
-record it was computed from. A figure over four trades and one over four hundred are drawn the
-same size otherwise.
+record it was computed from.
 
-**An absent list is not an empty list.** No `gaps` array means "we did not say", which must be
-read as unknown, never as "there are none".
+**An absent list is not an empty list.** No `gaps` array means "we did not say".
 
 **A partial answer says it is partial.** `partial: true` with a `partialReason` such as
 `chains_missing` naming the chains, `unpriced_positions`, or `unsellable_positions`.
 
-**Every refusal is a machine word.** `too_little_priced`, `nothing_answered`,
-`chains_unrebuildable`, `address_in_use`: each becomes a sentence a person reads, so each is
-published in `/v1/fields` rather than discovered.
+**Every refusal is a machine word**, published in `/v2/fields` rather than discovered.
 
 **A unit never changes under a stable name.** Every `*At` is ISO-8601, every `*Share` is 0–1,
-every `*Usd` is dollars. Published, and the data is checked against it.
+every `*Usd` is dollars.
 
-**A figure the service will not stand behind is refused, not rounded.** A balance priced from
-under a quarter of a wallet's positions is refused with its reason and the arithmetic kept
-beside it as `partialUsd`, unless the priced value alone clears the partial-serve floor, in
-which case it is served as `partial`. A price whose implied market cap exceeds $20B never enters
-a reading; the row carries `priceSuspect: true` with the failed check named.
+**A figure the service will not stand behind is refused, not rounded.** A price whose implied
+market cap exceeds $20B never enters a valuation; the row carries `priceSuspect: true` with the
+failed check named. A balance priced from under a quarter of a wallet's positions is refused
+unless the priced value alone clears $100, in which case it is served as partial.
 
 ---
 
 ## The published vocabulary
 
 `supabase/functions/api/shared/vocabulary.ts` is the single list of every enumerated word the
-API can emit, with a `version` (currently **7**). `GET /v1/fields` serves it. The consumer's
+API can emit, with a `version` (currently **10**). `GET /v2/fields` serves it. The consumer's
 build fails on an unpublished word by design, so the order of work is a contract:
 
 1. Add the word to `shared/vocabulary.ts` and bump `version`.
@@ -334,287 +277,222 @@ build fails on an unpublished word by design, so the order of work is a contract
 3. Add the line to `docs/consumer/Field_Contracts.md`.
 4. `deno task test`: `tests/vocabulary_test.ts` fails if SQL can store a word the API does not publish.
 
-Tell the consumer before deploying a new version. The current draft of that note is
-`docs/consumer/reply-to-genie-17-sep.md`.
+---
+
+## Balance history and the live value
+
+Until 18 Sep 2026 a trader's balance was **sampled**: a rotation read wallets off chain every
+few hours and stored readings. That gave one reading per trader per ~4 h, and an hourly chart
+had empty buckets. It is now **built**, and the readings that exist are folded in.
+
+**`aum_history`**, one row per trader per UTC hour, built by the hourly job (`:25`) and read
+by `/aum/history`. For each hour: if a sampled or archive reading exists in that hour it is
+the row (`basis: reading`); otherwise the latest stored balance capture per chain before the
+hour ends is valued at that hour's price (`basis: priced`) with the same ceilings and floors
+the rest of the API applies. Prices come from the hourly price table, else the daily table,
+else the current price for the current hour. Hours that cannot be valued are `null` with
+`reason`: `no_holdings`, `no_prices`, or `too_little_priced`. Daily, weekly and monthly views
+roll the hours up with close, high, low and the count of valued hours. The series reaches back
+to 11 August 2026 today, as far as stored readings and captures exist; older history would
+need archive-node balance reads, which are not built.
+
+**`aum_live`**, one row per trader, is the current value, refreshed by whichever happens
+first: a Helius push for a wallet that just transacted (`source: webhook`), a balance slice
+that read the wallet (`balances`), an hourly price run (`prices`), or the history build for
+anyone older than an hour (`build`). The same refresh rewrites the current hour of
+`aum_history`, so the last point of the series is as fresh as the live value. Solana is
+therefore real-time; EVM freshness is the balance-slice cadence, 25 wallets every 10 minutes,
+because EVM chains have no push source.
 
 ---
 
-## Balance history, and how it is kept fresh
+## Price history
 
-A trader's balance is **sampled**, not reconstructed. The swap stream is roughly 86% buys to
-14% sells, so a balance rolled backwards from transactions drifts upward and never sees an exit;
-and a coin already sold never appears in a holdings list at all. Nobody records the balance when
-it happens; `aum-sample` does.
-
-Each point says how it was arrived at:
-
-| | |
-|---|---|
-| `basis: sampled` · `tier: verified` | the chain was read at that moment |
-| `basis: rebuilt` · `tier: reported` | inferred afterwards from archive state and transactions; drawn dimmer by the consumer, and never the sole support of `drawing.drawable` |
-
-A reading is per trader and per chain. Every chain of a wallet is read in the same slice, the
-reads run in parallel behind a per-host throttle, and one chain's failure no longer discards
-the others: the reading names the chains that answered and marks the rest `chains_missing`.
-The chain's own coin (ETH, BNB, SOL) is read and priced from the wrapped coin.
-
-### Kept fresh two ways
-
-**A rotation.** `pg_cron` fires every 5 minutes and `pg_net` posts a slice of traders,
-oldest-sampled first, to the `aum-sample` function. The whole roster comes round in a few
-hours, with no queue table to get out of step.
-
-<a name="live-on-demand"></a>
-**Live on demand.** When `/aum` finds the stored reading older than five minutes it fetches a
-new one, writes it, and serves it. `liveRead.state` says which happened:
-
-```
-still_running   a fetch was started and outlasted the wait; this answer is the previous
-                reading and the next request has the new one
-fetched         a live read finished and `now` is from it
-not_needed      the stored reading is inside the freshness floor
-skipped         the caller passed ?live=false (the batch route's default)
-```
-
-This is the one place the API makes an external call, and `/v1/health` says so in
-`externalCallsPerRequest`.
-
-### What "all" means
-
-`window=all` covers the stored readings, not the trader's career, and `trackedSince` marks where
-measurement begins. The step is chosen from the tracked span as well as the window, so a trader
-tracked for three days still draws more than one point on `window=1m`. It cannot simply be
-extended backwards: most of the tokens a trader holds have no transaction record, transactions
-begin months after a trader's first trade, and dated prices exist for very few tokens. See
-`docs/consumer/ACCEPTANCE_TEST_PLAN.md` §2.3 and `docs/consumer/balance-history-summary.md`.
+`token_price_hourly` holds an hourly price and liquidity per held token from 17 Sep 2026, with
+a running all-time high in `token_price_stats`. Daily, weekly and monthly views carry open,
+close, high, low and the number of hours in the bucket. `/tokens/:address/prices` serves them.
+The hourly job prices the most-held tokens first, so the tokens most balances depend on are
+priced every hour and the one-holder tail rotates.
 
 ---
 
 ## Submitting a wallet
 
-`POST /v1/traders/:handle/wallets` is the only write in the service. It accepts a wallet as a
+`POST /v2/traders/:handle/wallets` is the only write in the service. It accepts a wallet as a
 **claim, not a fact**:
 
 ```bash
-curl -X POST "$BASE/v1/traders/somehandle/wallets" \
+curl -X POST "$BASE/v2/traders/somehandle/wallets" \
   -H 'Content-Type: application/json' \
   -d '{"secret":"…","evmAddress":"0x…","solanaAddress":"…"}'
 ```
 
-- an address already on another trader is **refused, never moved**; that single check is what
-  stops one person's money appearing on another's page
+- an address already on another trader is **refused, never moved**
 - an address a trader already has is refused rather than silently overwritten
-- what is stored carries `source: "submitted"`, `confidence: "reported"`, `verified_at` null, so
-  every figure derived from it inherits the weaker tier
+- what is stored carries `source: "submitted"`, `confidence: "reported"`, `verified_at` null
 
 Refusals: `unauthorized`, `not_found`, `bad_request`, `invalid_address`, `address_in_use`
 (naming who holds it), `already_on_record`.
 
 ---
 
-## What loads the data
+## The jobs that fill the tables
 
-Nothing in the request path calls fomoapi, Helius, Bitquery, Etherscan, GMGN or DexScreener.
-These do.
+Every job is `worker/src/jobs/<name>.ts`, `runX(env, budgetMs)`: it selects the stalest units
+first, does as much as fits in `JOB_BUDGET_MS` (10 minutes), writes as it goes, reports a
+summary with `remaining` and `stoppedEarly`, counts a failed unit rather than failing the run,
+and throws only when nothing at all could be done, so a failed cron shows in the dashboard.
+`worker/src/index.ts` maps each cron string to its job; the strings must match `wrangler.toml`.
 
-### Nightly · 06:00 UTC · `.github/workflows/refresh.yml`
-
-| Step | Script |
-|---|---|
-| Build the directory from fomoapi | `loaders/build_directory_fomoapi.py --top 100` |
-| Load it into Postgres | `loaders/load_to_db.py` |
-| Refresh trades | `loaders/load_trades.py --converge --all --stale-hours 20` |
-| Resolve chains for newly traded tokens | `scripts/resolve_trade_chains.mjs` |
-| Refresh on-chain transfers | `scripts/backfill_transactions.mjs` |
-| Link funded wallets | `scripts/link_wallets.mjs` |
-| Price quote-asset transfers | `scripts/load_quote_prices.mjs` |
-| Price Robinhood-chain coins (DexScreener, keyless) | `scripts/load_robinhood_prices.mjs` |
-| Refresh token fundamentals | `scripts/load_token_info.mjs` (sets `honeypot_since` on the first flip) |
-| Refresh token launch metadata (pump.fun curve) | `scripts/load_token_launch.mjs` |
-| Refresh the dev ledger | `scripts/refresh_creators.mjs` |
-| Sync the Helius watch list | `scripts/register_webhook.mjs` |
-| Read chain balances, then re-price under the ceilings | `scripts/load_chain_balances.mjs` |
-| Resolve supply for new tokens | `scripts/load_token_supply.mjs` |
-| Close trades the wallet no longer holds | `scripts/close_stale_trades.mjs` |
-| Sample AUM (the sampler's Node twin) | `scripts/load_aum_samples.mjs` |
-| Position timing | `scripts/refresh_position_timing.mjs` |
-| Transaction fees per chain, then the per-trader rollup | `scripts/load_transaction_fees.mjs`, `scripts/refresh_trader_fees.mjs` |
-| Resolve EVM swaps from receipts | `scripts/resolve_evm_swaps_from_receipts.mjs` |
-
-### On other schedules
-
-| Workflow | When | What |
+| Cron (UTC) | Job | What it does |
 |---|---|---|
-| `prices.yml` | hourly at :17 | `scripts/load_token_prices.mjs`: hourly price history and the running ATH per token |
-| `scorecards.yml` | every 6 hours | `loaders/load_trades.py --converge --stale-hours 72`: reloads a scorecard once it passes its own `staleAfterHours` instead of waiting for the nightly slot |
-| `staleness.yml` | 09:00 UTC | curls `/v1/health` and fails the run on a stale feed |
-| `cloudflare.yml` | every push, and on dispatch | typecheck, tests, Worker build; deploy only when the `CLOUDFLARE_DEPLOY` variable is `true`; optional acceptance diff between the two deployments |
+| `17 * * * *` | `prices` | hourly price and liquidity per held token, most-held first; running ATH; then refreshes every live value |
+| `25 * * * *` | `aum_history` | builds every trader-hour not yet built, always redoing the last two; refreshes live values older than an hour |
+| `40 * * * *` | `transfers` | on-chain transfers per wallet, stalest first; syncs the Helius watch list |
+| `45 * * * *` | `quote_prices` | prices quote-asset transfers; Robinhood-chain coins |
+| `*/10 * * * *` | `balances` | a slice of the stalest wallets' balances on every chain, re-priced under the ceilings; closes trades the wallet no longer holds; refreshes their live value |
+| `5 */2 * * *` | `tokens` | chain resolution, supply and decimals, fundamentals and honeypot flags |
+| `10 */2 * * *` | `fees` | transaction fees per chain, then the per-trader rollup |
+| `20 */3 * * *` | `swaps` | EVM swaps resolved into trades |
+| `0 */6 * * *` | `scorecards` | reloads fomoapi trade records once a scorecard passes its own `staleAfterHours` |
+| `0 1 * * *` | `directory` | fomo leaderboard, wallets, fomo-reported holdings, delisting |
+| `15 2 * * *` | `gmgn` | GMGN traders and their trades |
+| `35 3 * * *` | `launches` | pump.fun launch metadata, dev ledger |
+| `50 4 * * *` | `wallets` | linked wallets |
+| `55 5 * * *` | `timing` | position timing |
 
-### Continuously
+Any job runs on demand: `POST /jobs/<name>?budgetMs=` with the `x-job-secret` header. The
+Helius webhook at `/webhook` is push, not a job; `/sample` is a manual balance read for one
+trader, kept for debugging.
 
-| | |
-|---|---|
-| `aum-sample` Edge Function | every 5 minutes via `pg_cron`, a slice of traders, every chain of each |
-| `helius-webhook` | whenever a watched Solana wallet transacts; feeds `holdings_live` and `/flow` |
+---
 
-### On demand
+## Data sources
 
-`rebuild_aum_archive.mjs`, `rebuild_aum_robinhood.mjs`, `rebuild_aum_solana.mjs` and
-`aggregate_aum_rebuilt.mjs` rebuild historical balance points. `load_gmgn_traders.mjs` and
-`load_gmgn_trades.mjs` bring in traders outside fomo's top 100.
+| Need | Source | Key |
+|---|---|---|
+| Trader directory, trade records | fomoapi, GMGN | `FOMOAPI_KEY`, `GMGN_API_KEY` |
+| Solana: transfers, balances, launch accounts, swap fees | Helius (push webhook and RPC) | `HELIUS_SOLANA_KEY`, `HELIUS_WEBHOOK_SECRET` |
+| EVM: balances, transfers, receipts, contract facts | Bitquery | `BITQUERY_KEY` |
+| Token prices and liquidity, every chain | DexScreener | none |
+| Quote-asset prices (SOL, ETH, BNB) | Binance | none |
+| Token fundamentals and honeypot flags | GMGN | `GMGN_API_KEY` |
+
+No free public JSON-RPC endpoint is called from the Worker; Cloudflare's shared egress was
+throttled by them. DexScreener and Binance stay because nothing else prices the whole held set
+across five chains at that cost.
 
 ---
 
 ## The database
 
-44 migrations under `supabase/migrations/`. The 14 dated `20260917` were applied to production on
-17 Sep 2026 after repairing an empty migration history; they add `price_suspect`, native EVM positions, partial
-sampler readings, balance-closed trades, trade-load bookkeeping, per-chain indexer coverage,
-hourly price history, launch metadata, the `holdings_live` view, `creators`, `linked_wallets`,
-the `trader_chain_history` view, `honeypot_since`, and the performance indexes the health and
-AUM routes assume.
+49 migrations under `supabase/migrations/`, all applied to production; `supabase migration
+list` shows local and remote in step. The history table was empty until 17 Sep 2026 and was
+repaired to match the schema before the 17 and 18 Sep migrations were pushed.
 
-Tables that matter most: `traders`, `wallets`, `trades` (fomoapi and GMGN), `transactions`
-(Helius pushes, the largest table), `holdings` and the `holdings_current` / `holdings_live`
-views, `aum_samples` and `aum_chain_samples`, `token_info`, `token_price_hourly`,
-`token_price_stats`, `rate_limits`. The sampler's schedule and Vault secrets are in
-`20260916120000_aum_sample_schedule.sql`.
+Tables that matter most: `traders`, `wallets`, `linked_wallets`, `trades`, `trade_loads`,
+`transactions` (the largest), `holdings` with the `holdings_current` and `holdings_live`
+views, `aum_history` with its daily, weekly and monthly views, `aum_live`, `aum_samples` (the
+legacy readings), `token_price_hourly` with its rollup views, `token_price_stats`,
+`token_info`, `token_launch`, `creators`, `chain_coverage`, `rate_limits`.
 
-Check constraints on `refused_reason`, `partial_reason` and the other word columns are the only
-vocabulary the database enforces; `tests/vocabulary_test.ts` keeps them a subset of what the
-API publishes.
+Two SQL functions carry valuation logic: `aum_history_build(handle, from, to)` and
+`aum_live_refresh(handles, source, older_than)`. Their ceilings and floors are literals that
+cite `aum-sample/value.ts` and `shared/aum-rules.ts` as the source of truth.
+
+Check constraints on the word columns are the only vocabulary the database enforces;
+`tests/vocabulary_test.ts` keeps them a subset of what the API publishes, per table.
 
 ---
 
 ## Running it locally
 
-The Edge Function runs under Deno against a database URL; with no database it still serves the
-route list, 404s and 503s, which is enough to smoke the pipeline:
+The API under Deno against a database URL; with no database it still serves the route list,
+404s and 503s:
 
 ```bash
 DB_URL='postgres://…' PORT=8000 deno run --allow-net --allow-env supabase/functions/api/index.ts
 curl -s localhost:8000/v1/fields | head -c 400
 ```
 
-Add `--unsafely-ignore-certificate-errors` if Deno rejects the pooler's TLS chain from your
-machine.
-
-The Worker runs under `wrangler dev` (local by default; `--remote` talks to production):
+The Worker under `wrangler dev` (local by default; `--remote` talks to production):
 
 ```bash
 cd worker && npx wrangler dev
 curl -s localhost:8787/healthz
 ```
 
-The loaders are Node:
+A job on the deployed Worker, on demand:
 
 ```bash
-npm install
-node scripts/load_chain_balances.mjs --help
+curl -X POST -H "x-job-secret: $JOB_SECRET" "$WORKER_URL/jobs/aum_history?budgetMs=600000"
 ```
 
-Node 20+, Deno 2+.
+Node 20+ (wrangler, TypeScript), Deno 2+.
 
 ---
 
 ## Verification
 
 ```bash
-deno task check                      # typecheck gate: no NEW errors vs scripts/typecheck_baseline.txt (baseline is empty; keep it so)
-deno task test                       # 53 pure-function tests, no database
+deno task check                      # typecheck gate: no NEW errors vs scripts/typecheck_baseline.txt (empty; keep it so)
+deno task test                       # 166 pure-function tests, no database
 npx tsc -p worker/tsconfig.json      # the Worker under the npm postgres types
-cd worker && npx wrangler deploy --dry-run --outdir dist   # bundles it (~408 KB)
-./scripts/smoke.sh [$BASE]           # 8 checks against a deployment; API_VERSION=v2 for the Worker
-./scripts/acceptance_capture.sh $BASE captures/x           # 72-file normalised capture; diff two runs
-npm run build                        # scripts/lib/ts → scripts/lib/dist for three loaders
+cd worker && npx wrangler deploy --dry-run --outdir dist   # bundles it
+deno task smoke [$BASE]              # 8 checks against a deployment; API_VERSION=v2 for the Worker
+deno task capture $BASE captures/x   # 72-file normalised capture; diff two runs
+npx @redocly/cli lint docs/openapi.yaml
 ```
 
-The acceptance capture strips the fields that legitimately differ between runs (request ids,
-`asOf`, live-read timing) and folds `/v2/` links back to `/v1/`, so a capture of the Supabase
-deployment and one of the Worker diff to nothing when the port is right. `cloudflare.yml` runs
-that diff on dispatch when both base URLs are given.
-
-Two consumer-written suites are also run against the deployed service and reported in
-`docs/consumer/`: 50 acceptance tests (`Acceptance_Tests.md`, 45 passing as of 16 Sep 2026)
-and 150 field contracts (`Field_Contracts.md`, all correct as of 16 Sep 2026, mapped in
-`Field_Contracts_Mapping.md`).
+`deno task smoke` against v2 reports `dataState: degraded` while any scorecard is stale; that
+is the T2 rule from the app team's report, not a failure of the deployment.
 
 ---
 
 ## Deploying
 
-### Supabase (v1)
+Everything is in `.github/workflows/cloudflare.yml`: every push runs the gate, the tests and
+the Worker build; when the repository variable `CLOUDFLARE_DEPLOY` is `true` it deploys with
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` and smokes `WORKER_URL`. By hand:
 
 ```bash
-npx supabase db push --project-ref <ref>                       # the 14 pending migrations, in order
-npx supabase functions deploy api        --project-ref <ref> --no-verify-jwt
-npx supabase functions deploy aum-sample --project-ref <ref> --no-verify-jwt
-npx supabase functions deploy helius-webhook --project-ref <ref> --no-verify-jwt
-./scripts/smoke.sh
+cd worker && npx wrangler deploy
 ```
 
-Secrets live on the function, never in the repo:
+Database changes:
 
 ```bash
-npx supabase secrets set \
-  AUM_SAMPLE_SECRET=… WALLET_SUBMIT_SECRET=… HELIUS_SOLANA_KEY=… \
-  AUM_SAMPLE_URL=https://<ref>.supabase.co/functions/v1/aum-sample \
-  --project-ref <ref>
+npx supabase db push --db-url "$SESSION_POOLER_URL"      # lists pending migrations, applies in order
 ```
 
-**Test `/v1/health` specifically after any deploy.** It is the one route that has failed while
-every other kept working; its queries are sequential on purpose.
+Worker secrets (`wrangler secret put`): `HELIUS_WEBHOOK_SECRET`, `HELIUS_SOLANA_KEY`,
+`BITQUERY_KEY`, `FOMOAPI_KEY`, `GMGN_API_KEY`, `JOB_SECRET`, plus `AUM_SAMPLE_SECRET` and
+`WALLET_SUBMIT_SECRET` (wallet submission refuses until it is set). The Hyperdrive config
+`genie-copy-trading-db` was created with `--caching-disabled` against the direct IPv6 host;
+keep caching off: the live value is read seconds after it is written.
 
-### Cloudflare (v2)
-
-Everything is in `.github/workflows/cloudflare.yml`; the runbook is
-`docs/CLOUDFLARE_MIGRATION.md` §8 and §13.
-
-1. Repository secrets `CLOUDFLARE_API_TOKEN` (needs *Account › Workers Scripts › Edit*) and
-   `CLOUDFLARE_ACCOUNT_ID`. Set the variable `CLOUDFLARE_DEPLOY=true` and dispatch the workflow;
-   the first deploy proves the pipeline and answers `/healthz` plus 503 on everything else.
-2. With the database password: `npx wrangler hyperdrive create genie-copy-trading-db
-   --connection-string=… --caching-disabled` against the **direct** host (not the 6543 pooler),
-   paste the id into the `[[hyperdrive]]` block of `worker/wrangler.toml`, and
-   `wrangler secret put` `HELIUS_WEBHOOK_SECRET`, `AUM_SAMPLE_SECRET`, `HELIUS_SOLANA_KEY`,
-   `WALLET_SUBMIT_SECRET`. Redeploy; set the `WORKER_URL` variable so the post-deploy smoke runs.
-3. Shadow phase: both deployments read and write the one database; run the acceptance diff.
-4. Cutover: uncomment `[triggers]` in `wrangler.toml` and disable the `pg_cron` job in the same
-   window, so exactly one sampler runs; point the Helius webhook at `/webhook`; move consumers
-   to `/v2/`.
-
-Caching stays disabled on Hyperdrive until the acceptance diff is clean; `/aum?live=true` reads
-a row the sampler wrote seconds earlier and a 60 s cache would serve the previous reading.
+The v1 Supabase functions are not redeployed. Retiring them is a consumer decision.
 
 ---
 
 ## Configuration
 
-| Variable | Used by | Purpose |
+| Variable | Where | Purpose |
 |---|---|---|
-| `DB_URL` / `SUPABASE_DB_URL` / `DATABASE_URL` | Supabase functions, loaders | Postgres. The functions point at the **transaction** pooler (6543) |
 | `HYPERDRIVE` (binding) | Worker | the Hyperdrive config over the direct host |
-| `GENIE_API_KEY` | api | optional; set it to require `X-API-Key` |
-| `RATE_LIMIT_PER_MINUTE` | api | default 240 |
-| `ROUTE_TIMEOUT_MS` | api | default 15000; the query's `statement_timeout` is 14 s |
-| `AUM_SAMPLE_SECRET` | api, aum-sample, Worker | authorises the sampler; without it the function refuses to run rather than defaulting open |
-| `AUM_SAMPLE_URL` | api | where live AUM reads are sent |
-| `AUM_LIVE_AFTER_MINUTES` | api, Worker | freshness floor, default 5 |
-| `AUM_LIVE_WAIT_MS` | api, Worker | how long a request waits for a live read, default 3000 |
-| `AUM_SAMPLE_BUDGET_MS` | Worker | wall-clock budget for one sampler slice, default 100000 |
-| `WALLET_SUBMIT_SECRET` | api, Worker | authorises wallet submission |
-| `HELIUS_SOLANA_KEY` | aum-sample, Worker, loaders | Solana balances and history |
-| `HELIUS_WEBHOOK_SECRET` | helius-webhook, Worker | verifies the push |
-| `ETHERSCAN_KEY` · `BITQUERY_KEY` · `FOMOAPI_KEY` · `GMGN_API_KEY` | loaders only | never read in the request path |
+| `JOB_BUDGET_MS` | Worker var | wall-clock budget per job run, default 600000 |
+| `BALANCE_SLICE` | Worker var | wallets per balances run, default 25 |
+| `WEBHOOK_URL` | Worker var | where the transfers job points the Helius watch list |
+| `AUM_SAMPLE_BUDGET_MS`, `AUM_LIVE_AFTER_MINUTES`, `AUM_LIVE_WAIT_MS` | Worker var | the manual `/sample` read and the legacy live-read timing |
+| `RATE_LIMIT_PER_MINUTE` | Worker var | default 240 |
+| `ROUTE_TIMEOUT_MS` | Worker var | default 15000; the query's `statement_timeout` is 14 s |
+| `GENIE_API_KEY` | Worker secret, optional | set it to require `X-API-Key` |
+| provider keys | Worker secrets | see [Data sources](#data-sources) |
+| `DB_URL` / `SUPABASE_DB_URL` / `DATABASE_URL` | v1 functions, local runs | Postgres; the functions use the transaction pooler |
 | `PORT` | local Deno run | default 8000 |
 
-Connection pooling matters more than it looks: Edge Functions scale horizontally, so every warm
-instance holds its own pool and `max` multiplies by instance count. The read API uses `max: 2`
-with `prepare: false` on the transaction pooler; the Worker uses `max: 5` per request over
-Hyperdrive with prepared statements on, and closes the client in `ctx.waitUntil`. Loaders once
-exhausted the pooler and took the API to 503.
-
-`.env.example` lists every variable for the loaders.
+The Worker opens one postgres.js client per request with `max: 5`, prepared statements on,
+`fetch_types` on (arrays break without it), and closes it in `ctx.waitUntil`.
 
 ---
 
@@ -623,38 +501,33 @@ exhausted the pooler and took the API to 503.
 | | |
 |---|---|
 | **[openapi.yaml](docs/openapi.yaml)** | The API reference, OpenAPI 3.0.3 |
-| **[PARAMETER_ROUTES.md](docs/PARAMETER_ROUTES.md)** | Every route and parameter in prose, with worked curl examples and the reasoning |
-| **[Field_Contracts.md](docs/consumer/Field_Contracts.md)** · **[Field_Contracts_Mapping.md](docs/consumer/Field_Contracts_Mapping.md)** | One line per field the consumer reads, and where each comes from |
-| **[Acceptance_Tests.md](docs/consumer/Acceptance_Tests.md)** · **[ACCEPTANCE_TEST_REPORT.md](docs/consumer/ACCEPTANCE_TEST_REPORT.md)** · **[ACCEPTANCE_TEST_PLAN.md](docs/consumer/ACCEPTANCE_TEST_PLAN.md)** | The consumer's 50 tests, measured, and what was fixed |
-| **[genie-fomo-fix-request-v2-16-sep.md](docs/consumer/genie-fomo-fix-request-v2-16-sep.md)** · **[TO-DO-BEFORE-MIGRATION.md](docs/TO-DO-BEFORE-MIGRATION.md)** · **[reply-to-genie-17-sep.md](docs/consumer/reply-to-genie-17-sep.md)** | The app team's 16 Sep report, the 15-item plan built from it (all on this branch), and the reply draft |
-| **[workflow-coverage-17-sep.md](docs/consumer/workflow-coverage-17-sep.md)** · **[composite-workflows-coverage-17-sep.md](docs/consumer/composite-workflows-coverage-17-sep.md)** | The app team's automated and composite workflows, checked against the API, and the routes added to cover them |
-| **[CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md)** · **[PROJECT_ANALYSIS.md](docs/PROJECT_ANALYSIS.md)** | The migration plan and runbook; the project analysis that reviewed it |
-| **[REVIEW_EFFICIENCY_17_SEP.md](docs/REVIEW_EFFICIENCY_17_SEP.md)** | The ranked efficiency review of the refactor, all items applied |
-| **[DECISIONS.md](docs/DECISIONS.md)** | 197 numbered rationale sections the code points at (`#dNNN`) |
-| **[AUM_CHART_PRD.md](docs/AUM_CHART_PRD.md)** · **[AUM_PLAN.md](docs/AUM_PLAN.md)** · **[AUM_ROUTES.md](docs/AUM_ROUTES.md)** | The balance-history design |
+| **[consumer/v2-handoff/](docs/consumer/v2-handoff/)** | What the app team receives: guide, spec, v1-to-v2 diff, vocabulary snapshot |
+| **[PARAMETER_ROUTES.md](docs/PARAMETER_ROUTES.md)** | Every route and parameter in prose with worked curl examples |
+| **[consumer/Field_Contracts.md](docs/consumer/Field_Contracts.md)** | One line per field the consumer reads, dated by the wave that added it |
+| **[CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md)** · **[PROJECT_ANALYSIS.md](docs/PROJECT_ANALYSIS.md)** | The migration plan, its review, and the phase status |
+| **[TO-DO-BEFORE-MIGRATION.md](docs/TO-DO-BEFORE-MIGRATION.md)** · **[consumer/genie-fomo-fix-request-v2-16-sep.md](docs/consumer/genie-fomo-fix-request-v2-16-sep.md)** | The app team's 16 Sep report and the plan built from it, all delivered |
+| **[consumer/workflow-coverage-17-sep.md](docs/consumer/workflow-coverage-17-sep.md)** · **[consumer/composite-workflows-coverage-17-sep.md](docs/consumer/composite-workflows-coverage-17-sep.md)** | Their workflows checked against the API, and what was added |
+| **[API_VALIDATION_FLAGS_17_SEP.md](docs/API_VALIDATION_FLAGS_17_SEP.md)** · **[REVIEW_EFFICIENCY_17_SEP.md](docs/REVIEW_EFFICIENCY_17_SEP.md)** | Open validation gaps with evidence; the efficiency review, applied |
+| **[DECISIONS.md](docs/DECISIONS.md)** | The numbered rationale sections the code points at (`#dNNN`) |
+| **[AUM_ROUTES.md](docs/AUM_ROUTES.md)** · **[AUM_PLAN.md](docs/AUM_PLAN.md)** · **[AUM_CHART_PRD.md](docs/AUM_CHART_PRD.md)** | The balance-history design, including the 18 Sep `aum_history` section |
 | **[LAUNCH_METADATA.md](docs/LAUNCH_METADATA.md)** · **[R4_ROBINHOOD_PRICES.md](docs/R4_ROBINHOOD_PRICES.md)** | Measured sources for launch data and Robinhood-chain prices |
-| **[PARAMETERS.md](docs/PARAMETERS.md)** | What each published figure means |
-| **[PROD-STEPS.md](docs/PROD-STEPS.md)** · **[STEPS.md](docs/STEPS.md)** | Deployment and directory-build runbooks |
-| **[GMGN_FEATURES.md](docs/GMGN_FEATURES.md)** · **[GMGN_GAP_ANALYSIS.md](docs/GMGN_GAP_ANALYSIS.md)** · **[GMGN_PARITY_PLAN.md](docs/GMGN_PARITY_PLAN.md)** | The GMGN source: what it offers, what is missing, the plan |
 | `tasks/todo.md` · `tasks/lessons.md` | The running status tracker and the lessons recorded from corrections |
 
 ---
 
 ## Operational notes
 
-**Read `chains[]`, `coverage` and `partial` before trusting an empty answer.** `count: 0` with
-no error is "no activity"; `count: 0` with a reason is "we could not look". Collapsing those is
-the fastest way to ship a wrong number.
+**Read `coverage`, `partial` and `reason` before trusting an empty answer.** `count: 0` with
+no error is "no activity"; `count: 0` with a reason is "we could not look".
 
-**Twins must be edited together.** `_shared/chain_reads.ts` ↔ `scripts/lib/chain_reads.mjs`;
-`aum-sample/index.ts` ↔ `scripts/load_aum_samples.mjs` ↔ `worker/src/sampler.ts`;
-`aum-sample/value.ts` ↔ `scripts/lib/value.mjs`. A ceiling changed in one and not the other is
-how a $101B reading got served.
+**A job's summary is its health.** `remaining` that never reaches zero across runs means the
+budget or the provider quota is the ceiling; `stoppedEarly` on every run means the slice is
+too big. Bitquery is metered in points; the balances job asks one query per EVM chain per
+wallet.
 
 **Every error carries a stable `code` and a `requestId`.** Quote the id and the exact request
-can be found; an empty-bodied 503 is indistinguishable from a network failure and gets retried
-forever, so it never happens here.
+can be found in `wrangler tail`.
 
-**`statement_timeout` is sent as a connection parameter.** Supavisor's transaction pooler and
-Hyperdrive may refuse startup parameters; run `scripts/smoke.sh` right after each deploy and,
-if it fails on that, move the timeout to a `set local` per query.
+**Secrets were pasted into a working session on 17 Sep 2026.** The database password, the
+Cloudflare token and every provider key in `.env` should be rotated once the handover settles;
+none of them is in the repository.
