@@ -703,7 +703,6 @@ components:
       - pnlToHoldings
       - trades
       - verdict
-      - basis
       - plain
       properties:
         handle:
@@ -767,7 +766,6 @@ components:
       description: What was looked at, so an absent flag cannot be read as a clean bill of health.
       required:
       - performed
-      - basis
       - blacklist
       - externalReputation
       properties:
@@ -1411,7 +1409,6 @@ components:
       required:
       - closedTrades
       - pnlUsd
-      - basis
       - tier
       - source
       - note
@@ -1538,7 +1535,6 @@ components:
       required:
       - of
       - total
-      - share
       - commonestAbsence
       properties:
         of:
@@ -1816,17 +1812,20 @@ components:
           description: null when no trader has a reading.
         scorecardStale:
           type: integer
-          description: fomoapi.io traders whose newest trade snapshot (`trades.captured_at`) is past 72 h - the set the six-hourly loader targets.
+          description: fomoapi.io traders whose newest trade snapshot (`trades.captured_at`) is past 72
+            h - the set the six-hourly loader targets.
         scorecardStaleGmgn:
           type: integer
-          description: The same for traders the fomoapi loader does not own (source gmgn); the nightly gmgn job refreshes them.
+          description: The same for traders the fomoapi loader does not own (source gmgn); the nightly
+            gmgn job refreshes them.
         scorecardStaleAfterHours:
           type: integer
           enum:
           - 72
         scorecardLoadFailed:
           type: integer
-          description: Of the stale, how many the loader's last attempt did not bring back (`loadOutcome` other than `loaded`); a never-attempted trader counts.
+          description: Of the stale, how many the loader's last attempt did not bring back (`loadOutcome`
+            other than `loaded`); a never-attempted trader counts.
         scorecardNeverAttempted:
           type: integer
           description: Of the stale, how many have no `trade_loads` row at all - a subset of `scorecardLoadFailed`.
@@ -1841,7 +1840,6 @@ components:
       required:
       - traders
       - withClosedTrades
-      - share
       properties:
         traders:
           type: integer
@@ -1937,7 +1935,6 @@ components:
       required:
       - degraded
       - providers
-      - basis
       properties:
         degraded:
           type: array
@@ -2099,7 +2096,6 @@ components:
       required:
       - of
       - total
-      - share
       properties:
         of:
           type: integer
@@ -2378,7 +2374,8 @@ components:
           type: number
           minimum: 0
           description: 'Priced value under a suspect price (`priceSuspect: true` rows), kept out of `totalValueUsd`,
-            `coverage.pricedPositions` and every `share`. The rows keep `priceUsd` and `valueUsd` so what was excluded is visible.'
+            `coverage.pricedPositions` and every `share`. The rows keep `priceUsd` and `valueUsd` so what
+            was excluded is visible.'
         partial:
           type: boolean
         partialReason:
@@ -2418,19 +2415,16 @@ components:
           - nightly_read
     PositionsChainCoverage:
       type: object
-      description: How much of one chain's activity the indexer holds, written by the balances job after each
-        EVM wallet read from one Bitquery `Transactions { count }` on the realtime dataset.
+      description: How much of one chain's activity the indexer holds, written by the balances job after
+        each EVM wallet read from one Bitquery `Transactions { count }` on the realtime dataset.
       required:
-      - chainTxCount
-      - rowsHeld
-      - share
       - readAt
-      - basis
       properties:
         chainTxCount:
           type: integer
           nullable: true
-          description: Transactions the wallet sent within Bitquery's realtime window, a LOWER bound on its nonce.
+          description: Transactions the wallet sent within Bitquery's realtime window, a LOWER bound on
+            its nonce.
         rowsHeld:
           type: integer
           nullable: true
@@ -2438,7 +2432,8 @@ components:
           type: number
           nullable: true
           description: '`rowsHeld / chainTxCount`; null when either side is unknown or the wallet never
-            sent. An upper bound (the count is a lower bound) and may exceed 1. Below 0.5 makes the list partial.'
+            sent. An upper bound (the count is a lower bound) and may exceed 1. Below 0.5 makes the list
+            partial.'
         readAt:
           type: string
           format: date-time
@@ -2452,7 +2447,6 @@ components:
       type: object
       required:
       - pricedPositions
-      - suspectPositions
       - unpricedPositions
       - chains
       properties:
@@ -2566,14 +2560,11 @@ components:
         - balanceAt
         - tier
         - priceUsd
-        - priceSource
-        - pricedAt
         - drawdownShare
         - valueUsd
         - whyNoPrice
         - priceSuspect
         - priceSuspectReason
-        - share
         - isQuoteAsset
         - isHoneypot
         - canSell
@@ -2633,9 +2624,9 @@ components:
             - token_prices
             - fomo_reported_entry
             - null
-            description: Which price ladder rung valued the holding (`pegged` = quote_assets.pegged_usd, `token_info` =
-              GMGN, `token_prices` = the newest daily row, `fomo_reported_entry` = the directory build's reported
-              price); null when unpriced.
+            description: Which price ladder rung valued the holding (`pegged` = quote_assets.pegged_usd,
+              `token_info` = GMGN, `token_prices` = the newest daily row, `fomo_reported_entry` = the
+              directory build's reported price); null when unpriced.
           pricedAt:
             type: string
             format: date-time
@@ -2816,7 +2807,8 @@ components:
         suspectUsd:
           type: number
           minimum: 0
-          description: Priced value under a suspect price, kept out of `totalValueUsd`; the rows still show it.
+          description: Priced value under a suspect price, kept out of `totalValueUsd`; the rows still
+            show it.
         partial:
           type: boolean
           enum:
@@ -2904,8 +2896,6 @@ components:
         - amount
         - balanceAt
         - priceUsd
-        - priceSource
-        - pricedAt
         - drawdownShare
         - valueUsd
         - whyNoPrice
@@ -3137,7 +3127,8 @@ components:
           - not_found
           - error
           - null
-          description: The loader's last attempt. `unchanged` = fomo answered but the snapshot (`loadedAt`) did not advance; retried six-hourly.
+          description: The loader's last attempt. `unchanged` = fomo answered but the snapshot (`loadedAt`)
+            did not advance; retried six-hourly.
         nextLoadAt:
           type: string
           format: date-time
@@ -3147,7 +3138,8 @@ components:
           enum:
           - six_hourly_slot
           - nightly_slot
-          description: '`six_hourly_slot` - the next 0/6/12/18 UTC tick of the loader; `nightly_slot` was the pre-Worker word and is published one more version.'
+          description: '`six_hourly_slot` - the next 0/6/12/18 UTC tick of the loader; `nightly_slot`
+            was the pre-Worker word and is published one more version.'
         staleness:
           $ref: '#/components/schemas/ScorecardStaleness'
         onChain:
@@ -3453,7 +3445,8 @@ components:
           - not_found
           - error
           - null
-          description: The loader's last attempt. `unchanged` = fomo answered but the snapshot (`loadedAt`) did not advance; retried six-hourly.
+          description: The loader's last attempt. `unchanged` = fomo answered but the snapshot (`loadedAt`)
+            did not advance; retried six-hourly.
         nextLoadAt:
           type: string
           format: date-time
@@ -3462,7 +3455,8 @@ components:
           enum:
           - six_hourly_slot
           - nightly_slot
-          description: '`six_hourly_slot` - the next 0/6/12/18 UTC tick of the loader; `nightly_slot` was the pre-Worker word and is published one more version.'
+          description: '`six_hourly_slot` - the next 0/6/12/18 UTC tick of the loader; `nightly_slot`
+            was the pre-Worker word and is published one more version.'
         note:
           type: string
     ScorecardStaleness:
@@ -3494,18 +3488,19 @@ components:
           enum:
           - on_chain
           - null
-          description: '`on_chain` when stale or never AND `onChain.coverage.share >= 0.5` (the swap store holds at least half the profile''s swaps) - draw `onChain` instead.'
+          description: '`on_chain` when stale or never AND `onChain.coverage.share >= 0.5` (the swap store
+            holds at least half the profile''s swaps) - draw `onChain` instead.'
         fallbackReason:
           type: string
           nullable: true
           enum:
           - swap_store_incomplete
           - null
-          description: Why `fallback` is null although the record is stale or never - the swap store covers under half of this trader. null when current or when `fallback` is set.
+          description: Why `fallback` is null although the record is stale or never - the swap store covers
+            under half of this trader. null when current or when `fallback` is set.
     ScorecardOnChain:
       type: object
       required:
-      - basis
       - swaps
       - buys
       - sells
@@ -3666,7 +3661,6 @@ components:
       - meanExitUsd
       - medianExitUsd
       - clearsSpecBar
-      - basis
       properties:
         exits:
           type: integer
@@ -3751,7 +3745,6 @@ components:
       - entryMcapMedianUsd
       - holdHoursMedian
       - tradesPerDay
-      - basis
       properties:
         lastBigWinAt:
           type: string
@@ -3796,7 +3789,6 @@ components:
       - entryMcapMedianUsd
       - holdHoursMedian
       - tradesPerDay
-      - basis
       properties:
         avgRealizedUsd:
           type: number
@@ -3847,7 +3839,6 @@ components:
       type: object
       required:
       - value
-      - basis
       - window
       - why
       properties:
@@ -3933,7 +3924,6 @@ components:
       required:
       - value
       - threshold
-      - basis
       - coverage
       properties:
         value:
@@ -3997,7 +3987,6 @@ components:
     ScorecardWindows:
       type: object
       required:
-      - basis
       - 24h
       - 7d
       - 30d
@@ -4019,8 +4008,6 @@ components:
       - buys
       - coinsWithBuys
       - coinsTotal
-      - share
-      - basis
       - why
       properties:
         buys:
@@ -4463,7 +4450,6 @@ components:
       - lastSwapAt
       - tier
       - source
-      - basis
       - coverage
       - note
       properties:
@@ -4637,7 +4623,6 @@ components:
       required:
       - of
       - total
-      - share
       properties:
         of:
           type: integer
@@ -4656,7 +4641,6 @@ components:
       - spentUsd
       - receivedUsd
       - netUsd
-      - basis
       - coverage
       - note
       properties:
@@ -5339,7 +5323,6 @@ components:
       type: object
       required:
       - since
-      - basis
       - chains
       - note
       properties:
@@ -5477,9 +5460,8 @@ components:
     AumHistoryPoint:
       type: object
       description: 'One bucket. Hourly points (`step: 1h`) carry `basis`, `reason`, `pricedPositions`
-        and `totalPositions`; rolled-up points (`1d`, `1w`, `1mo`) carry `highUsd`, `lowUsd` and
-        `valuedHours`, with `totalUsd` the close (last valued hour in the bucket). `null` is absent,
-        never 0.'
+        and `totalPositions`; rolled-up points (`1d`, `1w`, `1mo`) carry `highUsd`, `lowUsd` and `valuedHours`,
+        with `totalUsd` the close (last valued hour in the bucket). `null` is absent, never 0.'
       required:
       - at
       - totalUsd
@@ -5517,8 +5499,8 @@ components:
         unsellableUsd:
           type: number
           nullable: true
-          description: Hourly only. Gross value of honeypot / cannot-sell positions, kept out of
-            `totalUsd`; `null` when none (never 0).
+          description: Hourly only. Gross value of honeypot / cannot-sell positions, kept out of `totalUsd`;
+            `null` when none (never 0).
         pricedPositions:
           type: integer
           description: Hourly only.
@@ -5624,9 +5606,9 @@ components:
             description: absent
     AumLiveNow:
       type: object
-      description: 'The trader''s current value, refreshed when a watched wallet transacts (Solana push),
-        when a balance slice reads the wallet, and when prices land. The hourly series'' last point is
-        refreshed with it. `totalUsd` is `null` when not valued (`reason` says why), never 0.'
+      description: The trader's current value, refreshed when a watched wallet transacts (Solana push),
+        when a balance slice reads the wallet, and when prices land. The hourly series' last point is
+        refreshed with it. `totalUsd` is `null` when not valued (`reason` says why), never 0.
       required:
       - at
       - totalUsd
@@ -5661,13 +5643,13 @@ components:
         suspectUsd:
           type: number
           nullable: true
-          description: Gross value of positions whose price failed the suspect rule, kept out of
-            `totalUsd`; `null` when none (never 0).
+          description: Gross value of positions whose price failed the suspect rule, kept out of `totalUsd`;
+            `null` when none (never 0).
         unsellableUsd:
           type: number
           nullable: true
-          description: Gross value of honeypot / cannot-sell positions, kept out of `totalUsd`;
-            `null` when none (never 0).
+          description: Gross value of honeypot / cannot-sell positions, kept out of `totalUsd`; `null`
+            when none (never 0).
         source:
           type: string
           enum:
@@ -5990,7 +5972,6 @@ components:
       - closedBelow
       - cautionBelow
       - survivalDowngradeBelow
-      - basis
       properties:
         closedBelow:
           type: number
@@ -6012,7 +5993,6 @@ components:
       - total
       - green7d
       - greenShare7d
-      - basis
       properties:
         total:
           type: integer
@@ -6033,7 +6013,6 @@ components:
       - graduated7d
       - survival7d
       - chains
-      - basis
       properties:
         seen7d:
           type: integer
@@ -6058,7 +6037,6 @@ components:
       required:
       - tokensMoved7d
       - topShare7d
-      - basis
       properties:
         tokensMoved7d:
           type: integer
@@ -6310,7 +6288,6 @@ components:
       - totalUsd
       - partialUsd
       - ageSeconds
-      - basis
       - tier
       - partial
       - partialReason
@@ -6424,7 +6401,6 @@ components:
       - at
       - totalUsd
       - partialUsd
-      - basis
       - tier
       - coverage
       - chains
@@ -7123,7 +7099,6 @@ components:
       required:
       - at
       - totalUsd
-      - basis
       properties:
         at:
           type: string
@@ -7289,7 +7264,8 @@ components:
         logoUrl:
           type: string
           nullable: true
-          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither source has one.
+          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
+            source has one.
         priceUsd:
           type: number
           nullable: true
@@ -7416,7 +7392,8 @@ components:
         logoUrl:
           type: string
           nullable: true
-          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither source has one.
+          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
+            source has one.
         holders:
           type: integer
           description: Distinct tracked leaders holding it (holdings snapshot).
@@ -7757,7 +7734,6 @@ components:
       - freshWalletRate
       - sniperHoldRate
       - botDegenRate
-      - basis
       - tier
       - source
       properties:
@@ -7972,7 +7948,6 @@ components:
       - top3
       - top10
       - leaders
-      - basis
       - coverage
       properties:
         top1:
@@ -7998,7 +7973,6 @@ components:
       required:
       - of
       - total
-      - share
       properties:
         of:
           type: integer
@@ -8296,7 +8270,8 @@ components:
         logoUrl:
           type: string
           nullable: true
-          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither source has one.
+          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
+            source has one.
         holders:
           type: integer
         previousHolders:
@@ -8318,8 +8293,8 @@ components:
           type: string
     TokenPricePoint:
       type: object
-      description: One bucket of the series. `1h` points carry `usd` and `liquidityUsd`; coarser steps carry
-        the candle (`usd` is the close). A missing figure is `null`, never 0.
+      description: One bucket of the series. `1h` points carry `usd` and `liquidityUsd`; coarser steps
+        carry the candle (`usd` is the close). A missing figure is `null`, never 0.
       required:
       - at
       - usd
@@ -8348,8 +8323,8 @@ components:
         hours:
           type: integer
           nullable: true
-          description: Hourly samples the bucket holds; a partial bucket has fewer than 24 / 168 / ~720. Absent
-            on `1h`.
+          description: Hourly samples the bucket holds; a partial bucket has fewer than 24 / 168 / ~720.
+            Absent on `1h`.
         liquidityUsd:
           type: number
           nullable: true
@@ -8479,7 +8454,8 @@ components:
           type: array
           minItems: 1
           maxItems: 50
-          description: Token addresses, case-insensitive. Over 50 is a 400 refusal; a duplicate is 400 `duplicate_identifier`.
+          description: Token addresses, case-insensitive. Over 50 is a 400 refusal; a duplicate is 400
+            `duplicate_identifier`.
           items:
             type: string
         chain:
@@ -11211,7 +11187,7 @@ paths:
                     costAmountShare: 1
                     balanceAt: '2026-09-16T06:12:41.000Z'
                     priceUsd: 0.0147
-                    priceSource: gmgn_token_info
+                    priceSource: token_info
                     pricedAt: '2026-09-16T06:00:14.000Z'
                     drawdownShare: 0.31
                     valueUsd: 18375
@@ -11864,14 +11840,14 @@ paths:
       - AUM
       summary: Built balance history for one trader at an hourly, daily, weekly or monthly grain
       description: 'Balance over time BUILT from stored holdings and prices (the `aum_history` table,
-        hourly grain, and its daily / weekly / monthly rollup views), so a chart can show any grain
-        including the past. Distinct from `/aum`, which serves the sampled readings. The range is a
-        `window` ending now, or an explicit `from`/`to`; `step` defaults from the window (1d, 1w → 1h;
-        1m, 3m → 1d; 1y → 1w; all → 1mo). Points are ascending, newest last; `limit` keeps the NEWEST
-        points. There is no cursor: the range is bounded. `totalUsd` is `null` when the hour was not
-        valued (`reason` says why on hourly points); `null` means absent, never 0. Hourly points carry
-        `basis`, `reason`, `pricedPositions`, `totalPositions`; rolled-up points carry `highUsd`,
-        `lowUsd`, `valuedHours` and `totalUsd` is the close (last valued hour in the bucket).'
+        hourly grain, and its daily / weekly / monthly rollup views), so a chart can show any grain including
+        the past. Distinct from `/aum`, which serves the sampled readings. The range is a `window` ending
+        now, or an explicit `from`/`to`; `step` defaults from the window (1d, 1w → 1h; 1m, 3m → 1d; 1y
+        → 1w; all → 1mo). Points are ascending, newest last; `limit` keeps the NEWEST points. There is
+        no cursor: the range is bounded. `totalUsd` is `null` when the hour was not valued (`reason` says
+        why on hourly points); `null` means absent, never 0. Hourly points carry `basis`, `reason`, `pricedPositions`,
+        `totalPositions`; rolled-up points carry `highUsd`, `lowUsd`, `valuedHours` and `totalUsd` is
+        the close (last valued hour in the bucket).'
       parameters:
       - name: handle
         in: path
@@ -11884,8 +11860,8 @@ paths:
       - name: step
         in: query
         required: false
-        description: 'Grain. Defaults from `window`. Any other word answers 400 `bad_request` with
-          `parameter: "step"`.'
+        description: 'Grain. Defaults from `window`. Any other word answers 400 `bad_request` with `parameter:
+          "step"`.'
         schema:
           type: string
           enum:
@@ -11896,8 +11872,8 @@ paths:
       - name: window
         in: query
         required: false
-        description: 'Range ending now; default `1w`. `all` has no lower bound. Any other word answers 400
-          `bad_request` with `parameter: "window"`.'
+        description: 'Range ending now; default `1w`. `all` has no lower bound. Any other word answers
+          400 `bad_request` with `parameter: "window"`.'
         schema:
           type: string
           enum:
@@ -12068,14 +12044,14 @@ paths:
       - AUM
       summary: Built balance history for up to 50 traders at one grain
       description: 'The batch form of `GET /v1/traders/{handle}/aum/history`. Takes up to 50 ids (handles,
-        display handles or `trd_` ids) and one `step` / `window` / `from` / `to` (same defaults and
-        rules as the GET; `limit` is fixed at 2000 newest points per trader), and answers one
-        `traders[]` entry per requested id in the order sent: `ok: true` with that trader''s series
-        (the GET shape minus `links`), or `ok: false` with a `not_found` error object for an id the
-        directory does not hold. Over 50 ids is a 400 refusal, never a silent trim, and a duplicate id
-        (or an id and its handle naming the same trader) is a 400 `duplicate_identifier`. One SQL read
-        serves every id. The envelope''s `asOf` is the newest build time across the traders answered,
-        `null` when none has history. The response''s `x-cost-units` header equals `asked`.'
+        display handles or `trd_` ids) and one `step` / `window` / `from` / `to` (same defaults and rules
+        as the GET; `limit` is fixed at 2000 newest points per trader), and answers one `traders[]` entry
+        per requested id in the order sent: `ok: true` with that trader''s series (the GET shape minus
+        `links`), or `ok: false` with a `not_found` error object for an id the directory does not hold.
+        Over 50 ids is a 400 refusal, never a silent trim, and a duplicate id (or an id and its handle
+        naming the same trader) is a 400 `duplicate_identifier`. One SQL read serves every id. The envelope''s
+        `asOf` is the newest build time across the traders answered, `null` when none has history. The
+        response''s `x-cost-units` header equals `asked`.'
       requestBody:
         required: true
         description: Must be JSON; a body that does not parse answers 400 `bad_request` ("body must be
@@ -12164,8 +12140,8 @@ paths:
                     code: not_found
                     detail: no trader 'trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f' in the directory
         '400':
-          description: '`ids` missing, empty, over 50 or duplicated; `step` / `window` not a published word;
-            `from` / `to` unparseable or inverted; body not JSON'
+          description: '`ids` missing, empty, over 50 or duplicated; `step` / `window` not a published
+            word; `from` / `to` unparseable or inverted; body not JSON'
           content:
             application/json:
               schema:
@@ -12241,12 +12217,12 @@ paths:
       tags:
       - AUM
       summary: The trader's live value, without the series
-      description: 'The `now` block of `GET /v1/traders/{handle}/aum/history` on its own, for callers that
-        only want the current figure. Read from `aum_live`, which is refreshed when a watched wallet
-        transacts (Solana push), when a balance slice reads the wallet, and when prices land; the
-        hourly series'' last point is refreshed with it. `now` is `null` when the trader has no live
-        figure yet; `now.totalUsd` is `null` when not valued (`reason` says why), never 0. `ageSeconds`
-        is how old the figure was when answered.'
+      description: The `now` block of `GET /v1/traders/{handle}/aum/history` on its own, for callers that
+        only want the current figure. Read from `aum_live`, which is refreshed when a watched wallet transacts
+        (Solana push), when a balance slice reads the wallet, and when prices land; the hourly series'
+        last point is refreshed with it. `now` is `null` when the trader has no live figure yet; `now.totalUsd`
+        is `null` when not valued (`reason` says why), never 0. `ageSeconds` is how old the figure was
+        when answered.
       parameters:
       - name: handle
         in: path
@@ -13075,7 +13051,7 @@ paths:
                   balanceAt: '2026-09-16T06:12:41.000Z'
                   tier: verified
                   priceUsd: 0.0147
-                  priceSource: gmgn_token_info
+                  priceSource: token_info
                   pricedAt: '2026-09-16T06:00:14.000Z'
                   drawdownShare: 0.31
                   valueUsd: 18375
@@ -14519,14 +14495,14 @@ paths:
       tags:
       - Tokens
       summary: Price history for one token, hourly or as daily / weekly / monthly candles
-      description: 'Served from `token_price_hourly` (one DexScreener sample per held token per UTC hour
+      description: Served from `token_price_hourly` (one DexScreener sample per held token per UTC hour
         since 17 Sep 2026) and its candle views; nothing is fetched live and nothing before the first
         sample is rebuilt from the daily `token_prices`. `step` defaults from `window` (`1d`,`1w` → `1h`;
         `1m`,`3m` → `1d`; `1y` → `1w`; `all` → `1mo`); `from`/`to` override the window. `1h` points carry
         `usd` and `liquidityUsd`; coarser steps carry the candle with `usd` as the close and `hours` saying
         how full the bucket is. The newest `limit` points are kept and `truncated` says whether older
         ones were dropped. `ath` is the running high since sampling began. An address on several chains
-        without `chain` is a 400 naming them. Costs 1 unit.'
+        without `chain` is a 400 naming them. Costs 1 unit.
       parameters:
       - name: address
         in: path
@@ -14573,8 +14549,8 @@ paths:
       - name: from
         in: query
         required: false
-        description: 'ISO-8601 lower bound (inclusive); overrides the window. Unparseable is 400 with `parameter:
-          "from"`; at or after `to` is 400.'
+        description: 'ISO-8601 lower bound (inclusive); overrides the window. Unparseable is 400 with
+          `parameter: "from"`; at or after `to` is 400.'
         schema:
           type: string
           format: date-time
@@ -14647,8 +14623,8 @@ paths:
                   token: /v1/tokens/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump?chain=solana
                   activity: /v1/tokens/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump/activity?chain=solana
         '400':
-          description: Bad `step`, `window`, `from`, `to`, `limit` or `chain` (`parameter` names it), or an
-            address on several chains with no `chain` (`chains[]` names them).
+          description: Bad `step`, `window`, `from`, `to`, `limit` or `chain` (`parameter` names it),
+            or an address on several chains with no `chain` (`chains[]` names them).
           headers: *id001
           content:
             application/json:
@@ -14688,11 +14664,11 @@ paths:
       - Tokens
       summary: Price history for up to 50 tokens in one call
       description: 'The batch form of `GET /v1/tokens/{address}/prices`, one `tokens[]` entry per requested
-        address in the order sent: `ok: true` with that token''s series, or `ok: false` with `error`
-        `not_found` (not in `tokens`) or `ambiguous_chain` (on several chains and no `chain`; `chains[]`
-        names them). One SQL read serves every token. Over 50 addresses is a 400 refusal, never a silent
-        trim; a duplicate is 400 `duplicate_identifier`. Step and window rules are the GET''s; the newest
-        `pointsLimit` points are kept per token. The response''s `x-cost-units` header equals `asked`.'
+        address in the order sent: `ok: true` with that token''s series, or `ok: false` with `error` `not_found`
+        (not in `tokens`) or `ambiguous_chain` (on several chains and no `chain`; `chains[]` names them).
+        One SQL read serves every token. Over 50 addresses is a 400 refusal, never a silent trim; a duplicate
+        is 400 `duplicate_identifier`. Step and window rules are the GET''s; the newest `pointsLimit`
+        points are kept per token. The response''s `x-cost-units` header equals `asked`.'
       requestBody:
         required: true
         description: Must be JSON; a body that does not parse answers 400 `bad_request` ("body must be
