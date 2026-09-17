@@ -7,7 +7,8 @@ export const DAY_MS = 86_400_000;
 /** Binance returns at most this many candles a call; ~2.7 years of days. */
 export const KLINES_LIMIT = 1000;
 
-/** Quote symbol -> Binance pair. Symbols absent here cannot be priced and are reported. */
+/** Quote symbol -> exchange pair. Binance and Bybit spell these the same, so one map serves both.
+ *  Symbols absent here cannot be priced and are reported. */
 export const PAIR: Readonly<Record<string, string>> = {
   SOL: "SOLUSDT",
   wSOL: "SOLUSDT",
@@ -16,6 +17,17 @@ export const PAIR: Readonly<Record<string, string>> = {
   WBNB: "BNBUSDT",
   BNB: "BNBUSDT",
 };
+
+/**
+ * Bybit wraps its candles in `result.list`; each row is
+ * `[startMs, open, high, low, close, volume, turnover]`, so index 0 and index 4 mean exactly what
+ * they mean in a Binance kline and `parseKlines` reads it unchanged. Anything else is an empty page.
+ */
+export function bybitList(body: unknown): unknown[] {
+  const result = typeof body === "object" && body !== null ? (body as { result?: unknown }).result : undefined;
+  const list = typeof result === "object" && result !== null ? (result as { list?: unknown }).list : undefined;
+  return Array.isArray(list) ? list : [];
+}
 
 export interface Closes {
   /** UTC day -> close, in candle order. */

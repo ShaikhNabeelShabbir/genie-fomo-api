@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { DAY_MS, PAIR, parseKlines, seriesStartMs } from "../worker/src/jobs/quote_prices-core.ts";
+import { DAY_MS, PAIR, bybitList, parseKlines, seriesStartMs } from "../worker/src/jobs/quote_prices-core.ts";
 
 // Expected values mirror scripts/load_quote_prices.mjs (the twin).
 
@@ -29,4 +29,25 @@ Deno.test("seriesStartMs: first swap day minus one day of slack; a year back whe
 Deno.test("PAIR: wSOL and SOL both price from SOLUSDT; an unmapped symbol is undefined", () => {
   assertEquals([PAIR.wSOL, PAIR.SOL, PAIR.WETH, PAIR.WBNB], ["SOLUSDT", "SOLUSDT", "ETHUSDT", "BNBUSDT"]);
   assertEquals(PAIR.USDC, undefined);
+});
+
+Deno.test("bybitList: candles come out of result.list, and parseKlines reads them as klines", () => {
+  const body = {
+    retCode: 0,
+    result: {
+      symbol: "BNBUSDT",
+      // [startMs, open, high, low, close, volume, turnover] — open at 0 and close at 4, as a kline.
+      list: [["1789603200000", "725.9", "729.2", "720.9", "725.1", "2146.0", "1556825.2"]],
+    },
+  };
+  const closes = parseKlines(bybitList(body));
+  assertEquals(closes.count, 1);
+  assertEquals(closes.byDay.get("2026-09-17"), 725.1);
+});
+
+Deno.test("bybitList: a refusal or an unexpected envelope is an empty page, never a throw", () => {
+  for (const body of [null, {}, { result: null }, { result: { list: "nope" } }, { retCode: 10001 }]) {
+    assertEquals(bybitList(body).length, 0);
+    assertEquals(parseKlines(bybitList(body)).count, 0);
+  }
 });

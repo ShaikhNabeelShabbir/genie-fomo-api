@@ -1,7 +1,7 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { ADDRESSES_PER_CALL, bestPairs, fetchPairs } from "../../../supabase/functions/_shared/dexscreener.ts";
-import { DAY_MS, KLINES_LIMIT, PAIR, parseKlines, seriesStartMs } from "./quote_prices-core";
+import { DAY_MS, KLINES_LIMIT, PAIR, bybitList, parseKlines, seriesStartMs } from "./quote_prices-core";
 
 /**
  * Quote-asset and Robinhood-coin pricing into `token_prices`, the Worker half of refresh.yml
@@ -25,6 +25,16 @@ interface QuoteAsset { readonly network_id: number; readonly token_key: string; 
 interface RobinhoodToken { readonly token_key: string; readonly address: string }
 
 const BINANCE = "https://api.binance.com/api/v3/klines";
+/**
+ * Binance answers HTTP 403 to every request from this Worker — it refuses Cloudflare's egress, and
+ * that single refusal is why native ETH and BNB had no price and why WBNB-quoted swaps had no
+ * dollar value (N1 and X2, diagnosed 17 Sep 2026). Bybit serves the same daily candles from the
+ * same pair names, and its rows put the open time at index 0 and the close at index 4 exactly as a
+ * kline does, so the existing parse reads them unchanged.
+ */
+const BYBIT = "https://api.bybit.com/v5/market/kline";
+/** Bybit's ceiling for one call: 1000 daily candles, about 2.7 years, so one call covers the window. */
+const BYBIT_LIMIT = 1000;
 /** Pages of KLINES_LIMIT per asset; one in practice, the loop keeps a longer history from silently truncating. */
 const MAX_PAGES = 20;
 /** Rows per value_usd update: a slice D1 finishes well inside the 30 s it allows one statement. */
@@ -65,7 +75,7 @@ const quoteAssets = (sql: Sql) => sql<QuoteAsset[]>`
 // (17 Sep). A null first_day makes \`seriesStartMs\` look a year back, one Binance page.
 
 /** Daily closes from Binance, paged from `startMs`. */
-async function dailyCloses(pair: string, startMs: number): Promise<Map<string, number>> {
+async function binanceCloses(pair: string, startMs: number): Promise<Map<string, number>> {
   const out = new Map<string, number>();
   let cursor = startMs;
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -78,6 +88,26 @@ async function dailyCloses(pair: string, startMs: number): Promise<Map<string, n
     cursor = closes.lastOpenMs + DAY_MS;
   }
   return out;
+}
+
+/** Daily closes from Bybit, one call: the window the callers ask for fits inside `BYBIT_LIMIT`. */
+async function bybitCloses(pair: string, startMs: number): Promise<Map<string, number>> {
+  const r = await fetch(`${BYBIT}?category=spot&symbol=${pair}&interval=D&start=${startMs}&limit=${BYBIT_LIMIT}`, { signal: AbortSignal.timeout(20_000) });
+  if (!r.ok) throw new Error(`bybit HTTP ${r.status} for ${pair}`);
+  return new Map(parseKlines(bybitList(await r.json())).byDay);
+}
+
+/**
+ * Binance first, Bybit when it refuses. Both are asked for the same pair and both answer daily
+ * closes; a run that falls back says so once per asset, so a silent switch never hides a bad price.
+ */
+async function dailyCloses(pair: string, startMs: number): Promise<Map<string, number>> {
+  try {
+    return await binanceCloses(pair, startMs);
+  } catch (e) {
+    console.log(`quote_prices: ${e instanceof Error ? e.message : String(e)}; asking bybit instead`);
+    return await bybitCloses(pair, startMs);
+  }
 }
 
 /** Fetch and upsert one asset's series. Returns days written; 0 when Binance has nothing for it. */
