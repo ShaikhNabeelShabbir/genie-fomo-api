@@ -1,6 +1,6 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
-import { buildAumHistory, refreshAumLiveUnmoved } from "./valuation.ts";
+import { buildAumHistory } from "./valuation.ts";
 import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_history-core";
 
 /**
@@ -19,8 +19,6 @@ export interface AumHistorySummary {
   /** Hours planned but not built because the budget ran out (or the call failed). */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
-  /** Traders whose aum_live row was missing or older than an hour and got revalued after the build. */
-  readonly liveRefreshed: number;
   readonly elapsedMs: number;
 }
 
@@ -52,48 +50,6 @@ async function ranges(sql: Sql): Promise<TraderRange[]> {
 const build = (sql: Sql, c: Chunk): Promise<number> =>
   buildAumHistory(sql, c.handle, c.from.toISOString(), c.to.toISOString());
 
-/**
- * The share of the run's budget the live catch-up may spend before the hour-build starts.
- * A quarter covers the 400-handle ceiling in the measured pace with room to spare; the build
- * keeps the rest, and a backfill that needs more than that has needed more than one run anyway.
- */
-const LIVE_BUDGET_SHARE = 0.25;
-/** Handles per statement. Slices of 40, so no single call holds the database for minutes (17 Sep 08:5x). */
-const LIVE_SLICE = 40;
-/** The whole roster fits in one pass now, so this is a guard against a runaway, not a throttle. */
-const LIVE_MAX = 600;
-
-/**
- * A2. Everyone whose live figure is over an hour old AND whom nothing has marked as moved,
- * stalest first. Returns handles refreshed; `budgetMs` is this pass's own, not the job's.
- *
- * The `aum_live_dirty` exclusion is what makes this affordable. A marked trader belongs to the
- * Helius flush and needs the Solana roll-forward; an unmarked one can be valued from the
- * balances as read, which is about twenty times less database work per trader. Before the
- * split this pass managed ~145 traders of 446 in its window, so a trader nobody watched was
- * revalued every three hours rather than hourly (v5 fixes, A2).
- */
-async function catchUpLive(sql: Sql, started: number, budgetMs: number): Promise<number> {
-  const anHourAgo = new Date(started - 3_600_000).toISOString();
-  const stale = (await sql<{ handle: string }[]>`
-    select t.handle from traders t
-    left join aum_live l on l.handle = t.handle
-    where (l.at is null or l.at < ${anHourAgo})
-      and exists (select 1 from wallets w where w.handle = t.handle)
-      and not exists (select 1 from aum_live_dirty d where d.handle = t.handle)
-    order by l.at limit ${LIVE_MAX}`).map((r) => r.handle);
-  let n = 0;
-  for (let i = 0; i < stale.length && Date.now() - started < budgetMs; i += LIVE_SLICE) {
-    n += await refreshAumLiveUnmoved(sql, stale.slice(i, i + LIVE_SLICE), "build");
-  }
-  return n;
-}
-
-/**
- * One pass within `budgetMs`. Throws only when work was planned and none of it could be
- * built, so the cron shows as failed rather than quietly building nothing.
- */
-/** On-demand rebuild: `handles` and `from` (POST /jobs/aum_history?handles=a,b&from=ISO) re-run every hour from `from` to now for those traders; the build upserts, so no delete is needed. */
 export interface AumHistoryOptions { readonly handles?: readonly string[]; readonly from?: Date }
 
 export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistoryOptions = {}): Promise<AumHistorySummary> {
@@ -106,17 +62,6 @@ export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistory
       const resumeFrom = new Date(opts.from.getTime() - 3_600_000);
       traders = traders.filter((t) => wanted.has(t.handle)).map((t) => ({ ...t, lastBuilt: resumeFrom, firstBuilt: null }));
     }
-    /**
-     * A2 (v5 fixes, 17 Sep 2026). THE LIVE CATCH-UP RUNS FIRST, ON ITS OWN BUDGET.
-     *
-     * It used to be the tail of this job, guarded by `while (Date.now() - started < budgetMs)`.
-     * The hour-build loop above it spends the whole budget on a backfill, so the catch-up was
-     * reached only when there was nothing to build -- and two traders sat at `at: 07:35:13`,
-     * `source: build` for six hours while the webhook feed refreshed everyone it saw move.
-     * A trader nobody watches is exactly the one this pass exists for, so it goes first.
-     */
-    const liveRefreshed = await catchUpLive(sql, started, budgetMs * LIVE_BUDGET_SHARE);
-
     const work = planWork(traders, new Date(started), CHUNK_HOURS);
     const planned = work.reduce((n, c) => n + c.hours, 0);
     let hours = 0, attempted = 0, failed = 0, stoppedEarly = false;
@@ -136,7 +81,6 @@ export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistory
       hours,
       remaining: planned - hours,
       stoppedEarly,
-      liveRefreshed,
       elapsedMs: Date.now() - started,
     };
   } finally {
