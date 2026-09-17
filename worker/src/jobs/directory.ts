@@ -1,6 +1,7 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
 import { db } from "../db";
+import { evmChainsSeen } from "./tokens";
 import {
   SOLANA_NETWORK_ID, SOURCE, canonical, chunk, holdingRows, isRecord, mergePositions, parseBalances,
   parseLeaderboard, parseOpenTrades, rejectBuild, statsRow, tokenRows, traderRow, walletRow,
@@ -36,14 +37,6 @@ const TRADE_LIMIT = 100;
 const FANOUT = 6;
 const TRIES = 3;
 const FETCH_TIMEOUT_MS = 45_000;
-const RPC_TIMEOUT_MS = 20_000;
-/** fomoapi never returns a chain id, so it is recovered from the chain itself with eth_getCode. */
-const EVM_CHAINS: readonly (readonly [number, string])[] = [
-  [4663, "https://rpc.mainnet.chain.robinhood.com"],
-  [1, "https://ethereum-rpc.publicnode.com"],
-  [56, "https://bsc-dataseed.binance.org"],
-  [8453, "https://mainnet.base.org"],
-];
 
 export interface DirectorySummary {
   /** Leaderboard traders fetched this run; 0 when the run resumed an unfinished generation. */
@@ -97,34 +90,18 @@ async function apiGet(path: string, key: string, signal: AbortSignal): Promise<u
   throw new Error("exhausted retries");
 }
 
-/** eth_getCode returns '0x' where nothing is deployed. The User-Agent matters: some of these RPCs reject a bare client with 403. */
-async function hasCode(rpc: string, addr: string, signal: AbortSignal): Promise<boolean> {
-  try {
-    const r = await fetch(rpc, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "User-Agent": UA },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getCode", params: [addr, "latest"] }),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(RPC_TIMEOUT_MS)]),
-    });
-    const body: unknown = await r.json();
-    return (isRecord(body) && typeof body.result === "string" ? body.result : "0x").length > 2;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * A contract can exist at one address on several EVM chains, so every hit is returned and the
  * position is emitted once per chain: the resolver finds no holder on the wrong one and
  * self-corrects, which beats guessing. `cache` is keyed on the lowercased address.
  */
-async function detectNetworks(addr: string, cache: Map<string, readonly number[]>, signal: AbortSignal): Promise<readonly number[]> {
+async function detectNetworks(addr: string, cache: Map<string, readonly number[]>, bitqueryKey: string): Promise<readonly number[]> {
   if (!addr.startsWith("0x")) return [SOLANA_NETWORK_ID];
   const key = addr.toLowerCase();
   const hit = cache.get(key);
   if (hit) return hit;
-  const found = await Promise.all(EVM_CHAINS.map(([, rpc]) => hasCode(rpc, addr, signal)));
-  const nets = EVM_CHAINS.filter((_, i) => found[i]).map(([id]) => id);
+  // Bitquery, not public RPC (18 Sep 2026): a failed probe is an empty list this run, retried next night.
+  const nets = (await evmChainsSeen(bitqueryKey, addr)) ?? [];
   cache.set(key, nets);
   return nets;
 }
@@ -142,7 +119,7 @@ async function knownNetworks(sql: Sql): Promise<Map<string, readonly number[]>> 
 }
 
 /** Current positions, the fingerprint the resolver verifies against: /trades (open, EVM + Solana) merged with /balances (Solana, live). */
-async function fetchPositions(handle: string, key: string, cache: Map<string, readonly number[]>, signal: AbortSignal): Promise<Fetched> {
+async function fetchPositions(handle: string, key: string, bitqueryKey: string, cache: Map<string, readonly number[]>, signal: AbortSignal): Promise<Fetched> {
   let failed = 0;
   let trades: OpenTrade[] = [];
   try {
@@ -152,7 +129,7 @@ async function fetchPositions(handle: string, key: string, cache: Map<string, re
     console.error(`directory: ${handle}: trades unavailable (${msg(e)})`);
   }
   const placed: (OpenTrade & { readonly networks: readonly number[] })[] = [];
-  for (const t of trades) placed.push({ ...t, networks: await detectNetworks(t.address, cache, signal) });
+  for (const t of trades) placed.push({ ...t, networks: await detectNetworks(t.address, cache, bitqueryKey) });
   let balances: Position[] = [];
   try {
     balances = parseBalances(await apiGet(`/v2/users/${encodeURIComponent(handle)}/balances`, key, signal));
@@ -260,6 +237,8 @@ async function writePositions(sql: Sql, captured: Date, group: readonly Target[]
 export async function runDirectory(env: Env, budgetMs: number): Promise<DirectorySummary> {
   const key = (env.FOMOAPI_KEY ?? "").trim();
   if (!key) throw new Error("FOMOAPI_KEY is not set; refusing to run the directory refresh");
+  const bitqueryKey = (env.BITQUERY_KEY ?? "").trim();
+  if (!bitqueryKey) throw new Error("BITQUERY_KEY is not set; EVM chain detection needs it");
   const started = Date.now();
   const deadline = AbortSignal.timeout(budgetMs);
   const sql = db(env);
@@ -288,7 +267,7 @@ export async function runDirectory(env: Env, budgetMs: number): Promise<Director
     let done = 0, written = 0;
     for (const group of chunk(gen.targets, FANOUT)) {
       if (deadline.aborted) { s.stoppedEarly = true; break; }
-      const fetched = await Promise.all(group.map((t) => fetchPositions(t.display_handle, key, cache, deadline)));
+      const fetched = await Promise.all(group.map((t) => fetchPositions(t.display_handle, key, bitqueryKey, cache, deadline)));
       /* A chunk the deadline cut into is not written: its traders are refetched when the generation resumes. */
       if (deadline.aborted) { s.stoppedEarly = true; break; }
       s.errored += fetched.filter((f) => f.failed > 0).length;

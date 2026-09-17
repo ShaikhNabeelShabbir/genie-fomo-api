@@ -30,7 +30,7 @@ export const NETWORK_OF: ReadonlyMap<string, number> = new Map<string, number>([
 
 /** `source` means WHO TOLD US — the provider, not the protocol Helius attributes. */
 export const providerOf = (chain: string): string =>
-  chain === "solana" ? "helius" : chain === "robinhood" ? "blockscout" : "bitquery";
+  chain === "solana" ? "helius" : "bitquery";
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 

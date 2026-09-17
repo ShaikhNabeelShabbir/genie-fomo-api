@@ -116,91 +116,7 @@ function nextParams(next: unknown, items: readonly unknown[]): string {
 
 // ------------------------------------------------------------------ Robinhood
 
-async function blockscoutTx(
-  chainId: number, wallet: string, limit: number, pages: number,
-): Promise<Transfer[]> {
-  const cfg = chainOf(chainId);
-  const out: Transfer[] = [];
-  let params = "";
-  for (let p = 0; p < pages && out.length < limit; p++) {
-    const r = await fetch(
-      `${cfg.blockscout}/api/v2/addresses/${wallet}/token-transfers${params}`,
-      { headers: HEADERS, signal: AbortSignal.timeout(25_000) },
-    );
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = rec(await r.json());
-    const items = recs(d.items);
-    for (const t of items) {
-      const token = rec(t.token);
-      const total = rec(t.total);
-      let amount: number | null = null;
-      try {
-        const dec = Number(total.decimals ?? token.decimals ?? 0);
-        amount = Number(big(total.value)) / 10 ** dec;
-      } catch {
-        amount = null;
-      }
-      out.push(row(
-        wallet, cfg.name, str(t.tx_hash ?? t.transaction_hash), secs(str(t.timestamp)),
-        str(token.symbol),
-        // newer Blockscout names the contract address_hash
-        str(token.address_hash ?? token.address),
-        amount, str(rec(t.from).hash), str(rec(t.to).hash), cfg.explorer,
-      ));
-    }
-    params = nextParams(d.next_page_params, items);
-    if (!params) break;
-  }
-  return out.slice(0, limit);
-}
-
 /** Native-currency movements and gas, from Blockscout's plain transaction list. */
-async function blockscoutNative(
-  chainId: number, wallet: string, limit: number, pages: number,
-): Promise<{ rows: Transfer[]; gas: GasMap }> {
-  const cfg = chainOf(chainId);
-  const rows: Transfer[] = [];
-  const gas: GasMap = new Map();
-  let params = "";
-  let seen = 0;
-
-  for (let p = 0; p < pages && seen < limit; p++) {
-    const r = await fetch(
-      `${cfg.blockscout}/api/v2/addresses/${wallet}/transactions${params}`,
-      { headers: HEADERS, signal: AbortSignal.timeout(25_000) },
-    );
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = rec(await r.json());
-    const items = recs(d.items);
-    for (const t of items) {
-      seen++;
-      const hash = str(t.hash);
-      const from = str(rec(t.from).hash);
-      const to = str(rec(t.to).hash);
-      const ts = secs(str(t.timestamp));
-
-      let value = 0;
-      try { value = Number(big(t.value)) / 1e18; } catch { value = 0; }
-      if (value > 0) {
-        rows.push(row(wallet, cfg.name, hash, ts, cfg.nativeSymbol, "native",
-          value, from, to, cfg.explorer));
-      }
-      // Only the sender pays for the block space.
-      if (from.toLowerCase() === wallet.toLowerCase()) {
-        try {
-          const fee = Number(big(t.gas_used) * big(t.gas_price)) / 1e18;
-          if (fee > 0) gas.set(hash, fee);
-        } catch { /* fee fields absent on some Blockscout builds */ }
-      }
-    }
-    params = nextParams(d.next_page_params, items);
-    if (!params) break;
-  }
-  return { rows, gas };
-}
-
-// ------------------------------------------------- Ethereum / BSC / Base
-
 async function bitqueryTx(key: string, chainId: number, wallet: string, limit: number): Promise<Transfer[]> {
   const cfg = chainOf(chainId);
   const query = `{
@@ -319,17 +235,8 @@ async function evmChain(
   const cfg = chainOf(chainId);
   const gas: GasMap = new Map();
   try {
-    let rows: Transfer[];
-    if (cfg.name === "robinhood" && cfg.blockscout) {
-      rows = await blockscoutTx(chainId, wallet, limit, opts.pages);
-      if (opts.includeNative) {
-        const n = await blockscoutNative(chainId, wallet, limit, opts.pages);
-        rows = rows.concat(n.rows);
-        for (const [h, f] of n.gas) gas.set(h, f);
-      }
-    } else {
-      rows = await bitqueryTx(keys.bitquery ?? "", chainId, wallet, limit);
-    }
+    // Every EVM chain, Robinhood included, comes from Bitquery (18 Sep 2026): no free explorer API.
+    const rows: Transfer[] = await bitqueryTx(keys.bitquery ?? "", chainId, wallet, limit);
     return { rows, gas, status: { chain: cfg.name, count: rows.length, error: null } };
   } catch (e) {
     return { rows: [], gas, status: { chain: cfg.name, count: 0, error: message(e) } };

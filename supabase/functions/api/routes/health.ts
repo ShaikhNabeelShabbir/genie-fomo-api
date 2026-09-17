@@ -259,7 +259,7 @@ async function healthBody(): Promise<Record<string, unknown>> {
       const caps: { name: string; supplies: FeedName[]; key: string }[] = [
         { name: "solana history and balances", key: "HELIUS_SOLANA_KEY",
           supplies: ["transactions", "positions", "aum"] },
-        { name: "evm history", key: "ETHERSCAN_KEY", supplies: ["transactions"] },
+        { name: "evm history", key: "BITQUERY_KEY", supplies: ["transactions"] },
         { name: "evm address resolution", key: "BITQUERY_KEY", supplies: ["wallets"] },
         { name: "trader directory and trades", key: "FOMOAPI_KEY", supplies: ["traders", "trades"] },
         { name: "gmgn directory", key: "GMGN_API_KEY", supplies: ["traders"] },

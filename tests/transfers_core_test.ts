@@ -19,7 +19,7 @@ Deno.test("NETWORK_OF: solana plus every EVM chain by name", () => {
   assertEquals(providerOf("solana"), "helius");
   assertEquals(providerOf("base"), "bitquery");
   assertEquals(providerOf("ethereum"), "bitquery");
-  assertEquals(providerOf("robinhood"), "blockscout");
+  assertEquals(providerOf("robinhood"), "bitquery");
 });
 
 Deno.test("toRows: solana row keys on the sol wallet, counterparty is the other end of the leg, time from seconds", () => {

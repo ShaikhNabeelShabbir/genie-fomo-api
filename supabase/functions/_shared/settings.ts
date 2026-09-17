@@ -10,7 +10,6 @@ export interface EvmChain {
   readonly name: string;
   readonly bitquery: string;
   /** null where no usable instance exists — BSC has none, Base's returns 500s. */
-  readonly blockscout: string | null;
   readonly rpc: string;
   readonly explorer: string;
   /** Gas token — what a fee is denominated in, and the native leg of a swap. */
@@ -21,7 +20,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
   4663: {
     name: "robinhood",
     bitquery: "robinhood",
-    blockscout: "https://robinhoodchain.blockscout.com",
     rpc: "https://rpc.mainnet.chain.robinhood.com",
     explorer: "https://robinhoodchain.blockscout.com",
     nativeSymbol: "ETH",
@@ -29,7 +27,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
   1: {
     name: "ethereum",
     bitquery: "eth",
-    blockscout: "https://eth.blockscout.com",
     rpc: "https://ethereum-rpc.publicnode.com",
     explorer: "https://etherscan.io",
     nativeSymbol: "ETH",
@@ -37,7 +34,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
   56: {
     name: "bsc",
     bitquery: "bsc",
-    blockscout: null,
     rpc: "https://bsc-dataseed.binance.org",
     explorer: "https://bscscan.com",
     nativeSymbol: "BNB",
@@ -45,7 +41,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
   8453: {
     name: "base",
     bitquery: "base",
-    blockscout: null,
     rpc: "https://mainnet.base.org",
     explorer: "https://basescan.org",
     nativeSymbol: "ETH",

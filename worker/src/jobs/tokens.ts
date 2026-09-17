@@ -66,17 +66,22 @@ ${EVM_IDS.map((id) => `  n${id}: EVM(network: ${EVM_CHAINS[id].bitquery}, datase
   }`).join("\n")}
 }`;
 
-/** base58 shape is Solana; 0x is probed on every EVM chain at once. */
-async function chainFor(key: string, address: string): Promise<number | null> {
-  if (isSolAddress(address)) return SOLANA_NETWORK_ID;
-  if (!isEvmAddress(address)) return null;
+/** Every EVM chain on which Bitquery has seen the contract; null when the probe failed. Shared with the directory job. */
+export async function evmChainsSeen(key: string, address: string): Promise<readonly number[] | null> {
   try {
-    return singleChain(chainHits(await bitquery(key, CHAIN_PROBE, { addr: address.toLowerCase() }), EVM_IDS));
+    return chainHits(await bitquery(key, CHAIN_PROBE, { addr: address.toLowerCase() }), EVM_IDS);
   } catch (e) {
-    // Unanswered is unresolved, as in the script; the token is retried next run.
     console.error(`tokens: chain probe for ${address.slice(0, 10)}… failed: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
+}
+
+/** base58 shape is Solana; 0x is probed on every EVM chain at once. Unanswered is unresolved: retried next run. */
+async function chainFor(key: string, address: string): Promise<number | null> {
+  if (isSolAddress(address)) return SOLANA_NETWORK_ID;
+  if (!isEvmAddress(address)) return null;
+  const hits = await evmChainsSeen(key, address);
+  return hits === null ? null : singleChain(hits);
 }
 
 async function resolveChains(sql: Sql, key: string, outOfTime: () => boolean): Promise<Phase> {
