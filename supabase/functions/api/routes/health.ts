@@ -208,9 +208,12 @@ async function healthBody(): Promise<Record<string, unknown>> {
    * per-row subquery.
    */
 
+  // The store follows the runtime: v1 still answers from the frozen Supabase Postgres, v2 from
+  // Cloudflare D1 (17 Sep 2026). Saying "postgres" on v2 misnamed the database to every consumer.
+  const onDeno = Boolean((globalThis as { Deno?: unknown }).Deno);
   return {
-    runtime: (globalThis as { Deno?: unknown }).Deno ? "supabase edge function (deno)" : "cloudflare worker",
-    source: "postgres",
+    runtime: onDeno ? "supabase edge function (deno)" : "cloudflare worker",
+    source: onDeno ? "postgres" : "cloudflare d1",
     build: { capturedAt: b?.captured_at ?? null, window: b?.window_label ?? null },
     /** Per-feed freshness AND a verdict on it. See docs/DECISIONS.md#d068 */
     feeds,

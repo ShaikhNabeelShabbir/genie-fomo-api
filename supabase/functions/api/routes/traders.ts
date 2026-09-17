@@ -457,7 +457,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
         firstSeenAt: act.first_at ? new Date(String(act.first_at)).toISOString() : null,
         lastActiveAt: act.last_at ? new Date(String(act.last_at)).toISOString() : null,
         tier: "verified",
-        source: "postgres · transactions (helius webhook)",
+        source: "d1 · transactions (helius webhook)",
         note: "counted from transfers we ingested, not from fomo's figures — and only from " +
               "the date on-chain ingestion began, so these are floors for older wallets",
       }

@@ -149,6 +149,6 @@ get("/v1/events", async (_p, url) => {
           "its `at`. Readings are the sampler's balance readings (basis sampled). " +
           "`since` defaults to the last 24 hours; page forward with `nextCursor`. " +
           "`?chain=` excludes readings, which are not per chain.",
-    source: "postgres · transactions, wallet_swaps, aum_samples, token_info",
+    source: "d1 · transactions, wallet_swaps, aum_samples, token_info",
   };
 });

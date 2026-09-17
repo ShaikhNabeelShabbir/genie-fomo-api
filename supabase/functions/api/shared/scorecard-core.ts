@@ -987,8 +987,8 @@ export async function scorecardBody(
     handle: t.display_handle, name: t.name ?? null,
     /** WHERE THESE ROWS CAME FROM — and it is not the same answer for every trader. See docs/DECISIONS.md#d164 */
     source: t.source === "gmgn"
-      ? "postgres · trades (folded from GMGN wallet activity)"
-      : "postgres · trades (loaded from fomoapi)",
+      ? "d1 · trades (folded from GMGN wallet activity)"
+      : "d1 · trades (loaded from fomoapi)",
     /** The directory this trader came from, the same value `GET /v1/traders` reports. */
     traderSource: t.source ?? null,
     /**

@@ -62,7 +62,7 @@ export function pnlBody(t: any, r: any | undefined) {
 
   return {
     handle: t.display_handle, name: t.name ?? null,
-    source: "postgres · trades",
+    source: "d1 · trades",
     bankedUsd: any ? round(realized) : null,
     closedTrades: closed,
     onPaperUsd: any ? round(unrealized) : null,

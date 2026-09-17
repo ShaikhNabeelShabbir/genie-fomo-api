@@ -778,7 +778,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     holdersInDirectory: holderCount,
     asOf: await asOfToken(key),
     totalValueUsd: priced.length ? round(priced.reduce((s, h) => s + (n(h.value) ?? 0), 0)) : null,
-    source: "postgres · trades",
+    source: "d1 · trades",
     /** Two different populations, kept apart on purpose. See docs/DECISIONS.md#d091 */
     coverage: {
       holdersNow: holderCount,

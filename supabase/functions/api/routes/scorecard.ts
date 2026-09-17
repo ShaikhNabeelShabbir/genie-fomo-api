@@ -125,7 +125,7 @@ get("/v1/traders/:handle/pnl", async ({ handle }) => {
       firstSwapAt: chain?.first_at ? new Date(String(chain.first_at)).toISOString() : null,
       lastSwapAt: chain?.last_at ? new Date(String(chain.last_at)).toISOString() : null,
       tier: "verified",
-      source: "postgres · wallet_swaps (helius rpc pre/post balances)",
+      source: "d1 · wallet_swaps (helius rpc pre/post balances)",
       basis: "both sides of each swap resolved from the wallet's net balance change, so a " +
              "buy and its matching sell reconcile on quantity. Solana only.",
       coverage: cov(swaps, Number(seen?.n ?? 0)),

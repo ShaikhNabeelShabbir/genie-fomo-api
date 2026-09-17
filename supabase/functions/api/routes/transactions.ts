@@ -99,7 +99,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     handle: t.display_handle,
     name: t.name ?? null,
     wallets: { evm: t.evm_address ?? null, solana: t.sol_address ?? null },
-    source: "postgres · transactions",
+    source: "d1 · transactions",
     asOf: stored.newest ? new Date(String(stored.newest)).toISOString() : null,
     /** What this feed is, said plainly, because it is easy to mistake for something else. See docs/DECISIONS.md#d113 */
     feed: "transfers",
@@ -475,6 +475,6 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
            "a chain with no rows here is one where we resolved none of this wallet's own " +
            "trades, not one where it made none",
     },
-    source: "postgres · wallet_swaps (helius rpc pre/post balances)",
+    source: "d1 · wallet_swaps (helius rpc pre/post balances)",
   };
 });
