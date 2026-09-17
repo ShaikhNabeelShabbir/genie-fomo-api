@@ -74,8 +74,22 @@ Deno.test({
   },
 });
 
-Deno.test("aumHistory.now.reason and points[].reason publish the same words", () => {
-  assertEquals([...VOCABULARY.fields["aumHistory.now.reason"]], [...VOCABULARY.fields["aumHistory.points[].reason"]]);
+/*
+ * The live figure and a history point are refused for the same reasons, with one exception the
+ * route owns: `not_built` is an hour inside the window that the builder never wrote (A3), and
+ * `now` is one figure with no hours to have holes in. So the live words are a SUBSET, not a
+ * copy: anything a point can say about a figure, `now` may say too.
+ */
+Deno.test("every aumHistory.now.reason is also a points[].reason", () => {
+  const points = new Set<string>(VOCABULARY.fields["aumHistory.points[].reason"]);
+  for (const w of VOCABULARY.fields["aumHistory.now.reason"]) {
+    assert(points.has(w), `published on now but not on a point: ${w}`);
+  }
+  assertEquals(
+    VOCABULARY.fields["aumHistory.points[].reason"].filter((w) =>
+      !(VOCABULARY.fields["aumHistory.now.reason"] as readonly string[]).includes(w)),
+    ["not_built"],
+  );
 });
 
 Deno.test("points[].refused and gaps[].reason publish the same words", () => {

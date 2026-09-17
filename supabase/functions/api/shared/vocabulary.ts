@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 11,
+  version: 12,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -37,8 +37,13 @@ export const VOCABULARY = {
                                 "price_suspect_and_unsellable_positions_and_indexer_coverage_low"],
     /* v3 fixes (V1d): no market behind the price: worth over 10x its best pool, or over $1M with no pool known. */
     "positions[].priceSuspectReason": ["implied_mcap_over_ceiling", "concentration_over_ceiling", "no_market_over_ceiling"],
-    /* v3 fixes (V1c): which price ladder rung valued the holding; the balances job writes the first three, the directory build the last. */
-    "positions[].priceSource": ["pegged", "token_info", "token_prices", "fomo_reported_entry"],
+    /**
+     * v3 fixes (V1c): which price ladder rung valued the holding. Since 17 Sep 2026 (v5 fixes,
+     * A1/N1/R7) every route prices from ONE ladder at request time — pegged -> token_price_stats
+     * -> token_prices (<= 7 days) -> token_info — so `token_price_stats`, the hourly DexScreener
+     * price, can now appear. `fomo_reported_entry` is still the directory build's own.
+     */
+    "positions[].priceSource": ["pegged", "token_price_stats", "token_info", "token_prices", "fomo_reported_entry"],
     /* v3 fixes (R6): the sent-transaction count is Bitquery's realtime window, a lower bound on the nonce. */
     "positions.coverage.chains.*.basis": ["bitquery_realtime"],
     "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
@@ -94,11 +99,18 @@ export const VOCABULARY = {
     /* 17 Sep 2026, v9: /aum/history, built from stored holdings and prices (table aum_history). */
     "aumHistory.step": ["1h", "1d", "1w", "1mo"],
     "aumHistory.points[].basis": ["reading", "priced"],
-    "aumHistory.points[].reason": ["no_holdings", "no_prices", "too_little_priced", "price_suspect"],
+    /* `not_built` is the route's own: an hour inside the window that the builder never wrote. */
+    "aumHistory.points[].reason": ["no_holdings", "no_prices", "too_little_priced", "price_suspect", "not_built"],
     /* The live figure (`now` on /aum/history and /aum/now): what last refreshed it, why unvalued. */
     "aumHistory.now.source": ["webhook", "balances", "prices", "build"],
     "aumHistory.now.reason": ["no_holdings", "no_prices", "too_little_priced", "price_suspect"],
     /* GET /tokens/:address/prices and POST /tokens/prices: the bucket a point covers. */
     "tokenPrices.step": ["1h", "1d", "1w", "1mo"],
+    /**
+     * 17 Sep 2026, v5 fixes (W2): per-chain swap coverage on /traders/:handle/trades.
+     * `truncated` is new — we hold rows for the chain but the loader's horizon cuts them off,
+     * so the record starts later than the trader did. `horizonAt` says where.
+     */
+    "trades.coverage.byChain[].state": ["complete", "truncated", "unresolved"],
   },
 } as const;
