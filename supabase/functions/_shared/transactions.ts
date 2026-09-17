@@ -2,6 +2,7 @@
 // in as `ProviderKeys`, never read from the environment) and in typing third-party JSON as
 // `unknown` narrowed by the helpers below instead of `any`.
 import { EVM_CHAINS, HEADERS, type EvmChain } from "./settings.ts";
+import { bitquery } from "./bitquery.ts";
 
 /**
  * Live transaction fetching for a resolved wallet.
@@ -286,7 +287,6 @@ async function etherscanNative(
 
 async function bitqueryTx(key: string, chainId: number, wallet: string, limit: number): Promise<Transfer[]> {
   const cfg = chainOf(chainId);
-  if (!key) throw new Error("BITQUERY_KEY is not set");
   const query = `{
     EVM(network: ${cfg.bitquery}, dataset: realtime) {
       Transfers(
@@ -303,18 +303,8 @@ async function bitqueryTx(key: string, chainId: number, wallet: string, limit: n
       }
     }
   }`;
-  const r = await fetch("https://streaming.bitquery.io/graphql", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ query }),
-    signal: AbortSignal.timeout(45_000),
-  });
-  const j = rec(await r.json());
-  if (j.errors) {
-    const msg = str(rec(recs(j.errors)[0]).message);
-    throw new Error(/points limit|quota/i.test(msg) ? "Bitquery quota reached" : msg.slice(0, 160));
-  }
-  return recs(rec(rec(j.data).EVM).Transfers).map((t) => {
+  const data = rec(await bitquery(key, query));
+  return recs(rec(data.EVM).Transfers).map((t) => {
     const tr = rec(t.Transfer);
     const cur = rec(tr.Currency);
     const amount = Number(tr.Amount); // already scaled by decimals

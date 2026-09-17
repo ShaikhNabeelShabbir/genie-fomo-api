@@ -1,9 +1,9 @@
 import type postgres from "postgres";
 import type { Env } from "./env";
 import { db } from "./db";
-import {
-  SOLANA_NETWORK_ID, solanaBalances, evmBalances, evmTxCount,
-} from "../../supabase/functions/_shared/chain_reads.ts";
+import { SOLANA_NETWORK_ID, solanaBalances, evmTxCount } from "../../supabase/functions/_shared/chain_reads.ts";
+import { evmBalancesBitquery } from "../../supabase/functions/_shared/bitquery.ts";
+import { EVM_CHAINS } from "../../supabase/functions/_shared/settings.ts";
 import { concentrationSuspect, decideTotal, value } from "../../supabase/functions/aum-sample/value.ts";
 
 /**
@@ -65,28 +65,21 @@ async function pricesFor(sql: Sql, pairs: Position[]): Promise<Map<string, { px:
  * Read ONE chain for one trader. Never throws: a chain that will not answer is a reason on
  * its own row, and the other chains still count (Z2, R5). See docs/DECISIONS.md#d192
  */
-async function readChain(
-  helius: string, t: Trader, c: Chain, decimals: Map<string, number>,
-  tradedByNet: Map<string, { token_key: string; address: string }[]>,
-): Promise<ChainRead> {
+async function readChain(keys: { helius: string; bitquery: string }, t: Trader, c: Chain): Promise<ChainRead> {
   const net = Number(c.network_id);
   const pos = (b: { address: string; amount: string }): Position => ({
     network_id: net, token_key: b.address.toLowerCase(), address: b.address, amount: Number(b.amount),
   });
   try {
     if (net === SOLANA_NETWORK_ID) {
-      const bals = await solanaBalances(t.sol_address ?? "", helius);
+      const bals = await solanaBalances(t.sol_address ?? "", keys.helius);
       if (bals === null) return { positions: null, reason: "service_timeout" };
       return { positions: bals.map(pos), reason: null };
     }
-    const tokens = tradedByNet.get(`${t.handle}|${net}`) ?? [];
-    /* Nothing to ask for is unread, not empty (Z1). Lift once evmBalances reads the native balance. */
-    if (!tokens.length) return { positions: null, reason: "no_tokens_known" };
-    const view = {
-      get: (k: string) => decimals.get(`${net}:${k}`),
-      set: (k: string, v: number) => { decimals.set(`${net}:${k}`, v); },
-    };
-    const res = await evmBalances(c.rpc, t.evm_address ?? "", tokens, view);
+    /* Bitquery lists every token held, native included, so an EVM chain is never "no_tokens_known" here (unlike the Supabase twin). */
+    const word = EVM_CHAINS[net]?.bitquery;
+    if (!word) throw new Error(`no Bitquery network for chain ${net}`);
+    const res = await evmBalancesBitquery(keys.bitquery, word, t.evm_address ?? "");
     return { positions: res.balances.map(pos), reason: null, nonce: await evmTxCount(c.rpc, t.evm_address ?? "") };
   } catch (e) {
     console.error(`aum-sample: ${t.handle} ${c.name}: ${(e as Error).message}`);
@@ -202,7 +195,8 @@ async function write(
  * run shows up as a failed invocation (§7).
  */
 export async function sampleSlice(env: Env, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const HELIUS = (env.HELIUS_SOLANA_KEY ?? "").trim();
+  const KEYS = { helius: (env.HELIUS_SOLANA_KEY ?? "").trim(), bitquery: (env.BITQUERY_KEY ?? "").trim() };
+  if (!KEYS.bitquery) throw new Error("aum-sample: BITQUERY_KEY is not set; EVM chains are read through Bitquery");
   /**
    * How long one invocation may spend reading chains before it stops and reports.
    *
@@ -252,36 +246,7 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
     const chains = await sql`
       select network_id::bigint, name, rpc from chains order by network_id`;
 
-    /*
-     * Decimals and traded-token lists, scoped to THIS SLICE.
-     *
-     * The Node job loads all 20,654 tokens once because it then works through 441 traders. A
-     * slice of ten does not earn that: scoping both queries to the handles in hand keeps an
-     * invocation's database cost proportional to the work it was asked to do.
-     */
     const handles = targets.map((t) => String(t.handle));
-    const traded = await sql`
-      select handle, network_id::bigint, token_key, min(token_address) as address
-      from trades
-      where handle = any(${handles}) and network_id <> ${SOLANA_NETWORK_ID}
-        and token_address is not null
-      group by 1, 2, 3`;
-    const tradedByNet = new Map<string, { token_key: string; address: string }[]>();
-    for (const r of traded) {
-      const k = `${r.handle}|${r.network_id}`;
-      const a = tradedByNet.get(k) ?? [];
-      a.push({ token_key: String(r.token_key), address: String(r.address) });
-      tradedByNet.set(k, a);
-    }
-    const tokenKeys = [...new Set(traded.map((r) => String(r.token_key)))];
-    const decimals = new Map<string, number>();
-    if (tokenKeys.length) {
-      for (const r of await sql`
-        select network_id::bigint, token_key, decimals from tokens
-        where token_key = any(${tokenKeys}) and decimals is not null`) {
-        decimals.set(`${r.network_id}:${r.token_key}`, Number(r.decimals));
-      }
-    }
 
     /*
      * The hour this sample describes. Truncated so a run at :07 and one at :52 do not produce
@@ -352,7 +317,7 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
       const askable = [...expected].filter((net) => chainById.has(net) && hasWallet(trader, net));
       /* Chains in parallel: the per-host throttle in chain_reads serialises same-host calls, so this is safe. */
       const answers = await Promise.all(askable.map((net) =>
-        readChain(HELIUS, trader, chainById.get(net)!, decimals, tradedByNet)));
+        readChain(KEYS, trader, chainById.get(net)!)));
       const reads = new Map<number, ChainRead>(askable.map((net, i) => [net, answers[i]]));
       const job = { trader, expected, reads };
       await finish(job);
@@ -364,7 +329,7 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
       if (Date.now() - started > BUDGET_MS) { stoppedEarly = true; break; }
       const stale = [...job.reads].filter(([, r]) => r.reason === "wallet_unreadable").map(([net]) => net);
       const again = await Promise.all(stale.map((net) =>
-        readChain(HELIUS, job.trader, chainById.get(net)!, decimals, tradedByNet)));
+        readChain(KEYS, job.trader, chainById.get(net)!)));
       let flipped = false;
       again.forEach((a, i) => { if (a.positions) { job.reads.set(stale[i], a); flipped = true; } });
       if (flipped) await finish(job);

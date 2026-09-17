@@ -9,7 +9,6 @@ export const DEFAULT_SLICE = 25;
 
 export interface Chain { readonly network_id: number; readonly name: string; readonly rpc: string }
 export interface Trader { readonly handle: string; readonly sol_address: string | null; readonly evm_address: string | null }
-export interface Traded { readonly token_key: string; readonly address: string }
 export interface Balance { readonly address: string; readonly amount: string }
 /** One holdings row before pricing, exactly the tuple the .mjs collects in `rowsOut`. */
 export interface Row {
@@ -26,19 +25,12 @@ export function sliceSize(raw: string | undefined): number {
   return Number.isInteger(n) && n > 0 ? n : DEFAULT_SLICE;
 }
 
-/** Key for the per-(trader, chain) traded-token lists, as the .mjs builds it. */
-export const tradedKey = (handle: string, net: number): string => `${handle}|${net}`;
-
 /**
- * The chains one trader is asked on: Solana whenever he has that wallet (it lists everything
- * held), an EVM chain only when he has that wallet AND has traded something there (the read
- * is scoped to traded tokens, so nothing to ask for is nothing to read). Same rule as the .mjs loop.
+ * The chains one trader is asked on: every chain he has the wallet for. Both reads list
+ * everything held (Helius for Solana, Bitquery for EVM), so no traded-token list gates an ask.
  */
-export function askable(t: Trader, chains: readonly Chain[], traded: ReadonlyMap<string, readonly Traded[]>): Chain[] {
-  return chains.filter((c) =>
-    c.network_id === SOLANA_NETWORK_ID
-      ? t.sol_address !== null
-      : t.evm_address !== null && (traded.get(tradedKey(t.handle, c.network_id))?.length ?? 0) > 0);
+export function askable(t: Trader, chains: readonly Chain[]): Chain[] {
+  return chains.filter((c) => (c.network_id === SOLANA_NETWORK_ID ? t.sol_address : t.evm_address) !== null);
 }
 
 /** Solana base58 is case sensitive; only the KEY is lowercased, matching tokens.token_key. */
