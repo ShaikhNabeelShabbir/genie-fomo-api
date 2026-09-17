@@ -1,18 +1,19 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
 import { db } from "../db";
-import { rpc, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
+import { SOLANA_NETWORK_ID, throttled } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
-import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaDecode, toRow } from "./swaps-core";
+import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaDecodeEnhanced, toRow } from "./swaps-core";
 
 /**
- * A4, the wallet's OWN two-sided swaps, written to `wallet_swaps`. Phase 1 is Solana: every
- * `transactions` row tagged SWAP, resolved through Helius `getTransaction` pre/post balances
- * (ported from `scripts/resolve_wallet_swaps.mjs`, deleted 17 Sep 2026). Phase 2 is the EVM
- * chains from Bitquery's decoded `DEXTrades` (ported from
- * `scripts/resolve_evm_swaps_from_receipts.mjs`; no free JSON-RPC endpoint is called from the
- * Worker). Same decode and pricing rules (`swaps-core.ts`), same insert. Candidates are read
+ * A4, the wallet's OWN two-sided swaps, written to `wallet_swaps`. Phase 1 is the EVM chains
+ * from Bitquery's decoded `DEXTrades` (ported from `scripts/resolve_evm_swaps_from_receipts.mjs`;
+ * no free JSON-RPC endpoint is called from the Worker). Phase 2 is Solana: every `transactions`
+ * row tagged SWAP, resolved through Helius's Enhanced Transactions API, 100 signatures a
+ * request (the `getTransaction` batches of 10 it replaced resolved ~2 candidates a second,
+ * behind the ~2,000 SWAP rows an hour the webhook writes). Same decode and pricing rules
+ * (`swaps-core.ts`), same insert. Candidates are read
  * newest first with a cap per run, so every run reaches the head of the feed and the backlog
  * drains from there; each candidate asked is marked in `wallet_swaps_checked` whether or not
  * it was a swap (95% are not), so the next run asks the next slice. A failed batch is counted
@@ -51,10 +52,10 @@ export interface SwapsSummary {
 
 /** Hashes per Bitquery query: one `in` list, one reply. */
 const BATCH = 100;
-/** Signatures per Helius JSON-RPC batch, as `fees.ts` sends them. */
-const SOLANA_BATCH = 10;
+/** Signatures per Helius parse request: the API's `maxItems`. */
+const SOLANA_BATCH = 100;
 /** ponytail: newest candidates per chain per run; the cron is every 15 min, so a slice a run drains a backlog without hogging the budget. Raise when `remaining` stays high. */
-const SOLANA_LIMIT = 400;   // ~2 candidates/s through Helius: ~3.5 min of a 10 min budget, so the EVM phase always runs
+const SOLANA_LIMIT = 3000;  // 30 parse requests, ~0.3 s each behind the host gate: well inside the budget after the EVM phase
 const EVM_LIMIT = 2000;
 /** ponytail: a route is a handful of hops; a transaction with more trades than this is not one wallet's swap anyway. */
 const TRADES_PER_TX = 10;
@@ -140,26 +141,35 @@ async function markChecked(sql: Sql, net: number, cands: readonly Cand[]): Promi
     on conflict do nothing`;
 }
 
-/** Helius `getTransaction` for a slice of signatures, one JSON-RPC batch; ids index the slice. A reply that is not an array is a refusal. */
+/**
+ * Helius Enhanced Transactions for a slice of signatures, one POST
+ * (https://www.helius.dev/docs/api-reference/enhanced-transactions/gettransactions: body
+ * `{ transactions: [<= 100 signatures] }`, key as `?api-key=`), keyed by `signature`. Helius
+ * drops a signature it cannot parse, so a missing key is an unresolved candidate. A reply that
+ * is not an array is a refusal.
+ */
 async function solanaTxs(url: string, hashes: readonly string[]): Promise<Map<string, unknown>> {
-  const body = hashes.map((h, id) =>
-    ({ jsonrpc: "2.0", id, method: "getTransaction", params: [h, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed" }] }));
-  const reply: unknown = await rpc(url, body);
-  if (!Array.isArray(reply)) throw new Error(`Helius answered without a batch for ${hashes.length} signatures`);
+  const r = await throttled(url, () => fetch(url, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ transactions: hashes }), signal: AbortSignal.timeout(45_000),
+  }));
+  if (!r.ok) throw new Error(`Helius parse HTTP ${r.status} for ${hashes.length} signatures`);
+  const reply: unknown = await r.json();
+  if (!Array.isArray(reply)) throw new Error(`Helius answered without an array for ${hashes.length} signatures`);
   const out = new Map<string, unknown>();
-  for (const r of reply) {
-    const id = typeof r === "object" && r !== null ? (r as { id?: unknown; result?: unknown }) : null;
-    if (id && typeof id.id === "number" && hashes[id.id]) out.set(hashes[id.id], id.result ?? null);
+  for (const t of reply) {
+    const sig = typeof t === "object" && t !== null ? (t as { signature?: unknown }).signature : undefined;
+    if (typeof sig === "string") out.set(sig, t);
   }
   return out;
 }
 
-/** ONE HELIUS BATCH: the wallet's net legs per transaction, priced, written, marked. Returns [resolved, not the wallet's own two-sided swap]. */
+/** ONE HELIUS PARSE REQUEST: the wallet's net legs per transaction, priced, written, marked. Returns [resolved, not the wallet's own two-sided swap]. */
 async function resolveSolanaBatch(sql: Sql, url: string, quotes: ReadonlyMap<string, Quote>, slice: readonly Cand[]): Promise<[number, number]> {
   const txs = await solanaTxs(url, [...new Set(slice.map((c) => c.tx_hash))]);
   const out: Priced[] = [];
   for (const cand of slice) {
-    const d = solanaDecode(txs.get(cand.tx_hash), cand.address_key);
+    const d = solanaDecodeEnhanced(txs.get(cand.tx_hash), cand.address_key);
     const row = d && toRow(d, quotes, null, new Date(cand.block_time));
     if (row) out.push({ cand, row });
   }
@@ -260,7 +270,7 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
   if (!key) throw new Error("swaps: BITQUERY_KEY is not set");
   const helius = (env.HELIUS_SOLANA_KEY ?? "").trim();
   if (!helius) throw new Error("swaps: HELIUS_SOLANA_KEY is not set; Solana is read through Helius only");
-  const heliusUrl = `https://mainnet.helius-rpc.com/?api-key=${helius}`;
+  const heliusUrl = `https://api.helius.xyz/v0/transactions?api-key=${helius}`;
   const sql = db(env);
   const perChain: Record<string, ChainCounts> = {};
   let remaining = 0, stoppedEarly = false, attempted = 0, failedBatches = 0, bitqueryQueries = 0;

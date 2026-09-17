@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { SOL_MINT, ZERO_ADDRESS } from "../supabase/functions/_shared/chain_reads.ts";
-import { decode, priceQuote, type Quote, solanaDecode, toRow, type Trade } from "../worker/src/jobs/swaps-core.ts";
+import { decode, priceQuote, type Quote, solanaDecode, solanaDecodeEnhanced, toRow, type Trade } from "../worker/src/jobs/swaps-core.ts";
 
 /* The rules of the scripts this replaced, over Bitquery `EVM.DEXTrades` rows
    (https://docs.bitquery.io/docs/schema/evm/dextrades/) and Helius `getTransaction` results:
@@ -141,4 +141,45 @@ Deno.test("solanaDecode: someone else's swap into the wallet, a same-sign touch 
 Deno.test("solanaDecode: dust below 1e-12 is not a leg; a null uiAmount reads as zero", () => {
   const tx = solTx([bal(OWNER, MINT, null), bal(OWNER, USDC, 1)], [bal(OWNER, MINT, 3), bal(OWNER, USDC, 1 - 1e-13)]);
   assertEquals(solanaDecode(tx, OWNER), null);
+});
+
+/* The same four cases in the Enhanced Transactions shape (`POST /v0/transactions`): a signed raw delta per (owner, mint), lamports per account. */
+const chg = (userAccount: string, mint: string, tokenAmount: string, decimals = 6) => ({ userAccount, tokenAccount: `${userAccount}-${mint}`, mint, rawTokenAmount: { tokenAmount, decimals } });
+/** One parsed transaction: `changes` under the token accounts, `native` as `[account, lamports]` entries. */
+const parsed = (changes: unknown[], native: [string, number][] = []) => ({
+  signature: "sig", type: "SWAP", feePayer: "relayer",
+  accountData: [
+    ...native.map(([account, nativeBalanceChange]) => ({ account, nativeBalanceChange, tokenBalanceChanges: [] })),
+    ...changes.map((c) => ({ account: (c as { tokenAccount: string }).tokenAccount, nativeBalanceChange: 0, tokenBalanceChanges: [c] })),
+  ],
+});
+
+Deno.test("solanaDecodeEnhanced: the owner's net change per mint, keys lower-cased, owner matched case-insensitively", () => {
+  const tx = parsed([chg(OWNER, MINT, "1000000000"), chg(OWNER, USDC, "-60000000")]);
+  assertEquals(solanaDecodeEnhanced(tx, OWNER.toLowerCase()), { recv: [MINT.toLowerCase(), 1000], sent: [USDC.toLowerCase(), -60] });
+  assertEquals(toRow(solanaDecodeEnhanced(tx, OWNER.toLowerCase())!, solQuotes, null, AT),
+    { tokenKey: MINT.toLowerCase(), tokenDelta: 1000, quoteKey: USDC.toLowerCase(), quoteDelta: -60, quoteUsd: -60, quoteSource: "money_side_pegged" });
+});
+
+Deno.test("solanaDecodeEnhanced: native SOL is a leg from the owner's own account entry; a lamport of rent is not", () => {
+  const tx = parsed([chg(OWNER, MINT, "-5000000")], [["relayer", -0.1e9], [OWNER, 0.5e9]]);
+  assertEquals(solanaDecodeEnhanced(tx, OWNER), { recv: [SOL_MINT, 0.5], sent: [MINT.toLowerCase(), -5] });
+  assertEquals(toRow(solanaDecodeEnhanced(tx, OWNER)!, solQuotes, null, AT),
+    { tokenKey: MINT.toLowerCase(), tokenDelta: -5, quoteKey: SOL_MINT, quoteDelta: 0.5, quoteUsd: 100, quoteSource: "money_side_daily_close" });
+  assertEquals(solanaDecodeEnhanced(parsed([chg(OWNER, MINT, "5000000")], [[OWNER, -5]]), OWNER), null);
+});
+
+Deno.test("solanaDecodeEnhanced: someone else's swap into the wallet, a same-sign touch of two mints, three mints, or a dropped signature is not the wallet's trade", () => {
+  assertEquals(solanaDecodeEnhanced(parsed([chg(OWNER, MINT, "10000000")]), OWNER), null);
+  assertEquals(solanaDecodeEnhanced(parsed([chg("someone", MINT, "1000000"), chg("someone", USDC, "-9000000")]), OWNER), null);
+  assertEquals(solanaDecodeEnhanced(parsed([chg(OWNER, MINT, "1000000"), chg(OWNER, USDC, "1000000")]), OWNER), null);
+  assertEquals(solanaDecodeEnhanced(parsed([chg(OWNER, MINT, "1000000"), chg(OWNER, USDC, "-10000000"), chg(OWNER, "Other", "3000000")]), OWNER), null);
+  assertEquals(solanaDecodeEnhanced(undefined, OWNER), null);
+  assertEquals(solanaDecodeEnhanced({ signature: "sig", accountData: null }, OWNER), null);
+});
+
+Deno.test("solanaDecodeEnhanced: dust below 1e-12 is not a leg; two token accounts of one mint sum", () => {
+  assertEquals(solanaDecodeEnhanced(parsed([chg(OWNER, MINT, "3000000"), chg(OWNER, USDC, "-100", 15)]), OWNER), null);
+  const split = parsed([chg(OWNER, MINT, "3000000"), chg(OWNER, MINT, "-1000000"), chg(OWNER, USDC, "-4000000")]);
+  assertEquals(solanaDecodeEnhanced(split, OWNER), { recv: [MINT.toLowerCase(), 2], sent: [USDC.toLowerCase(), -4] });
 });
