@@ -12,7 +12,8 @@ import { CsvParseStream } from "jsr:@std/csv@1";
 import { type Column, convertRow, insertStatements } from "./lib/d1_rows.ts";
 
 // wrangler reads the whole file as one JS string before uploading; V8 caps a string near 512 MB.
-const MAX_FILE_BYTES = 256_000_000;
+const MAX_FILE_BYTES = 48_000_000;  // 48 MB: 256 MB files failed the import endpoint with a
+                                    // spurious auth error (17 Sep), and a small file retries cheaply.
 const ROWS_PER_STATEMENT_BATCH = 500;
 const ROOT = new URL("..", import.meta.url);
 
