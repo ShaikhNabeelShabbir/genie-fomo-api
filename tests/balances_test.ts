@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { askable, positionRows, sliceSize, tradedKey } from "../worker/src/jobs/balances-core.ts";
+import { askable, positionRows, sliceSize } from "../worker/src/jobs/balances-core.ts";
 import { SOLANA_NETWORK_ID } from "../supabase/functions/_shared/chain_reads.ts";
 
 const chains = [
@@ -7,7 +7,6 @@ const chains = [
   { network_id: 56, name: "bsc", rpc: "https://bsc" },
   { network_id: 8453, name: "base", rpc: "https://base" },
 ];
-const traded = new Map([[tradedKey("a", 56), [{ token_key: "0xabc", address: "0xAbC" }]]]);
 
 Deno.test("sliceSize: env value or the default", () => {
   assertEquals(sliceSize(undefined), 25);
@@ -16,12 +15,12 @@ Deno.test("sliceSize: env value or the default", () => {
   assertEquals(sliceSize("x"), 25);
 });
 
-Deno.test("askable: solana needs the sol wallet, an EVM chain needs the wallet and traded tokens", () => {
+Deno.test("askable: solana needs the sol wallet, every EVM chain needs the evm wallet", () => {
   const both = { handle: "a", sol_address: "So1", evm_address: "0x1" };
-  assertEquals(askable(both, chains, traded).map((c) => c.name), ["solana", "bsc"]);
-  assertEquals(askable({ ...both, sol_address: null }, chains, traded).map((c) => c.name), ["bsc"]);
-  assertEquals(askable({ ...both, evm_address: null }, chains, traded).map((c) => c.name), ["solana"]);
-  assertEquals(askable({ handle: "b", sol_address: null, evm_address: "0x2" }, chains, traded), []);
+  assertEquals(askable(both, chains).map((c) => c.name), ["solana", "bsc", "base"]);
+  assertEquals(askable({ ...both, sol_address: null }, chains).map((c) => c.name), ["bsc", "base"]);
+  assertEquals(askable({ ...both, evm_address: null }, chains).map((c) => c.name), ["solana"]);
+  assertEquals(askable({ handle: "b", sol_address: null, evm_address: null }, chains), []);
 });
 
 Deno.test("positionRows: key lowercased, address kept as the chain spells it", () => {

@@ -115,6 +115,9 @@ export async function solanaBalances(
  * Scoped to traded tokens on purpose: an EVM chain has no cheap "list everything this address
  * holds" primitive without a paid indexer, and a token they never traded is one we could not
  * price or name anyway. It is the honest superset of their positions here.
+ *
+ * LEGACY: the Supabase v1 sampler only. The Worker reads EVM through `bitquery.ts`
+ * `evmBalancesBitquery` (public RPCs 429 Cloudflare's egress); nothing under worker/ may call this.
  */
 export async function evmBalances(
   rpcUrl: string,

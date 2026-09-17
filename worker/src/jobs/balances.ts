@@ -1,19 +1,23 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
 import { db } from "../db";
-import { SOLANA_NETWORK_ID, evmBalances, solanaBalances } from "../../../supabase/functions/_shared/chain_reads.ts";
+import { SOLANA_NETWORK_ID, solanaBalances } from "../../../supabase/functions/_shared/chain_reads.ts";
+import { evmBalancesBitquery } from "../../../supabase/functions/_shared/bitquery.ts";
+import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
 import { IMPLIED_MCAP_CEILING_USD, MAX_POSITION_USD, MAX_PRICE_PER_TOKEN, value } from "../../../supabase/functions/aum-sample/value.ts";
-import { askable, positionRows, sliceSize, tradedKey, type Chain, type Row, type Traded, type Trader } from "./balances-core";
+import { askable, positionRows, sliceSize, type Chain, type Row, type Trader } from "./balances-core";
 
 /**
  * Chain balances, the Worker half of refresh.yml's "Read chain balances" and "Close trades the
  * wallet no longer holds" steps: `scripts/load_chain_balances.mjs` then `close_stale_trades.mjs`.
  *
- * TWIN OF THOSE TWO SCRIPTS: edit both. Same reads (`_shared/chain_reads.ts`), same ceilings
- * (`aum-sample/value.ts`), same SQL. Differs only where the platform does: a slice of the
- * stalest traders per run instead of the whole roster, a trader's chains read in parallel, one
- * transaction per trader so a killed run keeps what it finished, a wall-clock budget, a failed
- * chain counted rather than fatal, the re-price and the trade close scoped to this run.
+ * TWIN OF THOSE TWO SCRIPTS: edit both. Same Solana read (`_shared/chain_reads.ts`), same
+ * ceilings (`aum-sample/value.ts`), same SQL. Differs where the platform does: EVM chains are
+ * read through Bitquery (`_shared/bitquery.ts`; public RPCs 429 Cloudflare's egress), so every
+ * held token comes back and no traded-token list is needed; a slice of the stalest traders per
+ * run instead of the whole roster, a trader's chains read in parallel, one transaction per
+ * trader so a killed run keeps what it finished, a wall-clock budget, a failed chain counted
+ * rather than fatal, the re-price and the trade close scoped to this run.
  */
 
 type Sql = postgres.Sql;
@@ -31,6 +35,8 @@ export interface BalancesSummary {
   readonly repriced: number;
   /** Open trades marked closed_by_balance for the traders read. */
   readonly tradesClosed: number;
+  /** Tokens Bitquery returned that `tokens` had never seen: inserted minimally (network_id, address, decimals), the way the .mjs did. */
+  readonly unknownTokens: number;
   /** Traders whose aum_live row was revalued after their capture (migration 20260918030000). */
   readonly liveRefreshed: number;
   /** Traders with a wallet whose newest chain capture is older than this run. Zero means the roster is current. */
@@ -56,57 +62,30 @@ async function targets(sql: Sql, limit: number): Promise<Trader[]> {
   return rows.map((r) => ({ handle: r.handle, sol_address: r.sol_address, evm_address: r.evm_address }));
 }
 
-/** Every EVM token any target has traded, grouped by chain. One query, not one per trader. */
-async function tradedByChain(sql: Sql, handles: readonly string[]): Promise<Map<string, Traded[]>> {
-  const rows = await sql<{ handle: string; network_id: string; token_key: string; address: string }[]>`
-    select tr.handle, tr.network_id::bigint, tr.token_key, min(tr.token_address) as address
-    from trades tr
-    where tr.handle = any(${handles}) and tr.network_id <> ${SOLANA_NETWORK_ID}
-    group by 1,2,3`;
-  const m = new Map<string, Traded[]>();
-  for (const r of rows) {
-    const k = tradedKey(r.handle, Number(r.network_id));
-    m.set(k, [...(m.get(k) ?? []), { token_key: r.token_key, address: r.address }]);
-  }
-  return m;
-}
-
-/** Known decimals for the tokens in hand, keyed `network_id:token_key`. Scoped to the slice, as the sampler scopes it. */
-async function knownDecimals(sql: Sql, traded: ReadonlyMap<string, readonly Traded[]>): Promise<Map<string, number>> {
-  const keys = [...new Set([...traded.values()].flat().map((t) => t.token_key))];
-  const m = new Map<string, number>();
-  if (!keys.length) return m;
-  const rows = await sql<{ network_id: string; token_key: string; decimals: number }[]>`
-    select network_id::bigint, token_key, decimals from tokens
-    where token_key = any(${keys}) and decimals is not null`;
-  for (const r of rows) m.set(`${r.network_id}:${r.token_key}`, Number(r.decimals));
-  return m;
-}
-
 /** One chain for one trader. Throws on a read fault; the caller counts it. */
-async function readChain(
-  helius: string, t: Trader, c: Chain, decimals: Map<string, number>, traded: ReadonlyMap<string, readonly Traded[]>,
-): Promise<ChainAnswer> {
+async function readChain(keys: { helius: string; bitquery: string }, t: Trader, c: Chain): Promise<ChainAnswer> {
   const net = c.network_id;
   if (net === SOLANA_NETWORK_ID) {
-    const bals = await solanaBalances(t.sol_address ?? "", helius);
+    const bals = await solanaBalances(t.sol_address ?? "", keys.helius);
     if (bals === null) throw new Error("HELIUS_SOLANA_KEY is not set");
     return { rows: positionRows(t.handle, net, bals), learned: new Map() };
   }
-  const view = {
-    get: (k: string) => decimals.get(`${net}:${k}`),
-    set: (k: string, v: number) => { decimals.set(`${net}:${k}`, v); },
-  };
-  const { balances, learned } = await evmBalances(c.rpc, t.evm_address ?? "", [...(traded.get(tradedKey(t.handle, net)) ?? [])], view);
-  return { rows: positionRows(t.handle, net, balances), learned: new Map([...learned].map(([k, v]) => [`${net}:${k}`, v])) };
+  const word = EVM_CHAINS[net]?.bitquery;
+  if (!word) throw new Error(`no Bitquery network for chain ${net}`);
+  const { balances } = await evmBalancesBitquery(keys.bitquery, word, t.evm_address ?? "");
+  // Decimals ride along with the balance; the write fills tokens.decimals where it is still null.
+  const learned = new Map(balances.flatMap((b) => (b.decimals === null ? [] : [[`${net}:${b.address}`, b.decimals] as const])));
+  return { rows: positionRows(t.handle, net, balances), learned };
 }
 
-/** The .mjs write, verbatim, for one trader's rows. Returns the holdings rows written. */
-async function writeRows(sql: Sql, capturedAt: Date, rows: readonly Row[], learned: ReadonlyMap<string, number>): Promise<number> {
-  if (!rows.length) return 0;
+/** The .mjs write, verbatim, for one trader's rows. Returns the holdings rows written and the tokens first seen. */
+async function writeRows(
+  sql: Sql, capturedAt: Date, rows: readonly Row[], learned: ReadonlyMap<string, number>,
+): Promise<{ written: number; unknown: number }> {
+  if (!rows.length) return { written: 0, unknown: 0 };
   return await sql.begin(async (tx) => {
     // FK: holdings -> tokens. A mint we have never seen is still a real position.
-    await tx`
+    const seen = await tx`
       insert into tokens (network_id, address)
       select * from unnest(${rows.map((r) => r.network_id)}::bigint[], ${rows.map((r) => r.address)}::text[])
       on conflict (network_id, token_key) do nothing`;
@@ -154,7 +133,7 @@ async function writeRows(sql: Sql, capturedAt: Date, rows: readonly Row[], learn
         set human_amount = excluded.human_amount, price = excluded.price,
             value = excluded.value, source = excluded.source
       returning value`;
-    return ins.length;
+    return { written: ins.length, unknown: seen.count };
   });
 }
 
@@ -219,26 +198,24 @@ async function closeStaleTrades(sql: Sql, handles: readonly string[]): Promise<n
  */
 export async function runBalances(env: Env, budgetMs: number): Promise<BalancesSummary> {
   const started = Date.now();
-  const helius = (env.HELIUS_SOLANA_KEY ?? "").trim();
+  const keys = { helius: (env.HELIUS_SOLANA_KEY ?? "").trim(), bitquery: (env.BITQUERY_KEY ?? "").trim() };
+  if (!keys.bitquery) throw new Error("balances: BITQUERY_KEY is not set; EVM chains are read through Bitquery");
   const sql = db(env);
   try {
     const slice = await targets(sql, sliceSize(env.BALANCE_SLICE));
     const chains = (await sql<{ network_id: string; name: string; rpc: string }[]>`
       select network_id::bigint, name, rpc from chains order by network_id`)
       .map((c): Chain => ({ network_id: Number(c.network_id), name: c.name, rpc: c.rpc }));
-    const traded = await tradedByChain(sql, slice.map((t) => t.handle));
-    const decimals = await knownDecimals(sql, traded);
-
     const capturedAt = new Date();
     const read: string[] = [];
-    let chainsRead = 0, chainsFailed = 0, rowsWritten = 0, liveRefreshed = 0, stoppedEarly = false;
+    let chainsRead = 0, chainsFailed = 0, rowsWritten = 0, unknownTokens = 0, liveRefreshed = 0, stoppedEarly = false;
     // ponytail: an emptied wallet writes no row, so its capture never advances and it keeps a slot at the head of the queue; record empty reads if that ever costs slots.
     for (const t of slice) {
       if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
       read.push(t.handle);
-      const ask = askable(t, chains, traded);
+      const ask = askable(t, chains);
       /* Chains in parallel: the per-host throttle in chain_reads serialises same-host calls, so this is safe. */
-      const answers = await Promise.allSettled(ask.map((c) => readChain(helius, t, c, decimals, traded)));
+      const answers = await Promise.allSettled(ask.map((c) => readChain(keys, t, c)));
       const rows: Row[] = [], learned = new Map<string, number>();
       answers.forEach((a, i) => {
         if (a.status === "fulfilled") {
@@ -251,7 +228,8 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
         }
       });
       try {
-        rowsWritten += await writeRows(sql, capturedAt, rows, learned);
+        const w = await writeRows(sql, capturedAt, rows, learned);
+        rowsWritten += w.written; unknownTokens += w.unknown;
         // The capture is in; revalue this trader's current AUM from it (aum_live, migration 20260918030000).
         const [live] = await sql<{ n: number }[]>`select aum_live_refresh(${[t.handle]}::text[], 'balances') as n`;
         liveRefreshed += Number(live?.n ?? 0);
@@ -273,7 +251,7 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
       where (w.sol_address is not null or w.evm_address is not null)
         and (h.last_at is null or h.last_at < ${capturedAt}::timestamptz)`;
     return {
-      traders: read.length, chainsRead, chainsFailed, rowsWritten, repriced, tradesClosed, liveRefreshed,
+      traders: read.length, chainsRead, chainsFailed, rowsWritten, unknownTokens, repriced, tradesClosed, liveRefreshed,
       remaining: Number(pending?.n ?? 0), stoppedEarly, elapsedMs: Date.now() - started,
     };
   } finally {
