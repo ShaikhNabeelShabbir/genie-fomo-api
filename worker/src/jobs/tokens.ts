@@ -26,6 +26,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const EVM_IDS = Object.keys(EVM_CHAINS).map(Number);
 const CHAIN_FANOUT = 6;
 const SUPPLY_FANOUT = 5;
+/** Targets built per run. Bitquery paces about 50 reads a minute, so a larger list only costs the
+ *  group-by that builds it — which, unbounded, used the whole phase budget (17 Sep 2026). */
+const SUPPLY_SLICE = 400;
 const STALE_HOURS = 20;
 /** The same staleness as a SQLite date modifier (`strftime(…, 'now', '-20 hours')`). */
 const STALE_AGO = `-${STALE_HOURS} hours`;
@@ -39,15 +42,18 @@ export interface TokensSummary {
   readonly infoRefreshed: number;
   /** token_info rows whose honeypot_since was stamped this run (first flip only). */
   readonly honeypotFlipped: number;
-  /** Units attempted that produced no write: unresolvable chain, unreadable supply, failed GMGN fetch or store. */
+  /** Units attempted whose source call or write FAILED. A source that answered "nothing here" is `unresolved`. */
   readonly errored: number;
+  /** Units a source answered for with no usable value: a contract on no or several chains, a token with no
+   *  supply row yet. Not a failure: retried next run, and never trips the all-failed guard. */
+  readonly unresolved: number;
   /** Units across the three phases never attempted because the budget ran out. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
   readonly elapsedMs: number;
 }
 
-interface Phase { readonly attempted: number; readonly ok: number; readonly errored: number; readonly remaining: number }
+interface Phase { readonly attempted: number; readonly ok: number; readonly errored: number; readonly unresolved: number; readonly remaining: number }
 
 // ------------------------------------------------------------- 1. trade chains
 /**
@@ -76,26 +82,31 @@ export async function evmChainsSeen(key: string, address: string): Promise<reado
   }
 }
 
-/** base58 shape is Solana; 0x is probed on every EVM chain at once. Unanswered is unresolved: retried next run. */
-async function chainFor(key: string, address: string): Promise<number | null> {
+/**
+ * base58 shape is Solana; 0x is probed on every EVM chain at once. `"failed"` is a probe that did not
+ * answer; `null` is an answer that names no single chain (no hits, several hits, or an address of
+ * neither shape) — not a failure, so it does not count against the all-failed guard.
+ */
+async function chainFor(key: string, address: string): Promise<number | null | "failed"> {
   if (isSolAddress(address)) return SOLANA_NETWORK_ID;
   if (!isEvmAddress(address)) return null;
   const hits = await evmChainsSeen(key, address);
-  return hits === null ? null : singleChain(hits);
+  return hits === null ? "failed" : singleChain(hits);
 }
 
 async function resolveChains(sql: Sql, key: string, outOfTime: () => boolean): Promise<Phase> {
   const rows = await sql<{ token_address: string; token_key: string }[]>`
     select distinct token_address, token_key from trades
     where network_id is null and token_address is not null`;
-  let attempted = 0, ok = 0, errored = 0;
+  let attempted = 0, ok = 0, errored = 0, unresolved = 0;
   for (let i = 0; i < rows.length && !outOfTime(); i += CHAIN_FANOUT) {
     const chunk = rows.slice(i, i + CHAIN_FANOUT);
     const nets = await Promise.all(chunk.map((t) => chainFor(key, t.token_address)));
     for (const [k, t] of chunk.entries()) {
       attempted += 1;
       const net = nets[k];
-      if (net === null) { errored += 1; continue; }
+      if (net === "failed") { errored += 1; continue; }
+      if (net === null) { unresolved += 1; continue; }
       try {
         // The token may be new to us entirely; create it before pointing trades at it.
         // token_key is a plain column in D1, so lower(address) is passed, not generated.
@@ -110,7 +121,7 @@ async function resolveChains(sql: Sql, key: string, outOfTime: () => boolean): P
       }
     }
   }
-  return { attempted, ok, errored, remaining: rows.length - attempted };
+  return { attempted, ok, errored, unresolved, remaining: rows.length - attempted };
 }
 
 // ------------------------------------------------------------------ 2. supply
@@ -168,14 +179,22 @@ async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): P
            or exists (select 1 from trades t
                       where t.network_id = tk.network_id and t.token_key = tk.token_key
                         and t.avg_entry_price > 0))
-    order by hv.held desc, tk.network_id, tk.address`;
-  let attempted = 0, ok = 0, errored = 0;
+    order by hv.held desc, tk.network_id, tk.address
+    limit ${SUPPLY_SLICE}`;
+  let attempted = 0, ok = 0, errored = 0, unresolved = 0;
   for (let i = 0; i < targets.length && !outOfTime(); i += SUPPLY_FANOUT) {
     const chunk = targets.slice(i, i + SUPPLY_FANOUT);
-    const read = await Promise.all(chunk.map((t) => readSupply(key, t).catch(() => null)));
+    // A read that throws is one failed token, not a dead run, and its message is logged: a silent
+    // null hid a GraphQL schema error behind 694 "errored" counts (17 Sep 2026). A read that
+    // answers with no supply row is `undefined` here, and counts as unresolved, not failed.
+    const read = await Promise.all(chunk.map((t) => readSupply(key, t).catch((e: unknown) => {
+      console.error(`tokens: supply read for ${t.address.slice(0, 12)}… on ${t.network_id} failed: ${e instanceof Error ? e.message : String(e)}`);
+      return undefined;
+    })));
     const found = chunk.flatMap((t, k) => { const s = read[k]; return s ? [{ t, s }] : []; });
     attempted += chunk.length;
-    errored += chunk.length - found.length;
+    errored += read.filter((r) => r === undefined).length;
+    unresolved += read.filter((r) => r === null).length;
     if (!found.length) continue;
     try {
       // One update per token, all in one batch: SQLite has no unnest, and SUPPLY_FANOUT rows
@@ -193,7 +212,7 @@ async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): P
       console.error(`tokens: supply write for ${found.length} tokens failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  return { attempted, ok, errored, remaining: targets.length - attempted };
+  return { attempted, ok, errored, unresolved, remaining: targets.length - attempted };
 }
 
 // --------------------------------------------------------------- 3. token_info
@@ -301,13 +320,20 @@ async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promis
      order by ti.security_fetched_at, ti.fetched_at, h.token_key`;
   const key = (env.GMGN_API_KEY ?? "").trim();
   if (targets.length && !key) throw new Error("GMGN_API_KEY is not set");
-  let attempted = 0, ok = 0, errored = 0, flipped = 0, secFailed = 0;
+  let attempted = 0, ok = 0, errored = 0, unresolved = 0, flipped = 0, secFailed = 0;
   for (const t of targets) {
     if (outOfTime()) break;
     attempted += 1;
     const code = CHAIN_CODE[t.chain];
-    const d = code ? await fetchInfo(key, code, t.address) : null;
-    if (!d || !code) { errored += 1; await sleep(GMGN_GAP_MS); continue; }
+    // A chain GMGN does not cover is unresolved, not failed: no request was made and none will help.
+    if (!code) { unresolved += 1; continue; }
+    const d = await fetchInfo(key, code, t.address);
+    if (!d) {
+      errored += 1;
+      console.error(`tokens: GMGN info for ${t.chain}/${t.address.slice(0, 12)}… returned nothing`);
+      await sleep(GMGN_GAP_MS);
+      continue;
+    }
     // Security is a second endpoint, so a second request and a second second of pacing.
     await sleep(GMGN_GAP_MS);
     const sec = await fetchSecurity(key, t.chain, code, t.address);
@@ -323,7 +349,7 @@ async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promis
     await sleep(GMGN_GAP_MS);
   }
   if (secFailed) console.log(`tokens: ${secFailed} token(s) stored without security`);
-  return { attempted, ok, errored, remaining: targets.length - attempted, flipped };
+  return { attempted, ok, errored, unresolved, remaining: targets.length - attempted, flipped };
 }
 
 /**
@@ -332,17 +358,21 @@ async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promis
  */
 export async function runTokens(env: Env, budgetMs: number): Promise<TokensSummary> {
   const started = Date.now();
-  const outOfTime = () => Date.now() - started > budgetMs;
+  // A cumulative deadline per phase. The chain probe has a 58k backlog that a realtime-only Bitquery
+  // plan will never finish, and a single shared deadline let it eat every run, so supply and
+  // token_info never ran (17 Sep 2026). Shares are cumulative: the phases run in order.
+  const outOfTime = (share: number) => () => Date.now() - started > budgetMs * share;
   const bitqueryKey = (env.BITQUERY_KEY ?? "").trim();
   if (!bitqueryKey) throw new Error("tokens: BITQUERY_KEY is not set; chains and supply are read through Bitquery");
   const sql = jobSql(env);
   try {
-    const chains = await resolveChains(sql, bitqueryKey, outOfTime);
-    const supply = await resolveSupply(sql, bitqueryKey, outOfTime);
-    const info = await refreshInfo(sql, env, outOfTime);
-    const phases = [chains, supply, info];
+    const supply = await resolveSupply(sql, bitqueryKey, outOfTime(0.5));
+    const chains = await resolveChains(sql, bitqueryKey, outOfTime(0.6));
+    const info = await refreshInfo(sql, env, outOfTime(1));
+    const phases = [supply, chains, info];
     const attempted = phases.reduce((n, p) => n + p.attempted, 0);
     const errored = phases.reduce((n, p) => n + p.errored, 0);
+    const unresolved = phases.reduce((n, p) => n + p.unresolved, 0);
     const remaining = phases.reduce((n, p) => n + p.remaining, 0);
     if (attempted > 0 && errored === attempted) throw new Error(`tokens: all ${attempted} units failed`);
     return {
@@ -351,6 +381,7 @@ export async function runTokens(env: Env, budgetMs: number): Promise<TokensSumma
       infoRefreshed: info.ok,
       honeypotFlipped: info.flipped,
       errored,
+      unresolved,
       remaining,
       stoppedEarly: remaining > 0,
       elapsedMs: Date.now() - started,
