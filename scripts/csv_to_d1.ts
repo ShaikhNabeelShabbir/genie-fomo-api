@@ -101,9 +101,29 @@ const exists = (path: string): boolean => {
   }
 };
 
+/**
+ * Columns D1 computes for itself. SQLite refuses an insert into a generated column, and the
+ * Postgres export carries their values like any other (`wallets.evm_address_key`, 17 Sep), so
+ * both the name and the value are dropped before the statement is built.
+ */
+const generatedColumns = (table: string): Set<string> => {
+  const schema = Deno.readTextFileSync(`${ROOT}/worker/d1/migrations/0001_schema.sql`);
+  const body = new RegExp(`create table(?: if not exists)? ${table} \\(([\\s\\S]*?)\\n\\);`, "i").exec(schema);
+  const out = new Set<string>();
+  for (const line of body?.[1].split("\n") ?? []) {
+    const m = /^\s*([a-z_]+)\s+[^,]*generated always as/i.exec(line);
+    if (m) out.add(m[1]);
+  }
+  return out;
+};
+
 const generate = async (table: string): Promise<string[]> => {
-  const columns: Column[] = JSON.parse(await Deno.readTextFile(`${indir}/${table}.columns.json`));
+  const all: Column[] = JSON.parse(await Deno.readTextFile(`${indir}/${table}.columns.json`));
+  const skip = generatedColumns(table);
+  const keep = all.map((c, i) => ({ c, i })).filter(({ c }) => !skip.has(c.name));
+  const columns = keep.map(({ c }) => c);
   const names = columns.map((c) => c.name);
+  if (skip.size) console.log(`${table}: D1 generates ${[...skip].join(", ")}, not imported`);
   for (const entry of Deno.readDirSync(sqlDir)) {
     if (new RegExp(`^${table}\\.\\d+\\.sql$`).test(entry.name)) Deno.removeSync(`${sqlDir}/${entry.name}`);
   }
@@ -115,7 +135,7 @@ const generate = async (table: string): Promise<string[]> => {
   let batch: (string | null)[][] = [];
   let count = 0;
   const flush = async (): Promise<void> => {
-    for (const statement of insertStatements(table, names, batch.map((r) => convertRow(r, columns)))) {
+    for (const statement of insertStatements(table, names, batch.map((r) => convertRow(keep.map(({ i }) => r[i]), columns)))) {
       await files.write(statement);
     }
     count += batch.length;
@@ -124,8 +144,8 @@ const generate = async (table: string): Promise<string[]> => {
   for await (const record of records) {
     if (header === null) {
       header = record;
-      if (header.join(",") !== names.join(",")) {
-        throw new Error(`${table}.csv header [${header}] differs from columns.json [${names}]`);
+      if (header.join(",") !== all.map((c) => c.name).join(",")) {
+        throw new Error(`${table}.csv header [${header}] differs from columns.json [${all.map((c) => c.name)}]`);
       }
       continue;
     }
