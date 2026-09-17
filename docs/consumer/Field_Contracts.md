@@ -420,3 +420,21 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | Field | Route | Contract |
 |---|---|---|
 | `error.code` | every route | One of `not_found`, `bad_request`, `duplicate_identifier`, `rate_limited`, `timeout`, `unavailable`, `include_unavailable`, `internal_error`, `not_configured`, `unauthorized`, `invalid_address`, `address_in_use`, `already_on_record`. v8 corrects the list: `internal` was published but the service emits `internal_error`; `unavailable` (503, Postgres not answering) and `include_unavailable` (503, `blocks[]` names the `?include=` blocks not produced) were emitted but unpublished. |
+
+## Added 18 Sep 2026 — token prices
+
+| Field | Route | Contract |
+|---|---|---|
+| `step` | /tokens/:address/prices, POST /tokens/prices | One of `1h`, `1d`, `1w`, `1mo` (`tokenPrices.step`, vocabulary v9). Defaults from `window`: `1d`/`1w` → `1h`, `1m`/`3m` → `1d`, `1y` → `1w`, `all` → `1mo`. Any other word is 400 with `parameter: "step"` and `valid`. |
+| `window` | same | One of `1d`, `1w`, `1m`, `3m`, `1y`, `all`; default `1w`. `from`/`to` (ISO-8601) override it; `from` after `to` is 400 with `parameter: "from"`. |
+| `from`, `to` | same | The bounds actually read, UTC ISO; `from` is `null` only for `all` with no explicit start. |
+| `points[].at` | same | Start of the bucket (the sampled hour for `1h`; UTC day, ISO week (Monday) or calendar month otherwise). Ascending. |
+| `points[].usd` | same | The hour's sample for `1h`; the bucket's close (last sampled hour) otherwise. Never 0 for "unknown": an hour with no sample is absent, not zero. Nothing before 17 Sep 2026 is rebuilt from the daily `token_prices`. |
+| `points[].openUsd`, `highUsd`, `lowUsd`, `hours` | same, step ≠ `1h` | First sampled hour, max, min, and how many hourly samples the bucket holds (a partial bucket has fewer than 24 / 168 / ~720). Absent on `1h`. |
+| `points[].liquidityUsd` | same, step `1h` | DexScreener liquidity at that hour; `null` when the source gave none. Absent on other steps. |
+| `count`, `limit`, `truncated` | GET | Points returned; the cap (`?limit=`, at most 2000, default 2000); `truncated: true` when the span held more than `limit` and the OLDEST were dropped. |
+| `latest` | both | `{ at, usd }` from `token_price_stats`, the newest hourly sample; `null` before the first sample. |
+| `ath` | GET | `{ usd, at }`, the running max since sampling began (not the token's lifetime high); `null` before the first sample. |
+| `asOf` | both | `latest.at` (batch: the newest across the answered tokens); `null` when none is sampled. |
+| `tokens[].ok`, `error` | POST | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error: "ambiguous_chain"` (address on several chains and no `chain`; `chains[]` names them). `ok: true` rows carry `address`, `chain`, `symbol`, `points`, `count`, `latest`. At most 50 addresses; a duplicate is 400 `duplicate_identifier`. |
+

@@ -6,6 +6,7 @@ import "./routes/scorecard.ts";
 import "./routes/transactions.ts";
 import "./routes/flow.ts";
 import "./routes/tokens.ts";
+import "./routes/token-prices.ts";
 import "./routes/aum.ts";
 import "./routes/fields.ts";
 import "./routes/health.ts";

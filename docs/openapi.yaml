@@ -7718,6 +7718,297 @@ components:
           description: Absent from the previous snapshot; bought or newly tracked cannot be told apart.
         plain:
           type: string
+    TokenPricePoint:
+      type: object
+      description: One bucket of the series. `1h` points carry `usd` and `liquidityUsd`; coarser steps carry
+        the candle (`usd` is the close). A missing figure is `null`, never 0.
+      required:
+      - at
+      - usd
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: Start of the bucket (the sampled hour for `1h`; UTC day, ISO week (Monday) or calendar
+            month otherwise).
+        usd:
+          type: number
+          nullable: true
+          description: The hour's sample (`1h`), or the bucket's close (last sampled hour).
+        openUsd:
+          type: number
+          nullable: true
+          description: First sampled hour in the bucket. Absent on `1h`.
+        highUsd:
+          type: number
+          nullable: true
+          description: Absent on `1h`.
+        lowUsd:
+          type: number
+          nullable: true
+          description: Absent on `1h`.
+        hours:
+          type: integer
+          nullable: true
+          description: Hourly samples the bucket holds; a partial bucket has fewer than 24 / 168 / ~720. Absent
+            on `1h`.
+        liquidityUsd:
+          type: number
+          nullable: true
+          description: DexScreener liquidity at that hour. Only on `1h`; `null` when the source gave none.
+    TokenPriceLatest:
+      type: object
+      required:
+      - at
+      - usd
+      properties:
+        at:
+          type: string
+          format: date-time
+        usd:
+          type: number
+          nullable: true
+    TokenPriceAth:
+      type: object
+      description: The running high since sampling began (17 Sep 2026), not the token's lifetime high.
+      required:
+      - usd
+      - at
+      properties:
+        usd:
+          type: number
+          nullable: true
+        at:
+          type: string
+          format: date-time
+    TokenPricesResponse:
+      type: object
+      required:
+      - address
+      - chain
+      - symbol
+      - step
+      - window
+      - from
+      - to
+      - points
+      - count
+      - limit
+      - truncated
+      - latest
+      - ath
+      - asOf
+      - links
+      properties:
+        address:
+          type: string
+          description: The address as stored (case preserved).
+        chain:
+          type: string
+        symbol:
+          type: string
+          nullable: true
+        step:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+          description: '`tokenPrices.step` (vocabulary v9).'
+        window:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+        from:
+          type: string
+          format: date-time
+          nullable: true
+          description: Lower bound actually read; `null` only for `all` with no explicit `from`.
+        to:
+          type: string
+          format: date-time
+        points:
+          type: array
+          description: Ascending by `at`.
+          items:
+            $ref: '#/components/schemas/TokenPricePoint'
+        count:
+          type: integer
+        limit:
+          type: integer
+          description: The point cap applied (`?limit=`, at most 2000).
+        truncated:
+          type: boolean
+          description: True when the span held more than `limit` points and the OLDEST were dropped.
+        latest:
+          anyOf:
+          - $ref: '#/components/schemas/TokenPriceLatest'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        ath:
+          anyOf:
+          - $ref: '#/components/schemas/TokenPriceAth'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        asOf:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the newest sample was taken (`latest.at`); `null` before the first sample.
+        links:
+          type: object
+          properties:
+            token:
+              type: string
+            activity:
+              type: string
+    TokenPricesBatchRequest:
+      type: object
+      required:
+      - addresses
+      properties:
+        addresses:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: Token addresses, case-insensitive. Over 50 is a 400 refusal; a duplicate is 400 `duplicate_identifier`.
+          items:
+            type: string
+        chain:
+          type: string
+          description: 'Restrict every address to one chain. Without it an address on several chains answers
+            `ok:false` with `error: ambiguous_chain`.'
+        step:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+        window:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+          default: 1w
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+    TokenPricesBatchToken:
+      type: object
+      required:
+      - ok
+      - requested
+      properties:
+        ok:
+          type: boolean
+        requested:
+          type: string
+          description: The address exactly as sent.
+        address:
+          type: string
+        chain:
+          type: string
+        symbol:
+          type: string
+          nullable: true
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/TokenPricePoint'
+        count:
+          type: integer
+        latest:
+          anyOf:
+          - $ref: '#/components/schemas/TokenPriceLatest'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        error:
+          type: string
+          enum:
+          - not_found
+          - ambiguous_chain
+          description: Only when `ok` is false.
+        detail:
+          type: string
+        chains:
+          type: array
+          description: With `ambiguous_chain`, the chains the address exists on.
+          items:
+            type: string
+    TokenPricesBatchResponse:
+      type: object
+      required:
+      - limit
+      - asked
+      - step
+      - window
+      - from
+      - to
+      - pointsLimit
+      - tokens
+      - asOf
+      properties:
+        limit:
+          type: integer
+          description: Addresses per call (50). The cap refuses rather than trims.
+        asked:
+          type: integer
+        step:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+        window:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+        from:
+          type: string
+          format: date-time
+          nullable: true
+        to:
+          type: string
+          format: date-time
+        pointsLimit:
+          type: integer
+          description: Newest points kept per token (2000).
+        tokens:
+          type: array
+          description: One entry per requested address, in the order sent.
+          items:
+            $ref: '#/components/schemas/TokenPricesBatchToken'
+        asOf:
+          type: string
+          format: date-time
+          nullable: true
+          description: The newest sample across the answered tokens; `null` when none is sampled.
 paths:
   /v1/chains:
     get:
@@ -12980,3 +13271,270 @@ paths:
                       detail: this route did not answer within 15s — retry
                       requestId: req_3f9c2a1b7d4e8f01
                       retryAfterSeconds: 5
+  /v1/tokens/{address}/prices:
+    get:
+      operationId: getTokenPrices
+      tags:
+      - Tokens
+      summary: Price history for one token, hourly or as daily / weekly / monthly candles
+      description: 'Served from `token_price_hourly` (one DexScreener sample per held token per UTC hour
+        since 17 Sep 2026) and its candle views; nothing is fetched live and nothing before the first
+        sample is rebuilt from the daily `token_prices`. `step` defaults from `window` (`1d`,`1w` → `1h`;
+        `1m`,`3m` → `1d`; `1y` → `1w`; `all` → `1mo`); `from`/`to` override the window. `1h` points carry
+        `usd` and `liquidityUsd`; coarser steps carry the candle with `usd` as the close and `hours` saying
+        how full the bucket is. The newest `limit` points are kept and `truncated` says whether older
+        ones were dropped. `ath` is the running high since sampling began. An address on several chains
+        without `chain` is a 400 naming them. Costs 1 unit.'
+      parameters:
+      - name: address
+        in: path
+        required: true
+        description: Token address (base58 Solana mint or 0x EVM address). Case-insensitive.
+        schema:
+          type: string
+          example: Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+      - name: chain
+        in: query
+        required: false
+        description: A `/v1/chains` name; required when the address exists on more than one chain. Unknown
+          is 400.
+        schema:
+          type: string
+          example: solana
+      - name: step
+        in: query
+        required: false
+        description: 'Bucket size. Defaults from `window`. Any other word answers 400 with `parameter:
+          "step"` and `valid`.'
+        schema:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+      - name: window
+        in: query
+        required: false
+        description: 'Span counted back from `to` (or now). Any other word answers 400 with `parameter:
+          "window"`.'
+        schema:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+          default: 1w
+      - name: from
+        in: query
+        required: false
+        description: 'ISO-8601 lower bound (inclusive); overrides the window. Unparseable is 400 with `parameter:
+          "from"`; at or after `to` is 400.'
+        schema:
+          type: string
+          format: date-time
+      - name: to
+        in: query
+        required: false
+        description: ISO-8601 upper bound (inclusive); default now.
+        schema:
+          type: string
+          format: date-time
+      - name: limit
+        in: query
+        required: false
+        description: Newest points to keep. Non-integer or below 1 answers 400; above 2000 is clamped.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 2000
+          default: 2000
+      responses:
+        '200':
+          description: The series, ascending by `at`.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+            RateLimit-Scope:
+              $ref: '#/components/headers/RateLimitScope'
+            x-request-id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPricesResponse'
+              example:
+                address: Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+                chain: solana
+                symbol: PUMP
+                step: 1d
+                window: 1m
+                from: '2026-08-19T09:12:00.000Z'
+                to: '2026-09-18T09:12:00.000Z'
+                points:
+                - at: '2026-09-17T00:00:00.000Z'
+                  usd: 0.0041102
+                  openUsd: 0.0043877
+                  highUsd: 0.004491
+                  lowUsd: 0.0040215
+                  hours: 7
+                - at: '2026-09-18T00:00:00.000Z'
+                  usd: 0.003988
+                  openUsd: 0.004105
+                  highUsd: 0.004199
+                  lowUsd: 0.0039102
+                  hours: 9
+                count: 2
+                limit: 2000
+                truncated: false
+                latest:
+                  at: '2026-09-18T09:00:00.000Z'
+                  usd: 0.003988
+                ath:
+                  usd: 0.004491
+                  at: '2026-09-17T14:00:00.000Z'
+                asOf: '2026-09-18T09:00:00.000Z'
+                links:
+                  token: /v1/tokens/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump?chain=solana
+                  activity: /v1/tokens/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump/activity?chain=solana
+        '400':
+          description: Bad `step`, `window`, `from`, `to`, `limit` or `chain` (`parameter` names it), or an
+            address on several chains with no `chain` (`chains[]` names them).
+          headers: *id001
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: bad_request
+                  detail: '''step'' must be one of 1h, 1d, 1w, 1mo — got ''5m'''
+                  requestId: req_3f9c2a1b7d4e8f01
+                  parameter: step
+                  valid:
+                  - 1h
+                  - 1d
+                  - 1w
+                  - 1mo
+        '401': *id008
+        '404':
+          description: The address is not in `tokens` (on this chain, when `chain` was sent).
+          headers: *id001
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: not_found
+                  detail: no token '0x000000000000000000000000000000000000dead' on record on bsc
+                  requestId: req_3f9c2a1b7d4e8f01
+        '429': *id009
+        '500': *id010
+        '503': *id011
+  /v1/tokens/prices:
+    post:
+      operationId: batchTokenPrices
+      tags:
+      - Tokens
+      summary: Price history for up to 50 tokens in one call
+      description: 'The batch form of `GET /v1/tokens/{address}/prices`, one `tokens[]` entry per requested
+        address in the order sent: `ok: true` with that token''s series, or `ok: false` with `error`
+        `not_found` (not in `tokens`) or `ambiguous_chain` (on several chains and no `chain`; `chains[]`
+        names them). One SQL read serves every token. Over 50 addresses is a 400 refusal, never a silent
+        trim; a duplicate is 400 `duplicate_identifier`. Step and window rules are the GET''s; the newest
+        `pointsLimit` points are kept per token. The response''s `x-cost-units` header equals `asked`.'
+      requestBody:
+        required: true
+        description: Must be JSON; a body that does not parse answers 400 `bad_request` ("body must be
+          JSON").
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenPricesBatchRequest'
+            example:
+              addresses:
+              - Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+              - '0x000000000000000000000000000000000000dead'
+              window: 1w
+      responses:
+        '200':
+          description: One entry per requested address
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+            RateLimit-Scope:
+              $ref: '#/components/headers/RateLimitScope'
+            x-request-id:
+              $ref: '#/components/headers/RequestId'
+            x-cost-units:
+              description: How many rate-limit units this call cost — the number of addresses asked for
+                (at most 50).
+              schema:
+                type: integer
+                minimum: 1
+                maximum: 50
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPricesBatchResponse'
+              example:
+                limit: 50
+                asked: 2
+                step: 1h
+                window: 1w
+                from: '2026-09-11T09:12:00.000Z'
+                to: '2026-09-18T09:12:00.000Z'
+                pointsLimit: 2000
+                tokens:
+                - ok: true
+                  requested: Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+                  address: Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+                  chain: solana
+                  symbol: PUMP
+                  points:
+                  - at: '2026-09-18T08:00:00.000Z'
+                    usd: 0.0040211
+                    liquidityUsd: 211980.4
+                  - at: '2026-09-18T09:00:00.000Z'
+                    usd: 0.003988
+                    liquidityUsd: 210044.9
+                  count: 2
+                  latest:
+                    at: '2026-09-18T09:00:00.000Z'
+                    usd: 0.003988
+                - ok: false
+                  requested: '0x000000000000000000000000000000000000dead'
+                  error: not_found
+                  detail: no token '0x000000000000000000000000000000000000dead' on record
+                asOf: '2026-09-18T09:00:00.000Z'
+        '400':
+          description: No `addresses`, more than 50, a duplicate (`duplicate_identifier`), or a bad `step`,
+            `window`, `from`, `to` or `chain` (`parameter` names it).
+          headers: *id001
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: bad_request
+                  detail: at most 50 addresses per call — got 51; split the list rather than relying on
+                    truncation
+                  requestId: req_3f9c2a1b7d4e8f01
+                  parameter: addresses
+        '401': *id008
+        '429': *id009
+        '500': *id010
+        '503': *id011

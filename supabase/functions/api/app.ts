@@ -121,6 +121,7 @@ export async function handle(req: Request): Promise<Response> {
           "GET /tokens/momentum",
           "GET /tokens/:address",
           "GET /tokens/:address/activity",
+          "GET /tokens/:address/prices?chain=&step=&window=&from=&to=&limit=",
           "GET /creators/:address",
           "GET /chains",
           "GET /market/regime",
@@ -129,6 +130,7 @@ export async function handle(req: Request): Promise<Response> {
           "POST /traders/positions   { ids: [...] }",
           "POST /traders/aum        { ids: [...], window, step }",
           "POST /traders/flow       { ids: [...], since }",
+          "POST /tokens/prices      { addresses: [...], chain?, step?, window?, from?, to? }",
           "POST /traders/:handle/wallets   { secret, evmAddress?, solanaAddress? }",
         ],
       });

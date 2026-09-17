@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 8,
+  version: 9,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -77,5 +77,7 @@ export const VOCABULARY = {
                    "not_configured", "unauthorized", "invalid_address", "address_in_use",
                    "already_on_record"],
     "walletSubmission.pricing.state": ["pending_first_read"],
+    /* GET /tokens/:address/prices and POST /tokens/prices: the bucket a point covers. */
+    "tokenPrices.step": ["1h", "1d", "1w", "1mo"],
   },
 } as const;
