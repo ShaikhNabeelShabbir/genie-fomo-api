@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { db, longStatement } from "../db";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/settings.ts";
 import {
@@ -152,7 +152,9 @@ async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): P
   // Only tokens where a supply would actually be used: an entry price exists, or somebody holds it.
   // The most valuable held position first (gross amount x price, ceilings or not): a supply is what
   // lets /positions run the implied-cap check on exactly those rows (V1b).
-  const rows = await sql<{ network_id: string; address: string; token_key: string }[]>`
+  // holdings_current is a view over every capture: both target scans outran the 14 s connection
+  // statement_timeout on 17 Sep, so they run under their own 60 s one.
+  const rows = await longStatement(sql, 60_000, (tx) => tx<{ network_id: string; address: string; token_key: string }[]>`
     select tk.network_id, tk.address, tk.token_key
     from tokens tk
     left join lateral (
@@ -164,7 +166,7 @@ async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): P
                      and t.avg_entry_price > 0)
            or exists (select 1 from holdings_current h
                       where h.network_id = tk.network_id and h.token_key = tk.token_key))
-    order by hv.held desc nulls last, tk.network_id, tk.address`;
+    order by hv.held desc nulls last, tk.network_id, tk.address`);
   const targets: SupplyTarget[] = rows.map((r) => ({ ...r, network_id: Number(r.network_id) }));
   let attempted = 0, ok = 0, errored = 0;
   for (let i = 0; i < targets.length && !outOfTime(); i += SUPPLY_FANOUT) {
@@ -272,7 +274,7 @@ async function storeInfo(sql: Sql, t: InfoTarget, d: Rec, sec: Security | null):
 }
 
 async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promise<Phase & { flipped: number }> {
-  const targets = await sql<InfoTarget[]>`
+  const targets = await longStatement(sql, 60_000, (tx) => tx<InfoTarget[]>`
     select h.network_id, h.token_key, tk.address, ch.name as chain
       from holdings_current h
       join tokens tk  on tk.network_id = h.network_id and tk.token_key = h.token_key
@@ -288,7 +290,7 @@ async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promis
             or ti.security_fetched_at < now() - (${STALE_HOURS} * interval '1 hour'))
      group by 1,2,3,4, ti.fetched_at, ti.security_fetched_at
      -- Never-fetched first, then stalest: a run cut short leaves the set more complete than it found it.
-     order by ti.security_fetched_at asc nulls first, ti.fetched_at asc nulls first, h.token_key`;
+     order by ti.security_fetched_at asc nulls first, ti.fetched_at asc nulls first, h.token_key`);
   const key = (env.GMGN_API_KEY ?? "").trim();
   if (targets.length && !key) throw new Error("GMGN_API_KEY is not set");
   let attempted = 0, ok = 0, errored = 0, flipped = 0, secFailed = 0;
