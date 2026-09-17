@@ -1,6 +1,5 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db, longStatement } from "../db";
+import { jobSql, type Sql } from "../sql";
 import { ADDRESSES_PER_CALL, bestPairs, fetchPairs } from "../../../supabase/functions/_shared/dexscreener.ts";
 import { DAY_MS, KLINES_LIMIT, PAIR, parseKlines, seriesStartMs } from "./quote_prices-core";
 
@@ -15,25 +14,24 @@ import { DAY_MS, KLINES_LIMIT, PAIR, parseKlines, seriesStartMs } from "./quote_
  * asset nor priced by GMGN (docs/R4_ROBINHOOD_PRICES.md).
  *
  * TWINS OF `scripts/load_quote_prices.mjs` and `scripts/load_robinhood_prices.mjs`: edit all
- * three. Same SQL, same sources, same batch sizes; differs only where the platform does — a
- * wall-clock budget checked before every unit (one asset, one update batch, one DexScreener
- * call), a failed unit is counted rather than fatal, the 20k-row update runs under
- * `longStatement` in place of the scripts' 2 min `statement_timeout`, the informational
+ * three. Same sources, same batch sizes; differs only where the platform does — a wall-clock
+ * budget checked before every unit (one asset, one update batch, one DexScreener call), a
+ * failed unit is counted rather than fatal, the `value_usd` update runs in slices D1 finishes
+ * inside its 30 s per statement (no `statement_timeout` to raise), the informational
  * "still unpriced" count is not taken, and no `--all`/`--days`/`--limit`/`--token` flags.
  */
 
-type Sql = postgres.Sql;
-interface QuoteAsset { readonly network_id: string; readonly token_key: string; readonly symbol: string; readonly first_day: Date | string | null }
+interface QuoteAsset { readonly network_id: number; readonly token_key: string; readonly symbol: string; readonly first_day: Date | string | null }
 interface RobinhoodToken { readonly token_key: string; readonly address: string }
 
 const BINANCE = "https://api.binance.com/api/v3/klines";
 /** Pages of KLINES_LIMIT per asset; one in practice, the loop keeps a longer history from silently truncating. */
 const MAX_PAGES = 20;
-/** Rows per value_usd update: the single-statement version hit the 2 min timeout and rolled back everything. */
-const UPDATE_BATCH = 20_000;
+/** Rows per value_usd update: a slice D1 finishes well inside the 30 s it allows one statement. */
+const UPDATE_BATCH = 5_000;
 const MAX_UPDATE_BATCHES = 200;
-/** The scripts' ceiling on one update batch; the job never waits past its own budget either. */
-const UPDATE_TIMEOUT_MS = 120_000;
+/** Days per token_prices insert: 5 columns x 18 rows = 90 of the 100 parameters D1 binds. */
+const PRICE_ROWS = 18;
 const ROBINHOOD_NETWORK_ID = 4663;
 const ROBINHOOD_CHAIN = "robinhood";
 const SOURCE = "dexscreener";
@@ -59,11 +57,11 @@ export interface QuotePricesSummary {
  * else `seriesStartMs` looks a year back.
  */
 const quoteAssets = (sql: Sql) => sql<QuoteAsset[]>`
-  select q.network_id, q.token_key, q.symbol, null::date as first_day
+  select q.network_id, q.token_key, q.symbol, null as first_day
     from quote_assets q
-   where q.pegged_usd is null and q.symbol = any(${Object.keys(PAIR)})
+   where q.pegged_usd is null and q.symbol in (${Object.keys(PAIR)})
    order by q.network_id, q.symbol`;
-// No join to \`transactions\` for the first swap day: that scan outran the 14 s statement timeout
+// No join to \`transactions\` for the first swap day: that scan is far too slow for one statement
 // (17 Sep). A null first_day makes \`seriesStartMs\` look a year back, one Binance page.
 
 /** Daily closes from Binance, paged from `startMs`. */
@@ -87,12 +85,21 @@ async function priceAsset(sql: Sql, a: QuoteAsset, pair: string, now: Date): Pro
   const closes = await dailyCloses(pair, seriesStartMs(a.first_day ? new Date(a.first_day) : null, now));
   if (!closes.size) return 0;
   const days = [...closes.keys()], vals = [...closes.values()];
-  await sql`
-    insert into token_prices (network_id, token_key, day, usd, source)
-    select ${a.network_id}, ${a.token_key}, d::date, v, ${`binance:${pair}`}
-      from unnest(${days}::text[], ${vals}::numeric[]) as t(d, v)
-    on conflict (network_id, token_key, day)
-    do update set usd = excluded.usd, source = excluded.source, fetched_at = now()`;
+  const source = `binance:${pair}`;
+  await sql.begin((tx) => {
+    for (let i = 0; i < days.length; i += PRICE_ROWS) {
+      const part = days.slice(i, i + PRICE_ROWS);
+      void tx.unsafe(
+        `insert into token_prices (network_id, token_key, day, usd, source)
+         values ${part.map(() => "(?,?,?,?,?)").join(",")}
+         on conflict (network_id, token_key, day)
+         do update set usd = excluded.usd, source = excluded.source,
+                       fetched_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+        part.flatMap((d, j) => [a.network_id, a.token_key, d, vals[i + j], source]),
+      );
+    }
+    return Promise.resolve();
+  });
   return days.length;
 }
 
@@ -101,53 +108,65 @@ async function priceAsset(sql: Sql, a: QuoteAsset, pair: string, now: Date): Pro
  * rows where `value_usd is null`. `value_usd` is a MAGNITUDE like `amount`; direction lives
  * in the `direction` column alone. Returns rows updated.
  */
-const priceTransactionsBatch = (sql: Sql, timeoutMs: number): Promise<number> => longStatement(sql, timeoutMs, async (tx) => {
-  const res = await tx`
-    update transactions t
-       set value_usd = t.amount * coalesce(q.pegged_usd, p.usd)
-      from quote_assets q
-      left join token_prices p
-        on p.network_id = q.network_id and p.token_key = q.token_key
-     where q.network_id = t.network_id
-       and q.token_key  = t.token_key
-       and (q.pegged_usd is not null or p.day = t.block_time::date)
-       and t.value_usd is null
-       and t.ctid = any (array(
-             select ctid from transactions
-              where value_usd is null and tx_type = 'SWAP'
-              limit ${UPDATE_BATCH}))`;
+const priceTransactionsBatch = async (sql: Sql): Promise<number> => {
+  // The Postgres `update … from quote_assets left join token_prices` became one scalar subquery
+  // per rung (peg, then that day's close) with an `exists` guard, so a row nothing can price is
+  // left untouched and does not count as written. `ctid` -> `rowid`.
+  const res = await sql`
+    update transactions
+       set value_usd = amount * coalesce(
+             (select q.pegged_usd from quote_assets q
+               where q.network_id = transactions.network_id and q.token_key = transactions.token_key),
+             (select p.usd from token_prices p
+               where p.network_id = transactions.network_id and p.token_key = transactions.token_key
+                 and p.day = substr(transactions.block_time, 1, 10)))
+     where value_usd is null
+       and rowid in (select rowid from transactions
+                      where value_usd is null and tx_type = 'SWAP'
+                      limit ${UPDATE_BATCH})
+       and exists (select 1 from quote_assets q
+                    where q.network_id = transactions.network_id and q.token_key = transactions.token_key
+                      and (q.pegged_usd is not null
+                           or exists (select 1 from token_prices p
+                                       where p.network_id = q.network_id and p.token_key = q.token_key
+                                         and p.day = substr(transactions.block_time, 1, 10))))`;
   return res.count;
-});
+};
 
 /**
  * Held Robinhood tokens that are not a quote asset and that GMGN (`token_info`) carries no price for.
- * `holdings_current` is a view over every capture; the scan outran the 14 s connection
- * statement_timeout on 17 Sep, so it runs under its own longer one.
+ * `holdings_current` is a view over every capture, so this is the run's one broad read; one chain
+ * keeps it small.
  */
-const robinhoodTargets = (sql: Sql) => longStatement(sql, 60_000, (tx) => tx<RobinhoodToken[]>`
+const robinhoodTargets = (sql: Sql) => sql<RobinhoodToken[]>`
   select distinct h.token_key, tk.address
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
    where h.network_id = ${ROBINHOOD_NETWORK_ID} and q.token_key is null and ti.price_usd is null
-   order by h.token_key`);
+   order by h.token_key`;
 
 /** Price one DexScreener batch and write today's row per token that has a pool. Returns tokens priced. */
 async function priceRobinhoodBatch(sql: Sql, chunk: readonly RobinhoodToken[], day: string): Promise<number> {
   const best = bestPairs(await fetchPairs(ROBINHOOD_CHAIN, chunk.map((t) => t.address)));
-  let priced = 0;
-  for (const t of chunk) {
+  const hits = chunk.flatMap((t) => {
     const b = best.get(t.address.toLowerCase());
-    if (!b) continue;
-    await sql`
-      insert into token_prices (network_id, token_key, day, usd, source)
-      values (${ROBINHOOD_NETWORK_ID}, ${t.token_key}, ${day}, ${b.usd}, ${`${SOURCE}:${b.dex}`})
-      on conflict (network_id, token_key, day)
-      do update set usd = excluded.usd, source = excluded.source, fetched_at = now()`;
-    priced += 1;
-  }
-  return priced;
+    return b ? [{ t, b }] : [];
+  });
+  if (!hits.length) return 0;
+  await sql.begin((tx) => {
+    for (const { t, b } of hits) {
+      void tx`
+        insert into token_prices (network_id, token_key, day, usd, source)
+        values (${ROBINHOOD_NETWORK_ID}, ${t.token_key}, ${day}, ${b.usd}, ${`${SOURCE}:${b.dex}`})
+        on conflict (network_id, token_key, day)
+        do update set usd = excluded.usd, source = excluded.source,
+                      fetched_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`;
+    }
+    return Promise.resolve();
+  });
+  return hits.length;
 }
 
 /**
@@ -157,7 +176,7 @@ async function priceRobinhoodBatch(sql: Sql, chunk: readonly RobinhoodToken[], d
 export async function runQuotePrices(env: Env, budgetMs: number): Promise<QuotePricesSummary> {
   const started = Date.now();
   const left = (): number => budgetMs - (Date.now() - started);
-  const sql = db(env);
+  const sql = jobSql(env);
   try {
     const now = new Date(started);
     let transfersPriced = 0, coinsPriced = 0, batches = 0, failedBatches = 0, done = 0, stoppedEarly = false;
@@ -184,7 +203,7 @@ export async function runQuotePrices(env: Env, budgetMs: number): Promise<QuoteP
     for (let i = 0; i < MAX_UPDATE_BATCHES && !stoppedEarly; i++) {
       if (left() <= 0) { stoppedEarly = true; break; }
       try {
-        const n = await priceTransactionsBatch(sql, Math.min(UPDATE_TIMEOUT_MS, left()));
+        const n = await priceTransactionsBatch(sql);
         if (n === 0) break;
         transfersPriced += n;
       } catch (e) { fail(`value_usd batch ${i + 1}`, e); break; }

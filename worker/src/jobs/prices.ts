@@ -1,6 +1,5 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db, longStatement } from "../db";
+import { jobSql, type Sql } from "../sql";
 import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
 import {
   ADDRESSES_PER_CALL, athUpdate, bestPairs, fetchPairs, type Ath, type BestPair,
@@ -10,15 +9,19 @@ import {
  * Hourly DexScreener price per held token, on every chain, with a rolling ATH: the Worker half
  * of `.github/workflows/prices.yml`.
  *
- * Ported from `scripts/load_token_prices.mjs` (deleted 17 Sep 2026; the Worker is the only copy). Same SQL, same 30-address batches under
+ * Ported from `scripts/load_token_prices.mjs` (deleted 17 Sep 2026; the Worker is the only copy). Same figures, same 30-address batches under
  * the shared per-host throttle; differs only where the platform does — a wall-clock budget
  * (a cron killed mid-write records nothing, stopping early and saying so is better), a
  * failed DexScreener batch is counted rather than fatal, and no `--dry-run`/`--token` flags.
  */
 
-type Sql = postgres.Sql;
 interface Target { readonly network_id: number; readonly chain: string; readonly token_key: string; readonly address: string }
 interface Hit { readonly t: Target; readonly b: BestPair; readonly source: string }
+
+/** Rows per multi-row insert: D1 binds at most 100 parameters a statement. 6 columns x 15 = 90. */
+const HOURLY_ROWS = 15;
+/** 8 columns x 11 = 88 parameters. */
+const STATS_ROWS = 11;
 
 export interface PricesSummary {
   /** The UTC hour the samples were filed under. */
@@ -40,10 +43,11 @@ export interface PricesSummary {
  * Every held, non-native token with the chain word DexScreener wants, MOST-HELD FIRST, then
  * stalest first. ~26k tokens are held and one run prices ~20k at the DexScreener pace, so the
  * order decides what an hourly run guarantees: the tokens most balances depend on are always
- * priced this hour; the one-holder dust tail rotates by `token_price_stats.last_at`.
+ * priced this hour; the one-holder dust tail rotates by `token_price_stats.last_at` (SQLite `asc`
+ * already puts the never-sampled first, so the Postgres `nulls first` is implied).
  */
 async function targets(sql: Sql): Promise<Target[]> {
-  const rows = await sql<{ network_id: string; chain: string; token_key: string; address: string }[]>`
+  const rows = await sql<{ network_id: number; chain: string; token_key: string; address: string }[]>`
     select h.network_id, ch.name as chain, h.token_key, tk.address
       from holdings_current h
       join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
@@ -51,46 +55,57 @@ async function targets(sql: Sql): Promise<Target[]> {
       left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
      where h.human_amount > 0 and h.token_key not in (${ZERO_ADDRESS}, ${SOL_MINT})
      group by h.network_id, ch.name, h.token_key, tk.address, ps.last_at
-     order by count(distinct h.handle) desc, ps.last_at asc nulls first, h.network_id, h.token_key`;
+     order by count(distinct h.handle) desc, ps.last_at asc, h.network_id, h.token_key`;
   return rows.map((r) => ({ ...r, network_id: Number(r.network_id) }));
 }
 
-/** Previous stats for a chunk, keyed `network_id:token_key`; one select per chunk. */
+/** Previous stats for a chunk, keyed `network_id:token_key`; one select per chunk (one chain). */
 async function prevStats(sql: Sql, chunk: readonly Target[]): Promise<Map<string, Ath>> {
-  const rows = await sql<{ network_id: string; token_key: string; ath_usd: string; ath_at: Date }[]>`
-    select s.network_id, s.token_key, s.ath_usd, s.ath_at
-      from token_price_stats s
-      join unnest(${chunk.map((t) => t.network_id)}::bigint[], ${chunk.map((t) => t.token_key)}::text[])
-           as k(network_id, token_key) using (network_id, token_key)`;
-  return new Map(rows.map((r) => [`${r.network_id}:${r.token_key}`, { athUsd: Number(r.ath_usd), athAt: new Date(r.ath_at).toISOString() }]));
+  const networkId = chunk[0].network_id;
+  const rows = await sql<{ token_key: string; ath_usd: number; ath_at: string }[]>`
+    select token_key, ath_usd, ath_at
+      from token_price_stats
+     where network_id = ${networkId} and token_key in (${chunk.map((t) => t.token_key)})`;
+  return new Map(rows.map((r) => [`${networkId}:${r.token_key}`, { athUsd: Number(r.ath_usd), athAt: new Date(r.ath_at).toISOString() }]));
 }
 
+/** Every write of one batch as ONE D1 batch: the two upserts in slices, then the logo fills. */
 async function writeChunk(sql: Sql, hour: string, priced: readonly Hit[], prev: Map<string, Ath>): Promise<void> {
-  const col = <T>(f: (p: Hit) => T): T[] => priced.map(f);
-  await sql`
-    insert into token_price_hourly (network_id, token_key, hour, usd, liquidity_usd, source)
-    select * from unnest(${col((p) => p.t.network_id)}::bigint[], ${col((p) => p.t.token_key)}::text[], ${col(() => hour)}::timestamptz[],
-                        ${col((p) => p.b.usd)}::numeric[], ${col((p) => p.b.liquidity)}::numeric[], ${col((p) => p.source)}::text[])
-    on conflict (network_id, token_key, hour) do update
-      set usd = excluded.usd, liquidity_usd = excluded.liquidity_usd, source = excluded.source`;
   const stats = priced.map((p) => athUpdate(prev.get(`${p.t.network_id}:${p.t.token_key}`) ?? null, { usd: p.b.usd, at: hour }));
-  await sql`
-    insert into token_price_stats (network_id, token_key, ath_usd, ath_at, last_usd, last_at, drawdown_share, source)
-    select * from unnest(${col((p) => p.t.network_id)}::bigint[], ${col((p) => p.t.token_key)}::text[],
-                        ${stats.map((s) => s.athUsd)}::numeric[], ${stats.map((s) => s.athAt)}::timestamptz[],
-                        ${col((p) => p.b.usd)}::numeric[], ${col(() => hour)}::timestamptz[],
-                        ${stats.map((s) => s.drawdownShare)}::numeric[], ${col((p) => p.source)}::text[])
-    on conflict (network_id, token_key) do update
-      set ath_usd = excluded.ath_usd, ath_at = excluded.ath_at, last_usd = excluded.last_usd, last_at = excluded.last_at,
-          drawdown_share = excluded.drawdown_share, source = excluded.source, updated_at = now()`;
   // G2: fill a missing logo from the pair; GMGN's own (tokens job) is never overwritten.
   const withLogo = priced.filter((p) => p.b.logo !== null);
-  if (withLogo.length === 0) return;
-  await sql`
-    update token_info ti set logo_url = v.logo
-      from unnest(${withLogo.map((p) => p.t.network_id)}::bigint[], ${withLogo.map((p) => p.t.token_key)}::text[],
-                  ${withLogo.map((p) => p.b.logo)}::text[]) as v(network_id, token_key, logo)
-     where ti.network_id = v.network_id and ti.token_key = v.token_key and ti.logo_url is null`;
+  await sql.begin((tx) => {
+    for (let i = 0; i < priced.length; i += HOURLY_ROWS) {
+      const part = priced.slice(i, i + HOURLY_ROWS);
+      void tx.unsafe(
+        `insert into token_price_hourly (network_id, token_key, hour, usd, liquidity_usd, source)
+         values ${part.map(() => "(?,?,?,?,?,?)").join(",")}
+         on conflict (network_id, token_key, hour) do update
+           set usd = excluded.usd, liquidity_usd = excluded.liquidity_usd, source = excluded.source`,
+        part.flatMap((p) => [p.t.network_id, p.t.token_key, hour, p.b.usd, p.b.liquidity, p.source]),
+      );
+    }
+    for (let i = 0; i < priced.length; i += STATS_ROWS) {
+      const part = priced.slice(i, i + STATS_ROWS);
+      void tx.unsafe(
+        `insert into token_price_stats (network_id, token_key, ath_usd, ath_at, last_usd, last_at, drawdown_share, source)
+         values ${part.map(() => "(?,?,?,?,?,?,?,?)").join(",")}
+         on conflict (network_id, token_key) do update
+           set ath_usd = excluded.ath_usd, ath_at = excluded.ath_at, last_usd = excluded.last_usd, last_at = excluded.last_at,
+               drawdown_share = excluded.drawdown_share, source = excluded.source,
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+        part.flatMap((p, j) => [
+          p.t.network_id, p.t.token_key, stats[i + j].athUsd, stats[i + j].athAt,
+          p.b.usd, hour, stats[i + j].drawdownShare, p.source,
+        ]),
+      );
+    }
+    for (const p of withLogo) {
+      void tx`update token_info set logo_url = ${p.b.logo}
+               where network_id = ${p.t.network_id} and token_key = ${p.t.token_key} and logo_url is null`;
+    }
+    return Promise.resolve();
+  });
 }
 
 /** DexScreener's endpoint is per chain, so a batch never mixes chains. */
@@ -119,7 +134,7 @@ async function priceBatch(sql: Sql, hour: string, chunk: readonly Target[]): Pro
  */
 export async function runPrices(env: Env, budgetMs: number): Promise<PricesSummary> {
   const started = Date.now();
-  const sql = db(env);
+  const sql = jobSql(env);
   try {
     const list = await targets(sql);
     const hour = new Date(Math.floor(started / 3_600_000) * 3_600_000).toISOString();
