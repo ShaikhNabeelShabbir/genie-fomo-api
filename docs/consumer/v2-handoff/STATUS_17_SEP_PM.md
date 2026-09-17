@@ -84,7 +84,7 @@ ran. Failures and unresolved items are now counted and reported separately.
 | G2 | No token logo | **Open** | No `logoUrl` field is published yet. GMGN's document is stored, DexScreener's image URL is dropped at parse |
 | B3 | Same-day retries invisible | **Answered, closed** | Refused readings were overwritten by design and sampling has stopped, so no retry can be shown |
 | L2 | Slow reads | **Improved, not closed** | The routes that timed out now answer. `/tokens` 8.7 s and `/market/regime` 9.7 s are still slow, see §6 |
-| — | Wallet submission secret | **Open, needs an ops step** | `POST /traders/:handle/wallets` answers 503 `not_configured` until `WALLET_SUBMIT_SECRET` is set on the Worker |
+| — | Wallet submission secret | **Fixed** | `WALLET_SUBMIT_SECRET` is set on the Worker. `POST /traders/:handle/wallets` is live; the secret goes in the JSON **body** as `secret`, not in a header. See §9 |
 
 ---
 
@@ -206,3 +206,32 @@ see a word that is not in `/v2/fields`, that is a bug on our side — send it to
 
 v1 on Supabase still answers and is frozen. It is not being written to any more and will be retired
 once you are fully on v2. Do not build anything new against it.
+
+
+---
+
+## 9. Submitting a wallet
+
+`POST /v2/traders/:handle/wallets` is enabled. The secret goes in the JSON body as `secret`, not in
+a header. Send `evmAddress`, `solanaAddress`, or both.
+
+```json
+{ "secret": "<the shared secret>", "evmAddress": "0x…", "solanaAddress": "…" }
+```
+
+A submitted address is recorded as `source: "submitted"`, `confidence: "reported"`, and
+`verified_at` stays null. Nothing here proves the address belongs to that trader, it was asserted,
+and that distinction travels with every figure the address later produces.
+
+The refusals, all verified against the live deployment:
+
+| Situation | Status | `code` |
+|---|---|---|
+| No `secret`, or the wrong one | 401 | `unauthorized` |
+| Handle is not in the directory | 404 | `not_found` |
+| Address is not a 20-byte hex or base58 address | 400 | `invalid_address` |
+| Neither `evmAddress` nor `solanaAddress` sent | 400 | `bad_request` |
+| The trader already has an address of that family | 409 | `already_on_record` |
+| Another trader already holds that address | 409 | `address_in_use`, with `heldBy` |
+
+An existing address is never overwritten by a submission. To correct one, ask us.
