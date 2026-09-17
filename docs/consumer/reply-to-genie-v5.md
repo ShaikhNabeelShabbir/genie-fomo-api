@@ -6,10 +6,10 @@ read in it was reproducible from the figures you gave, and four of them found th
 **Deployed to v2 on 17 Sep 2026, ~15:05 UTC**, migration `0005` applied first. Every figure
 below quoted as current was read back from production after the deploy, not from a test.
 
-**One thing to read carefully rather than skim: V1d.** We found it after the first deploy and
-fixed it (§1) — the cause was one line, and it is the same line behind A4's sawtooth. Hours
-already stored keep their old figures until they are rebuilt, so **cupseyy's 07:00 may still
-read $2.5B when you check**; keep your $1B guard on until it does not.
+**V1d is fixed, including the hour you named.** We found it after the first deploy (§1) — the
+cause was one line, and it is the same line behind A4's sawtooth. **cupseyy's 07:00 now returns
+`totalUsd: null`, `reason: "too_little_priced"`, `pricedShare: 0.0169`** instead of
+$2,509,077,756. You can drop the $1B guard for him once you have seen that.
 
 **A2 is now met** (§2): 445 of 446 traders carry a figure under an hour old. We cannot tell you
 what that number was when you wrote, because the field that measures it did not exist until
@@ -120,17 +120,25 @@ published them as though they were.
   `token_info` rung and should — `now` IS current, so a current price is the right thing to
   value it with. A past hour is not.
 
+  **The hour you named, before and after:**
+
+  | | `totalUsd` | `pricedShare` | `reason` |
+  |---|---|---|---|
+  | before | 2,509,077,756.02 | 0.4506 | — |
+  | **now** | **null** | **0.0169** | **`too_little_priced`** |
+
   **Two things you need to know about the state of the data.**
 
-  1. **Hours already stored keep their old figures until they are rebuilt.** The builder only
-     recomputes the last two hours, so cupseyy's 07:00 still reads $2.5B right now. We are
-     running a targeted rebuild; until it lands, **keep your $1B guard on**.
-  2. **Expect more nulls, and that is the honest answer.** With the untimestamped rung gone,
-     a wallet of 11,278 dust memecoins has dated prices for only about 190 of them — under our
-     5% floor — so many of cupseyy's hours will come back `totalUsd: null` with
-     `reason: too_little_priced` and a `partialUsd`. We would rather hand you a gap you can see
-     than a number built from 1.7% of a wallet. Traders with fewer, better-covered positions are
+  1. **Expect more nulls, and that is the honest answer.** Note the `pricedShare` above: with
+     the untimestamped rung gone, 11,278 dust memecoins yield dated prices for 1.69% of the
+     wallet, so the figure is withheld rather than replaced by a smaller fiction. We would
+     rather hand you a gap you can see. Traders with fewer, better-covered positions are
      unaffected.
+  2. **Older hours are still healing.** The builder only recomputes the last two hours, so the
+     hours written before the fix are being rewritten by a self-terminating pass — 1,487 rows
+     across 420 traders when it started, converging over several hours. cupseyy went first. If
+     you find another trader with an implausible hour, it is in that queue; tell us and we will
+     confirm rather than ask you to wait.
 
 ## 2. The sawtooth and the missing hours — A4, A3, A2
 
@@ -403,7 +411,7 @@ and **send a `User-Agent` that names your app** or Cloudflare will answer 403 `e
 | 2 | `GET /v2/traders/gmgn_0xf80d7961/positions?limit=5` | `totalValueUsd` about **2,889** (it moves with the ETH close), `suspectUsd: 0`; the ethereum native priced `token_prices`, **not null** — it was null for you (N1) |
 | 3 | `GET /v2/traders/397397/aum/history?window=1d` | no flat $43,780.82 rung: those hours are `totalUsd: null`, `reason: too_little_priced`, `partialUsd: 43780.82`, `pricedShare: 0.0069` (A4) |
 | 4 | the same read | 08:00 and 09:00 present as `totalUsd: null`, `reason: not_built` (A3) |
-| 5 | `GET /v2/traders/cupseyy/aum/history?window=1d` | 12:00 withheld, 13:00 `partial: true`. **07:00 reads $2.5B until the rebuild lands** — the cause is fixed and deployed, the stored row is not yet rewritten (V1d, §1). Expect more `null` hours here afterwards, not fewer |
+| 5 | `GET /v2/traders/cupseyy/aum/history?window=1d` | **07:00 is now `totalUsd: null`, `reason: too_little_priced`, `pricedShare: 0.0169`** — not $2.5B (V1d, §1). 12:00 withheld, 13:00 `partial: true`. Expect MORE `null` hours here than before, which is the honest answer |
 | 6 | `GET /v2/traders/smokey0x/trades?limit=50` | `complete: false`, `incompleteReason: chains_unresolved_and_chains_truncated`; solana `state: truncated` with a `horizonAt` that moves EARLIER on later reads as the backfill walks (W2) |
 | 7 | `GET /v2/traders/smokey0x` | `onChain.swapsAppearedIn` about **593** and `onChain.ownSwaps` about **6** — both rise as transfers land, the point is the gap between them, not the figures; **`onChain.swaps` is gone** |
 | 8 | `GET /v2/traders/397397/positions?limit=500` | all four honeypot rows `isHoneypot: true, canSell: false` (H2) |
@@ -438,7 +446,7 @@ build, tell us and we will serve both spellings for a version rather than make y
 
 | Ask | State | When |
 |---|---|---|
-| **V1d** — the cause is fixed and deployed; stored hours need a targeted rebuild before 07:00 stops reading $2.5B | code fixed, data pending | rebuild today |
+| **V1d** — remaining pre-fix hours on other traders (1,487 rows across 420 when the heal started; cupseyy already done) | healing, self-terminating | converges overnight |
 | `/tokens` query rewrite (the cold-isolate timeout) | planned | 24 Sep |
 | Solana backfill reaching every wallet's first trade (184 wallets hold a Solana address; 0 finished) | starts on the :40 run | ~1 week |
 | `truncated` for EVM chains (no end-of-history signal from Bitquery) | open, no date | — |
