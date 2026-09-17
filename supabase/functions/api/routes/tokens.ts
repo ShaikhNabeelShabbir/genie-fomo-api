@@ -675,7 +675,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
              trade_qty(tr.status, tr.amount, tr.realized_pnl_usd,
                        tr.avg_entry_price, tr.avg_exit_price) as qty
       from trades tr join traders t on t.handle = tr.handle
-      where t.display_handle = any(${per.map((r) => String(r.handle))}) and tr.status = 'closed')
+      where t.display_handle in (${per.map((r) => String(r.handle))}) and tr.status = 'closed')
     select l.handle, ti.price_usd as current,
            coalesce(
              sum(avg_exit_price * qty) filter (where avg_exit_price > 0 and qty is not null)

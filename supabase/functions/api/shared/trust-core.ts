@@ -6,11 +6,11 @@ import { money } from "../shared/format.ts";
 /** Holdings aggregate per trader, grouped so the bulk route needs one statement. */
 export const trustHoldings = (handles: string[]) => sql`
   select handle,
-         count(*)::int as positions,
-         count(value) filter (where value > 0)::int as priced,
-         coalesce(sum(value) filter (where value > 0), 0) as holdings_value,
+         count(*) as positions,
+         count(case when value > 0 then value end) as priced,
+         coalesce(sum(case when value > 0 then value end), 0) as holdings_value,
          max(captured_at) as as_of
-  from holdings_current where handle = any(${handles}) group by handle`;
+  from holdings_current where handle in (${handles}) group by handle`;
 
 /**
  * Shared by the single and bulk routes. As with `pnlBody`, `group by` yields no row for a

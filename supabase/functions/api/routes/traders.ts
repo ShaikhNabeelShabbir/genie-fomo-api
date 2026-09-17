@@ -367,7 +367,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     select (select count(*) from holdings_current where handle = ${h})  as positions,
            (select count(*) from trades   where handle = ${h})          as trades,
            (select count(*) from transactions
-             where address_key = any(${[t.evm_address, t.sol_address]
+             where address_key in (${[t.evm_address, t.sol_address]
                .filter((a): a is string => !!a).map((a) => a.toLowerCase())})) as transfers`;
 
   return {
@@ -481,7 +481,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
 const dailyTradeCounts = (addrs: string[]) => sql`
   select date_trunc('day', block_time)::date as day, count(*)::int as trades
   from transactions
-  where address_key = any(${addrs}) and block_time is not null
+  where address_key in (${addrs}) and block_time is not null
   group by 1 order by 1`;
 
 /** Gini over trades-per-day, expressed as evenness (1 − gini). See docs/DECISIONS.md#d104 */
@@ -510,7 +510,7 @@ const walletActivity = (addrs: string[]) => sql`
          -- O1: which chains the counts above actually cover.
          coalesce(array_agg(distinct c.name) filter (where c.name is not null), '{}') as chains_covered
   from transactions x left join chains c using (network_id)
-  where x.address_key = any(${addrs})`;
+  where x.address_key in (${addrs})`;
 
 
 /** Wallets, each with its FAMILY and the chains it has actually been seen on. See docs/DECISIONS.md#d105 */

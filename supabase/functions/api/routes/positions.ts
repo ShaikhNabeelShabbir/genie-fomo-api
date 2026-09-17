@@ -178,7 +178,7 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
 const positionTiming = (addrs: string[]) => sql`
   select network_id, token_key, start_at, end_at, last_at
   from position_timing
-  where address_key = any(${addrs})`;
+  where address_key in (${addrs})`;
 
 
 get("/v1/traders/:handle/positions", async ({ handle }, url) => {
@@ -404,7 +404,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
        where network_id = h.network_id and token_key = h.token_key
        order by hour desc limit 1
     ) ph on true
-    where h.handle = any(${handles})
+    where h.handle in (${handles})
     order by h.handle, h.value desc nulls last`;
 
   const by = new Map<string, any[]>();

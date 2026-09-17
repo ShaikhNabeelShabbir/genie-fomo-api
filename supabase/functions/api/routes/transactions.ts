@@ -51,7 +51,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
            tx.counterparty, tx.token_key, tx.token_symbol, tx.amount, tx.source,
            tx.tx_type, tx.tx_source, tx.address_key, tx.transfer_key, tx.value_usd
     from transactions tx join chains c using (network_id)
-    where tx.address_key = any(${keys})
+    where tx.address_key in (${keys})
       ${net === null ? sql`` : sql`and tx.network_id = ${net}`}
       ${kind === null ? sql`` : sql`and upper(tx.tx_type) = ${kind.toUpperCase()}`}
       ${
@@ -74,7 +74,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
   // finding; a count of zero with an empty store is a gap in ingestion.
   const storedQ = sql`
     select count(*)::int as total, max(block_time) as newest, min(block_time) as oldest
-    from transactions where address_key = any(${keys})`;
+    from transactions where address_key in (${keys})`;
 
   /** T2.1. See docs/DECISIONS.md#d111 */
   const moneyQ = sql`
@@ -83,7 +83,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
            count(*) filter (where tx_type = 'SWAP')::int             as swap_legs,
            count(value_usd) filter (where tx_type = 'SWAP')::int     as swap_legs_priced
     from transactions
-    where address_key = any(${keys})
+    where address_key in (${keys})
       ${net === null ? sql`` : sql`and network_id = ${net}`}`;
 
   /** The money block is a WHOLE-WALLET total, identical on every page — so it is computed when… See docs/DECISIONS.md#d112 */
@@ -238,7 +238,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
       left join tokens tk on tk.network_id = ws.network_id and tk.token_key = ws.token_key
       left join token_info ti on ti.network_id = ws.network_id and ti.token_key = ws.token_key
       left join quote_assets qa on qa.network_id = ws.network_id and qa.token_key = ws.quote_key
-      where ws.address_key = any(${addrs})
+      where ws.address_key in (${addrs})
         and (${chainQ}::text is null or c.name = ${chainQ})
         and (${since}::timestamptz is null or ws.block_time >= ${since}::timestamptz)
         and (${until}::timestamptz is null or ws.block_time <= ${until}::timestamptz)
@@ -252,7 +252,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
              ws.token_key, ws.token_delta, c.name as chain
       from wallet_swaps ws
       join chains c using (network_id)
-      where ws.address_key = any(${addrs})
+      where ws.address_key in (${addrs})
       order by ws.block_time asc, ws.tx_hash`,
     ])
     : [[], []];
@@ -315,7 +315,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
     ? await Promise.all([
       sql`select network_id, tx_hash, fee_native, fee_native_symbol
           from transaction_fees
-          where tx_hash = any(${pageHashes})`,
+          where tx_hash in (${pageHashes})`,
       nativePrices(),
     ])
     : [[], new Map<number, NativePrice>()];

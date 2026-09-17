@@ -62,11 +62,11 @@ export const scorecardRows = (handles: string[]) => sql`
   left join (
     select network_id, token_key, count(distinct handle)::int as holders
     from trades
-    where (network_id, token_key) in (select network_id, token_key from trades where handle = any(${handles}))
+    where (network_id, token_key) in (select network_id, token_key from trades where handle in (${handles}))
     group by 1, 2
   ) co on co.network_id = tr.network_id and co.token_key = tr.token_key
   left join token_price_stats ps on ps.network_id = tr.network_id and ps.token_key = tr.token_key
-  where tr.handle = any(${handles})`;
+  where tr.handle in (${handles})`;
 
 
 /** Dollars for a FEE, which is often a fraction of a cent. See docs/DECISIONS.md#d138 */
@@ -95,7 +95,7 @@ export async function feesFor(
            sum(fee_native)  as wall,
            sum(tx_count)::int as txs
     from trader_fees_daily
-    where handle = any(${handles})
+    where handle in (${handles})
     group by handle, network_id`;
 
   for (const r of rows) {
@@ -159,7 +159,7 @@ export async function swapsFor(handles: string[]): Promise<Map<string, Swap[]>> 
   const handleByAddr = new Map<string, string[]>();
   for (const w of await sql`
     select handle, lower(sol_address) as sol, evm_address_key as evm
-    from wallets where handle = any(${handles})`) {
+    from wallets where handle in (${handles})`) {
     for (const a of [w.sol, w.evm]) {
       if (!a) continue;
       const k = String(a);
@@ -169,7 +169,7 @@ export async function swapsFor(handles: string[]): Promise<Map<string, Swap[]>> 
   if (!handleByAddr.size) return out;
   const rows = await sql`
     select address_key, network_id, token_key, tx_hash, block_time, token_delta, quote_usd
-    from wallet_swaps where address_key = any(${[...handleByAddr.keys()]})
+    from wallet_swaps where address_key in (${[...handleByAddr.keys()]})
     order by block_time asc`;
   for (const r of rows) {
     for (const h of handleByAddr.get(String(r.address_key)) ?? []) {
@@ -426,7 +426,7 @@ export async function monthStartCapital(handles: string[]): Promise<Map<string, 
            total_usd,
            extract(day from (at at time zone 'utc'))::int as day_of_month
     from aum_samples
-    where handle = any(${handles}) and total_usd is not null
+    where handle in (${handles}) and total_usd is not null
     order by handle, month, at asc`;
   for (const r of rows) {
     if (Number(r.day_of_month) > START_CAPITAL_WINDOW_DAYS) continue;

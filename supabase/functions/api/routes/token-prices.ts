@@ -41,7 +41,7 @@ const resolveTokens = (keys: string[], net: number | null): Promise<TokenRow[]> 
     from tokens t
     join chains c on c.network_id = t.network_id
     left join token_price_stats ps on ps.network_id = t.network_id and ps.token_key = t.token_key
-   where t.token_key = any(${keys}) ${net === null ? sql`` : sql`and t.network_id = ${net}`}
+   where t.token_key in (${keys}) ${net === null ? sql`` : sql`and t.network_id = ${net}`}
    order by t.token_key, t.network_id`;
 
 /** Built per request: `sql` is the per-request client, so nothing may touch it at module load. */

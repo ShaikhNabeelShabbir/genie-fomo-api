@@ -748,7 +748,7 @@ async function aumFor(
   const span = AUM_WINDOWS[opts.windowKey];
 
   const traders = await sql`
-    select handle, display_handle from traders where handle = any(${handles})`;
+    select handle, display_handle from traders where handle in (${handles})`;
   if (!traders.length) return out;
   const present = traders.map((r: Record<string, unknown>) => String(r.handle));
 
@@ -775,7 +775,7 @@ async function aumFor(
                max(at) filter (where total_usd is not null and (priced_share is null
                  or priced_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
         from aum_chain_samples
-        where handle = any(${present}) and network_id = ${opts.chainFilter.network_id}
+        where handle in (${present}) and network_id = ${opts.chainFilter.network_id}
         group by handle`
     : await sql`
         select handle,
@@ -785,7 +785,7 @@ async function aumFor(
                max(at) filter (where total_usd is not null and (value_share is null
                  or value_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
         from aum_samples
-        where handle = any(${present})
+        where handle in (${present})
         group by handle`;
   const histBy = new Map<string, Record<string, unknown>>(
     history.map((h: Record<string, unknown>) => [String(h.handle), h]));
@@ -850,7 +850,7 @@ async function aumFor(
     select handle, count(distinct network_id)::int as chains,
            bool_or(network_id = ${SOLANA_NET}) as on_solana,
            bool_or(network_id <> ${SOLANA_NET}) as on_evm
-    from holdings_current where handle = any(${present}) and human_amount > 0
+    from holdings_current where handle in (${present}) and human_amount > 0
     group by handle`,
   ]);
 
@@ -1062,7 +1062,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
   /** THE FULL ENVELOPE IS THE DEFAULT here too, for the reason above and one measurement: witho… See docs/DECISIONS.md#d058 */
   if (Number(b?.contractVersion) !== 1) {
     const idRows = await sql`
-      select handle, id from traders where handle = any(${handles})`;
+      select handle, id from traders where handle in (${handles})`;
     const idBy = new Map<string, string | null>(idRows.map((r: Record<string, unknown>) => [String(r.handle), r.id ? String(r.id) : null]));
 
     const rowsOut = requested.map((req, i) => {

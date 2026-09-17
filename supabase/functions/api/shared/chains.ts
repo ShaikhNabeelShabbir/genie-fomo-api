@@ -47,7 +47,7 @@ export async function knownChainsFor(handles: string[]): Promise<Map<string, Kno
                 else w.evm_address is not null end as has_wallet
     from trader_chain_history h
     left join wallets w using (handle)
-    where h.handle = any(${handles})
+    where h.handle in (${handles})
     order by h.handle, h.chain`;
 
   for (const r of rows) {
@@ -61,7 +61,7 @@ export async function knownChainsFor(handles: string[]): Promise<Map<string, Kno
        * reaches this chain is on record, and 0 when the chain is evidenced but the address
        * behind it is not -- which is a real state and worth seeing rather than assuming.
        */
-      wallets: r.has_wallet === true ? 1 : 0,
+      wallets: Number(r.has_wallet) ? 1 : 0,
       hasPositions: Number(r.positions) > 0,
       /* ready | warming | none by the series' two-point rule, decided in the view. */
       historyState: String(r.history_state),

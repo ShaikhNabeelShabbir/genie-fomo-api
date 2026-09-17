@@ -18,3 +18,7 @@ export const cov = (of: number, total: number) => ({
 });
 export const money = (v: number) =>
   `${v < 0 ? "-" : ""}$${Math.abs(Math.round(v)).toLocaleString("en-US")}`;
+
+/** SQLite has no boolean: a 0/1 column (NULL = absent) becomes true/false/null at the boundary. */
+export const bool = (v: unknown): boolean | null =>
+  v === null || v === undefined ? null : Number(v) !== 0;

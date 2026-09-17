@@ -28,7 +28,7 @@ const flowRows = (handles: string[], since: string) => sql`
   join wallets w on w.sol_address_key = t.address_key
   join chains c on c.network_id = t.network_id
   left join tokens tk on tk.network_id = t.network_id and tk.token_key = t.token_key
-  where w.handle = any(${handles})
+  where w.handle in (${handles})
     and t.network_id = ${SOLANA}
     and t.direction in ('in', 'out')
     and t.amount is not null
@@ -79,7 +79,7 @@ post("/v1/traders/flow", async (_p, _url, body) => {
   const since = parseIso((body as { since?: unknown })?.since, "since");
   if (since === null) throw badRequest("body must carry 'since': an ISO-8601 timestamp", { parameter: "since" });
 
-  const known = await sql`select handle, display_handle from traders where handle = any(${handles})`;
+  const known = await sql`select handle, display_handle from traders where handle in (${handles})`;
   const display = new Map<string, string>(
     known.map((r: Record<string, unknown>) => [String(r.handle), String(r.display_handle)]));
   const by = new Map<string, Record<string, unknown>[]>();

@@ -1,6 +1,6 @@
 import { sql, n, round } from "../db.ts";
 import { get } from "../router.ts";
-import { cov } from "../shared/format.ts";
+import { bool, cov } from "../shared/format.ts";
 
 /** WHAT A TRADER PAID FOR WHAT HE STILL HOLDS. See docs/DECISIONS.md#d136 */
 export type CostBasis = {
@@ -13,17 +13,16 @@ export async function costBasisFor(handles: string[]): Promise<Map<string, Map<s
   if (!handles.length) return out;
   const rows = await sql`
     select handle, network_id, token_key,
-           sum(amount) filter (
-             where status = 'open' and avg_entry_price is not null and amount > 0) as cost_qty,
-           sum(avg_entry_price * amount) filter (
-             where status = 'open' and avg_entry_price is not null and amount > 0) as cost_usd,
-           count(*) filter (where status = 'open')::int as open_positions,
-           count(*) filter (
-             where status = 'open' and avg_entry_price is not null and amount > 0)::int
-             as open_priced,
-           sum(realized_pnl_usd) filter (where status = 'closed') as realized_usd
+           sum(case when status = 'open' and avg_entry_price is not null and amount > 0
+                    then amount end) as cost_qty,
+           sum(case when status = 'open' and avg_entry_price is not null and amount > 0
+                    then avg_entry_price * amount end) as cost_usd,
+           count(case when status = 'open' then 1 end) as open_positions,
+           count(case when status = 'open' and avg_entry_price is not null and amount > 0
+                      then 1 end) as open_priced,
+           sum(case when status = 'closed' then realized_pnl_usd end) as realized_usd
     from trades
-    where handle = any(${handles})
+    where handle in (${handles})
     group by handle, network_id, token_key`;
   for (const r of rows) {
     const h = String(r.handle);
@@ -80,9 +79,9 @@ export function costBlock(cb: CostBasis | undefined, amount: number | null, pric
 
 /** V2. A confirmed honeypot or unsellable coin is held, priced, and NOT part of the total. */
 export const unsellable = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) =>
-  r.is_honeypot === true || r.can_not_sell === true;
+  bool(r.is_honeypot) === true || bool(r.can_not_sell) === true;
 export const sellFlags = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) => ({
-  isHoneypot: r.is_honeypot === true,
+  isHoneypot: bool(r.is_honeypot) === true,
   /** null when the security source never judged it; false when it said "cannot sell". */
   canSell: r.can_not_sell === null || r.can_not_sell === undefined ? null : !r.can_not_sell,
 });
@@ -124,7 +123,7 @@ export async function indexerCoverageFor(handles: string[]): Promise<Map<string,
   const rows = await sql`
     select cc.handle, c.name as chain, cc.chain_nonce, cc.rows_held, cc.read_at
     from chain_coverage cc join chains c using (network_id)
-    where cc.handle = any(${handles})`;
+    where cc.handle in (${handles})`;
   for (const r of rows) {
     const h = String(r.handle);
     out.set(h, { ...(out.get(h) ?? {}), [String(r.chain)]: chainCoverage(r) });
