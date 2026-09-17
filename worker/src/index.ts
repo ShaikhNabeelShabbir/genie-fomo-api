@@ -41,8 +41,9 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "* * * * *":    runAumLiveFlush, // live value for traders whose wallet moved in the last minute
 };
 
-/** On-demand runs of the same jobs: `POST /jobs/<name>?budgetMs=` with `x-job-secret`. */
-const JOB_BY_NAME: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unknown>>> = {
+/** On-demand runs of the same jobs: `POST /jobs/<name>?budgetMs=&handles=&from=` with `x-job-secret`; only aum_history reads `handles`/`from`. */
+interface JobOptions { readonly handles?: readonly string[]; readonly from?: Date }
+const JOB_BY_NAME: Readonly<Record<string, (env: Env, budgetMs: number, opts: JobOptions) => Promise<unknown>>> = {
   prices: runPrices, aum_history: runAumHistory, transfers: runTransfers, quote_prices: runQuotePrices,
   balances: runBalances, tokens: runTokens, fees: runFees, swaps: runSwaps, scorecards: runScorecards,
   launches: runLaunches, wallets: runWallets, timing: runTiming, gmgn: runGmgn, directory: runDirectory,
@@ -61,7 +62,11 @@ async function runJob(req: Request, env: Env): Promise<Response> {
   if (!job) return Response.json({ error: `no job '${name}'`, jobs: Object.keys(JOB_BY_NAME) }, { status: 404 });
   const asked = Number(url.searchParams.get("budgetMs") ?? env.JOB_BUDGET_MS ?? MAX_BUDGET_MS);
   const budgetMs = Math.min(MAX_BUDGET_MS, Number.isFinite(asked) && asked > 0 ? asked : MAX_BUDGET_MS);
-  try { return Response.json({ job: name, budgetMs, summary: await job(env, budgetMs) }); }
+  const handles = url.searchParams.get("handles")?.split(",").map((h) => h.trim()).filter(Boolean);
+  const fromRaw = url.searchParams.get("from");
+  const from = fromRaw ? new Date(fromRaw) : undefined;
+  if (from && Number.isNaN(from.getTime())) return Response.json({ error: "from must be ISO-8601" }, { status: 400 });
+  try { return Response.json({ job: name, budgetMs, summary: await job(env, budgetMs, { handles, from }) }); }
   catch (e) { return Response.json({ job: name, error: e instanceof Error ? e.message : String(e) }, { status: 500 }); }
 }
 

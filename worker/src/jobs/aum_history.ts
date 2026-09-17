@@ -55,11 +55,20 @@ async function build(sql: Sql, c: Chunk): Promise<number> {
  * One pass within `budgetMs`. Throws only when work was planned and none of it could be
  * built, so the cron shows as failed rather than quietly building nothing.
  */
-export async function runAumHistory(env: Env, budgetMs: number): Promise<AumHistorySummary> {
+/** On-demand rebuild: `handles` and `from` (POST /jobs/aum_history?handles=a,b&from=ISO) re-run every hour from `from` to now for those traders; the build upserts, so no delete is needed. */
+export interface AumHistoryOptions { readonly handles?: readonly string[]; readonly from?: Date }
+
+export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistoryOptions = {}): Promise<AumHistorySummary> {
   const started = Date.now();
   const sql = db(env);
   try {
-    const work = planWork(await ranges(sql), new Date(started), CHUNK_HOURS);
+    let traders = await ranges(sql);
+    if (opts.handles?.length && opts.from) {
+      const wanted = new Set(opts.handles);
+      const resumeFrom = new Date(opts.from.getTime() - 3_600_000);
+      traders = traders.filter((t) => wanted.has(t.handle)).map((t) => ({ ...t, lastBuilt: resumeFrom, firstBuilt: null }));
+    }
+    const work = planWork(traders, new Date(started), CHUNK_HOURS);
     const planned = work.reduce((n, c) => n + c.hours, 0);
     let hours = 0, attempted = 0, failed = 0, stoppedEarly = false;
     for (const c of work) {
