@@ -56,6 +56,18 @@ export interface SuspectRow {
   readonly price: number | null; readonly supply: number | null; readonly usd: number | null;
   /** DexScreener liquidity of the best pair; null when no pair is known anywhere. */
   readonly liquidityUsd: number | null;
+  /**
+   * N1 (v5 fixes, 17 Sep 2026): a row in `quote_assets` — a dollar coin or a chain's own coin.
+   * The concentration and no-market rules do not apply to it. Both key on "we cannot check this
+   * price", and for ETH, BNB, SOL and USDC we can: their prices are exchange closes or a peg,
+   * the most trustworthy figures in the system, and their markets are the deepest that exist.
+   *
+   * Without this, a wallet holding nothing but 1.17 ETH was `concentration_over_ceiling` — the
+   * native sentinel carries no `total_supply`, so `capKnown` is false and the position is 100%
+   * of the total. It cost the single-native traders their whole balance twice over: unpriced
+   * before the ladder, and suspect after it. A wallet that is all ETH is not a broken price.
+   */
+  readonly quoteAsset?: boolean;
 }
 
 /**
@@ -65,20 +77,27 @@ export interface SuspectRow {
  * Then every row still clean is checked against its own pool (V1d), whatever its share.
  */
 export function suspectRows(rows: readonly SuspectRow[]): (PriceSuspectReason | null)[] {
+  /* A quote asset still faces the implied-cap check; it is only the two market checks it skips. */
+  const exempt = rows.map((r) => r.quoteAsset === true);
   const out: (PriceSuspectReason | null)[] = rows.map((r) =>
     r.price !== null && r.supply !== null && r.supply > 0 && r.price * r.supply > IMPLIED_MCAP_CEILING_USD
       ? "implied_mcap_over_ceiling" : null);
+  /* An exempt row stays in the base: it is real value the other rows are judged against. */
   let base = rows.reduce((s, r, i) => s + (out[i] === null ? r.usd ?? 0 : 0), 0);
   for (;;) {
     let top = -1;
-    rows.forEach((r, i) => { if (out[i] === null && r.usd !== null && (top < 0 || r.usd > rows[top].usd!)) top = i; });
+    rows.forEach((r, i) => {
+      if (!exempt[i] && out[i] === null && r.usd !== null && (top < 0 || r.usd > rows[top].usd!)) top = i;
+    });
     if (top < 0) break;
     const reason = priceSuspectReason(rows[top].price, rows[top].supply, rows[top].usd, base);
     if (reason === null) break;
     out[top] = reason;
     base -= rows[top].usd!;
   }
-  rows.forEach((r, i) => { if (out[i] === null && noMarketSuspect(r.usd, r.liquidityUsd)) out[i] = "no_market_over_ceiling"; });
+  rows.forEach((r, i) => {
+    if (!exempt[i] && out[i] === null && noMarketSuspect(r.usd, r.liquidityUsd)) out[i] = "no_market_over_ceiling";
+  });
   return out;
 }
 

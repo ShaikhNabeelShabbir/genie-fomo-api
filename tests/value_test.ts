@@ -108,3 +108,41 @@ Deno.test("decideTotal: 0 only when a chain answered and every answer was empty"
   assertEquals(decideTotal(2, 1, 12.5, 3, []), { totalUsd: 12.5, reason: null });
   assertEquals(decideTotal(1, 0, 0, 2, []), { totalUsd: null, reason: "no_prices" });
 });
+
+Deno.test("suspectRows: N1 — a wallet that is all ETH is not a broken price", () => {
+  /* The native sentinel carries no total_supply, so capKnown is false and the row is 100% of
+     the total: without the exemption this is concentration_over_ceiling and the trader's whole
+     balance disappears into suspectUsd. */
+  const nativeOnly = [
+    { price: 2464.97, supply: null, usd: 2889.02, liquidityUsd: null, quoteAsset: true },
+    { price: 1.5e-7, supply: null, usd: 7.6e-7, liquidityUsd: null, quoteAsset: false },
+  ];
+  assertEquals(suspectRows(nativeOnly), [null, null]);
+  /* Without the flag, the same rows are exactly the bug this exempts. */
+  assertEquals(suspectRows(nativeOnly.map((r) => ({ ...r, quoteAsset: false })))[0],
+    "concentration_over_ceiling");
+});
+
+Deno.test("suspectRows: a quote asset skips the no-market check, an unknown coin does not", () => {
+  /* Over $1M with no pool known is no_market_over_ceiling — unless it is a dollar coin.
+     A known supply keeps the concentration rule (which fires first) out of the way. */
+  const usdc = { price: 1, supply: 1e6, usd: 1_059_250.04, liquidityUsd: null, quoteAsset: true };
+  const memecoin = { ...usdc, quoteAsset: false };
+  assertEquals(suspectRows([usdc]), [null]);
+  assertEquals(suspectRows([memecoin]), ["no_market_over_ceiling"]);
+});
+
+Deno.test("suspectRows: the exemption does not shelter a broken price or the rest of the wallet", () => {
+  /* Implied market cap still applies to a quote asset with a supply we can check. */
+  assertEquals(
+    suspectRows([{ price: 1e9, supply: 1e9, usd: 10, liquidityUsd: null, quoteAsset: true }]),
+    ["implied_mcap_over_ceiling"],
+  );
+  /* An exempt row stays in the base, so a junk row beside it is still judged against real value. */
+  const [eth, junk] = suspectRows([
+    { price: 2464.97, supply: null, usd: 2_000_000, liquidityUsd: null, quoteAsset: true },
+    { price: 5, supply: null, usd: 50, liquidityUsd: 900, quoteAsset: false },
+  ]);
+  assertEquals(eth, null);
+  assertEquals(junk, null);
+});

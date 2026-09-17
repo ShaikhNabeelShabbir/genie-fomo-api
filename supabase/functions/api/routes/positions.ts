@@ -78,7 +78,10 @@ const byValueThenAddress = (a: Record<string, unknown>, b: Record<string, unknow
 /** V1b: one trader's rows judged together; an unsellable row is already out of the total and never enters the base. */
 const suspectVerdicts = (rows: readonly Record<string, unknown>[]): (PriceSuspectReason | null)[] =>
   suspectRows(rows.map((r) => ({
-    price: n(r.price), supply: n(r.total_supply), usd: unsellable(r) ? null : gross(r), liquidityUsd: n(r.liquidity_usd),
+    price: n(r.price), supply: n(r.total_supply), usd: unsellable(r) ? null : gross(r),
+    liquidityUsd: n(r.liquidity_usd),
+    /* N1: a dollar coin or a chain's own coin is not judged by the market checks. */
+    quoteAsset: !!r.is_quote,
   })));
 
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
@@ -476,6 +479,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
            h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
+           (q.token_key is not null) as is_quote,
            cast(coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0)) as real) as total_supply,
            cast(coalesce(ph.liquidity_usd, ti.liquidity_usd) as real) as liquidity_usd,
            ${ladderColumns()}

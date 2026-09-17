@@ -34,6 +34,8 @@ export interface Position {
   readonly supply: number | null;
   readonly liquidityUsd: number | null;
   readonly unsellable: boolean;
+  /** N1: a `quote_assets` row — a dollar coin or a chain's own coin. See value.ts SuspectRow. */
+  readonly quoteAsset?: boolean;
 }
 
 export interface Valuation {
@@ -66,6 +68,7 @@ export function valueGroup(rows: readonly Position[]): Valuation {
   // The concentration base is the sellable, priced gross: an unsellable row is not part of it.
   const reasons = suspectRows(rows.map((r, i) => ({
     price: r.price, supply: r.supply, usd: r.unsellable ? null : raw[i], liquidityUsd: r.liquidityUsd,
+    quoteAsset: r.quoteAsset === true,
   })));
   const kinds = rows.map((r, i): "priced" | "suspect" | "unsellable" | "unpriced" => {
     const usd = raw[i];
@@ -109,10 +112,12 @@ interface Facts {
   pegged: number | null;
   infoPrice: number | null;
   statsLast: number | null;
+  /** N1: the token is in `quote_assets` at all, pegged or floating. */
+  quoteAsset: boolean;
 }
 
 const factsKey = (networkId: number, tokenKey: string): string => `${networkId}|${tokenKey}`;
-const emptyFacts = (): Facts => ({ supply: null, liquidity: null, unsellable: false, pegged: null, infoPrice: null, statsLast: null });
+const emptyFacts = (): Facts => ({ supply: null, liquidity: null, unsellable: false, pegged: null, infoPrice: null, statsLast: null, quoteAsset: false });
 
 /** `network_id -> token_key[]`, so every `in (…)` stays inside one chain and inside 80 binds. */
 function byNetwork(refs: readonly TokenRef[]): Map<number, string[]> {
@@ -158,10 +163,15 @@ async function loadFacts(sql: Sql, refs: readonly TokenRef[], withStats: boolean
         const f = at(networkId, r.token_key);
         f.supply = positive(r.total_supply) ?? f.supply;
       }
-      const pegs = await sql<{ token_key: string; pegged_usd: number }[]>`
+      const pegs = await sql<{ token_key: string; pegged_usd: number | null }[]>`
         select token_key, pegged_usd from quote_assets
-         where network_id = ${networkId} and token_key in (${keys}) and pegged_usd > 0`;
-      for (const r of pegs) at(networkId, r.token_key).pegged = r.pegged_usd;
+         where network_id = ${networkId} and token_key in (${keys})`;
+      for (const r of pegs) {
+        const f = at(networkId, r.token_key);
+        /* Membership alone exempts the row from the market checks; only a positive peg prices it. */
+        f.quoteAsset = true;
+        if (typeof r.pegged_usd === "number" && r.pegged_usd > 0) f.pegged = r.pegged_usd;
+      }
       // V1d liquidity: the best pair's, from the latest hourly sample, else GMGN's (already set).
       const liq = await sql<{ token_key: string; liquidity_usd: number | null }[]>`
         select token_key, liquidity_usd from (
@@ -339,7 +349,8 @@ export async function buildAumHistory(sql: Sql, handle: string, fromIso: string,
         ?? daily.get(`${k}|${dayOf(hour)}`)
         ?? (hour === currentHour ? f.infoPrice : null)
         ?? null;
-      return { amount: b.amount, price, supply: f.supply, liquidityUsd: f.liquidity, unsellable: f.unsellable };
+      return { amount: b.amount, price, supply: f.supply, liquidityUsd: f.liquidity,
+               unsellable: f.unsellable, quoteAsset: f.quoteAsset };
     });
     return { handle, hour, basis: "priced" as const, v: valueGroup(positions) };
   });
@@ -432,7 +443,8 @@ export async function refreshAumLive(
       const k = factsKey(b.networkId, b.tokenKey);
       const f = facts.get(k) ?? emptyFacts();
       const price = f.pegged ?? f.statsLast ?? daily.get(k) ?? f.infoPrice ?? null;
-      return { amount: b.amount, price, supply: f.supply, liquidityUsd: f.liquidity, unsellable: f.unsellable };
+      return { amount: b.amount, price, supply: f.supply, liquidityUsd: f.liquidity,
+               unsellable: f.unsellable, quoteAsset: f.quoteAsset };
     });
     return { handle, v: valueGroup(positions) };
   });
