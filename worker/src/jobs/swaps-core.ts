@@ -1,6 +1,6 @@
 /**
  * Pure half of the swap resolver (`./swaps.ts`): Bitquery's decoded `DEXTrades` rows (EVM) or
- * a Helius `getTransaction` (Solana) for one transaction -> the wallet's net legs -> one
+ * a Helius parsed transaction (Solana) for one transaction -> the wallet's net legs -> one
  * `wallet_swaps` row. No I/O, so `tests/swaps_core_test.ts` runs it under Deno. The rules are
  * those of the scripts this replaced (`resolve_evm_swaps_from_receipts.mjs`,
  * `resolve_wallet_swaps.mjs`): only the wallet's own two-sided trade is a swap, a native leg
@@ -182,6 +182,42 @@ export function solanaDecode(tx: unknown, owner: string): Decoded | null {
     const d = Number.isFinite(before) && Number.isFinite(after) ? (after - before) / 1e9 : 0;
     if (Math.abs(d) > 1e-7) net.set(SOL_MINT, (net.get(SOL_MINT) ?? 0) + d);
   }
+  return twoSided(net);
+}
+
+/** One two-sided trade: exactly one mint received and one sent. */
+function twoSided(net: ReadonlyMap<string, number>): Decoded | null {
   const received = [...net].filter(([, v]) => v > 0), sent = [...net].filter(([, v]) => v < 0);
   return received.length === 1 && sent.length === 1 ? { recv: received[0], sent: sent[0] } : null;
+}
+
+/**
+ * `solanaDecode` over a Helius Enhanced Transactions reply (`POST /v0/transactions`, per
+ * https://www.helius.dev/docs/api-reference/enhanced-transactions/gettransactions): the same
+ * net change per mint, from every `accountData[].tokenBalanceChanges[]` whose `userAccount` is
+ * the wallet (`rawTokenAmount { tokenAmount, decimals }` is the signed raw delta), and native
+ * SOL from the wallet's own `accountData[]` entry's `nativeBalanceChange` (lamports). Same keys,
+ * dust and rent rules, so both decoders give one row for one transaction.
+ */
+export function solanaDecodeEnhanced(parsed: unknown, owner: string): Decoded | null {
+  if (!isRec(parsed) || !Array.isArray(parsed.accountData)) return null;
+  const w = owner.toLowerCase();
+  const net = new Map<string, number>();
+  for (const a of parsed.accountData) {
+    if (!isRec(a)) continue;
+    for (const c of Array.isArray(a.tokenBalanceChanges) ? a.tokenBalanceChanges : []) {
+      if (!isRec(c) || lower(c.userAccount) !== w || typeof c.mint !== "string" || !isRec(c.rawTokenAmount)) continue;
+      const raw = Number(c.rawTokenAmount.tokenAmount), dec = Number(c.rawTokenAmount.decimals);
+      const d = Number.isFinite(raw) && Number.isFinite(dec) ? raw / 10 ** dec : 0;
+      const mint = c.mint.toLowerCase();
+      net.set(mint, (net.get(mint) ?? 0) + d);
+    }
+    if (lower(a.account) === w) {
+      /* Fees are paid by whoever submitted (a relayer for these traders), so a native change is real movement, not gas. */
+      const d = Number(a.nativeBalanceChange) / 1e9;
+      if (Number.isFinite(d) && Math.abs(d) > 1e-7) net.set(SOL_MINT, (net.get(SOL_MINT) ?? 0) + d);
+    }
+  }
+  for (const [mint, d] of net) if (Math.abs(d) <= 1e-12) net.delete(mint);
+  return twoSided(net);
 }
