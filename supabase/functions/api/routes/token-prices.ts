@@ -54,27 +54,45 @@ async function seriesFor(pairs: Pair[], q: SeriesQuery, limit: number): Promise<
   if (!pairs.length) return out;
   const nets = pairs.map((p) => p.network_id);
   const keys = pairs.map((p) => p.token_key);
+  /*
+   * The pairwise `unnest(nets, keys)` is two `json_each` runs joined on the array index (the
+   * shim binds a non-IN array as JSON text), and the per-pair `cross join lateral (… limit n)`
+   * is `row_number() <= n` over the same ordering. The outer `order by` is new: the lateral
+   * emitted each pair's rows newest-first and the loop below `unshift`es them into ascending
+   * order, so that order is now stated rather than inherited from the plan.
+   */
   const rows = q.step === "1h"
     ? await sql<PointRow[]>`
         select w.network_id, w.token_key, p.at, p.usd, p.liquidity_usd,
-               null::numeric as open_usd, null::numeric as high_usd, null::numeric as low_usd, null::int as hours
-          from unnest(${nets}::bigint[], ${keys}::text[]) as w(network_id, token_key)
-          cross join lateral (
-            select h.hour as at, h.usd, h.liquidity_usd
+               null as open_usd, null as high_usd, null as low_usd, null as hours
+          from (select jn.value as network_id, jk.value as token_key
+                  from json_each(${nets}) jn
+                  join json_each(${keys}) jk on jk.key = jn.key) w
+          join (
+            select h.network_id, h.token_key, h.hour as at, h.usd, h.liquidity_usd,
+                   row_number() over (
+                     partition by h.network_id, h.token_key order by h.hour desc) as rn
               from token_price_hourly h
-             where h.network_id = w.network_id and h.token_key = w.token_key
-               and h.hour <= ${q.to}::timestamptz ${q.from === null ? sql`` : sql`and h.hour >= ${q.from}::timestamptz`}
-             order by h.hour desc limit ${limit}) p`
+             where h.token_key in (select value from json_each(${keys}))
+               and h.hour <= ${q.to} ${q.from === null ? sql`` : sql`and h.hour >= ${q.from}`}) p
+            on p.network_id = w.network_id and p.token_key = w.token_key and p.rn <= ${limit}
+         order by w.network_id, w.token_key, p.at desc`
     : await sql<PointRow[]>`
-        select w.network_id, w.token_key, p.at, p.usd, null::numeric as liquidity_usd,
+        select w.network_id, w.token_key, p.at, p.usd, null as liquidity_usd,
                p.open_usd, p.high_usd, p.low_usd, p.hours
-          from unnest(${nets}::bigint[], ${keys}::text[]) as w(network_id, token_key)
-          cross join lateral (
-            select v.bucket as at, v.close_usd as usd, v.open_usd, v.high_usd, v.low_usd, v.hours
+          from (select jn.value as network_id, jk.value as token_key
+                  from json_each(${nets}) jn
+                  join json_each(${keys}) jk on jk.key = jn.key) w
+          join (
+            select v.network_id, v.token_key, v.bucket as at, v.close_usd as usd,
+                   v.open_usd, v.high_usd, v.low_usd, v.hours,
+                   row_number() over (
+                     partition by v.network_id, v.token_key order by v.bucket desc) as rn
               from ${view(q.step)} v
-             where v.network_id = w.network_id and v.token_key = w.token_key
-               and v.bucket <= ${q.to}::timestamptz ${q.from === null ? sql`` : sql`and v.bucket >= ${q.from}::timestamptz`}
-             order by v.bucket desc limit ${limit}) p`;
+             where v.token_key in (select value from json_each(${keys}))
+               and v.bucket <= ${q.to} ${q.from === null ? sql`` : sql`and v.bucket >= ${q.from}`}) p
+            on p.network_id = w.network_id and p.token_key = w.token_key and p.rn <= ${limit}
+         order by w.network_id, w.token_key, p.at desc`;
   for (const r of rows) {
     const point: Point = q.step === "1h"
       ? { at: iso(r.at) ?? "", usd: n(r.usd), liquidityUsd: n(r.liquidity_usd) }
