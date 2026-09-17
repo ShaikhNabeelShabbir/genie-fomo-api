@@ -39,12 +39,36 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "0 1 * * *":    runDirectory,    // fomo leaderboard, wallets, fomo-reported holdings
 };
 
+/** On-demand runs of the same jobs: `POST /jobs/<name>?budgetMs=` with `x-job-secret`. */
+const JOB_BY_NAME: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unknown>>> = {
+  prices: runPrices, aum_history: runAumHistory, transfers: runTransfers, quote_prices: runQuotePrices,
+  balances: runBalances, tokens: runTokens, fees: runFees, swaps: runSwaps, scorecards: runScorecards,
+  launches: runLaunches, wallets: runWallets, timing: runTiming, gmgn: runGmgn, directory: runDirectory,
+};
+const MAX_BUDGET_MS = 600_000;
+
+async function runJob(req: Request, env: Env): Promise<Response> {
+  if (req.method !== "POST") return Response.json({ error: "POST only" }, { status: 405 });
+  if (!env.JOB_SECRET) return Response.json({ error: "JOB_SECRET is not set; refusing to run" }, { status: 503 });
+  if (req.headers.get("x-job-secret") !== env.JOB_SECRET) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!env.HYPERDRIVE) return Response.json({ error: "HYPERDRIVE binding is not configured" }, { status: 503 });
+  const url = new URL(req.url);
+  const name = url.pathname.slice("/jobs/".length);
+  const job = JOB_BY_NAME[name];
+  if (!job) return Response.json({ error: `no job '${name}'`, jobs: Object.keys(JOB_BY_NAME) }, { status: 404 });
+  const asked = Number(url.searchParams.get("budgetMs") ?? env.JOB_BUDGET_MS ?? MAX_BUDGET_MS);
+  const budgetMs = Math.min(MAX_BUDGET_MS, Number.isFinite(asked) && asked > 0 ? asked : MAX_BUDGET_MS);
+  try { return Response.json({ job: name, budgetMs, summary: await job(env, budgetMs) }); }
+  catch (e) { return Response.json({ job: name, error: e instanceof Error ? e.message : String(e) }, { status: 500 }); }
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(req.url);
     if (pathname === "/healthz" && req.method === "GET") return Response.json({ ok: true, worker: "genie-copy-trading-api" });
     if (pathname === "/webhook") return webhook(req, env, ctx);
     if (pathname === "/sample") return sample(req, env);
+    if (pathname.startsWith("/jobs/")) return runJob(req, env);
     return api(req, env, ctx);
   },
 
