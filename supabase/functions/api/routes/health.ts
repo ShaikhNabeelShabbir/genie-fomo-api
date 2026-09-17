@@ -81,7 +81,12 @@ async function healthBody(): Promise<Record<string, unknown>> {
     select
       -- A2 (v5 fixes): a trader nobody watched kept a six-hour-old live figure while
       -- /health said nothing about it. This is the count to watch, beside the readings.
-      count(case when v.at is null then 1 end)                            as live_never,
+      -- A trader with no wallet on record can never carry a balance, so counting them here
+      -- would leave liveNever permanently non-zero and looking like a defect.
+      count(case when v.at is null
+                  and exists (select 1 from wallets w where w.handle = t.handle
+                                and (w.sol_address is not null or w.evm_address is not null))
+                 then 1 end)                                              as live_never,
       count(case when v.at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 hours') then 1 end) as live_stale,
       cast(round(max((julianday('now') - julianday(v.at)) * 24.0)) as integer)
                                                                           as oldest_live_h,

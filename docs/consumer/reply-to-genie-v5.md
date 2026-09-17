@@ -6,12 +6,15 @@ read in it was reproducible from the figures you gave, and four of them found th
 **Deployed to v2 on 17 Sep 2026, ~15:05 UTC**, migration `0005` applied first. Every figure
 below quoted as current was read back from production after the deploy, not from a test.
 
-**Two asks need reading carefully rather than skimming.** **V1d — we found it after the first
-deploy and fixed it** (§1); the cause turned out to be one line, and it is the same line behind
-A4's sawtooth. Hours already stored keep their old figures until they are rebuilt, so cupseyy's
-07:00 still reads $2.5B as you check this. **A2 is partly fixed** (§2): the stuck six-hour
-figures are gone, but "every trader hourly" is not met, and we give you the measured numbers
-rather than a promise.
+**One thing to read carefully rather than skim: V1d.** We found it after the first deploy and
+fixed it (§1) — the cause was one line, and it is the same line behind A4's sawtooth. Hours
+already stored keep their old figures until they are rebuilt, so **cupseyy's 07:00 may still
+read $2.5B when you check**; keep your $1B guard on until it does not.
+
+**A2 is now met** (§2): 445 of 446 traders carry a figure under an hour old. We cannot tell you
+what that number was when you wrote, because the field that measures it did not exist until
+this deploy — what we can tell you is that it read 308 of 446 the moment it did exist. It took
+three fixes, two of which only showed up because we kept measuring after each one.
 
 **What we need from you: run the ten reads in "Verify the deployment" below** — each one says
 what it should return — then re-run your comparisons and send the next batch whenever it suits
@@ -174,34 +177,37 @@ published them as though they were.
   `reason: "not_built"` (new word). Hours *before* the first point are still absent: we were not
   tracking him then, and inventing them would claim knowledge we do not have.
 
-- **A2 — deployed, and honestly: not yet observed working.** The live catch-up was the tail of
-  the hourly history job, guarded by "while budget remains". The backfill loop above it spent
-  the budget, so the catch-up was reached only when there was nothing to build — and a trader
-  the webhook never sees move is exactly the one it exists for. It now runs **first**, with a
-  quarter of the job's budget reserved.
+- **A2 — fixed, and measured rather than asserted. 445 of 446 traders now carry a figure under
+  an hour old.**
 
   `/health.staleTraders` gains `liveStale`, `liveStaleAfterHours: 1`, `liveNever` and
-  `oldestLiveHours` so you can hold us to it.
+  `oldestLiveHours`, so you can check this yourself rather than take our word. The series, all
+  from production on 17 Sep:
 
-  **We watched the first pass rather than calling it fixed on the strength of the diff, and it
-  is a partial result.** Across the 15:25 run, out of 446 traders:
-
-  | 15:17 | 15:26 | 15:27 | 15:28 |
+  | 15:17 | 16:29 | 16:52 | **17:15** |
   |---|---|---|---|
-  | `liveStale` 308 | 243 | 203 | **163** |
+  | `liveStale` 308 | 195 | 34 | **1** |
 
-  `oldestLiveHours` fell from **9 to 4** over the same minutes. So one pass revalues roughly
-  **145 traders**, and the stalest are always taken first.
+  `oldestLiveHours` went from **9 to 1**. It took three fixes, and the second and third only
+  became visible because we kept measuring after each one:
 
-  What that means for your ask: the six-hour stuck figure you found is gone, and nobody is
-  stranded any more. **"Every trader at least hourly" is not met** — at ~145 a pass, a trader
-  the webhook never sees move is revalued about every three hours. The cost is one
-  `holdings_live` read per trader; reaching all 446 an hour needs a cron of its own or a
-  cheaper valuation, and taking more of this job's budget would only starve the history build.
-  **Date: 22 Sep**, with the V1d work.
+  1. **Cost.** The catch-up read `holdings_live`, which rolls Solana forward with three
+     correlated subqueries per row — 818,851 rows and 2,111 ms on our largest trader, against
+     105,388 rows and 106 ms for the same trader's balances as read. For a trader nothing has
+     marked as moved, that roll-forward can only add zero. Those are now valued from the read.
+  2. **Cadence.** An hourly pass against a one-hour threshold can never hold the number down:
+     the cohort refreshed at :25 ages out together at :25 the next hour. Moved to the existing
+     five-minute job, so a trader is picked up minutes after crossing the line.
+  3. **Queue order, which was the real one.** Every trader still stale after (1) and (2) was
+     one the webhook had marked as moved — and that queue was served oldest-*mark*-first. A
+     busy wallet is re-marked on every push, so its mark is never old and it sat at the back
+     for ever. **The most active traders held the stalest figures.** One of them carried a
+     value from 12:25 with a mark refreshed at 16:47. The queue now serves the oldest *value*.
 
-  `liveStale` sits in `/health` precisely so you can watch that number without asking us. If it
-  is not falling, we have not done it.
+  The remaining `liveStale: 1` is a single trader sitting on the one-hour boundary, which is
+  what a one-hour threshold looks like when it is working. `liveNever` counts only traders with
+  a wallet on record, so it reads 0; three listed traders have no wallet at all and can never
+  carry a balance.
 
 ## 3. ETH and BNB — N1: fixed, and no sweep needed
 
@@ -402,7 +408,7 @@ and **send a `User-Agent` that names your app** or Cloudflare will answer 403 `e
 | 7 | `GET /v2/traders/smokey0x` | `onChain.swapsAppearedIn` about **593** and `onChain.ownSwaps` about **6** — both rise as transfers land, the point is the gap between them, not the figures; **`onChain.swaps` is gone** |
 | 8 | `GET /v2/traders/397397/positions?limit=500` | all four honeypot rows `isHoneypot: true, canSell: false` (H2) |
 | 9 | `GET /v2/traders/tdmilky/positions?limit=500` | `coverage.chains.bsc` reads `transferRowsHeld: 200, rowsPerSentTx: 2.2989` — **the same 2.2989 you flagged, under a name that makes it correct**; `rowsHeld` and `share` are gone (C1). His four natives all price `token_prices` (N1) |
-| 10 | `GET /v2/health` | `feeds.aum` current, with `sampler.retired: true`; `staleTraders.liveStale` present (A2) |
+| 10 | `GET /v2/health` | `feeds.aum` current, with `sampler.retired: true`; **`staleTraders.liveStale` in the low single digits of 446** and `oldestLiveHours` 1 (A2). A number in the hundreds means the five-minute job has stopped — tell us |
 
 Three of those are breaking renames (7, 9, and `share`/`rowsHeld`). If any of them breaks your
 build, tell us and we will serve both spellings for a version rather than make you rush a fix.
@@ -433,7 +439,6 @@ build, tell us and we will serve both spellings for a version rather than make y
 | Ask | State | When |
 |---|---|---|
 | **V1d** — the cause is fixed and deployed; stored hours need a targeted rebuild before 07:00 stops reading $2.5B | code fixed, data pending | rebuild today |
-| **A2** — `now` hourly for EVERY trader (measured ~145 a pass, so ~3 h for an unwatched trader) | **partly fixed** | 22 Sep |
 | `/tokens` query rewrite (the cold-isolate timeout) | planned | 24 Sep |
 | Solana backfill reaching every wallet's first trade (184 wallets hold a Solana address; 0 finished) | starts on the :40 run | ~1 week |
 | `truncated` for EVM chains (no end-of-history signal from Bitquery) | open, no date | — |
