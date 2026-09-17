@@ -33,7 +33,7 @@ export async function nativePrices(): Promise<Map<number, NativePrice>> {
                 when xc.usd is not null then xc.source || ' (via ' || xc.chain || ')'
                 else null end as source
     from native n
-    -- Each Postgres `left join lateral (… limit 1)` is the rn = 1 row of the same ordering.
+    -- Each Postgres left join lateral (... limit 1) is the rn = 1 row of the same ordering.
     left join (
       select network_id, token_key, usd,
              row_number() over (partition by network_id, token_key order by day desc) as rn

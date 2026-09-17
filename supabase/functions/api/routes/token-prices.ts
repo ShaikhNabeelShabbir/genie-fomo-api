@@ -55,11 +55,11 @@ async function seriesFor(pairs: Pair[], q: SeriesQuery, limit: number): Promise<
   const nets = pairs.map((p) => p.network_id);
   const keys = pairs.map((p) => p.token_key);
   /*
-   * The pairwise `unnest(nets, keys)` is two `json_each` runs joined on the array index (the
-   * shim binds a non-IN array as JSON text), and the per-pair `cross join lateral (… limit n)`
-   * is `row_number() <= n` over the same ordering. The outer `order by` is new: the lateral
-   * emitted each pair's rows newest-first and the loop below `unshift`es them into ascending
-   * order, so that order is now stated rather than inherited from the plan.
+   * The pairwise unnest(nets, keys) is two json_each runs joined on the array index (the shim
+   * binds a non-IN array as JSON text), and the per-pair cross join lateral (... limit n) is
+   * row_number() <= n over the same ordering. The outer order by is new: the lateral emitted
+   * each pair's rows newest-first and the loop below unshifts them into ascending order, so
+   * that order is now stated rather than inherited from the plan.
    */
   const rows = q.step === "1h"
     ? await sql<PointRow[]>`

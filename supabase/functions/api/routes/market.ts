@@ -54,7 +54,7 @@ get("/v1/market/regime", async () => {
     select (select count(*) from leaders)                                as leaders_total,
            (select count(case when pnl > 0 then 1 end) from leaders)     as leaders_green,
            (select count(*) from launches)                               as launches_seen,
-           -- `graduated` is 0/1 now; a null is still "not graduated", as `filter (where …)` was.
+           -- graduated is 0/1 now; a null is still 'not graduated', as filter (where ...) was.
            (select count(case when graduated then 1 end) from launches)  as launches_graduated,
            (select count(*) from moved)                                  as tokens_moved,
            (select coalesce(sum(transfers), 0) from moved)               as transfers_total,

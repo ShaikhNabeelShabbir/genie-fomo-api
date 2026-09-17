@@ -210,7 +210,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
-    -- The lateral's `order by hour desc limit 1` is the rn = 1 row of the same ordering.
+    -- The lateral's order by hour desc limit 1 is the rn = 1 row of the same ordering.
     left join (
       select network_id, token_key, liquidity_usd,
              row_number() over (partition by network_id, token_key order by hour desc) as rn
@@ -400,7 +400,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
-    -- The lateral's `order by hour desc limit 1` is the rn = 1 row of the same ordering.
+    -- The lateral's order by hour desc limit 1 is the rn = 1 row of the same ordering.
     left join (
       select network_id, token_key, liquidity_usd,
              row_number() over (partition by network_id, token_key order by hour desc) as rn
