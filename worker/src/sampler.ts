@@ -81,7 +81,7 @@ async function readChain(keys: { helius: string; bitquery: string }, t: Trader, 
     if (!word) throw new Error(`no Bitquery network for chain ${net}`);
     const res = await evmBalancesBitquery(keys.bitquery, word, t.evm_address ?? "");
     // ponytail: no nonce on v2 — the public-RPC eth_getTransactionCount is gone and a Bitquery
-    // `Transactions(where: {Transaction: {From: {is: $wallet}}}) { count }` (dataset: combined,
+    // `Transactions(where: {Transaction: {From: {is: $wallet}}}) { count }` (dataset: realtime,
     // https://docs.bitquery.io/docs/evm/transactions/) would double this 5-minute cron's paid
     // calls for a diagnostic. R6 chain_coverage therefore goes stale under v2; add that query
     // in bitquery.ts if R6 is wanted back.

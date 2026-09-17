@@ -116,7 +116,7 @@ async function writeRows(sql: Sql, net: number, out: readonly Priced[]): Promise
  */
 async function tradesByHash(ctx: Ctx, hashes: readonly string[]): Promise<Map<string, Trade[]>> {
   const query = `query ($hashes: [String!]) {
-    EVM(network: ${ctx.network}, dataset: combined) {
+    EVM(network: ${ctx.network}, dataset: realtime) {
       DEXTrades(where: { Transaction: { Hash: { in: $hashes } } }, limit: { count: ${hashes.length * TRADES_PER_TX} }) {
         Transaction { Hash From }
         Trade {

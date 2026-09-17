@@ -66,7 +66,7 @@ Deno.test("evmBalancesBitquery: posts the network word in the query text and the
     const { balances } = await evmBalancesBitquery("k", "base", "0xAbC");
     assertEquals(balances.length, 3);
     assertEquals(sent!.variables, { wallet: "0xAbC" });
-    assertEquals(/EVM\(network: base, dataset: combined\)/.test(sent!.query), true);
+    assertEquals(/EVM\(network: base, dataset: realtime\)/.test(sent!.query), true);
     await assertRejects(() => evmBalancesBitquery("k", "base; drop", "0x1"), Error, "network word");
   } finally {
     globalThis.fetch = real;

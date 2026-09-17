@@ -132,7 +132,7 @@ async function solanaFees(url: string, hashes: readonly string[]): Promise<Batch
  */
 async function evmFees(key: string, network: string, hashes: readonly string[]): Promise<BatchRead | null> {
   const query = `query ($hashes: [String!]) {
-    EVM(network: ${network}, dataset: combined) {
+    EVM(network: ${network}, dataset: realtime) {
       Transactions(where: { Transaction: { Hash: { in: $hashes } } }, limit: { count: ${hashes.length} }) {
         Transaction { Hash Cost }
         Fee { SenderFee }

@@ -7,6 +7,13 @@
  */
 import { throttled, ZERO_ADDRESS } from "./chain_reads.ts";
 
+/**
+ * DATASET IS `realtime` EVERYWHERE. The plan (checked 18 Sep 2026) allows only the realtime
+ * dataset; `combined` and `archive` answer 403 "access restricted". Realtime `Balances`
+ * still returns the full current balance per currency, and `TransactionBalances`,
+ * `Transactions`, `DEXTrades` and `Transfers` answer for recent activity, which is what the
+ * jobs ask for. Upgrade the plan before asking for history older than the realtime window.
+ */
 const ENDPOINT = "https://streaming.bitquery.io/graphql";
 
 interface Reply { readonly data?: unknown; readonly errors?: readonly unknown[] }
@@ -80,7 +87,7 @@ export function parseBalances(data: unknown): BitqueryBalance[] {
 
 /**
  * Every token one wallet holds on one EVM chain, native coin included, with no traded-token
- * list needed. `Balances` on `dataset: combined` is Bitquery's "latest balances" cube; the
+ * list needed. `Balances` on `dataset: realtime` is Bitquery's "latest balances" cube; the
  * `selectWhere` keeps the reply to non-zero rows.
  *
  * Field names and the native marker per https://docs.bitquery.io/docs/examples/balances/balance-api/,
@@ -101,7 +108,7 @@ export async function evmBalancesBitquery(
 ): Promise<{ balances: BitqueryBalance[] }> {
   if (!/^[a-z0-9_]+$/.test(network)) throw new Error(`Bitquery network word "${network}" is not one`);
   const query = `query ($wallet: String!) {
-    EVM(network: ${network}, dataset: combined) {
+    EVM(network: ${network}, dataset: realtime) {
       Balances(where: { Balance: { Address: { is: $wallet } } }) {
         Currency { Symbol SmartContract Native Decimals }
         Balance { Amount(selectWhere: { gt: "0" }) }

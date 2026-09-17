@@ -56,10 +56,10 @@ interface Phase { readonly attempted: number; readonly ok: number; readonly erro
  * row means "lives here". Shape per
  * https://docs.bitquery.io/docs/blockchain/Ethereum/transfers/erc20-token-transfer-api/
  * (`Transfers(where: {Transfer: {Currency: {SmartContract: {is}}}}, limit: {count})`), on
- * `dataset: combined` so old tokens count too.
+ * `dataset: realtime` so old tokens count too.
  */
 const CHAIN_PROBE = `query ($addr: String!) {
-${EVM_IDS.map((id) => `  n${id}: EVM(network: ${EVM_CHAINS[id].bitquery}, dataset: combined) {
+${EVM_IDS.map((id) => `  n${id}: EVM(network: ${EVM_CHAINS[id].bitquery}, dataset: realtime) {
     Transfers(where: { Transfer: { Currency: { SmartContract: { is: $addr } } } }, limit: { count: 1 }) {
       Transfer { Currency { SmartContract } }
     }
@@ -123,7 +123,7 @@ interface SupplyTarget { readonly network_id: number; readonly address: string; 
  * `totalSupply()` word is no longer read.
  */
 const EVM_SUPPLY = (network: string): string => `query ($addr: String!) {
-  EVM(network: ${network}, dataset: combined) {
+  EVM(network: ${network}, dataset: realtime) {
     TransactionBalances(limit: { count: 1 }, orderBy: { descending: Block_Time },
                         where: { TokenBalance: { Currency: { SmartContract: { is: $addr } } } }) {
       TokenBalance { TotalSupply Currency { Symbol Name Decimals } }
