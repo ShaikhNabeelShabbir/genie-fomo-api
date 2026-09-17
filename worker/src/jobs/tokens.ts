@@ -1,11 +1,11 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
 import { db } from "../db";
-import { rpc } from "../../../supabase/functions/_shared/chain_reads.ts";
+import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/settings.ts";
 import {
-  CHAIN_CODE, type Rec, type Security, type Supply, evmSupply, gmgnData, hasCode, infoRow,
-  isEvmAddress, isRec, isSolAddress, normaliseSecurity, singleChain, solanaSupply,
+  CHAIN_CODE, type Rec, type Security, type Supply, chainHits, evmSupply, gmgnData, infoRow,
+  isEvmAddress, isSolAddress, normaliseSecurity, singleChain, solanaSupply,
 } from "./tokens-core";
 
 /**
@@ -16,9 +16,10 @@ import {
  *
  * TWINS of those scripts: edit both. Same SQL, same target order, same bookkeeping (a
  * resolved chain, a stored supply, `token_info.fetched_at` are what take a token off the
- * list), so a run cut short by the budget resumes where it stopped. Differs only where the
+ * list), so a run cut short by the budget resumes where it stopped. Differs where the
  * platform does: writes land per chunk rather than at the end, a failed unit is counted
- * rather than fatal, and no CLI flags.
+ * rather than fatal, no CLI flags, and chain + supply come from Bitquery, not JSON-RPC (no
+ * public node is called from the Worker, decision of 18 Sep 2026; see `_shared/bitquery.ts`).
  */
 
 type Sql = postgres.Sql;
@@ -49,28 +50,43 @@ export interface TokensSummary {
 interface Phase { readonly attempted: number; readonly ok: number; readonly errored: number; readonly remaining: number }
 
 // ------------------------------------------------------------- 1. trade chains
-/** base58 shape is Solana; 0x is probed with eth_getCode on each EVM chain. */
-async function chainFor(address: string): Promise<number | null> {
+/**
+ * One request probes every EVM chain: an `EVM` root per chain (aliased `n<id>`), each asking
+ * for a single transfer of the contract. A traded token has transferred at least once, so a
+ * row means "lives here". Shape per
+ * https://docs.bitquery.io/docs/blockchain/Ethereum/transfers/erc20-token-transfer-api/
+ * (`Transfers(where: {Transfer: {Currency: {SmartContract: {is}}}}, limit: {count})`), on
+ * `dataset: combined` so old tokens count too.
+ */
+const CHAIN_PROBE = `query ($addr: String!) {
+${EVM_IDS.map((id) => `  n${id}: EVM(network: ${EVM_CHAINS[id].bitquery}, dataset: combined) {
+    Transfers(where: { Transfer: { Currency: { SmartContract: { is: $addr } } } }, limit: { count: 1 }) {
+      Transfer { Currency { SmartContract } }
+    }
+  }`).join("\n")}
+}`;
+
+/** base58 shape is Solana; 0x is probed on every EVM chain at once. */
+async function chainFor(key: string, address: string): Promise<number | null> {
   if (isSolAddress(address)) return SOLANA_NETWORK_ID;
   if (!isEvmAddress(address)) return null;
-  const hits: number[] = [];
-  for (const id of EVM_IDS) {
-    try {
-      const j: unknown = await rpc(EVM_CHAINS[id].rpc, { jsonrpc: "2.0", id: 1, method: "eth_getCode", params: [address, "latest"] }, 2);
-      if (hasCode(j)) hits.push(id);
-    } catch { /* a chain that will not answer is a chain without the contract, as in the script */ }
+  try {
+    return singleChain(chainHits(await bitquery(key, CHAIN_PROBE, { addr: address.toLowerCase() }), EVM_IDS));
+  } catch (e) {
+    // Unanswered is unresolved, as in the script; the token is retried next run.
+    console.error(`tokens: chain probe for ${address.slice(0, 10)}… failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
   }
-  return singleChain(hits);
 }
 
-async function resolveChains(sql: Sql, outOfTime: () => boolean): Promise<Phase> {
+async function resolveChains(sql: Sql, key: string, outOfTime: () => boolean): Promise<Phase> {
   const rows = await sql<{ token_address: string; token_key: string }[]>`
     select distinct token_address, token_key from trades
     where network_id is null and token_address is not null`;
   let attempted = 0, ok = 0, errored = 0;
   for (let i = 0; i < rows.length && !outOfTime(); i += CHAIN_FANOUT) {
     const chunk = rows.slice(i, i + CHAIN_FANOUT);
-    const nets = await Promise.all(chunk.map((t) => chainFor(t.token_address)));
+    const nets = await Promise.all(chunk.map((t) => chainFor(key, t.token_address)));
     for (const [k, t] of chunk.entries()) {
       attempted += 1;
       const net = nets[k];
@@ -93,26 +109,41 @@ async function resolveChains(sql: Sql, outOfTime: () => boolean): Promise<Phase>
 // ------------------------------------------------------------------ 2. supply
 interface SupplyTarget { readonly network_id: number; readonly address: string; readonly token_key: string }
 
-async function evmCall(url: string, to: string, data: string): Promise<unknown> {
-  const j: unknown = await rpc(url, { jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to, data }, "latest"] });
-  return isRec(j) ? j.result : null;
-}
-
-/** Through chain_reads' rpc(): the same per-host throttle the AUM sampler uses. */
-async function readSupply(env: Env, t: SupplyTarget): Promise<Supply | null> {
-  if (t.network_id === SOLANA_NETWORK_ID) {
-    const key = (env.HELIUS_SOLANA_KEY ?? "").trim();
-    if (!key) return null;
-    return solanaSupply(await rpc(`https://mainnet.helius-rpc.com/?api-key=${key}`, { jsonrpc: "2.0", id: 1, method: "getTokenSupply", params: [t.address] }));
+/**
+ * Latest total supply after the token's most recent transaction, per
+ * https://docs.bitquery.io/docs/blockchain/Ethereum/token-supply/evm-token-supply/ and
+ * https://docs.bitquery.io/docs/blockchain/Ethereum/transfers/total-supply/
+ * (`TransactionBalances { TokenBalance { TotalSupply Currency { Decimals } } }`). Bitquery
+ * returns the supply already scaled by `Decimals`, as its `Balance.Amount` is; the ERC-20
+ * `totalSupply()` word is no longer read.
+ */
+const EVM_SUPPLY = (network: string): string => `query ($addr: String!) {
+  EVM(network: ${network}, dataset: combined) {
+    TransactionBalances(limit: { count: 1 }, orderBy: { descending: Block_Time },
+                        where: { TokenBalance: { Currency: { SmartContract: { is: $addr } } } }) {
+      TokenBalance { TotalSupply Currency { Symbol Name Decimals } }
+    }
   }
+}`;
+
+/** https://docs.bitquery.io/docs/blockchain/Solana/token-supply-cube/ : `PostBalance` is the supply after the latest mint or burn. */
+const SOLANA_SUPPLY = `query ($mint: String!) {
+  Solana {
+    TokenSupplyUpdates(limit: { count: 1 }, orderBy: { descending: Block_Time },
+                       where: { TokenSupplyUpdate: { Currency: { MintAddress: { is: $mint } } } }) {
+      TokenSupplyUpdate { PostBalance Currency { Symbol Decimals } }
+    }
+  }
+}`;
+
+async function readSupply(key: string, t: SupplyTarget): Promise<Supply | null> {
+  if (t.network_id === SOLANA_NETWORK_ID) return solanaSupply(await bitquery(key, SOLANA_SUPPLY, { mint: t.address }));
   const cfg = EVM_CHAINS[t.network_id];
   if (!cfg) return null;
-  // totalSupply() = 0x18160ddd, decimals() = 0x313ce567
-  const [rawSupply, rawDecimals] = await Promise.all([evmCall(cfg.rpc, t.address, "0x18160ddd"), evmCall(cfg.rpc, t.address, "0x313ce567")]);
-  return evmSupply(rawSupply, rawDecimals);
+  return evmSupply(await bitquery(key, EVM_SUPPLY(cfg.bitquery), { addr: t.address.toLowerCase() }));
 }
 
-async function resolveSupply(sql: Sql, env: Env, outOfTime: () => boolean): Promise<Phase> {
+async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): Promise<Phase> {
   // Only tokens where a supply would actually be used: an entry price exists, or somebody holds it.
   const rows = await sql<{ network_id: string; address: string; token_key: string }[]>`
     select tk.network_id, tk.address, tk.token_key
@@ -128,7 +159,7 @@ async function resolveSupply(sql: Sql, env: Env, outOfTime: () => boolean): Prom
   let attempted = 0, ok = 0, errored = 0;
   for (let i = 0; i < targets.length && !outOfTime(); i += SUPPLY_FANOUT) {
     const chunk = targets.slice(i, i + SUPPLY_FANOUT);
-    const read = await Promise.all(chunk.map((t) => readSupply(env, t).catch(() => null)));
+    const read = await Promise.all(chunk.map((t) => readSupply(key, t).catch(() => null)));
     const found = chunk.flatMap((t, k) => { const s = read[k]; return s ? [{ t, s }] : []; });
     attempted += chunk.length;
     errored += chunk.length - found.length;
@@ -280,10 +311,12 @@ async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promis
 export async function runTokens(env: Env, budgetMs: number): Promise<TokensSummary> {
   const started = Date.now();
   const outOfTime = () => Date.now() - started > budgetMs;
+  const bitqueryKey = (env.BITQUERY_KEY ?? "").trim();
+  if (!bitqueryKey) throw new Error("tokens: BITQUERY_KEY is not set; chains and supply are read through Bitquery");
   const sql = db(env);
   try {
-    const chains = await resolveChains(sql, outOfTime);
-    const supply = await resolveSupply(sql, env, outOfTime);
+    const chains = await resolveChains(sql, bitqueryKey, outOfTime);
+    const supply = await resolveSupply(sql, bitqueryKey, outOfTime);
     const info = await refreshInfo(sql, env, outOfTime);
     const phases = [chains, supply, info];
     const attempted = phases.reduce((n, p) => n + p.attempted, 0);
