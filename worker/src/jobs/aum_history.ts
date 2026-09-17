@@ -26,17 +26,19 @@ export interface AumHistorySummary {
 
 /** Rule 3 in one query: every trader with a chain capture or a sampled reading, and where their history stands. */
 async function ranges(sql: Sql): Promise<TraderRange[]> {
-  const rows = await sql<{ handle: string; last_built: Date | null; earliest: Date }[]>`
+  const rows = await sql<{ handle: string; last_built: Date | null; first_built: Date | null; earliest: Date }[]>`
     select t.handle,
            (select max(hour) from aum_history a where a.handle = t.handle) as last_built,
+           (select min(hour) from aum_history a where a.handle = t.handle) as first_built,
            least((select min(captured_at) from holdings h where h.handle = t.handle and h.source = 'chain'),
-                 (select min(at) from aum_samples s where s.handle = t.handle and s.basis = 'sampled')) as earliest
+                 (select min(at) from aum_samples s where s.handle = t.handle and s.basis in ('sampled', 'rebuilt') and s.total_usd is not null)) as earliest
       from traders t
      where exists (select 1 from holdings h where h.handle = t.handle and h.source = 'chain')
         or exists (select 1 from aum_samples s where s.handle = t.handle and s.basis = 'sampled')`;
   return rows.map((r) => ({
     handle: r.handle,
     lastBuilt: r.last_built ? new Date(r.last_built) : null,
+    firstBuilt: r.first_built ? new Date(r.first_built) : null,
     earliest: new Date(r.earliest),
   }));
 }

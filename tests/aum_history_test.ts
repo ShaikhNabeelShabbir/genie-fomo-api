@@ -53,3 +53,11 @@ Deno.test("planWork: chunks across traders are ordered by from, so a backfill is
   ], now);
   assertEquals(work.map((c) => [c.handle, c.hours]), [["new", 168], ["new", 33], ["old", 2]]);
 });
+
+Deno.test("planChunks: a source that reaches further back than the first built hour is backfilled before it", () => {
+  const now = new Date("2026-09-18T10:30:00Z");
+  const t = { handle: "a", lastBuilt: new Date("2026-09-18T10:00:00Z"), firstBuilt: new Date("2026-09-09T08:00:00Z"), earliest: new Date("2026-09-09T05:00:00Z") };
+  const spans = planChunks(t, now).map((c) => [c.from.toISOString(), c.to.toISOString(), c.hours]);
+  assertEquals(spans[0], ["2026-09-09T05:00:00.000Z", "2026-09-09T07:00:00.000Z", 3]);
+  assertEquals(spans[spans.length - 1], ["2026-09-18T09:00:00.000Z", "2026-09-18T10:00:00.000Z", 2]);
+});

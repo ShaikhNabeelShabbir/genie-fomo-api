@@ -15,6 +15,8 @@ export interface TraderRange {
   readonly handle: string;
   /** max(aum_history.hour) for the trader, or null when nothing is built yet. */
   readonly lastBuilt: Date | null;
+  /** Oldest built hour; when `earliest` moved back (a new source), the gap before it is built too. */
+  readonly firstBuilt?: Date | null;
   /** least(min(holdings.captured_at), min(aum_samples.at)). */
   readonly earliest: Date;
 }
@@ -38,6 +40,14 @@ export function planChunks(t: TraderRange, now: Date, chunkHours: number = CHUNK
   const resume = t.lastBuilt ? new Date(truncHour(t.lastBuilt).getTime() + HOUR_MS) : truncHour(t.earliest);
   const start = new Date(Math.max(truncHour(t.earliest).getTime(), Math.min(resume.getTime(), recomputeFrom.getTime())));
   const chunks: Chunk[] = [];
+  const first = t.firstBuilt ? truncHour(t.firstBuilt) : null;
+  if (first && truncHour(t.earliest).getTime() < first.getTime()) {
+    const stop = new Date(first.getTime() - HOUR_MS);
+    for (let from = truncHour(t.earliest); from <= stop; from = new Date(from.getTime() + chunkHours * HOUR_MS)) {
+      const to = new Date(Math.min(from.getTime() + (chunkHours - 1) * HOUR_MS, stop.getTime()));
+      chunks.push({ handle: t.handle, from, to, hours: (to.getTime() - from.getTime()) / HOUR_MS + 1 });
+    }
+  }
   for (let from = start; from <= end; from = new Date(from.getTime() + chunkHours * HOUR_MS)) {
     const to = new Date(Math.min(from.getTime() + (chunkHours - 1) * HOUR_MS, end.getTime()));
     chunks.push({ handle: t.handle, from, to, hours: (to.getTime() - from.getTime()) / HOUR_MS + 1 });
