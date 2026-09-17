@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "smoke": "./scripts/smoke.sh"
+    "smoke": "deno task smoke"
   },
   "dependencies": {
     "postgres": "^3.4.9"
