@@ -83,8 +83,8 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
                  row_number() over (partition by handle order by hour desc) as rn
           from aum_history
           where handle in (${handles})
-            and hour <= ${o.to}::timestamptz
-            and (${o.from}::timestamptz is null or hour >= ${o.from}::timestamptz)
+            and hour <= ${o.to}
+            and (${o.from} is null or hour >= ${o.from})
         ) x where rn <= ${o.limit}
         order by handle, at`
     : await sql<BucketRow[]>`
@@ -93,8 +93,8 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
                  row_number() over (partition by handle order by bucket desc) as rn
           from ${sql(VIEW[o.step])}
           where handle in (${handles})
-            and bucket <= ${o.to}::timestamptz
-            and (${o.from}::timestamptz is null or bucket >= ${o.from}::timestamptz)
+            and bucket <= ${o.to}
+            and (${o.from} is null or bucket >= ${o.from})
         ) x where rn <= ${o.limit}
         order by handle, at`;
   const by = new Map<string, Point[]>();

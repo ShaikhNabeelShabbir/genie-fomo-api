@@ -46,7 +46,8 @@ export type EventRow = {
   counterparty: string | null; source: string | null; tx_type: string | null;
   token_delta: unknown; quote_delta: unknown; quote_usd: unknown;
   total_usd: unknown; refused_reason: string | null;
-  has_info: boolean; is_honeypot: boolean | null; can_not_sell: boolean | null;
+  /** SQLite booleans arrive as 0/1 (NULL = not assessed); read through `sellFlags`. */
+  has_info: unknown; is_honeypot: unknown; can_not_sell: unknown;
 };
 
 const iso = (v: string | Date): string => new Date(String(v)).toISOString();
@@ -96,8 +97,8 @@ get("/v1/events", async (_p, url) => {
       select 'transfer' as kind, tx.block_time as at, tx.tx_hash as id, w.handle,
              tx.network_id, tx.direction, tx.token_key as token_address, tx.amount,
              tx.counterparty, tx.tx_source as source, tx.tx_type,
-             null::numeric as token_delta, null::numeric as quote_delta, null::numeric as quote_usd,
-             null::numeric as total_usd, null::text as refused_reason
+             null as token_delta, null as quote_delta, null as quote_usd,
+             null as total_usd, null as refused_reason
       from transactions tx
       join wallets w on tx.address_key in (w.evm_address_key, w.sol_address_key)
       where tx.block_time is not null
@@ -109,8 +110,9 @@ get("/v1/events", async (_p, url) => {
       join wallets w on ws.address_key in (w.evm_address_key, w.sol_address_key)
       where ws.block_time is not null
       union all
-      -- JS cursors carry milliseconds; a µs-precise sampled_at would resume on itself.
-      select 'reading', date_trunc('milliseconds', s.sampled_at), s.handle, s.handle,
+      -- JS cursors carry milliseconds; sampled_at is already stored to the millisecond,
+      -- so date_trunc('milliseconds', …) has nothing left to do.
+      select 'reading', s.sampled_at, s.handle, s.handle,
              null, null, null, null, null, null, null,
              null, null, null, s.total_usd, s.refused_reason
       from aum_samples s
@@ -122,12 +124,12 @@ get("/v1/events", async (_p, url) => {
     join traders t using (handle)
     left join chains c using (network_id)
     left join token_info ti on ti.network_id = ev.network_id and ti.token_key = ev.token_address
-    where ev.at >= ${since}::timestamptz
+    where ev.at >= ${since}
       ${kind === null ? sql`` : sql`and ev.kind = ${kind}`}
       ${net === null ? sql`` : sql`and ev.network_id = ${net}`}
       ${handle === null ? sql`` : sql`and ev.handle = ${handle}`}
       ${cur === null ? sql``
-        : sql`and (ev.at, ev.kind, ev.id) > (${cur.at}::timestamptz, ${cur.kind}, ${cur.id})`}
+        : sql`and (ev.at, ev.kind, ev.id) > (${cur.at}, ${cur.kind}, ${cur.id})`}
     order by ev.at, ev.kind, ev.id
     limit ${limit}`;
 

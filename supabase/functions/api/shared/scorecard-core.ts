@@ -7,7 +7,8 @@ import { NativePrice } from "../shared/prices.ts";
 
 /**
  * T1. The newest `trade_loads` row per trader, as the two columns `scorecardBody` reads
- * (`load_attempted_at`, `load_outcome`). Join after `from traders t`; select `ld.*`.
+ * (`load_attempted_at`, `load_outcome`). Join after `from traders t`; select those two by
+ * name — the derived table also carries `handle` and `rn`, so `ld.*` would clobber `handle`.
  */
 export const latestLoad = () => sql`
   left join (

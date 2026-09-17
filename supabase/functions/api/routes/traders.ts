@@ -92,7 +92,8 @@ get("/v1/traders", async (_p, url) => {
 
   const rows = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at, t.source,
-           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at, ld.*,
+           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
+           ld.load_attempted_at, ld.load_outcome,
            case
              when ${q} = '' then 0
              when lower(t.display_handle) = ${q} or lower(coalesce(t.name,'')) = ${q} then 0
