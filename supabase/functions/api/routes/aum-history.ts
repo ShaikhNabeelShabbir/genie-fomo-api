@@ -6,7 +6,8 @@ import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import {
   HISTORY_STEPS, HISTORY_WINDOWS, type HistoryStep, type HistoryWindow,
-  ageSeconds, defaultStep, isHistoryStep, isHistoryWindow, latestValued, windowRange,
+  ageSeconds, confidence, defaultStep, fillHourGaps, isHistoryStep, isHistoryWindow,
+  latestValued, windowRange,
 } from "../shared/aum-history-rules.ts";
 
 /**
@@ -65,6 +66,8 @@ type Point = {
   at: string; totalUsd: number | null; basis?: string; reason?: string | null;
   suspectUsd?: number | null; unsellableUsd?: number | null;
   pricedPositions?: number; totalPositions?: number;
+  /** A4: the share of the wallet this figure was priced from, and whether that makes it partial. */
+  pricedShare?: number | null; partial?: boolean; partialUsd?: number | null;
   highUsd?: number | null; lowUsd?: number | null; valuedHours?: number;
 };
 
@@ -99,14 +102,32 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
         order by handle, at`;
   const by = new Map<string, Point[]>();
   for (const r of rows) {
-    const p: Point = "basis" in r
-      ? { at: iso(r.at), totalUsd: round(n(r.total_usd)), basis: r.basis, reason: r.reason ?? null,
-          suspectUsd: round(n(r.suspect_usd)), unsellableUsd: round(n(r.unsellable_usd)),
-          pricedPositions: Number(r.priced_positions), totalPositions: Number(r.total_positions) }
-      : { at: iso(r.at), totalUsd: round(n(r.total_usd)), highUsd: round(n(r.high_usd)),
-          lowUsd: round(n(r.low_usd)), valuedHours: Number(r.valued_hours) };
+    let p: Point;
+    if ("basis" in r) {
+      /* A4: the stored total is judged against the coverage it came from before it is served. */
+      const c = confidence({
+        totalUsd: n(r.total_usd), pricedPositions: Number(r.priced_positions),
+        totalPositions: Number(r.total_positions), reason: r.reason ?? null,
+      });
+      p = { at: iso(r.at), totalUsd: round(c.totalUsd), basis: r.basis, reason: c.reason,
+            suspectUsd: round(n(r.suspect_usd)), unsellableUsd: round(n(r.unsellable_usd)),
+            pricedPositions: Number(r.priced_positions), totalPositions: Number(r.total_positions),
+            pricedShare: c.pricedShare, partial: c.partial, partialUsd: round(c.partialUsd) };
+    } else {
+      p = { at: iso(r.at), totalUsd: round(n(r.total_usd)), highUsd: round(n(r.high_usd)),
+            lowUsd: round(n(r.low_usd)), valuedHours: Number(r.valued_hours) };
+    }
     if (!by.has(r.handle)) by.set(r.handle, []);
     by.get(r.handle)!.push(p);
+  }
+  /* A3: an hour with no row is a null point with a reason, never a hole in the series. */
+  if (o.step === "1h") {
+    for (const [h, pts] of by) {
+      by.set(h, fillHourGaps(pts, (at): Point => ({
+        at, totalUsd: null, reason: "not_built", suspectUsd: null, unsellableUsd: null,
+        pricedPositions: 0, totalPositions: 0, pricedShare: null, partial: false, partialUsd: null,
+      })));
+    }
   }
   return by;
 }
@@ -127,7 +148,10 @@ type LiveRow = {
 };
 type Live = {
   at: string; totalUsd: number | null; suspectUsd: number | null; unsellableUsd: number | null;
-  pricedPositions: number; totalPositions: number; reason: string | null; source: string; ageSeconds: number;
+  pricedPositions: number; totalPositions: number;
+  /** A4: the same coverage rule the history points carry. */
+  pricedShare: number | null; partial: boolean; partialUsd: number | null;
+  reason: string | null; source: string; ageSeconds: number;
 };
 
 /** The live figure per handle from `aum_live`, one query; a handle with no row is absent. */
@@ -138,10 +162,16 @@ async function live(handles: string[]): Promise<Map<string, Live>> {
   const now = new Date();
   const by = new Map<string, Live>();
   for (const r of rows) {
+    const c = confidence({
+      totalUsd: n(r.total_usd), pricedPositions: Number(r.priced_positions),
+      totalPositions: Number(r.total_positions), reason: r.reason ?? null,
+    });
     by.set(r.handle, {
-      at: iso(r.at), totalUsd: round(n(r.total_usd)), suspectUsd: round(n(r.suspect_usd)),
+      at: iso(r.at), totalUsd: round(c.totalUsd), suspectUsd: round(n(r.suspect_usd)),
       unsellableUsd: round(n(r.unsellable_usd)), pricedPositions: Number(r.priced_positions),
-      totalPositions: Number(r.total_positions), reason: r.reason ?? null, source: r.source,
+      totalPositions: Number(r.total_positions),
+      pricedShare: c.pricedShare, partial: c.partial, partialUsd: round(c.partialUsd),
+      reason: c.reason, source: r.source,
       ageSeconds: ageSeconds(r.at, now),
     });
   }
