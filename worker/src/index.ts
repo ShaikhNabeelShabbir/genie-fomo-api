@@ -31,7 +31,7 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "*/10 * * * *": runBalances,     // a slice of the stalest wallets' balances -> holdings
   "5 */2 * * *":  runTokens,       // chains, supply, fundamentals (GMGN 1 req/s)
   "10 */2 * * *": runFees,         // receipts per chain, then the per-trader rollup
-  "20 */3 * * *": runSwaps,        // EVM swaps from receipts
+  "*/15 * * * *": runSwaps,        // Solana + EVM swaps, newest first (X1); budget-bounded so overlap is safe
   "0 */6 * * *":  runScorecards,   // stale fomoapi trade records
   "35 3 * * *":   runLaunches,     // pump.fun launch metadata, dev ledger
   "50 4 * * *":   runWallets,      // linked wallets
