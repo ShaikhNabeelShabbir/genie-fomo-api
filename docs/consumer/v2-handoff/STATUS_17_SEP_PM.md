@@ -156,9 +156,17 @@ of a transfer, not instantly. `now.ageSeconds` always tells you how old the figu
 **Read speed.** `/tokens` and `/market/regime` take around 9 seconds. The 15 second route timeout
 still applies. Cache these two if you poll them.
 
-**`dataState` is `degraded`.** It has been since the handoff and it means one thing right now: one
-trader of 446 has a stale scorecard. `staleFeeds` names what is stale. Do not treat `degraded` as
-an outage; `status` is `ok`.
+**`dataState` is `degraded`.** It means one thing right now: one trader of 446, `poker_kb_`, has a
+stale scorecard. We ask fomoapi for it every six hours and fomoapi returns an empty document, which
+we record as `loadOutcome: degraded`. That is a gap at the source, not a loader failure, and
+`/health.staleTraders` now separates `scorecardLoadFailed` from `scorecardNeverAttempted` so you can
+tell which. `staleFeeds` names what is stale. Do not treat `degraded` as an outage; `status` is `ok`.
+
+**Occasional 503 under load.** D1 runs one query at a time, so while the loaders are working a read
+can exceed its CPU allowance. You get a clean `503` with `code: "unavailable"` and
+`retryAfterSeconds: 5`, not a broken payload. In a quiet minute every route answers; during a heavy
+loader run we measured roughly one request in three failing this way on the heaviest route.
+**Retry on `unavailable` with the delay we give you.** We are spreading the loaders to reduce it.
 
 ---
 
