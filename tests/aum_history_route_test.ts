@@ -1,7 +1,15 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
-  HISTORY_STEPS, HISTORY_WINDOWS, HistoryWindow, defaultStep, windowRange, isHistoryStep, isHistoryWindow,
+  HISTORY_STEPS, HISTORY_WINDOWS, HistoryWindow, ageSeconds, defaultStep, windowRange, isHistoryStep, isHistoryWindow,
 } from "../supabase/functions/api/shared/aum-history-rules.ts";
+
+Deno.test("ageSeconds: whole seconds since `at`, from a Date or an ISO string, never negative", () => {
+  const now = new Date("2026-09-18T12:00:00.000Z");
+  assertEquals(ageSeconds("2026-09-18T11:59:00.000Z", now), 60);
+  assertEquals(ageSeconds(new Date("2026-09-18T11:59:59.400Z"), now), 0);
+  assertEquals(ageSeconds("2026-09-18T11:58:58.900Z", now), 61);
+  assertEquals(ageSeconds("2026-09-18T12:00:05.000Z", now), 0);
+});
 
 Deno.test("defaultStep: every window implies the documented step", () => {
   assertEquals(defaultStep("1d"), "1h");

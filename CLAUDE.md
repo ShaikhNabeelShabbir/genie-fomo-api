@@ -37,6 +37,7 @@ v1: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`. v2: `https://ge
 | `/:address/prices`, `POST /tokens/prices` | `routes/token-prices.ts` (step/window rules in `shared/series-rules.ts`; candle views in migration `20260918020000`) |
 | `/:handle/aum`, `POST /traders/aum` | `routes/aum.ts` (rules in `shared/aum-rules.ts`) |
 | `/:handle/aum/history`, `POST /traders/aum/history` | `routes/aum-history.ts` (built series over `aum_history` + rollup views; step/window rules in `shared/aum-history-rules.ts`) |
+| `/:handle/aum/now`, `POST /traders/aum/now` | `routes/aum-history.ts` (the `now` block alone, from `aum_live`; the same block rides on every `/aum/history` answer) |
 | `GET /v1/fields` | `routes/fields.ts` (data in `shared/vocabulary.ts`) |
 | `GET /v1/health` | `routes/health.ts` |
 | `GET /v1/events` | `routes/events.ts` (keyset feed over transfers, swaps, readings) |

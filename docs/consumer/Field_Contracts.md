@@ -442,6 +442,24 @@ Vocabulary v9. `GET /traders/:handle/aum/history` and `POST /traders/aum/history
 | `latest` | /aum/history | `{ at, totalUsd }` of the newest valued point in range; null when none |
 | `asOf` | /aum/history | When this trader's history was last built (`max(computed_at)`); null when never. The batch envelope's `asOf` is the newest across the traders answered |
 | `traders[]` | POST /traders/aum/history | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: true` entries carry the GET shape minus `links` |
+
+## Added 18 Sep 2026 — live value
+
+Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its own at `GET /traders/:handle/aum/now` and `POST /traders/aum/now { ids }`: the trader's current value from `aum_live`, refreshed when a watched wallet transacts (Solana push), when a balance slice reads the wallet, and when prices land. The hourly series' last point is refreshed with it.
+
+| Field | Route | Contract |
+|---|---|---|
+| `now` | /aum/history, /aum/now | The live figure; `null` when the trader has none yet (never an empty object, never 0) |
+| `now.at` | same | When the figure was last refreshed, ISO-8601 UTC |
+| `now.totalUsd` | same | Value held in USD; `null` when not valued, never 0 |
+| `now.pricedPositions`, `now.totalPositions` | same | Positions priced and held at `at` |
+| `now.reason` | same | Why `totalUsd` is null: `no_holdings`, `no_prices`, `too_little_priced` (`aumHistory.now.reason`, the same words as `aumHistory.points[].reason`); `null` when valued |
+| `now.source` | same | What last refreshed the figure: `webhook`, `balances`, `prices`, `build` (`aumHistory.now.source`) |
+| `now.ageSeconds` | same | Whole seconds between `at` and the answer; never negative |
+| `asOf` | POST /traders/aum/now | The newest `now.at` across the traders answered; `null` when none has a live figure |
+| `traders[]` | POST /traders/aum/now | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: true` entries carry `handle`, `id`, `now` |
+| `links.now` | /aum/history | The trader's `/aum/now` |
+
 ## Added 18 Sep 2026 — token prices
 
 | Field | Route | Contract |

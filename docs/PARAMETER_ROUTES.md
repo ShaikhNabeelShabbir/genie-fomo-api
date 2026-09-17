@@ -2957,6 +2957,22 @@ curl -s -X POST "$B/traders/aum/history" -H 'content-type: application/json' \
   -d '{"ids":["0xAvast","frankdegods"],"window":"1y"}' | jq '.traders[] | {handle, ok, count, latest}'
 ```
 
+### `now` — the live value, and `GET /traders/:handle/aum/now` / `POST /traders/aum/now { ids }`
+
+Added 18 Sep 2026, vocabulary v10. Every `/aum/history` answer (and each batch row) carries
+`now: { at, totalUsd, pricedPositions, totalPositions, reason, source, ageSeconds } | null`, read
+from `aum_live`: the trader's current value, refreshed when a watched wallet transacts (Solana
+push), when a balance slice reads the wallet, and when prices land (`source` says which:
+`webhook`, `balances`, `prices`, `build`). The hourly series' last point is refreshed with it.
+`now` is null when the trader has no live figure yet; `now.totalUsd` is null when not valued
+(`reason` says why, the same three words as `points[].reason`), never 0. `/aum/now` serves the
+block alone (with `handle`, `id`, `links`); the batch form takes up to 50 ids under the §11
+rules and its envelope `asOf` is the newest `now.at` answered.
+
+```bash
+curl -s "$B/traders/0xAvast/aum/now" | jq '.now'
+```
+
 ---
 
 ## 10. Trades, both sides

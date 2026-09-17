@@ -31,3 +31,7 @@ export const windowRange = (window: HistoryWindow, now: Date): { from: string | 
   const span = HISTORY_WINDOWS[window].ms;
   return { from: span === null ? null : new Date(now.getTime() - span).toISOString(), to: now.toISOString() };
 };
+
+/** Whole seconds between a live figure's `at` and `now`; never negative (clock skew reads as 0). */
+export const ageSeconds = (at: Date | string, now: Date): number =>
+  Math.max(0, Math.floor((now.getTime() - new Date(at).getTime()) / 1000));
