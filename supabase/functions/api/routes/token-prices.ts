@@ -44,9 +44,9 @@ const resolveTokens = (keys: string[], net: number | null): Promise<TokenRow[]> 
    where t.token_key = any(${keys}) ${net === null ? sql`` : sql`and t.network_id = ${net}`}
    order by t.token_key, t.network_id`;
 
-const VIEW = {
-  "1d": sql`token_price_daily`, "1w": sql`token_price_weekly`, "1mo": sql`token_price_monthly`,
-} as const satisfies Record<Exclude<SeriesStep, "1h">, unknown>;
+/** Built per request: `sql` is the per-request client, so nothing may touch it at module load. */
+const view = (step: Exclude<SeriesStep, "1h">) =>
+  step === "1d" ? sql`token_price_daily` : step === "1w" ? sql`token_price_weekly` : sql`token_price_monthly`;
 
 /** One query for every token: the newest `limit` points per pair, ascending in the answer. */
 async function seriesFor(pairs: Pair[], q: SeriesQuery, limit: number): Promise<Map<string, Point[]>> {
@@ -71,7 +71,7 @@ async function seriesFor(pairs: Pair[], q: SeriesQuery, limit: number): Promise<
           from unnest(${nets}::bigint[], ${keys}::text[]) as w(network_id, token_key)
           cross join lateral (
             select v.bucket as at, v.close_usd as usd, v.open_usd, v.high_usd, v.low_usd, v.hours
-              from ${VIEW[q.step]} v
+              from ${view(q.step)} v
              where v.network_id = w.network_id and v.token_key = w.token_key
                and v.bucket <= ${q.to}::timestamptz ${q.from === null ? sql`` : sql`and v.bucket >= ${q.from}::timestamptz`}
              order by v.bucket desc limit ${limit}) p`;
