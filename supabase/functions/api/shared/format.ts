@@ -22,3 +22,7 @@ export const money = (v: number) =>
 /** SQLite has no boolean: a 0/1 column (NULL = absent) becomes true/false/null at the boundary. */
 export const bool = (v: unknown): boolean | null =>
   v === null || v === undefined ? null : Number(v) !== 0;
+
+/** A JSON column is TEXT in SQLite (so is json_extract / json_group_array): parse it once. */
+export const fromJson = <T>(v: unknown): T | null =>
+  v === null || v === undefined ? null : typeof v === "string" ? JSON.parse(v) as T : v as T;

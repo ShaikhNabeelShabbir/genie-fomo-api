@@ -3,7 +3,7 @@ import { get } from "../router.ts";
 import { notFound, badRequest } from "../errors.ts";
 import { asOfHoldings, asOfToken } from "../shared/asof.ts";
 import { intParam, numParam, sortParam, nonEmpty } from "../shared/params.ts";
-import { cov, money } from "../shared/format.ts";
+import { bool, cov, fromJson, money } from "../shared/format.ts";
 import { chainWhere } from "../shared/chains.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { ledgerBody } from "../shared/creators-core.ts";
@@ -29,7 +29,7 @@ get("/v1/tokens", async (_p, url) => {
   const tokenSortCol = tokenSort.key === "holders"
     ? sql`count(distinct h.handle)`
     : tokenSort.key === "priced"
-    ? sql`count(h.value) filter (where h.value > 0)`
+    ? sql`count(case when h.value > 0 then h.value end)`
     : tokenSort.key === "marketCap"
     ? sql`max(ti.market_cap_usd)`
     : tokenSort.key === "liquidity"
@@ -37,10 +37,10 @@ get("/v1/tokens", async (_p, url) => {
     : tokenSort.key === "chainHolders"
     ? sql`max(ti.holder_count)`
     : tokenSort.key === "smartWallets"
-    ? sql`max((ti.raw->'wallet_tags_stat'->>'smart_wallets')::int)`
+    ? sql`max(cast(json_extract(ti.raw, '$.wallet_tags_stat.smart_wallets') as integer))`
     : tokenSort.key === "renownedWallets"
-    ? sql`max((ti.raw->'wallet_tags_stat'->>'renowned_wallets')::int)`
-    : sql`coalesce(sum(h.value) filter (where h.value > 0), 0)`;
+    ? sql`max(cast(json_extract(ti.raw, '$.wallet_tags_stat.renowned_wallets') as integer))`
+    : sql`coalesce(sum(case when h.value > 0 then h.value end), 0)`;
   const minValue = numParam(url, "minValue"), maxValue = numParam(url, "maxValue");
   const minMarketCap = numParam(url, "minMarketCap"), maxMarketCap = numParam(url, "maxMarketCap");
   const minLiquidity = numParam(url, "minLiquidity");
@@ -49,7 +49,7 @@ get("/v1/tokens", async (_p, url) => {
   const excludeHoneypots = url.searchParams.get("excludeHoneypots") === "true";
 
 
-  const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
+  const [{ traders: traderCount }] = await sql`select count(*) as traders from traders`;
 
   // Quote assets are excluded and it is NOT optional: 85 of 100 leaders "hold" USDC, so
   // leaving them in makes the top of the board the currency rather than a trade.
@@ -63,25 +63,26 @@ get("/v1/tokens", async (_p, url) => {
            max(ti.fetched_at)     as info_fetched_at,
            -- T3e on the board. Only the two tags worth scanning a list by; the rest are on
            -- the token detail route with the cap disclosure attached.
-           max((ti.raw->'wallet_tags_stat'->>'smart_wallets')::int)    as smart_wallets,
-           max((ti.raw->'wallet_tags_stat'->>'renowned_wallets')::int) as renowned_wallets,
+           max(cast(json_extract(ti.raw, '$.wallet_tags_stat.smart_wallets') as integer))    as smart_wallets,
+           max(cast(json_extract(ti.raw, '$.wallet_tags_stat.renowned_wallets') as integer)) as renowned_wallets,
            -- T3a on the board. A honeypot flag is worthless on a detail page nobody opens
            -- before acting; it has to be visible where the scanning happens.
-           bool_or(ti.is_honeypot)      as is_honeypot,
-           bool_or(ti.can_not_sell)     as can_not_sell,
+           -- bool_or over 0/1 columns is max(), which ignores the NULL = not assessed rows.
+           max(ti.is_honeypot)          as is_honeypot,
+           max(ti.can_not_sell)         as can_not_sell,
            max(ti.sell_tax)             as sell_tax,
            max(ti.rug_ratio)            as rug_ratio,
            max(ti.security_fetched_at)  as security_fetched_at,
            -- Launch metadata (docs/LAUNCH_METADATA.md): the two words worth scanning by.
            max(tk.launchpad)            as launchpad,
-           bool_or(tk.graduated)        as graduated,
-           count(distinct h.handle)::int              as holders,
-           sum(h.value) filter (where h.value > 0)    as total_value,
-           count(h.value) filter (where h.value > 0)::int as priced,
+           max(tk.graduated)            as graduated,
+           count(distinct h.handle)                   as holders,
+           sum(case when h.value > 0 then h.value end) as total_value,
+           count(case when h.value > 0 then h.value end) as priced,
            -- Biggest position first: who has conviction, not who sorted first. Unpriced
            -- counts as 0 (matching the Node path), and ties break on rank because JS sort
            -- is stable and the directory is ordered by rank.
-           array_agg(h.handle order by coalesce(h.value, 0) desc, st.rank nulls last) as handles
+           json_group_array(h.handle order by coalesce(h.value, 0) desc, st.rank nulls last) as handles
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
@@ -101,14 +102,14 @@ get("/v1/tokens", async (_p, url) => {
     where q.token_key is null ${net === null ? sql`` : sql`and h.network_id = ${net}`}
     group by h.network_id, c.name, tk.address
     having count(distinct h.handle) >= ${minHolders}
-      ${minValue === null ? sql`` : sql`and coalesce(sum(h.value) filter (where h.value > 0), 0) >= ${minValue}`}
-      ${maxValue === null ? sql`` : sql`and coalesce(sum(h.value) filter (where h.value > 0), 0) <= ${maxValue}`}
+      ${minValue === null ? sql`` : sql`and coalesce(sum(case when h.value > 0 then h.value end), 0) >= ${minValue}`}
+      ${maxValue === null ? sql`` : sql`and coalesce(sum(case when h.value > 0 then h.value end), 0) <= ${maxValue}`}
       ${minMarketCap === null ? sql`` : sql`and max(ti.market_cap_usd) >= ${minMarketCap}`}
       ${maxMarketCap === null ? sql`` : sql`and max(ti.market_cap_usd) <= ${maxMarketCap}`}
       ${minLiquidity === null ? sql`` : sql`and max(ti.liquidity_usd) >= ${minLiquidity}`}
       ${
-    !excludeHoneypots ? sql`` : sql`and coalesce(bool_or(ti.is_honeypot), false) = false
-                                    and coalesce(bool_or(ti.can_not_sell), false) = false`
+    !excludeHoneypots ? sql`` : sql`and coalesce(max(ti.is_honeypot), 0) = 0
+                                    and coalesce(max(ti.can_not_sell), 0) = 0`
   }
     -- Address is the tiebreak, and it matters: hundreds of tokens tie on holder count with
     -- no price, so without it the board order is whatever the planner produced. It stays on
@@ -117,14 +118,15 @@ get("/v1/tokens", async (_p, url) => {
              lower(tk.address), h.network_id`;
 
   const [{ total_tokens }] = await sql`
-    select count(*)::int as total_tokens from (
+    select count(*) as total_tokens from (
       select 1 from holdings_current h
       left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
       where q.token_key is null ${net === null ? sql`` : sql`and h.network_id = ${net}`}
       group by h.network_id, h.token_key) x`;
 
   const [ex] = await sql`
-    select count(distinct (h.network_id, h.token_key))::int as tokens, count(*)::int as positions
+    -- count(distinct (a, b)) has no SQLite row-value form; the pair is keyed as text.
+    select count(distinct h.network_id || ':' || h.token_key) as tokens, count(*) as positions
     from holdings_current h
     join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     ${net === null ? sql`` : sql`where h.network_id = ${net}`}`;
@@ -225,7 +227,7 @@ get("/v1/tokens", async (_p, url) => {
       fundamentalsTier: r.info_fetched_at ? "third_party" : null,
       holderShare: Number((Number(r.holders) / Number(traderCount)).toFixed(4)),
       totalValueUsd: Number(r.priced) ? round(n(r.total_value)) : null,
-      holderHandles: [...new Set(r.handles as string[])].map((h) => disp.get(h) ?? h),
+      holderHandles: [...new Set(fromJson<string[]>(r.handles) ?? [])].map((h) => disp.get(h) ?? h),
       // Crowding is REPORTED, never recommended: 34 of 150 traders once held the same
       // honeypot. Consensus can mean a good call or a coordinated pump, and this number
       // cannot tell them apart.
@@ -253,17 +255,17 @@ get("/v1/tokens/:address", async ({ address }, url) => {
            -- T3b/T3c/T3e. Specific paths rather than the whole ti.raw document: this query
            -- returns one row per holder, so selecting all of it would ship the same ~10KB
            -- JSON once per holder — 70+ copies of an identical value on a widely-held token.
-           ti.raw->'stat'->>'dev_team_hold_rate'          as dev_team_hold_rate,
-           ti.raw->'stat'->>'creator_hold_rate'           as creator_hold_rate,
-           ti.raw->'stat'->>'fresh_wallet_rate'           as fresh_wallet_rate,
-           ti.raw->'stat'->>'top70_sniper_hold_rate'      as sniper_hold_rate,
-           ti.raw->'stat'->>'bot_degen_rate'              as bot_degen_rate,
-           ti.raw->'wallet_tags_stat'                     as wallet_tags,
-           ti.raw->'dev'->>'creator_address'              as creator_address,
-           ti.raw->'dev'->>'creator_token_status'         as creator_status,
-           ti.raw->'dev'->>'cto_flag'                     as cto_flag,
-           ti.raw->'dev'->>'creator_open_count'           as creator_open_count,
-           ti.raw->'dev'->'ath_token_info'                as creator_ath,
+           json_extract(ti.raw, '$.stat.dev_team_hold_rate')     as dev_team_hold_rate,
+           json_extract(ti.raw, '$.stat.creator_hold_rate')      as creator_hold_rate,
+           json_extract(ti.raw, '$.stat.fresh_wallet_rate')      as fresh_wallet_rate,
+           json_extract(ti.raw, '$.stat.top70_sniper_hold_rate') as sniper_hold_rate,
+           json_extract(ti.raw, '$.stat.bot_degen_rate')         as bot_degen_rate,
+           json_extract(ti.raw, '$.wallet_tags_stat')            as wallet_tags,
+           json_extract(ti.raw, '$.dev.creator_address')         as creator_address,
+           json_extract(ti.raw, '$.dev.creator_token_status')    as creator_status,
+           json_extract(ti.raw, '$.dev.cto_flag')                as cto_flag,
+           json_extract(ti.raw, '$.dev.creator_open_count')      as creator_open_count,
+           json_extract(ti.raw, '$.dev.ath_token_info')          as creator_ath,
            -- Gap 5a. The nightly dev ledger for this token's creator (null columns: no row yet).
            cr.launches, cr.best_peak_mcap_usd, cr.best_token_key, cr.still_holding_count,
            cr.sold_count, cr.honeypot_count, cr.last_launch_at,
@@ -305,18 +307,18 @@ get("/v1/tokens/:address", async ({ address }, url) => {
   if (!rows.length) {
     throw notFound(`no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
   }
-  const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
+  const [{ traders: traderCount }] = await sql`select count(*) as traders from traders`;
   /**
    * C3, Cabal Trader. Tracked traders with any trade in the coin, per chain, and how many
    * remain once wallets linked to another trader (linked_wallets) are collapsed. A trader is
    * dependent when one of his wallets is another trader's linked address.
    */
   const cohortRows: { network_id: number; holders: number; independent: number }[] = await sql`
-    select tr.network_id, count(distinct tr.handle)::int as holders,
-           count(distinct tr.handle) filter (where not exists (
+    select tr.network_id, count(distinct tr.handle) as holders,
+           count(distinct case when not exists (
              select 1 from wallets w join linked_wallets lw
                on lw.address_key in (w.evm_address_key, w.sol_address_key)
-             where w.handle = tr.handle and lw.handle <> tr.handle))::int as independent
+             where w.handle = tr.handle and lw.handle <> tr.handle) then tr.handle end) as independent
     from trades tr
     where tr.token_key = ${key} ${net === null ? sql`` : sql`and tr.network_id = ${net}`}
     group by 1`;
@@ -392,22 +394,22 @@ get("/v1/tokens/:address", async ({ address }, url) => {
         /** T3a. See docs/DECISIONS.md#d084 */
         security: group[0].security_fetched_at
           ? (() => {
-            const b = (v: unknown) => (v === null || v === undefined ? null : Boolean(v));
+            const b = bool;
             const isSol = Number(group[0].network_id) === 1399811149;
             const flags: string[] = [];
-            if (group[0].is_honeypot === true) flags.push("honeypot");
-            if (group[0].can_not_sell === true) flags.push("sell_blocked");
-            if (group[0].is_blacklisted === true) flags.push("blacklist_function");
+            if (b(group[0].is_honeypot) === true) flags.push("honeypot");
+            if (b(group[0].can_not_sell) === true) flags.push("sell_blocked");
+            if (b(group[0].is_blacklisted) === true) flags.push("blacklist_function");
             if ((n(group[0].buy_tax) ?? 0) > 0.1) flags.push("high_buy_tax");
             if ((n(group[0].sell_tax) ?? 0) > 0.1) flags.push("high_sell_tax");
             if ((n(group[0].rug_ratio) ?? 0) > 0.3) flags.push("high_rug_ratio");
-            if (isSol && group[0].renounced_mint === false) flags.push("mint_not_renounced");
-            if (isSol && group[0].renounced_freeze === false) flags.push("freeze_not_renounced");
-            if (!isSol && group[0].is_renounced === false) flags.push("owner_not_renounced");
+            if (isSol && b(group[0].renounced_mint) === false) flags.push("mint_not_renounced");
+            if (isSol && b(group[0].renounced_freeze) === false) flags.push("freeze_not_renounced");
+            if (!isSol && b(group[0].is_renounced) === false) flags.push("owner_not_renounced");
             return {
-              canSell: group[0].is_honeypot === null
+              canSell: b(group[0].is_honeypot) === null
                 ? null
-                : !(group[0].is_honeypot === true || group[0].can_not_sell === true),
+                : !(b(group[0].is_honeypot) === true || b(group[0].can_not_sell) === true),
               isHoneypot: b(group[0].is_honeypot),
               /** C3. First nightly read that flagged it (honeypot or sell-blocked); never cleared. */
               honeypotSince: group[0].honeypot_since ? new Date(String(group[0].honeypot_since)).toISOString() : null,
@@ -476,7 +478,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
           : null,
         /** T3e. See docs/DECISIONS.md#d086 */
         walletTags: (() => {
-          const w = group[0].wallet_tags as Record<string, unknown> | null;
+          const w = fromJson<Record<string, unknown>>(group[0].wallet_tags);
           if (!w) return null;
           const CAP = 1000;
           const val = (k: string) => {
@@ -542,7 +544,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
             tokensLaunched: n(group[0].creator_open_count),
             /** The creator's best previous launch — null when there is not one. See docs/DECISIONS.md#d087 */
             bestPreviousToken: (() => {
-              const a = group[0].creator_ath as Record<string, unknown> | null;
+              const a = fromJson<Record<string, unknown>>(group[0].creator_ath);
               if (!a) return null;
               const symbol = nonEmpty(a.symbol as string | null);
               const address = nonEmpty(a.ath_token as string | null);
@@ -633,33 +635,56 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
       select t.display_handle as handle, tr.status, tr.trade_id,
              tr.realized_pnl_usd, tr.unrealized_pnl_usd,
              tr.avg_entry_price, tr.avg_exit_price, tr.opened_at, tr.closed_at,
-             trade_qty(tr.status, tr.amount, tr.realized_pnl_usd,
-                       tr.avg_entry_price, tr.avg_exit_price) as qty
+             -- trade_qty() is gone with Postgres (worker/d1/SCHEMA_MAP.md): the case is
+             -- inlined here, and its TS twin is legQty in shared/scorecard-core.ts.
+             case
+               when tr.status = 'open' and tr.amount > 0 then tr.amount
+               when tr.status = 'closed'
+                    and tr.realized_pnl_usd is not null
+                    and tr.avg_entry_price is not null
+                    and tr.avg_exit_price is not null
+                    and tr.avg_exit_price <> tr.avg_entry_price
+                    and tr.realized_pnl_usd / (tr.avg_exit_price - tr.avg_entry_price) > 0
+                 then tr.realized_pnl_usd / (tr.avg_exit_price - tr.avg_entry_price)
+               else null
+             end as qty,
+             -- (array_agg(px order by opened_at nulls last, trade_id) filter (where px > 0))[1]
+             -- is the first PRICED leg: the unpriced ones are ordered behind, then rn = 1.
+             row_number() over (
+               partition by t.display_handle
+               order by (case when tr.avg_entry_price > 0 then 0 else 1 end),
+                        tr.opened_at nulls last, tr.trade_id) as entry_rn,
+             row_number() over (
+               partition by t.display_handle
+               order by (case when tr.avg_exit_price > 0 then 0 else 1 end),
+                        tr.opened_at nulls last, tr.trade_id) as exit_rn
       from trades tr join traders t on t.handle = tr.handle
       where tr.token_key = ${key}
     )
     select handle,
-           count(*)::int                                           as trades,
-           count(*) filter (where status = 'closed')::int           as closed,
-           coalesce(sum(realized_pnl_usd)
-                    filter (where status = 'closed'), 0)            as realized,
-           coalesce(sum(unrealized_pnl_usd)
-                    filter (where status not in ('closed', 'closed_by_balance')), 0) as unrealized,
+           count(*)                                                as trades,
+           count(case when status = 'closed' then 1 end)            as closed,
+           coalesce(sum(case when status = 'closed'
+                             then realized_pnl_usd end), 0)         as realized,
+           coalesce(sum(case when status not in ('closed', 'closed_by_balance')
+                             then unrealized_pnl_usd end), 0)       as unrealized,
            coalesce(
-             sum(avg_entry_price * qty) filter (where avg_entry_price > 0 and qty is not null)
-               / nullif(sum(qty) filter (where avg_entry_price > 0 and qty is not null), 0),
-             (array_agg(avg_entry_price order by opened_at nulls last, trade_id)
-                filter (where avg_entry_price > 0))[1]
+             sum(case when avg_entry_price > 0 and qty is not null
+                      then avg_entry_price * qty end)
+               / nullif(sum(case when avg_entry_price > 0 and qty is not null
+                                 then qty end), 0),
+             max(case when entry_rn = 1 and avg_entry_price > 0 then avg_entry_price end)
            )                                                        as entry,
            coalesce(
-             sum(avg_exit_price * qty) filter (where avg_exit_price > 0 and qty is not null)
-               / nullif(sum(qty) filter (where avg_exit_price > 0 and qty is not null), 0),
-             (array_agg(avg_exit_price order by opened_at nulls last, trade_id)
-                filter (where avg_exit_price > 0))[1]
+             sum(case when avg_exit_price > 0 and qty is not null
+                      then avg_exit_price * qty end)
+               / nullif(sum(case when avg_exit_price > 0 and qty is not null
+                                 then qty end), 0),
+             max(case when exit_rn = 1 and avg_exit_price > 0 then avg_exit_price end)
            )                                                        as exit,
-           count(*) filter (where avg_entry_price > 0)::int          as entry_positions,
-           count(*) filter (where avg_entry_price > 0
-                              and qty is not null)::int              as entry_positions_weighted,
+           count(case when avg_entry_price > 0 then 1 end)           as entry_positions,
+           count(case when avg_entry_price > 0
+                       and qty is not null then 1 end)               as entry_positions_weighted,
            min(opened_at)                                           as first_buy,
            max(closed_at)                                           as last_sell
     from legs
@@ -672,16 +697,32 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
     with legs as (
       select t.display_handle as handle, tr.network_id, tr.token_key,
              tr.avg_exit_price, tr.opened_at, tr.trade_id,
-             trade_qty(tr.status, tr.amount, tr.realized_pnl_usd,
-                       tr.avg_entry_price, tr.avg_exit_price) as qty
+             -- trade_qty() is gone with Postgres (worker/d1/SCHEMA_MAP.md): the case is
+             -- inlined here, and its TS twin is legQty in shared/scorecard-core.ts.
+             case
+               when tr.status = 'open' and tr.amount > 0 then tr.amount
+               when tr.status = 'closed'
+                    and tr.realized_pnl_usd is not null
+                    and tr.avg_entry_price is not null
+                    and tr.avg_exit_price is not null
+                    and tr.avg_exit_price <> tr.avg_entry_price
+                    and tr.realized_pnl_usd / (tr.avg_exit_price - tr.avg_entry_price) > 0
+                 then tr.realized_pnl_usd / (tr.avg_exit_price - tr.avg_entry_price)
+               else null
+             end as qty,
+             row_number() over (
+               partition by t.display_handle, tr.network_id, tr.token_key
+               order by (case when tr.avg_exit_price > 0 then 0 else 1 end),
+                        tr.opened_at nulls last, tr.trade_id) as exit_rn
       from trades tr join traders t on t.handle = tr.handle
       where t.display_handle in (${per.map((r) => String(r.handle))}) and tr.status = 'closed')
     select l.handle, ti.price_usd as current,
            coalesce(
-             sum(avg_exit_price * qty) filter (where avg_exit_price > 0 and qty is not null)
-               / nullif(sum(qty) filter (where avg_exit_price > 0 and qty is not null), 0),
-             (array_agg(avg_exit_price order by opened_at nulls last, trade_id)
-                filter (where avg_exit_price > 0))[1]
+             sum(case when avg_exit_price > 0 and qty is not null
+                      then avg_exit_price * qty end)
+               / nullif(sum(case when avg_exit_price > 0 and qty is not null
+                                 then qty end), 0),
+             max(case when exit_rn = 1 and avg_exit_price > 0 then avg_exit_price end)
            ) as exit
     from legs l
     left join token_info ti on ti.network_id = l.network_id and ti.token_key = l.token_key
@@ -814,15 +855,15 @@ get("/v1/tokens/momentum", async (_p, url) => {
     now_handles: string[]; before_handles: string[];
   };
   const rows: MomentumRow[] = await sql`
-    with a as (select network_id, token_key, array_agg(handle) as handles
+    with a as (select network_id, token_key, json_group_array(handle) as handles
                from holdings where captured_at = ${from} group by 1,2),
-         b as (select network_id, token_key, array_agg(handle) as handles
+         b as (select network_id, token_key, json_group_array(handle) as handles
                from holdings where captured_at = ${to} group by 1,2)
     select coalesce(a.network_id, b.network_id) as network_id,
            coalesce(a.token_key, b.token_key)   as token_key,
-           coalesce(array_length(b.handles,1),0) as holders,
-           coalesce(array_length(a.handles,1),0) as previous_holders,
-           coalesce(b.handles,'{}') as now_handles, coalesce(a.handles,'{}') as before_handles
+           coalesce(json_array_length(b.handles),0) as holders,
+           coalesce(json_array_length(a.handles),0) as previous_holders,
+           coalesce(b.handles,'[]') as now_handles, coalesce(a.handles,'[]') as before_handles
     from a full outer join b using (network_id, token_key)`;
 
   const disp = new Map<string, string>();
@@ -843,8 +884,8 @@ get("/v1/tokens/momentum", async (_p, url) => {
   }
 
   const moved = rows.flatMap((r) => {
-    const now = new Set(r.now_handles as string[]);
-    const before = new Set(r.before_handles as string[]);
+    const now = new Set(fromJson<string[]>(r.now_handles) ?? []);
+    const before = new Set(fromJson<string[]>(r.before_handles) ?? []);
     const gained = [...now].filter((h) => !before.has(h));
     const lost = [...before].filter((h) => !now.has(h));
     if (!gained.length && !lost.length) return [];
@@ -905,16 +946,21 @@ get("/v1/creators/:address", async ({ address }, url) => {
   // One EVM address is the same creator on every EVM chain, so without ?chain= the ledger
   // sums across networks; (network, token) pairs are distinct, so launches do not double.
   const [ledger] = await sql`
-    select sum(launches)::int as launches,
+    select sum(launches) as launches,
            max(best_peak_mcap_usd) as best_peak_mcap_usd,
-           (array_agg(best_token_key order by best_peak_mcap_usd desc nulls last))[1] as best_token_key,
-           sum(still_holding_count)::int as still_holding_count,
-           sum(sold_count)::int as sold_count,
-           sum(honeypot_count)::int as honeypot_count,
+           -- (array_agg(k order by mcap desc nulls last))[1]: DESC already sorts NULL last.
+           max(case when rn = 1 then best_token_key end) as best_token_key,
+           sum(still_holding_count) as still_holding_count,
+           sum(sold_count) as sold_count,
+           sum(honeypot_count) as honeypot_count,
            max(last_launch_at) as last_launch_at,
            max(updated_at) as updated_at
-    from creators
-    where creator_address_key = ${key} ${net === null ? sql`` : sql`and network_id = ${net}`}
+    from (
+      select creator_address_key, launches, best_peak_mcap_usd, best_token_key,
+             still_holding_count, sold_count, honeypot_count, last_launch_at, updated_at,
+             row_number() over (order by best_peak_mcap_usd desc) as rn
+      from creators
+      where creator_address_key = ${key} ${net === null ? sql`` : sql`and network_id = ${net}`})
     group by creator_address_key`;
   if (!ledger) {
     throw notFound(`no creator '${address}' on record${chainQ ? ` on ${chainQ}` : ""}`);
