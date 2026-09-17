@@ -8,8 +8,12 @@ export const IMPLIED_MCAP_CEILING_USD = 20e9;
 /** V1: one position over this share of a reading refuses the reading when its cap is unknown or the total tops the USD ceiling. */
 export const CONCENTRATION_SHARE = 0.9;
 export const CONCENTRATION_TOTAL_USD = 1e9;
+/** V1d: a position over this much with no pool anywhere (liquidity unknown) has no market behind its price. */
+export const NO_MARKET_CEILING_USD = 1_000_000;
+/** V1d: a position worth more than this many times its best pool cannot be realised. */
+export const NO_MARKET_LIQUIDITY_MULTIPLE = 10;
 
-export type PriceSuspectReason = "implied_mcap_over_ceiling" | "concentration_over_ceiling";
+export type PriceSuspectReason = "implied_mcap_over_ceiling" | "concentration_over_ceiling" | "no_market_over_ceiling";
 
 /** Value one position, or refuse it. `supply` unknown (null) skips the implied-cap check. See docs/DECISIONS.md#d190 */
 export function value(amount: number, price: number | null, supply: number | null = null): { usd?: number; rejected?: boolean } {
@@ -42,12 +46,23 @@ export function priceSuspectReason(
   return null;
 }
 
-export interface SuspectRow { readonly price: number | null; readonly supply: number | null; readonly usd: number | null }
+/** V1d: no market behind the price: worth over 10x the pool, or over the ceiling with no pool known. */
+export function noMarketSuspect(usd: number | null, liquidityUsd: number | null): boolean {
+  if (usd === null) return false;
+  return liquidityUsd === null ? usd > NO_MARKET_CEILING_USD : usd > NO_MARKET_LIQUIDITY_MULTIPLE * liquidityUsd;
+}
+
+export interface SuspectRow {
+  readonly price: number | null; readonly supply: number | null; readonly usd: number | null;
+  /** DexScreener liquidity of the best pair; null when no pair is known anywhere. */
+  readonly liquidityUsd: number | null;
+}
 
 /**
  * V1b: every row's verdict at once, aligned with the input. The concentration base is the sum of
  * the rows not yet suspect: the largest row is judged against it, dropped from it when flagged,
  * and the next largest judged again, so two absurd prices in one wallet cannot hide each other.
+ * Then every row still clean is checked against its own pool (V1d), whatever its share.
  */
 export function suspectRows(rows: readonly SuspectRow[]): (PriceSuspectReason | null)[] {
   const out: (PriceSuspectReason | null)[] = rows.map((r) =>
@@ -57,12 +72,14 @@ export function suspectRows(rows: readonly SuspectRow[]): (PriceSuspectReason | 
   for (;;) {
     let top = -1;
     rows.forEach((r, i) => { if (out[i] === null && r.usd !== null && (top < 0 || r.usd > rows[top].usd!)) top = i; });
-    if (top < 0) return out;
+    if (top < 0) break;
     const reason = priceSuspectReason(rows[top].price, rows[top].supply, rows[top].usd, base);
-    if (reason === null) return out;
+    if (reason === null) break;
     out[top] = reason;
     base -= rows[top].usd!;
   }
+  rows.forEach((r, i) => { if (out[i] === null && noMarketSuspect(r.usd, r.liquidityUsd)) out[i] = "no_market_over_ceiling"; });
+  return out;
 }
 
 /**

@@ -35,7 +35,8 @@ export const VOCABULARY = {
                                 /* v3 fixes (V1): a suspect price leads the word. */
                                 "price_suspect", "price_suspect_and_unsellable_positions", "price_suspect_and_indexer_coverage_low",
                                 "price_suspect_and_unsellable_positions_and_indexer_coverage_low"],
-    "positions[].priceSuspectReason": ["implied_mcap_over_ceiling", "concentration_over_ceiling"],
+    /* v3 fixes (V1d): no market behind the price: worth over 10x its best pool, or over $1M with no pool known. */
+    "positions[].priceSuspectReason": ["implied_mcap_over_ceiling", "concentration_over_ceiling", "no_market_over_ceiling"],
     /* v3 fixes (V1c): which price ladder rung valued the holding; the balances job writes the first three, the directory build the last. */
     "positions[].priceSource": ["pegged", "token_info", "token_prices", "fomo_reported_entry"],
     /* v3 fixes (R6): the sent-transaction count is Bitquery's realtime window, a lower bound on the nonce. */
