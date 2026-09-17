@@ -197,7 +197,7 @@ Option A, and §6 covers Option B.
 
 | Today | On Cloudflare | Notes |
 |---|---|---|
-| Supabase Edge Function `api` | **one Worker** `genie-copy-trading-api`, `fetch` on `/v1/*` | §5, §11 |
+| Supabase Edge Function `api` | **one Worker** `genie-copy-trading-api`, `fetch` on `/v2/*` | §5, §11 |
 | Supabase Edge Function `aum-sample` | the same Worker: `scheduled` handler plus `fetch` on `/sample` | §5, §7 |
 | Supabase Edge Function `helius-webhook` | the same Worker: `fetch` on `/webhook` | §9 |
 | Supabase Postgres | **unchanged**, reached through Hyperdrive (A′); external host later if wanted (A) | §4 |

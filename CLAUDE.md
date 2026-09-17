@@ -4,8 +4,8 @@ Read this before exploring. It answers what past sessions spent ~500k tokens red
 
 ## What is live
 
-Three Supabase Edge Functions and one Postgres. Nothing else is deployed.
-Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
+Three Supabase Edge Functions, one Postgres, and (since 17 Sep 2026) one Cloudflare Worker in shadow.
+v1: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`. v2: `https://genie-copy-trading-api.agent-73b.workers.dev/v2` (same database via Hyperdrive `genie-copy-trading-db`, caching disabled).
 
 | Path | What |
 |---|---|
@@ -14,7 +14,7 @@ Live URL: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`.
 | `supabase/functions/api/shared/*.ts` | helpers used by 2+ families; `vocabulary.ts` is the published word list; `aum-rules.ts` the pure /aum rules |
 | `supabase/functions/aum-sample/` | the balance sampler; `value.ts` holds the price ceilings. Fired every 5 min by `pg_cron` (`supabase/migrations/20260916120000_aum_sample_schedule.sql`) |
 | `supabase/functions/helius-webhook/` | Solana transfer push receiver |
-| `worker/` | the Cloudflare port (`docs/CLOUDFLARE_MIGRATION.md`): **ported, not deployed**. `/webhook` and `/sample` + `scheduled` (`sampler.ts` is the twin of `aum-sample/index.ts`: edit both); `/v1/*` via `api.ts`, which runs the SAME `supabase/functions/api` modules inside `runWith({ sql, env })` — 503 `not_configured` until Hyperdrive is bound |
+| `worker/` | the Cloudflare port (`docs/CLOUDFLARE_MIGRATION.md`): **deployed in shadow** (`npx wrangler deploy` from `worker/`; CI deploys on push when `CLOUDFLARE_DEPLOY=true`). `/webhook` and `/sample` + `scheduled` (`sampler.ts` is the twin of `aum-sample/index.ts`: edit both); `/v2/*` via `api.ts`, which runs the SAME `supabase/functions/api` modules inside `runWith({ sql, env })`. Keep postgres.js `fetch_types` on: arrays break without it |
 | `supabase/functions/_shared/chain_reads.ts` | balance reads. **Twin of `scripts/lib/chain_reads.mjs`: edit both.** |
 | `supabase/migrations/` | schema; check constraints are the only SQL-enforced vocabulary |
 | `scripts/*.mjs` | Node loaders run by `.github/workflows/refresh.yml` nightly 06:00 UTC |

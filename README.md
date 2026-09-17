@@ -11,7 +11,7 @@ thousand visitors cost what one does.
 | Deployment | Base URL | Status |
 |---|---|---|
 | **v1** Supabase Edge Function | `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api` | live |
-| **v2** Cloudflare Worker `genie-copy-trading-api` | `https://genie-copy-trading-api.<subdomain>.workers.dev/v2/…` | ported on this branch, not yet deployed |
+| **v2** Cloudflare Worker `genie-copy-trading-api` | `https://genie-copy-trading-api.agent-73b.workers.dev/v2/…` | live in shadow since 17 Sep 2026, same database |
 
 Both serve the same handlers. v2 exists so the Worker can be proven against v1 with a byte
 diff before consumers move; see [Deploying](#deploying) and `docs/CLOUDFLARE_MIGRATION.md`.
@@ -43,7 +43,7 @@ diff before consumers move; see [Deploying](#deploying) and `docs/CLOUDFLARE_MIG
 ## How it is put together
 
 Three Supabase Edge Functions and one Postgres database are live. One Cloudflare Worker,
-serving the same code, is ported and waits on a Hyperdrive binding.
+serving the same code through Hyperdrive, runs in shadow against the same database.
 
 ```
                           ┌──────────────────────────────────────────────┐
@@ -78,7 +78,7 @@ serving the same code, is ported and waits on a Hyperdrive binding.
 | **`api`** | Every read route. Makes no external call except one: the `/aum` live read-through to the sampler |
 | **`aum-sample`** | Reads a slice of traders' balances off-chain, prices them from tables already in Postgres, records a reading per trader and per chain. Fired every 5 minutes by `pg_cron` → `pg_net` |
 | **`helius-webhook`** | Receives Helius pushes when a watched Solana wallet transacts. Push, not polling: ~290k rows a week, idempotent on a computed transfer key |
-| **`worker/`** | The Cloudflare port. `fetch` routes `/v2/*` to the api modules, `/webhook` to the receiver, `/sample` to the sampler; `scheduled` is the sampler's cron. Everything answers 503 `not_configured` until Hyperdrive is bound |
+| **`worker/`** | The Cloudflare port. `fetch` routes `/v2/*` to the api modules, `/webhook` to the receiver, `/sample` to the sampler; `scheduled` is the sampler's cron. Bound to Hyperdrive `genie-copy-trading-db` (direct IPv6 host, caching disabled) |
 
 The api modules are runtime-agnostic: `db.ts` exposes `sql` as a Proxy over a per-request
 `AsyncLocalStorage` store, and `config.ts` reads configuration from the same store before it
@@ -467,12 +467,12 @@ These do.
 
 ## The database
 
-44 migrations under `supabase/migrations/`. The last 14, dated `20260917`, are on this branch
-and **not yet applied** to production; they add `price_suspect`, native EVM positions, partial
+44 migrations under `supabase/migrations/`. The 14 dated `20260917` were applied to production on
+17 Sep 2026 after repairing an empty migration history; they add `price_suspect`, native EVM positions, partial
 sampler readings, balance-closed trades, trade-load bookkeeping, per-chain indexer coverage,
 hourly price history, launch metadata, the `holdings_live` view, `creators`, `linked_wallets`,
 the `trader_chain_history` view, `honeypot_since`, and the performance indexes the health and
-AUM routes assume. Apply them before deploying the api from this branch.
+AUM routes assume.
 
 Tables that matter most: `traders`, `wallets`, `trades` (fomoapi and GMGN), `transactions`
 (Helius pushes, the largest table), `holdings` and the `holdings_current` / `holdings_live`

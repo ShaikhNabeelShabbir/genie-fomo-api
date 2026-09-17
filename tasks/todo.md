@@ -52,8 +52,11 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `clo
       caching disabled; Worker `genie-copy-trading-api` deployed on Workers Paid (Free rejected `[limits]`);
       `/v2/chains` and `/v2/fields` answer from production. `/v2/health` 500 until the 14 migrations land.
       Remote migration history was EMPTY (all 44 unrecorded): repair the 30 live ones, then push 14.
-- [ ] User: `supabase migration repair`, `db push`, 4× `wrangler secret put`, Supabase `functions deploy`,
-      then acceptance diff v1 vs v2.
+- [x] Migration history repaired (30) and 14 migrations pushed by the user; `fetch_types: false` removed
+      (arrays broke); v2 answers every family; smoke 7/8 (the 8th is `dataState: degraded`, by design T2).
+      Worker secrets: HELIUS_WEBHOOK_SECRET, HELIUS_SOLANA_KEY set; AUM_SAMPLE_SECRET, WALLET_SUBMIT_SECRET pending.
+- [ ] User: Supabase `functions deploy` api + aum-sample + helius-webhook, then acceptance diff v1 vs v2;
+      merge to main so the hourly/6-hourly crons run (GitHub schedules only fire on the default branch).
 
 ## Status for the morning (17 Sep 2026)
 
