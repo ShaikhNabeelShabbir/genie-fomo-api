@@ -11,7 +11,7 @@ async function refreshLive(sql: ReturnType<typeof db>, keys: readonly string[]):
     const handles = (await sql<{ handle: string }[]>`
       select distinct handle from wallets where sol_address_key = any(${keys})`).map((r) => r.handle);
     if (!handles.length) return;
-    const [row] = await sql<{ n: number }[]>`select aum_live_refresh(${handles}::text[], 'webhook') as n`;
+    const [row] = await sql<{ n: number }[]>`select aum_live_refresh(${handles}::text[], 'webhook', interval '5 minutes') as n`;
     console.log("webhook aum_live:", { handles: handles.length, refreshed: Number(row?.n ?? 0) });
   } catch (e) {
     console.error("webhook aum_live:", e instanceof Error ? e.message : String(e));

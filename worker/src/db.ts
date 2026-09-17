@@ -11,7 +11,9 @@ export function db(env: Env): postgres.Sql {
   return postgres(env.HYPERDRIVE.connectionString, {
     // Cloudflare's own example uses 5: Workers allow six simultaneous outbound connections,
     // and a route that does `Promise.all` over several queries wants more than one of them.
-    max: 5,
+    // 2, not Cloudflare's example 5: the Hyperdrive pool is shared by API requests, 14 jobs and every
+    // Helius push; at 5 each it ran dry on 18 Sep ("Timed out while waiting for an open slot").
+    max: 2,
     // `prepare` stays at its default (true): Hyperdrive over a DIRECT connection caches
     // named statements; `prepare: false` was for the 6543 transaction pooler (§4.2).
     // `fetch_types` stays on: without the type fetch the driver cannot serialise arrays, and
