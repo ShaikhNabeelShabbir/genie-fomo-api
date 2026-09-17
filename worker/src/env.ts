@@ -26,5 +26,6 @@ export interface Env {
   /** fomoapi bearer for the scorecard refresh (`jobs/scorecards.ts`). */
   readonly FOMOAPI_KEY?: string;
   /** GMGN key for the token fundamentals refresh (`jobs/tokens.ts`). */
+  /** GMGN openapi key for the directory load (`jobs/gmgn.ts`). */
   readonly GMGN_API_KEY?: string;
 }
