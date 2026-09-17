@@ -54,7 +54,7 @@ const BATCH = 100;
 /** Signatures per Helius JSON-RPC batch, as `fees.ts` sends them. */
 const SOLANA_BATCH = 10;
 /** ponytail: newest candidates per chain per run; the cron is every 15 min, so a slice a run drains a backlog without hogging the budget. Raise when `remaining` stays high. */
-const SOLANA_LIMIT = 1500;
+const SOLANA_LIMIT = 400;   // ~2 candidates/s through Helius: ~3.5 min of a 10 min budget, so the EVM phase always runs
 const EVM_LIMIT = 2000;
 /** ponytail: a route is a handful of hops; a transaction with more trades than this is not one wallet's swap anyway. */
 const TRADES_PER_TX = 10;
@@ -287,7 +287,7 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
   };
   try {
     const chains: Chain[] = (await sql<{ network_id: string; name: string }[]>`
-      select network_id, name from chains order by (network_id = ${SOLANA_NETWORK_ID}) desc, name`)
+      select network_id, name from chains order by (network_id = ${SOLANA_NETWORK_ID}) asc, name`)  // EVM first: 20 Bitquery calls; Solana's slower slice takes what is left
       .map((r) => ({ ...r, network_id: Number(r.network_id) }));
     const quotes = await loadQuotes(sql);
     const natives = await loadNativeQuotes(sql, quotes);
