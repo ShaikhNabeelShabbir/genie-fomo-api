@@ -28,9 +28,17 @@ Deno.test("every refused_reason the database can store is published", async () =
   for (const w of await sqlAllowed("aum_samples", "refused_reason")) assert(published.has(w), `unpublished: ${w}`);
 });
 
+/** Every `check (col in (...))` across the migrations, one list per constraint. */
+
 Deno.test("basis and tier match their check constraints exactly", async () => {
   assertEquals([...VOCABULARY.fields["aum.points[].basis"]].sort(), (await sqlAllowed("aum_samples", "basis")).sort());
   assertEquals([...VOCABULARY.fields["aum.points[].tier"]].sort(), (await sqlAllowed("aum_samples", "tier")).sort());
+  assertEquals([...VOCABULARY.fields["aumHistory.points[].basis"]].sort(), (await sqlAllowed("aum_history", "basis")).sort());
+});
+
+Deno.test("every aum_history reason the database can store is published", async () => {
+  const published = new Set<string>(VOCABULARY.fields["aumHistory.points[].reason"]);
+  for (const w of await sqlAllowed("aum_history", "reason")) assert(published.has(w), `unpublished: ${w}`);
 });
 
 Deno.test("points[].refused and gaps[].reason publish the same words", () => {

@@ -420,3 +420,25 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | Field | Route | Contract |
 |---|---|---|
 | `error.code` | every route | One of `not_found`, `bad_request`, `duplicate_identifier`, `rate_limited`, `timeout`, `unavailable`, `include_unavailable`, `internal_error`, `not_configured`, `unauthorized`, `invalid_address`, `address_in_use`, `already_on_record`. v8 corrects the list: `internal` was published but the service emits `internal_error`; `unavailable` (503, Postgres not answering) and `include_unavailable` (503, `blocks[]` names the `?include=` blocks not produced) were emitted but unpublished. |
+
+## Added 18 Sep 2026 — aum history
+
+Vocabulary v9. `GET /traders/:handle/aum/history` and `POST /traders/aum/history { ids, step?, window?, from?, to? }`: balance history BUILT from stored holdings and prices (table `aum_history`, hourly grain; daily / weekly / monthly rollup views), distinct from the sampled series on `/aum`.
+
+| Field | Route | Contract |
+|---|---|---|
+| `step` | /aum/history | One of `1h`, `1d`, `1w`, `1mo`. Defaults from `window`: 1d, 1w → `1h`; 1m, 3m → `1d`; 1y → `1w`; all → `1mo`. Any other word is 400 with `parameter: "step"` |
+| `window` | /aum/history | One of `1d`, `1w` (default), `1m`, `3m`, `1y`, `all`; the range ends now. `from` / `to` (ISO-8601) override either bound; `from` at or after `to` is 400 |
+| `from`, `to` | /aum/history | The bounds applied, ISO-8601 UTC; `from` is null for `all` with no `from` |
+| `points[]` | /aum/history | Ascending, newest last; at most `limit` (≤ 2000, default 2000) NEWEST points. No cursor: the range is bounded |
+| `points[].at` | /aum/history | Bucket start, UTC |
+| `points[].totalUsd` | /aum/history | Value held in USD; null when the bucket was not valued, never 0. On rolled-up steps it is the close (last valued hour in the bucket) |
+| `points[].basis` | /aum/history | `1h` only. `reading` when a sampled reading stood in that hour; `priced` when built from holdings and prices |
+| `points[].reason` | /aum/history | `1h` only. Why `totalUsd` is null: `no_holdings`, `no_prices`, `too_little_priced`; null when valued |
+| `points[].pricedPositions`, `points[].totalPositions` | /aum/history | `1h` only. Positions priced and held in that hour |
+| `points[].highUsd`, `points[].lowUsd` | /aum/history | `1d` / `1w` / `1mo` only. Highest and lowest valued hour in the bucket; null when none |
+| `points[].valuedHours` | /aum/history | `1d` / `1w` / `1mo` only. Hours in the bucket that carried a value |
+| `count`, `valued` | /aum/history | Points returned, and those with a non-null `totalUsd` |
+| `latest` | /aum/history | `{ at, totalUsd }` of the newest valued point in range; null when none |
+| `asOf` | /aum/history | When this trader's history was last built (`max(computed_at)`); null when never. The batch envelope's `asOf` is the newest across the traders answered |
+| `traders[]` | POST /traders/aum/history | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: true` entries carry the GET shape minus `links` |
