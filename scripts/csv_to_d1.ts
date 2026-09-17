@@ -12,8 +12,10 @@ import { CsvParseStream } from "jsr:@std/csv@1";
 import { type Column, convertRow, insertStatements } from "./lib/d1_rows.ts";
 
 // wrangler reads the whole file as one JS string before uploading; V8 caps a string near 512 MB.
-const MAX_FILE_BYTES = 48_000_000;  // 48 MB: 256 MB files failed the import endpoint with a
-                                    // spurious auth error (17 Sep), and a small file retries cheaply.
+const MAX_FILE_BYTES = 10_000_000;  // 10 MB. Each file is one D1 transaction: 256 MB was refused
+                                    // outright and 48 MB reset the database's Durable Object
+                                    // ({"D1_RESET_DO":true}), because deferred FK checks all land
+                                    // at the commit. 10 MB keeps a commit small and a retry cheap.
 const ROWS_PER_STATEMENT_BATCH = 500;
 const ROOT = new URL("..", import.meta.url);
 
