@@ -121,15 +121,19 @@ const priceTransactionsBatch = (sql: Sql, timeoutMs: number): Promise<number> =>
   return res.count;
 });
 
-/** Held Robinhood tokens that are not a quote asset and that GMGN (`token_info`) carries no price for. */
-const robinhoodTargets = (sql: Sql) => sql<RobinhoodToken[]>`
+/**
+ * Held Robinhood tokens that are not a quote asset and that GMGN (`token_info`) carries no price for.
+ * `holdings_current` is a view over every capture; the scan outran the 14 s connection
+ * statement_timeout on 17 Sep, so it runs under its own longer one.
+ */
+const robinhoodTargets = (sql: Sql) => longStatement(sql, 60_000, (tx) => tx<RobinhoodToken[]>`
   select distinct h.token_key, tk.address
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
    where h.network_id = ${ROBINHOOD_NETWORK_ID} and q.token_key is null and ti.price_usd is null
-   order by h.token_key`;
+   order by h.token_key`);
 
 /** Price one DexScreener batch and write today's row per token that has a pool. Returns tokens priced. */
 async function priceRobinhoodBatch(sql: Sql, chunk: readonly RobinhoodToken[], day: string): Promise<number> {
