@@ -4,24 +4,26 @@ Read this before exploring. It answers what past sessions spent ~500k tokens red
 
 ## What is live
 
-Three Supabase Edge Functions, one Postgres, and (since 17 Sep 2026) one Cloudflare Worker in shadow.
-v1: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`. v2: `https://genie-copy-trading-api.agent-73b.workers.dev/v2` (same database via Hyperdrive `genie-copy-trading-db`, caching disabled).
+One Cloudflare Worker (`genie-copy-trading-api`) and one Postgres on Supabase, reached through Hyperdrive
+`genie-copy-trading-db` (direct IPv6 host, caching disabled). **v2 is the product:** `https://genie-copy-trading-api.agent-73b.workers.dev/v2`.
+v1 (`https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`) is the frozen 16 Sep 2026 Supabase deploy; nothing new lands there.
+Every loader is a Worker cron job (`worker/src/jobs/*`, table in `worker/src/index.ts`); GitHub Actions is CI/CD only.
+Balance history is BUILT (`aum_history`, hourly) and the current value is live (`aum_live`), not sampled.
+EVM data: Bitquery. Solana: Helius. Prices: DexScreener (+ Binance for quote assets). No free public RPC from the Worker.
 
 | Path | What |
 |---|---|
 | `supabase/functions/api/` | the read API: `app.ts` (`handle`: auth, rate limit, 15 s timeout race), `index.ts` (Deno entry: builds the client, serves), `router.ts`, `errors.ts`, `db.ts` (`sql` is a Proxy over the per-request `AsyncLocalStorage` store, falling back to `setDefaultSql`), `config.ts` (`cfg(name)`: store env, then `Deno.env` — the only place `Deno` is touched outside `index.ts`), `routes.ts` (barrel) |
 | `supabase/functions/api/routes/*.ts` | one module per route family (below) |
 | `supabase/functions/api/shared/*.ts` | helpers used by 2+ families; `vocabulary.ts` is the published word list; `aum-rules.ts` the pure /aum rules |
-| `supabase/functions/aum-sample/` | the balance sampler; `value.ts` holds the price ceilings. Fired every 5 min by `pg_cron` (`supabase/migrations/20260916120000_aum_sample_schedule.sql`) |
+| `supabase/functions/aum-sample/` | v1's sampler (retired: pg_cron unscheduled 18 Sep); `value.ts` still holds the price ceilings the SQL functions cite |
 | `supabase/functions/helius-webhook/` | Solana transfer push receiver |
-| `worker/` | the Cloudflare port (`docs/CLOUDFLARE_MIGRATION.md`): **deployed in shadow** (`npx wrangler deploy` from `worker/`; CI deploys on push when `CLOUDFLARE_DEPLOY=true`). `/webhook` and `/sample` + `scheduled` (`sampler.ts` is the twin of `aum-sample/index.ts`: edit both); `/v2/*` via `api.ts`, which runs the SAME `supabase/functions/api` modules inside `runWith({ sql, env })`. Keep postgres.js `fetch_types` on: arrays break without it |
-| `supabase/functions/_shared/chain_reads.ts` | balance reads. **Twin of `scripts/lib/chain_reads.mjs`: edit both.** |
-| `supabase/migrations/` | schema; check constraints are the only SQL-enforced vocabulary |
-| `scripts/*.mjs` | Node loaders run by `.github/workflows/refresh.yml` nightly 06:00 UTC |
-| `scripts/lib/ts/` | `transactions.ts`, `settings.ts`: compiled by `npm run build` to `scripts/lib/dist/` for three loaders. Not the API |
-| `loaders/*.py` | directory build, DB load, trades (fomoapi) |
+| `worker/` | THE deployment (`npx wrangler deploy` from `worker/`; CI deploys on push when `CLOUDFLARE_DEPLOY=true`). `src/index.ts`: `JOBS` cron table (strings must match `wrangler.toml` [triggers]) and `POST /jobs/<name>` behind `JOB_SECRET`; `src/api.ts` runs the `supabase/functions/api` modules inside `runWith({ sql, env })`; `src/webhook.ts` Helius push (+ `aum_live_refresh`); `src/jobs/*.ts` one sliced, resumable loader per source with a `-core.ts` of pure helpers. Keep postgres.js `fetch_types` on: arrays break without it |
+| `supabase/functions/_shared/` | providers for the jobs: `bitquery.ts` (client + EVM balances), `transactions.ts` (transfers), `dexscreener.ts`, `pumpfun.ts`, `solana_pda.ts`, `settings.ts` (EVM_CHAINS); `chain_reads.ts` is LEGACY RPC for v1 only |
+| `supabase/migrations/` | schema, all applied; check constraints are the only SQL-enforced vocabulary. `aum_history_build` and `aum_live_refresh` hold valuation SQL |
+| `scripts/` | Deno tools: `smoke.ts`, `acceptance_capture.ts`, `typecheck_gate.ts` (`deno task smoke|capture|check`) |
 | `docs/` | design docs and runbooks; `openapi.yaml` is the API reference (lint: `npx @redocly/cli lint docs/openapi.yaml`); `API_VALIDATION_FLAGS_17_SEP.md` the open validation gaps; `REVIEW_EFFICIENCY_17_SEP.md` is the ranked optimisation list; `LAUNCH_METADATA.md`, `R4_ROBINHOOD_PRICES.md` record measured sources; `docs/DECISIONS.md` holds the long rationale comments moved out of the code (`See docs/DECISIONS.md#dNNN`) |
-| `docs/consumer/` | acceptance suites, field contracts, the Genie app team's reports |
+| `docs/consumer/` | acceptance suites, field contracts, the Genie app team's reports; `v2-handoff/` is what they receive |
 | `tests/` | `deno task test` — pure-function tests, no database |
 
 ## Route → file
@@ -76,15 +78,15 @@ The consumer's build fails on an unpublished word, so this order is a contract.
 ## Verify
 
 ```bash
-deno task check      # typecheck gate: no NEW errors vs scripts/typecheck_baseline.txt (baseline is empty: keep it so)
-deno task test       # pure-function tests
+deno task check                                    # typecheck gate: no NEW errors (baseline empty: keep it so)
+deno task test                                     # pure-function tests
 npx tsc -p worker/tsconfig.json                    # the Worker; `cd worker && npx wrangler deploy --dry-run --outdir dist` bundles it
-./scripts/smoke.sh   # 8 checks against production
-./scripts/acceptance_capture.sh $BASE captures/x   # 72-file normalised capture; diff two runs
-npm run build        # scripts/lib/ts -> scripts/lib/dist for the loaders
+API_VERSION=v2 deno task smoke $WORKER_URL         # 8 checks (dataState degraded is by design while scorecards are stale)
+deno task capture $BASE captures/x                 # 72-file normalised capture; diff two runs
+npx @redocly/cli lint docs/openapi.yaml
 ```
 
-Deploy: `npx supabase functions deploy api --project-ref <ref> --no-verify-jwt` (same for `aum-sample`, `helius-webhook`). After any deploy, run smoke and test `/v1/health` specifically; its four queries are sequential on purpose.
+Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true`). Migrations: `npx supabase db push --db-url <session pooler url>` (the user runs it). A job on demand: `POST $WORKER_URL/jobs/<name>` with `x-job-secret`. Do NOT redeploy the v1 Supabase functions.
 
 ## Working rules for this repo
 
@@ -92,4 +94,5 @@ Deploy: `npx supabase functions deploy api --project-ref <ref> --no-verify-jwt` 
 - Rationale lives in `docs/DECISIONS.md`; the code keeps one sentence and a pointer. Do not paste essays back into the code.
 - `null` means absent, zero means zero. Never coerce a missing figure to 0.
 - No tool can edit `.env.example` here; ask the user.
-- Current work: `docs/TO-DO-BEFORE-MIGRATION.md` (consumer asks, P0 first) then `docs/CLOUDFLARE_MIGRATION.md`.
+- Jobs never call a free public RPC; EVM goes through `_shared/bitquery.ts`, Solana through Helius. Job strings in `index.ts` and `wrangler.toml` must match character for character.
+- Current state: v2 handed to the app team 18 Sep 2026 (`docs/consumer/v2-handoff/`). Open: rotate secrets, retire v1 when consumers have moved.
