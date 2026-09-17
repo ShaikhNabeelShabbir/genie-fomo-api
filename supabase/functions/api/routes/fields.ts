@@ -5,8 +5,23 @@ import { MIN_DRAWABLE_POINTS, PARTIAL_SERVE_FLOOR_USD, PRICED_FLOOR } from "../s
 
 // ------------------------------------------------------------------ fields
 
+/**
+ * Memoised per isolate: the fill rates scan every trade and reading, which timed out once at
+ * the 15 s route limit, and they move at most hourly (the loaders' cadence). Same pattern as
+ * `routes/market.ts`.
+ */
+const TTL_MS = 5 * 60_000;
+let cache: { at: number; body: unknown } | null = null;
+
 /** WHAT EVERY FIELD MEANS, WHAT IT CAN SAY, AND HOW OFTEN IT SAYS ANYTHING. See docs/DECISIONS.md#d062 */
 get("/v1/fields", async () => {
+  if (cache && Date.now() - cache.at < TTL_MS) return cache.body;
+  const body = await fieldsBody();
+  cache = { at: Date.now(), body };
+  return body;
+});
+
+async function fieldsBody(): Promise<unknown> {
   const [f] = await sql`
     with sc as (
       select t.handle,
@@ -116,5 +131,6 @@ get("/v1/fields", async () => {
            "how much of the directory carries each field. Counted live, not sampled. " +
            "POST /v1/traders/aum accepts and ignores `live`; its rows carry liveRead: skipped. " +
            "RateLimit-Remaining is per X-API-Key; RateLimit-Scope says whether the counter is global.",
+    cachedForSeconds: TTL_MS / 1000,
   };
-});
+}

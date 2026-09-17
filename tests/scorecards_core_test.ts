@@ -41,14 +41,23 @@ Deno.test("isFomoDoc: an object whose trades, when present, is a list", () => {
   assertEquals(isFomoDoc("{}"), false);
 });
 
-Deno.test("outcomeOf: the five trade_loads words, with the directory source splitting degraded from unavailable", () => {
-  assertEquals(outcomeOf({ kind: "error", detail: "HTTP 502" }, "fomoapi.io"), { outcome: "error", detail: "HTTP 502" });
-  assertEquals(outcomeOf({ kind: "not_found" }, "fomoapi.io"), { outcome: "not_found", detail: "HTTP 404" });
-  assertEquals(outcomeOf({ kind: "doc", doc: { available: false, trades: [] } }, "fomoapi.io"), { outcome: "degraded", detail: null });
-  assertEquals(outcomeOf({ kind: "doc", doc: { available: false, trades: [] } }, "gmgn.ai"), { outcome: "unavailable", detail: null });
-  assertEquals(outcomeOf({ kind: "doc", doc: { available: false, trades: [] } }, null), { outcome: "unavailable", detail: null });
-  assertEquals(outcomeOf({ kind: "doc", doc: { trades: [{}, {}] } }, "fomoapi.io"), { outcome: "loaded", detail: "2 trades" });
-  assertEquals(outcomeOf({ kind: "doc", doc: {} }, "fomoapi.io"), { outcome: "loaded", detail: "0 trades" });
+Deno.test("outcomeOf: the six trade_loads words, with the directory source splitting degraded from unavailable", () => {
+  const now = new Date("2026-09-18T06:00:00Z");
+  const prev = new Date("2026-09-10T00:00:00Z");
+  assertEquals(outcomeOf({ kind: "error", detail: "HTTP 502" }, "fomoapi.io", prev, now), { outcome: "error", detail: "HTTP 502" });
+  assertEquals(outcomeOf({ kind: "not_found" }, "fomoapi.io", prev, now), { outcome: "not_found", detail: "HTTP 404" });
+  assertEquals(outcomeOf({ kind: "doc", doc: { available: false, trades: [] } }, "fomoapi.io", prev, now), { outcome: "degraded", detail: null });
+  assertEquals(outcomeOf({ kind: "doc", doc: { available: false, trades: [] } }, "gmgn.ai", prev, now), { outcome: "unavailable", detail: null });
+  assertEquals(outcomeOf({ kind: "doc", doc: { available: false, trades: [] } }, null, prev, now), { outcome: "unavailable", detail: null });
+  /* loaded: the document's snapshot advances max(trades.captured_at); no capturedAt means the fetch time. */
+  assertEquals(outcomeOf({ kind: "doc", doc: { trades: [{}, {}] } }, "fomoapi.io", prev, now), { outcome: "loaded", detail: "2 trades" });
+  assertEquals(outcomeOf({ kind: "doc", doc: { trades: [{}], capturedAt: "2026-09-17T00:00:00Z" } }, "fomoapi.io", null, now), { outcome: "loaded", detail: "1 trades" });
+  /* unchanged: a re-served snapshot, or an empty document (nothing written, so nothing advances). */
+  assertEquals(outcomeOf({ kind: "doc", doc: { trades: [{}], capturedAt: "2026-09-10T00:00:00Z" } }, "fomoapi.io", prev, now),
+    { outcome: "unchanged", detail: "1 trades, snapshot 2026-09-10T00:00:00.000Z not newer" });
+  assertEquals(outcomeOf({ kind: "doc", doc: { trades: [{}], capturedAt: "2026-09-07T00:00:00Z" } }, "fomoapi.io", prev, now).outcome, "unchanged");
+  assertEquals(outcomeOf({ kind: "doc", doc: {} }, "fomoapi.io", prev, now).outcome, "unchanged");
+  assertEquals(outcomeOf({ kind: "doc", doc: { trades: [] } }, "fomoapi.io", null, now).outcome, "unchanged");
 });
 
 Deno.test("tradeRow: the python tuple, column for column", () => {

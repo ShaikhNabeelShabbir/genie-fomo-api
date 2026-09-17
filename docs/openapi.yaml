@@ -1793,8 +1793,10 @@ components:
       - noReading
       - oldestReadingHours
       - scorecardStale
+      - scorecardStaleGmgn
       - scorecardStaleAfterHours
       - scorecardLoadFailed
+      - scorecardNeverAttempted
       - oldestScorecardHours
       - of
       properties:
@@ -1814,14 +1816,20 @@ components:
           description: null when no trader has a reading.
         scorecardStale:
           type: integer
-          description: Traders whose newest trade load is past 72 h.
+          description: fomoapi.io traders whose newest trade snapshot (`trades.captured_at`) is past 72 h - the set the six-hourly loader targets.
+        scorecardStaleGmgn:
+          type: integer
+          description: The same for traders the fomoapi loader does not own (source gmgn); the nightly gmgn job refreshes them.
         scorecardStaleAfterHours:
           type: integer
           enum:
           - 72
         scorecardLoadFailed:
           type: integer
-          description: Of the stale, how many the loader last asked about and did not get back.
+          description: Of the stale, how many the loader's last attempt did not bring back (`loadOutcome` other than `loaded`); a never-attempted trader counts.
+        scorecardNeverAttempted:
+          type: integer
+          description: Of the stale, how many have no `trade_loads` row at all - a subset of `scorecardLoadFailed`.
         oldestScorecardHours:
           type: integer
           nullable: true
@@ -3074,11 +3082,13 @@ components:
           nullable: true
           enum:
           - loaded
+          - unchanged
           - unavailable
           - degraded
           - not_found
           - error
           - null
+          description: The loader's last attempt. `unchanged` = fomo answered but the snapshot (`loadedAt`) did not advance; retried six-hourly.
         nextLoadAt:
           type: string
           format: date-time
@@ -3086,7 +3096,9 @@ components:
         nextLoadBasis:
           type: string
           enum:
+          - six_hourly_slot
           - nightly_slot
+          description: '`six_hourly_slot` - the next 0/6/12/18 UTC tick of the loader; `nightly_slot` was the pre-Worker word and is published one more version.'
         staleness:
           $ref: '#/components/schemas/ScorecardStaleness'
         onChain:
@@ -3386,18 +3398,22 @@ components:
           nullable: true
           enum:
           - loaded
+          - unchanged
           - unavailable
           - degraded
           - not_found
           - error
           - null
+          description: The loader's last attempt. `unchanged` = fomo answered but the snapshot (`loadedAt`) did not advance; retried six-hourly.
         nextLoadAt:
           type: string
           format: date-time
         nextLoadBasis:
           type: string
           enum:
+          - six_hourly_slot
           - nightly_slot
+          description: '`six_hourly_slot` - the next 0/6/12/18 UTC tick of the loader; `nightly_slot` was the pre-Worker word and is published one more version.'
         note:
           type: string
     ScorecardStaleness:
@@ -3407,6 +3423,7 @@ components:
       - ageSeconds
       - staleAfterHours
       - fallback
+      - fallbackReason
       properties:
         state:
           type: string
@@ -3428,7 +3445,14 @@ components:
           enum:
           - on_chain
           - null
-          description: '`on_chain` when stale or never AND `onChain.swaps > 0` - draw `onChain` instead.'
+          description: '`on_chain` when stale or never AND `onChain.coverage.share >= 0.5` (the swap store holds at least half the profile''s swaps) - draw `onChain` instead.'
+        fallbackReason:
+          type: string
+          nullable: true
+          enum:
+          - swap_store_incomplete
+          - null
+          description: Why `fallback` is null although the record is stale or never - the swap store covers under half of this trader. null when current or when `fallback` is set.
     ScorecardOnChain:
       type: object
       required:
@@ -9199,8 +9223,10 @@ paths:
                   noReading: 14
                   oldestReadingHours: 177
                   scorecardStale: 0
+                  scorecardStaleGmgn: 0
                   scorecardStaleAfterHours: 72
                   scorecardLoadFailed: 0
+                  scorecardNeverAttempted: 0
                   oldestScorecardHours: 61
                   of: 448
                 measurements:
@@ -13213,7 +13239,7 @@ paths:
                   loadAttemptedAt: '2026-09-16T06:04:12.000Z'
                   loadOutcome: loaded
                   nextLoadAt: '2026-09-18T06:00:00.000Z'
-                  nextLoadBasis: nightly_slot
+                  nextLoadBasis: six_hourly_slot
                   note: 'no cap is applied: every position stored for this trader is used. `returned`
                     counts positions, `reportedTrades` counts fills, and they are not comparable.'
                 complete: true
@@ -13223,12 +13249,13 @@ paths:
                 loadAttemptedAt: '2026-09-16T06:04:12.000Z'
                 loadOutcome: loaded
                 nextLoadAt: '2026-09-18T06:00:00.000Z'
-                nextLoadBasis: nightly_slot
+                nextLoadBasis: six_hourly_slot
                 staleness:
                   state: current
                   ageSeconds: 129600
                   staleAfterHours: 72
                   fallback: null
+                  fallbackReason: null
                 onChain:
                   basis: wallet_swaps
                   swaps: 54
