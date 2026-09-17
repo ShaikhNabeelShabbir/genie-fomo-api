@@ -1,5 +1,5 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
-import { bitquery, evmBalancesBitquery, parseBalances } from "../supabase/functions/_shared/bitquery.ts";
+import { bitquery, evmBalancesBitquery, evmTxCount, parseBalances, parseTxCount } from "../supabase/functions/_shared/bitquery.ts";
 import { ZERO_ADDRESS } from "../supabase/functions/_shared/chain_reads.ts";
 
 /** One `EVM.Balances` reply as https://docs.bitquery.io/docs/examples/balances/balance-api/ shapes it. */
@@ -68,6 +68,34 @@ Deno.test("evmBalancesBitquery: posts the network word in the query text and the
     assertEquals(sent!.variables, { wallet: "0xAbC" });
     assertEquals(/EVM\(network: base, dataset: realtime\)/.test(sent!.query), true);
     await assertRejects(() => evmBalancesBitquery("k", "base; drop", "0x1"), Error, "network word");
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+/** R6: the `count` metric reply, one row per dimension set (none here), the count as Bitquery strings it. */
+Deno.test("parseTxCount: the count row is a number; no row is 0; no count is null, never 0", () => {
+  assertEquals(parseTxCount({ EVM: { Transactions: [{ count: "412" }] } }), 412);
+  assertEquals(parseTxCount({ EVM: { Transactions: [{ count: 7 }] } }), 7);
+  assertEquals(parseTxCount({ EVM: { Transactions: [] } }), 0);
+  assertEquals(parseTxCount({ EVM: { Transactions: [{ count: "lots" }] } }), null);
+  assertEquals(parseTxCount({ EVM: {} }), null);
+  assertEquals(parseTxCount(undefined), null);
+});
+
+Deno.test("evmTxCount: filters on Transaction.From on the realtime dataset, wallet as a variable", async () => {
+  const real = globalThis.fetch;
+  let sent: { query: string; variables: { wallet: string } } | null = null;
+  globalThis.fetch = (_u, init) => {
+    sent = JSON.parse(String(init?.body));
+    return Promise.resolve(new Response(JSON.stringify({ data: { EVM: { Transactions: [{ count: "35487" }] } } })));
+  };
+  try {
+    assertEquals(await evmTxCount("k", "bsc", "0xAbC"), 35487);
+    assertEquals(sent!.variables, { wallet: "0xAbC" });
+    assertEquals(/EVM\(network: bsc, dataset: realtime\)/.test(sent!.query), true);
+    assertEquals(/Transactions\(where: \{ Transaction: \{ From: \{ is: \$wallet \} \} \}\) \{ count \}/.test(sent!.query), true);
+    await assertRejects(() => evmTxCount("k", "bsc; drop", "0x1"), Error, "network word");
   } finally {
     globalThis.fetch = real;
   }

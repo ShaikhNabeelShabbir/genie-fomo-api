@@ -31,8 +31,15 @@ export const VOCABULARY = {
     /* 17 Sep 2026, v3: the words added by the pre-migration fixes (docs/TO-DO-BEFORE-MIGRATION.md). */
     "aum.stepChosenFrom": ["window", "tracked_span", "fallback"],
     "aum.points[].reliability": ["low"],
-    "positions.partialReason": ["unsellable_positions", "unpriced_positions", "indexer_coverage_low", "unsellable_positions_and_indexer_coverage_low"],
+    "positions.partialReason": ["unsellable_positions", "unpriced_positions", "indexer_coverage_low", "unsellable_positions_and_indexer_coverage_low",
+                                /* v3 fixes (V1): a suspect price leads the word. */
+                                "price_suspect", "price_suspect_and_unsellable_positions", "price_suspect_and_indexer_coverage_low",
+                                "price_suspect_and_unsellable_positions_and_indexer_coverage_low"],
     "positions[].priceSuspectReason": ["implied_mcap_over_ceiling", "concentration_over_ceiling"],
+    /* v3 fixes (V1c): which price ladder rung valued the holding; the balances job writes the first three, the directory build the last. */
+    "positions[].priceSource": ["pegged", "token_info", "token_prices", "fomo_reported_entry"],
+    /* v3 fixes (R6): the sent-transaction count is Bitquery's realtime window, a lower bound on the nonce. */
+    "positions.coverage.chains.*.basis": ["bitquery_realtime"],
     "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
     "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards"],
     /* 17 Sep 2026, v4: second wave (items 10, 11, 12, R6). */

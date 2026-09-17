@@ -12,7 +12,7 @@ import {
   positionsPartialReason, sellFlags, unsellable,
 } from "../shared/positions-core.ts";
 import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
-import { priceSuspectReason } from "../../aum-sample/value.ts";
+import { type PriceSuspectReason, suspectRows } from "../../aum-sample/value.ts";
 
 /** The chain's own coin: EVM native under the sentinel, SOL under the system-program key. */
 const NATIVE_KEYS = new Set([ZERO_ADDRESS, SOL_MINT.toLowerCase()]);
@@ -23,6 +23,10 @@ const gross = (r: Record<string, unknown>): number | null => {
   const a = n(r.human_amount), p = n(r.price);
   return a !== null && p !== null ? a * p : null;
 };
+
+/** V1b: one trader's rows judged together; an unsellable row is already out of the total and never enters the base. */
+const suspectVerdicts = (rows: readonly Record<string, unknown>[]): (PriceSuspectReason | null)[] =>
+  suspectRows(rows.map((r) => ({ price: n(r.price), supply: n(r.total_supply), usd: unsellable(r) ? null : gross(r) })));
 
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
@@ -193,7 +197,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            h.price_source, h.priced_at, h.captured_at, h.source as balance_source,
            (q.token_key is not null) as is_quote,
            ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
-           tk.total_supply::float8 as total_supply,
+           coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0))::float8 as total_supply,
            -- Workflow gap 4: Solana rolled forward from the webhook feed since the read.
            h.human_amount_live, h.delta, h.last_transfer_at
     from holdings_live h
@@ -229,13 +233,16 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const iso = (v: unknown) => (v ? new Date(String(v)).toISOString() : null);
 
   const valued = (r: Record<string, unknown>) => ((n(r.value) ?? 0) > 0 ? n(r.value)! : 0);
-  const total = rows.reduce((s: number, r: Record<string, unknown>) => s + (unsellable(r) ? 0 : valued(r)), 0);
+  /** V1: the suspect verdict comes BEFORE the totals, so a broken price is never in one. */
+  const verdicts = suspectVerdicts(rows);
+  const suspectRow = (r: Record<string, unknown>, i: number) => !unsellable(r) && verdicts[i] !== null;
+  const total = rows.reduce((s: number, r: Record<string, unknown>, i: number) => s + (unsellable(r) || suspectRow(r, i) ? 0 : valued(r)), 0);
   const unsellableUsd = round(rows.reduce((s: number, r: Record<string, unknown>) => s + (unsellable(r) ? valued(r) : 0), 0))!;
-  const grossTotal = rows.reduce((s: number, r: Record<string, unknown>) => s + (gross(r) ?? 0), 0);
-  const all = rows.map((r: Record<string, unknown>) => {
+  const suspectUsd = round(rows.reduce((s: number, r: Record<string, unknown>, i: number) => s + (suspectRow(r, i) ? valued(r) : 0), 0))!;
+  const all = rows.map((r: Record<string, unknown>, i: number) => {
     const tm = timeBy.get(`${r.network_id}:${r.token_key}`);
     const v = (n(r.value) ?? 0) > 0 ? n(r.value) : null;
-    const suspect = priceSuspectReason(n(r.price), n(r.total_supply), gross(r), grossTotal);
+    const suspect = verdicts[i];
     return {
       tokenAddress: r.address,
       networkId: Number(r.network_id),
@@ -257,7 +264,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       tier: r.balance_source === "chain" ? "verified"
         : r.balance_source === null ? "rolled_forward" : "reported",
       priceUsd: n(r.price),
-      /** pegged_usd | gmgn_token_info | token_prices_daily | fomo_reported_entry | wallet_swap_derived */
+      /** pegged | token_info | token_prices | fomo_reported_entry (vocabulary `positions[].priceSource`) */
       priceSource: (r.price_source as string) ?? null,
       /** When that price was true. A reported entry price can be weeks old and says so. */
       pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
@@ -269,10 +276,10 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       whyNoPrice: v !== null ? null
         : n(r.price) !== null ? "price refused by the valuation ceilings; see priceSuspectReason"
         : "no price for this token in any source we hold",
-      /** V1: the price fails a check a consumer cannot run alone (price x supply, concentration). */
+      /** V1: the price fails a check a consumer cannot run alone (price x supply, concentration). The row keeps its figures; the totals do not. */
       priceSuspect: suspect !== null,
       priceSuspectReason: suspect,
-      share: v !== null && total > 0 && !unsellable(r) ? Number((v / total).toFixed(4)) : null,
+      share: v !== null && total > 0 && !unsellable(r) && suspect === null ? Number((v / total).toFixed(4)) : null,
       isQuoteAsset: !!r.is_quote,
       ...sellFlags(r),
       /**
@@ -307,7 +314,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const page = limit === null ? filtered.slice(from) : filtered.slice(from, from + limit);
   const last = page.length ? page[page.length - 1] : null;
   const more = from + page.length < filtered.length;
-  const priced = all.filter((r: Record<string, unknown>) => r.valueUsd !== null).length;
+  const priced = all.filter((r: Record<string, unknown>) => r.valueUsd !== null && !r.priceSuspect).length;
+  const suspectPositions = all.filter((r: Record<string, unknown>) => r.priceSuspect).length;
 
   return {
     handle: t.display_handle,
@@ -334,9 +342,14 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     totalValueUsd: rows.length === 0 ? 0 : priced === 0 ? null : round(total),
     /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
     unsellableUsd,
-    partial: unsellableUsd > 0 || coverageLow(chains),
-    partialReason: positionsPartialReason(unsellableUsd > 0, coverageLow(chains)),
-    coverage: { pricedPositions: priced, unpricedPositions: all.length - priced, chains },
+    /** V1. Priced value under a suspect price, kept OUT of `totalValueUsd`; the rows still show it. */
+    suspectUsd,
+    partial: unsellableUsd > 0 || coverageLow(chains) || suspectPositions > 0,
+    partialReason: positionsPartialReason(unsellableUsd > 0, coverageLow(chains), suspectPositions > 0),
+    coverage: {
+      pricedPositions: priced, suspectPositions,
+      unpricedPositions: all.filter((r: Record<string, unknown>) => r.valueUsd === null).length, chains,
+    },
     /** T1.1. See docs/DECISIONS.md#d075 */
     chainHistory: {
       observedFrom: historyFrom,
@@ -370,7 +383,7 @@ post("/v1/traders/positions", async (_p, _url, body) => {
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
            h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
-           tk.total_supply::float8 as total_supply
+           coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0))::float8 as total_supply
     from holdings_current h
     join chains ch using (network_id)
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
@@ -394,12 +407,12 @@ post("/v1/traders/positions", async (_p, _url, body) => {
   /** Same cost basis and indexer coverage the individual route serves, from the same functions. */
   const [costByHandle, coverByHandle] = await Promise.all([costBasisFor(handles), indexerCoverageFor(handles)]);
 
-  /** Per-trader gross totals, for the concentration check on each row. */
-  const grossBy = new Map<string, number>();
-  for (const r of rows) grossBy.set(String(r.handle), (grossBy.get(String(r.handle)) ?? 0) + (gross(r) ?? 0));
+  /** V1: each trader's rows judged together, before any total (same rule as the single route). */
+  const verdictBy = new Map([...by].map(([h, own]) => [h, suspectVerdicts(own)] as const));
+  const suspectAt = (h: string, i: number) => verdictBy.get(h)?.[i] ?? null;
 
-  const position = (r: Record<string, unknown>) => {
-    const suspect = priceSuspectReason(n(r.price), n(r.total_supply), gross(r), grossBy.get(String(r.handle)) ?? 0);
+  const position = (r: Record<string, unknown>, i: number) => {
+    const suspect = suspectAt(String(r.handle), i);
     return {
     chain: r.chain, networkId: Number(r.network_id),
     tokenAddress: r.token_address, symbol: r.symbol,
@@ -444,21 +457,21 @@ post("/v1/traders/positions", async (_p, _url, body) => {
           };
         }
         const own = by.get(h) ?? [];
-        const priced = own.filter((r) => n(r.value) !== null && Number(r.value) > 0);
+        const valued = own.map((r, i) => ({ r, i })).filter(({ r }) => n(r.value) !== null && Number(r.value) > 0);
+        const sum = (xs: { r: Record<string, unknown> }[]) => round(xs.reduce((s: number, { r }) => s + Number(r.value), 0))!;
         /*
          * A null total means we could not value ANY of what he holds; zero means he was read
          * and holds nothing. Collapsing the two would turn an unreadable portfolio into an
          * empty one, which is the difference between "we do not know" and "there is nothing".
          */
-        const sellable = priced.filter((r) => !unsellable(r));
-        const unsellableUsd = round(priced.filter(unsellable).reduce((s: number, r) => s + Number(r.value), 0))!;
-        const totalValueUsd = own.length === 0
-          ? 0
-          : priced.length === 0
-          ? null
-          : round(sellable.reduce((sum, r) => sum + Number(r.value), 0));
+        const suspect = valued.filter(({ r, i }) => !unsellable(r) && suspectAt(h, i) !== null);
+        const sellable = valued.filter(({ r, i }) => !unsellable(r) && suspectAt(h, i) === null);
+        const unsellableUsd = sum(valued.filter(({ r }) => unsellable(r)));
+        const suspectUsd = sum(suspect);
+        const priced = valued.length - suspect.length;
+        const totalValueUsd = own.length === 0 ? 0 : priced === 0 ? null : sum(sellable);
         const chains = coverByHandle.get(h) ?? {};
-        const partialReason = positionsPartialReason(unsellableUsd > 0, coverageLow(chains));
+        const partialReason = positionsPartialReason(unsellableUsd > 0, coverageLow(chains), suspect.length > 0);
         return {
           ok: true as const,
           requested: req,
@@ -466,12 +479,15 @@ post("/v1/traders/positions", async (_p, _url, body) => {
           handle: meta.display_handle,
           positions: own.map(position),
           positionCount: own.length,
-          pricedPositionCount: priced.length,
+          pricedPositionCount: priced,
+          suspectPositionCount: suspect.length,
           totalValueUsd,
           /** V2. Priced value in honeypot / unsellable coins, kept OUT of `totalValueUsd`. */
           unsellableUsd,
+          /** V1. Priced value under a suspect price, kept OUT of `totalValueUsd`; the rows still show it. */
+          suspectUsd,
           ...(partialReason ? { partial: true, partialReason } : {}),
-          coverage: { ...cov(priced.length, own.length), chains },
+          coverage: { ...cov(priced, own.length), chains },
           /*
            * Every position this trader holds is in this row -- the batch does not page, so a
            * consumer never has to wonder whether it saw all of them. `nextCursor` is null for

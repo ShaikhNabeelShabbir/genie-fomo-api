@@ -215,16 +215,19 @@ async function writeLeaderboard(sql: Sql, captured: Date, entries: readonly Entr
 /** Phase 2, per chunk: tokens before holdings (FK). Returns holdings rows written. */
 async function writePositions(sql: Sql, captured: Date, group: readonly Target[], fetched: readonly Fetched[]): Promise<number> {
   const tokens = tokenRows(fetched.flatMap((f) => f.positions));
-  const holdings = group.flatMap((t, i) => holdingRows(t.handle, captured, fetched[i].positions));
+  /* V1c: a fomo price is the build's reported entry, true as of the capture; its readers (shared/prices.ts, swaps) exclude that word. */
+  const holdings = group.flatMap((t, i) => holdingRows(t.handle, captured, fetched[i].positions))
+    .map((h) => ({ ...h, price_source: h.price === null ? null : "fomo_reported_entry", priced_at: h.price === null ? null : captured }));
   if (!holdings.length) return 0;
   await sql.begin(async (tx) => {
     await tx`
       insert into tokens ${tx(tokens, "network_id", "address")}
       on conflict (network_id, token_key) do update set last_seen_at = now()`;
     await tx`
-      insert into holdings ${tx(holdings, "handle", "network_id", "token_key", "captured_at", "human_amount", "price", "value")}
+      insert into holdings ${tx(holdings, "handle", "network_id", "token_key", "captured_at", "human_amount", "price", "value", "price_source", "priced_at")}
       on conflict (handle, network_id, token_key, captured_at) do update set
-        human_amount = excluded.human_amount, price = excluded.price, value = excluded.value`;
+        human_amount = excluded.human_amount, price = excluded.price, value = excluded.value,
+        price_source = excluded.price_source, priced_at = excluded.priced_at`;
   });
   return holdings.length;
 }

@@ -26,15 +26,43 @@ export function concentrationSuspect(usd: number, total: number, capKnown: boole
   return total > 0 && usd > CONCENTRATION_SHARE * total && (!capKnown || total > CONCENTRATION_TOTAL_USD);
 }
 
-/** Why a /positions row's price is not to be trusted, or null. `usd`/`total` are the row's and the trader's gross amount x price. */
+/**
+ * Why a /positions row's price is not to be trusted, or null. `usd`/`total` are the row's and the
+ * trader's gross amount x price. With no cap to check, one position over the USD ceiling is a
+ * broken price too (V1b), whatever its share of the total.
+ */
 export function priceSuspectReason(
   price: number | null, supply: number | null, usd: number | null, total: number,
 ): PriceSuspectReason | null {
   if (price === null) return null;
   const capKnown = supply !== null && supply > 0;
   if (capKnown && price * supply > IMPLIED_MCAP_CEILING_USD) return "implied_mcap_over_ceiling";
+  if (usd !== null && !capKnown && usd > MAX_POSITION_USD) return "concentration_over_ceiling";
   if (usd !== null && concentrationSuspect(usd, total, capKnown)) return "concentration_over_ceiling";
   return null;
+}
+
+export interface SuspectRow { readonly price: number | null; readonly supply: number | null; readonly usd: number | null }
+
+/**
+ * V1b: every row's verdict at once, aligned with the input. The concentration base is the sum of
+ * the rows not yet suspect: the largest row is judged against it, dropped from it when flagged,
+ * and the next largest judged again, so two absurd prices in one wallet cannot hide each other.
+ */
+export function suspectRows(rows: readonly SuspectRow[]): (PriceSuspectReason | null)[] {
+  const out: (PriceSuspectReason | null)[] = rows.map((r) =>
+    r.price !== null && r.supply !== null && r.supply > 0 && r.price * r.supply > IMPLIED_MCAP_CEILING_USD
+      ? "implied_mcap_over_ceiling" : null);
+  let base = rows.reduce((s, r, i) => s + (out[i] === null ? r.usd ?? 0 : 0), 0);
+  for (;;) {
+    let top = -1;
+    rows.forEach((r, i) => { if (out[i] === null && r.usd !== null && (top < 0 || r.usd > rows[top].usd!)) top = i; });
+    if (top < 0) return out;
+    const reason = priceSuspectReason(rows[top].price, rows[top].supply, rows[top].usd, base);
+    if (reason === null) return out;
+    out[top] = reason;
+    base -= rows[top].usd!;
+  }
 }
 
 /**

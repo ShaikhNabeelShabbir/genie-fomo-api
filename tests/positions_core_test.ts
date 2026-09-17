@@ -65,7 +65,7 @@ Deno.test("portfolioFrom: no rows / nothing sellable -> null total and top, as S
 
 Deno.test("R6: coverage share is rows / nonce, null when either is unknown; partial composes", () => {
   const thin = chainCoverage({ chain_nonce: 35487, rows_held: 24, read_at: "2026-09-17T10:00:00Z" });
-  assertEquals(thin, { chainTxCount: 35487, rowsHeld: 24, share: 0.0007, readAt: "2026-09-17T10:00:00.000Z" });
+  assertEquals(thin, { chainTxCount: 35487, rowsHeld: 24, share: 0.0007, readAt: "2026-09-17T10:00:00.000Z", basis: "bitquery_realtime" });
   assertEquals(chainCoverage({ chain_nonce: null, rows_held: 24, read_at: null }).share, null);
   assertEquals(chainCoverage({ chain_nonce: 0, rows_held: 0, read_at: null }).share, null);
   const full = chainCoverage({ chain_nonce: 10, rows_held: 9, read_at: null });
@@ -76,6 +76,11 @@ Deno.test("R6: coverage share is rows / nonce, null when either is unknown; part
   assertEquals(positionsPartialReason(true, false), "unsellable_positions");
   assertEquals(positionsPartialReason(false, true), "indexer_coverage_low");
   assertEquals(positionsPartialReason(true, true), "unsellable_positions_and_indexer_coverage_low");
+  // V1: a suspect price leads the word, in every combination that can occur.
+  assertEquals(positionsPartialReason(false, false, true), "price_suspect");
+  assertEquals(positionsPartialReason(true, false, true), "price_suspect_and_unsellable_positions");
+  assertEquals(positionsPartialReason(false, true, true), "price_suspect_and_indexer_coverage_low");
+  assertEquals(positionsPartialReason(true, true, true), "price_suspect_and_unsellable_positions_and_indexer_coverage_low");
 });
 
 Deno.test("V2: honeypot / cannot-sell flags mark a row unsellable; unjudged stays null", () => {

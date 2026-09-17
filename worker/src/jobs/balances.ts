@@ -2,7 +2,7 @@ import type postgres from "postgres";
 import type { Env } from "../env";
 import { db } from "../db";
 import { SOLANA_NETWORK_ID, solanaBalances } from "../../../supabase/functions/_shared/chain_reads.ts";
-import { evmBalancesBitquery } from "../../../supabase/functions/_shared/bitquery.ts";
+import { evmBalancesBitquery, evmTxCount } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
 import { IMPLIED_MCAP_CEILING_USD, MAX_POSITION_USD, MAX_PRICE_PER_TOKEN, value } from "../../../supabase/functions/aum-sample/value.ts";
 import { askable, positionRows, sliceSize, type Chain, type Row, type Trader } from "./balances-core";
@@ -45,7 +45,12 @@ export interface BalancesSummary {
   readonly elapsedMs: number;
 }
 
-interface ChainAnswer { readonly rows: Row[]; readonly learned: ReadonlyMap<string, number> }
+interface ChainAnswer {
+  readonly rows: Row[];
+  readonly learned: ReadonlyMap<string, number>;
+  /** R6: transactions the wallet sent, from Bitquery's realtime window (a lower bound); null on Solana or when the count failed. */
+  readonly nonce: number | null;
+}
 
 /** Stalest first: max(holdings.captured_at) where source = 'chain', never read first. */
 async function targets(sql: Sql, limit: number): Promise<Trader[]> {
@@ -68,14 +73,36 @@ async function readChain(keys: { helius: string; bitquery: string }, t: Trader, 
   if (net === SOLANA_NETWORK_ID) {
     const bals = await solanaBalances(t.sol_address ?? "", keys.helius);
     if (bals === null) throw new Error("HELIUS_SOLANA_KEY is not set");
-    return { rows: positionRows(t.handle, net, bals), learned: new Map() };
+    return { rows: positionRows(t.handle, net, bals), learned: new Map(), nonce: null };
   }
   const word = EVM_CHAINS[net]?.bitquery;
   if (!word) throw new Error(`no Bitquery network for chain ${net}`);
-  const { balances } = await evmBalancesBitquery(keys.bitquery, word, t.evm_address ?? "");
+  const wallet = t.evm_address ?? "";
+  // The count is a diagnostic (R6): its failure is logged, never a failed chain read.
+  const [{ balances }, nonce] = await Promise.all([
+    evmBalancesBitquery(keys.bitquery, word, wallet),
+    evmTxCount(keys.bitquery, word, wallet).catch((e: unknown) => {
+      console.error(`balances: ${t.handle} ${c.name} tx count: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }),
+  ]);
   // Decimals ride along with the balance; the write fills tokens.decimals where it is still null.
   const learned = new Map(balances.flatMap((b) => (b.decimals === null ? [] : [[`${net}:${b.address}`, b.decimals] as const])));
-  return { rows: positionRows(t.handle, net, balances), learned };
+  return { rows: positionRows(t.handle, net, balances), learned, nonce };
+}
+
+/** R6: the sampler's chain_coverage write, one row per EVM chain that answered with a count, against the transfer rows held. */
+async function writeCoverage(sql: Sql, t: Trader, counted: readonly { network_id: number; nonce: number }[]): Promise<void> {
+  if (!counted.length || !t.evm_address) return;
+  const addr = t.evm_address.toLowerCase();
+  await sql`
+    insert into chain_coverage (handle, network_id, address_key, chain_nonce, rows_held, read_at)
+    select ${t.handle}, u.n, ${addr}, u.c,
+           (select count(*) from transactions x where x.address_key = ${addr} and x.network_id = u.n), now()
+    from unnest(${counted.map((c) => c.network_id)}::bigint[], ${counted.map((c) => c.nonce)}::bigint[]) as u(n, c)
+    on conflict (handle, network_id) do update set
+      address_key = excluded.address_key, chain_nonce = excluded.chain_nonce,
+      rows_held = excluded.rows_held, read_at = excluded.read_at`;
 }
 
 /** The .mjs write, verbatim, for one trader's rows. Returns the holdings rows written and the tokens first seen. */
@@ -100,9 +127,13 @@ async function writeRows(
     }
 
     /** Price from what we already hold, and leave NULL where we hold nothing; an unpriced position is still written (the portfolio route reports the gap as `pricedShare`). */
-    const priced = await tx<{ handle: string; network_id: string; token_key: string; human_amount: string; price: string | null; supply: number | null }[]>`
+    const priced = await tx<{ handle: string; network_id: string; token_key: string; human_amount: string; price: string | null; price_source: string | null; supply: number | null }[]>`
       select i.handle, i.network_id, i.token_key, i.human_amount,
-             coalesce(qa.pegged_usd, ti.price_usd, tp.usd) as price,
+             coalesce(qa.pegged_usd, nullif(ti.price_usd, 0), tp.usd) as price,
+             -- V1c: which rung priced it (vocabulary positions[].priceSource); a GMGN zero is no price (Z1b).
+             case when qa.pegged_usd is not null then 'pegged'
+                  when nullif(ti.price_usd, 0) is not null then 'token_info'
+                  when tp.usd is not null then 'token_prices' end as price_source,
              tk.total_supply::float8 as supply
       from unnest(${rows.map((r) => r.handle)}::text[], ${rows.map((r) => r.network_id)}::bigint[],
                   ${rows.map((r) => r.token_key)}::text[], ${rows.map((r) => r.amount)}::numeric[])
@@ -114,7 +145,7 @@ async function writeRows(
              on ti.network_id = i.network_id and ti.token_key = i.token_key and ti.price_usd is not null
       left join lateral (
         select usd from token_prices p
-        where p.network_id = i.network_id and p.token_key = i.token_key
+        where p.network_id = i.network_id and p.token_key = i.token_key and p.usd > 0
         order by day desc limit 1
       ) tp on true
       left join tokens tk on tk.network_id = i.network_id and tk.token_key = i.token_key`;
@@ -124,14 +155,17 @@ async function writeRows(
       value(Number(r.human_amount), r.price === null ? null : Number(r.price), r.supply).usd ?? null);
 
     const ins = await tx`
-      insert into holdings (handle, network_id, token_key, captured_at, human_amount, price, value, source)
-      select handle, network_id, token_key, ${capturedAt}::timestamptz, human_amount, price, value, 'chain'
+      insert into holdings (handle, network_id, token_key, captured_at, human_amount, price, value, source, price_source, priced_at)
+      select handle, network_id, token_key, ${capturedAt}::timestamptz, human_amount, price, value, 'chain',
+             price_source, case when price is not null then now() end
       from unnest(${priced.map((r) => r.handle)}::text[], ${priced.map((r) => r.network_id)}::bigint[], ${priced.map((r) => r.token_key)}::text[],
-                  ${priced.map((r) => r.human_amount)}::numeric[], ${priced.map((r) => r.price)}::numeric[], ${values}::numeric[])
-           as t(handle, network_id, token_key, human_amount, price, value)
+                  ${priced.map((r) => r.human_amount)}::numeric[], ${priced.map((r) => r.price)}::numeric[], ${values}::numeric[],
+                  ${priced.map((r) => r.price_source)}::text[])
+           as t(handle, network_id, token_key, human_amount, price, value, price_source)
       on conflict (handle, network_id, token_key, captured_at) do update
         set human_amount = excluded.human_amount, price = excluded.price,
-            value = excluded.value, source = excluded.source
+            value = excluded.value, source = excluded.source,
+            price_source = excluded.price_source, priced_at = excluded.priced_at
       returning value`;
     return { written: ins.length, unknown: seen.count };
   });
@@ -145,21 +179,24 @@ async function writeRows(
 async function reprice(sql: Sql, capturedAt: Date): Promise<number> {
   const r = await sql`
     update holdings h
-       set price = p.px, value = h.human_amount * p.px
+       set price = p.px, value = h.human_amount * p.px, price_source = p.src, priced_at = now()
       from (
         select t.network_id, t.token_key, t.total_supply,
-               coalesce(qa.pegged_usd, ti.price_usd, tp.usd) as px
+               coalesce(qa.pegged_usd, nullif(ti.price_usd, 0), tp.usd) as px,
+               case when qa.pegged_usd is not null then 'pegged'
+                    when nullif(ti.price_usd, 0) is not null then 'token_info'
+                    when tp.usd is not null then 'token_prices' end as src
         from tokens t
         left join quote_assets qa on qa.network_id = t.network_id and qa.token_key = t.token_key
         left join token_info  ti on ti.network_id = t.network_id and ti.token_key = t.token_key
                                 and ti.price_usd is not null
         left join lateral (select usd from token_prices x
-                           where x.network_id = t.network_id and x.token_key = t.token_key
+                           where x.network_id = t.network_id and x.token_key = t.token_key and x.usd > 0
                            order by day desc limit 1) tp on true
       ) p
      where h.source = 'chain' and h.value is null and h.human_amount is not null
        and h.captured_at = ${capturedAt}::timestamptz
-       and p.network_id = h.network_id and p.token_key = h.token_key and p.px is not null
+       and p.network_id = h.network_id and p.token_key = h.token_key and p.px > 0
        and p.px <= ${MAX_PRICE_PER_TOKEN}
        and h.human_amount * p.px <= ${MAX_POSITION_USD}
        and (p.total_supply is null or p.total_supply = 0 or p.px * p.total_supply <= ${IMPLIED_MCAP_CEILING_USD})`;
@@ -216,12 +253,13 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
       const ask = askable(t, chains);
       /* Chains in parallel: the per-host throttle in chain_reads serialises same-host calls, so this is safe. */
       const answers = await Promise.allSettled(ask.map((c) => readChain(keys, t, c)));
-      const rows: Row[] = [], learned = new Map<string, number>();
+      const rows: Row[] = [], learned = new Map<string, number>(), counted: { network_id: number; nonce: number }[] = [];
       answers.forEach((a, i) => {
         if (a.status === "fulfilled") {
           chainsRead += 1;
           rows.push(...a.value.rows);
           for (const [k, v] of a.value.learned) learned.set(k, v);
+          if (a.value.nonce !== null) counted.push({ network_id: ask[i].network_id, nonce: a.value.nonce });
         } else {
           chainsFailed += 1;
           console.error(`balances: ${t.handle} ${ask[i].name}: ${a.reason instanceof Error ? a.reason.message : String(a.reason)}`);
@@ -230,6 +268,7 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
       try {
         const w = await writeRows(sql, capturedAt, rows, learned);
         rowsWritten += w.written; unknownTokens += w.unknown;
+        await writeCoverage(sql, t, counted);
         // The capture is in; revalue this trader's current AUM from it (aum_live, migration 20260918030000).
         const [live] = await sql<{ n: number }[]>`select aum_live_refresh(${[t.handle]}::text[], 'balances') as n`;
         liveRefreshed += Number(live?.n ?? 0);
