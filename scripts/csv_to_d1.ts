@@ -161,7 +161,17 @@ const importTable = async (table: string): Promise<void> => {
   }
   for (const path of await generate(table)) {
     if (exists(`${path}.done`)) continue;
-    await wrangler("--yes", `--file=${path}`);
+    // A 52-file table meets the odd transient from the import endpoint; one failure must not
+    // abandon the run, and every file is idempotent only in the sense that it is retried whole
+    // (a failed file is rolled back by D1, as its own warning says).
+    for (let attempt = 1; ; attempt++) {
+      try { await wrangler("--yes", `--file=${path}`); break; } catch (e) {
+        if (attempt >= 5) throw e;
+        const wait = attempt * 15_000;
+        console.log(`${path}: attempt ${attempt} failed, retrying in ${wait / 1000}s`);
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
     await Deno.writeTextFile(`${path}.done`, "");
     console.log(`  imported ${path}`);
   }
