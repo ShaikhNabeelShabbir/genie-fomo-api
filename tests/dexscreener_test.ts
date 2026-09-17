@@ -1,24 +1,64 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { athUpdate, bestPairs } from "../scripts/lib/dexscreener.mjs";
+import { athUpdate, bestPairs } from "../supabase/functions/_shared/dexscreener.ts";
 
-Deno.test("bestPairs: deepest priced pool per token, unpriced pairs dropped", () => {
-  const pairs = [
+// Expected values mirror scripts/lib/dexscreener.mjs (the twin) line for line.
+
+Deno.test("bestPairs: deepest priced pool per token wins, keyed lower-case", () => {
+  const best = bestPairs([
     { baseToken: { address: "0xAAA" }, priceUsd: "1.0", liquidity: { usd: 10 }, pairAddress: "p1", dexId: "uniswap", labels: ["v2"] },
     { baseToken: { address: "0xaaa" }, priceUsd: "1.1", liquidity: { usd: 1000 }, pairAddress: "p2", dexId: "uniswap", labels: ["v3"] },
-    { baseToken: { address: "0xbbb" }, priceUsd: null, liquidity: { usd: 5000 }, pairAddress: "p3", dexId: "uniswap", labels: ["v4"] },
-    { baseToken: { address: "0xccc" }, priceUsd: "0.5", pairAddress: "p4", dexId: "uniswap" },
-  ];
-  const best = bestPairs(pairs);
-  assertEquals(best.get("0xaaa"), { usd: 1.1, liquidity: 1000, pair: "p2", dex: "uniswap:v3" });
-  assertEquals(best.has("0xbbb"), false);
-  assertEquals(best.get("0xccc"), { usd: 0.5, liquidity: 0, pair: "p4", dex: "uniswap:?" });
+    { baseToken: { address: "0xaaa" }, priceUsd: "1.2", liquidity: { usd: 1000 }, pairAddress: "p3", dexId: "uniswap", labels: ["v3"] },
+  ]);
+  // A tie on liquidity keeps the first seen (strictly deeper replaces).
+  assertEquals([...best.entries()], [["0xaaa", { usd: 1.1, liquidity: 1000, pair: "p2", dex: "uniswap:v3" }]]);
 });
 
-Deno.test("athUpdate: first sample is the high, a lower one draws down, a higher one resets", () => {
-  const first = athUpdate(null, { usd: 2, at: "2026-09-17T10:00:00.000Z" });
-  assertEquals(first, { athUsd: 2, athAt: "2026-09-17T10:00:00.000Z", drawdownShare: 0 });
-  const lower = athUpdate(first, { usd: 0.5, at: "2026-09-17T11:00:00.000Z" });
-  assertEquals(lower, { athUsd: 2, athAt: "2026-09-17T10:00:00.000Z", drawdownShare: 0.75 });
-  const higher = athUpdate(lower, { usd: 3, at: "2026-09-17T12:00:00.000Z" });
-  assertEquals(higher, { athUsd: 3, athAt: "2026-09-17T12:00:00.000Z", drawdownShare: 0 });
+Deno.test("bestPairs: a pair with no positive USD price is no pair", () => {
+  const best = bestPairs([
+    { baseToken: { address: "0xbbb" }, priceUsd: null, liquidity: { usd: 5000 }, pairAddress: "p3", dexId: "uniswap" },
+    { baseToken: { address: "0xccc" }, priceUsd: "0", liquidity: { usd: 5000 }, pairAddress: "p4", dexId: "uniswap" },
+    { baseToken: { address: "0xddd" }, priceUsd: "abc", liquidity: { usd: 5000 }, pairAddress: "p5", dexId: "uniswap" },
+    { baseToken: { address: "0xeee" }, priceUsd: "2", liquidity: { usd: 5000 }, pairAddress: "p6", dexId: "raydium", labels: ["clmm"] },
+  ]);
+  assertEquals([...best.keys()], ["0xeee"]);
+  assertEquals(best.get("0xeee"), { usd: 2, liquidity: 5000, pair: "p6", dex: "raydium:clmm" });
+});
+
+Deno.test("bestPairs: missing liquidity, labels and pair address fall back to 0, '?' and ''", () => {
+  const best = bestPairs([{ baseToken: { address: "0xCCC" }, priceUsd: "0.5", dexId: "uniswap" }]);
+  assertEquals(best.get("0xccc"), { usd: 0.5, liquidity: 0, pair: "", dex: "uniswap:?" });
+  assertEquals(bestPairs([{ priceUsd: "0.5" }]).size, 0, "no base token address is no pair");
+  assertEquals(bestPairs([null, { baseToken: { address: "x" }, priceUsd: 3, labels: ["a", "b"] }]).get("x")?.dex, "?:a+b");
+});
+
+Deno.test("bestPairs: several tokens each keep their own best pool", () => {
+  const best = bestPairs([
+    { baseToken: { address: "a" }, priceUsd: "1", liquidity: { usd: 1 }, pairAddress: "a1", dexId: "d" },
+    { baseToken: { address: "b" }, priceUsd: "2", liquidity: { usd: 9 }, pairAddress: "b1", dexId: "d" },
+    { baseToken: { address: "a" }, priceUsd: "1.5", liquidity: { usd: 3 }, pairAddress: "a2", dexId: "d" },
+  ]);
+  assertEquals(best.get("a")?.pair, "a2");
+  assertEquals(best.get("b")?.pair, "b1");
+  assertEquals(best.size, 2);
+});
+
+const T0 = "2026-09-17T10:00:00.000Z";
+const T1 = "2026-09-17T11:00:00.000Z";
+
+Deno.test("athUpdate: the first sample is the high with zero drawdown", () => {
+  assertEquals(athUpdate(null, { usd: 2, at: T0 }), { athUsd: 2, athAt: T0, drawdownShare: 0 });
+});
+
+Deno.test("athUpdate: a lower sample keeps the high and draws down, to 4 decimals", () => {
+  const prev = { athUsd: 2, athAt: T0 };
+  assertEquals(athUpdate(prev, { usd: 0.5, at: T1 }), { athUsd: 2, athAt: T0, drawdownShare: 0.75 });
+  assertEquals(athUpdate({ athUsd: 3, athAt: T0 }, { usd: 1, at: T1 }).drawdownShare, 0.6667);
+});
+
+Deno.test("athUpdate: a higher sample resets the high and its time", () => {
+  assertEquals(athUpdate({ athUsd: 2, athAt: T0 }, { usd: 3, at: T1 }), { athUsd: 3, athAt: T1, drawdownShare: 0 });
+});
+
+Deno.test("athUpdate: a sample equal to the high is the high (time moves to the sample)", () => {
+  assertEquals(athUpdate({ athUsd: 2, athAt: T0 }, { usd: 2, at: T1 }), { athUsd: 2, athAt: T1, drawdownShare: 0 });
 });
