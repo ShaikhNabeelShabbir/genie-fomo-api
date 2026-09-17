@@ -14,7 +14,8 @@ export function db(env: Env): postgres.Sql {
     max: 5,
     // `prepare` stays at its default (true): Hyperdrive over a DIRECT connection caches
     // named statements; `prepare: false` was for the 6543 transaction pooler (§4.2).
-    fetch_types: false,
+    // `fetch_types` stays on: without the type fetch the driver cannot serialise arrays, and
+    // every `= any(${list})` fails with "malformed array literal" (seen on the first deploy).
     /** 14 s, just under the 15 s route race (`ROUTE_TIMEOUT_MS`, app.ts): a timed-out route must not keep its query. */
     connection: { statement_timeout: 14000 },
   });
