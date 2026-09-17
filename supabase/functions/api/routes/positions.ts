@@ -12,16 +12,67 @@ import {
   positionsPartialReason, sellFlags, unsellable,
 } from "../shared/positions-core.ts";
 import { SOL_MINT, ZERO_ADDRESS } from "../../_shared/chain_reads.ts";
-import { type PriceSuspectReason, suspectRows } from "../../aum-sample/value.ts";
+import { type PriceSuspectReason, suspectRows, value } from "../../aum-sample/value.ts";
+import { ladderPrice, oldestUsableDay } from "../shared/price-ladder.ts";
 
 /** The chain's own coin: EVM native under the sentinel, SOL under the system-program key. */
 const NATIVE_KEYS = new Set([ZERO_ADDRESS, SOL_MINT.toLowerCase()]);
 const isNative = (tokenKey: unknown): boolean => NATIVE_KEYS.has(String(tokenKey));
 
+/**
+ * The amount a value is taken from: Solana's rolled-forward balance where the webhook feed has
+ * one, else the balance as read. Same quantity `refreshAumLive` uses, so a row's `valueUsd` and
+ * the trader's `/aum/now` figure are built from the same number (v5 fixes, A1).
+ */
+const liveAmount = (r: Record<string, unknown>): number | null =>
+  n(r.human_amount_live) ?? n(r.human_amount);
+
 /** A row's gross amount x price, before any ceiling withheld its `value` (V1). */
 const gross = (r: Record<string, unknown>): number | null => {
-  const a = n(r.human_amount), p = n(r.price);
+  const a = liveAmount(r), p = n(r.price);
   return a !== null && p !== null ? a * p : null;
+};
+
+/**
+ * The four price rungs as columns. Every positions query selects this fragment, so /positions,
+ * the batch and /portfolio cannot price the same coin differently. Requires `h` (the holdings
+ * row) plus `left join quote_assets q`, `token_price_stats ps` and `token_info ti` in scope.
+ */
+const ladderColumns = () => sql`
+  q.pegged_usd,
+  ps.last_usd as stats_usd, ps.last_at as stats_at,
+  ti.price_usd as info_usd, ti.fetched_at as info_at,
+  -- Packed day|usd: two columns would be two correlated seeks on an 11,000-row list.
+  (select tp.day || '|' || tp.usd from token_prices tp
+    where tp.network_id = h.network_id and tp.token_key = h.token_key
+      and tp.usd > 0 and tp.day >= ${oldestUsableDay(new Date())}
+    order by tp.day desc limit 1) as daily`;
+
+/**
+ * V5 A1/N1/R7: the row priced from the ladder AT REQUEST TIME, and revalued from that price.
+ *
+ * `holdings.price` is written by the balances job and frozen until the trader is read again --
+ * a ~9 h round trip -- so a coin priced an hour ago still came back null, and the list
+ * disagreed with `/aum/now` by construction. The one rung the ladder cannot reproduce is the
+ * directory build's own reported entry price, so that alone survives as a fallback.
+ */
+const repriced = (r: Record<string, unknown>): Record<string, unknown> => {
+  const p = ladderPrice(r);
+  if (p === null) {
+    return r.price_source === "fomo_reported_entry"
+      ? r
+      : { ...r, price: null, price_source: null, priced_at: null, value: null };
+  }
+  const amount = liveAmount(r);
+  const usd = amount === null ? undefined : value(amount, p.usd, n(r.total_supply)).usd;
+  return { ...r, price: p.usd, price_source: p.source, priced_at: p.at, value: usd ?? null };
+};
+
+/** Priced first, descending, unpriced trailing by address -- the SQL order, redone on ladder prices. */
+const byValueThenAddress = (a: Record<string, unknown>, b: Record<string, unknown>): number => {
+  const av = n(a.value), bv = n(b.value);
+  if (av !== bv) return (bv ?? -Infinity) - (av ?? -Infinity);
+  return String(a.address ?? a.token_address ?? "").localeCompare(String(b.address ?? b.token_address ?? ""));
 };
 
 /** V1b: one trader's rows judged together; an unsellable row is already out of the total and never enters the base. */
@@ -43,15 +94,28 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
    * the current snapshot, so a cross-chain-looking AUM is in practice a Solana figure.
    * Saying so per chain is the difference between a total and a total that misleads.
    */
-  const rows = await sql<PortfolioRow[]>`
+  const raw = await sql`
     select tk.address, h.network_id, h.token_key, c.name as chain, h.value, h.captured_at,
-           (q.token_key is not null) as is_quote, ti.is_honeypot, ti.can_not_sell
+           h.human_amount, h.price, h.price_source,
+           (q.token_key is not null) as is_quote, ti.is_honeypot, ti.can_not_sell,
+           cast(coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0)) as real) as total_supply,
+           cast(ti.liquidity_usd as real) as liquidity_usd,
+           ${ladderColumns()}
     from holdings_current h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     where h.handle = ${t.handle}`;
+  /**
+   * The same ladder and the same suspect rule as /positions (v5 fixes, A1): this route used to
+   * sum the stored `h.value` and apply no suspect rule at all, so one broken price put a
+   * trillion dollars in `totalValueUsd` while `/positions` left it out.
+   */
+  const repricedRows = (raw as Record<string, unknown>[]).map(repriced);
+  const portfolioVerdicts = suspectVerdicts(repricedRows);
+  const rows = repricedRows.map((r, i) =>
+    (portfolioVerdicts[i] === null ? r : { ...r, value: null })) as PortfolioRow[];
   const p = portfolioFrom(rows);
 
   /**
@@ -191,7 +255,7 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
   const addrs = [t.evm_address, t.sol_address]
     .filter((a): a is string => !!a).map((a) => a.toLowerCase());
 
-  const rows = await sql`
+  const raw = await sql`
     select tk.address, h.network_id, h.token_key, c.name as chain, h.human_amount, h.price, h.value,
            -- PRD §3: a price is only judgeable if it says where it came from and when it
            -- was true. A live quote and a three-week-old reported entry are both usable and
@@ -203,7 +267,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            -- V1d: the best pair's liquidity, latest hourly sample first, else GMGN's; null = no pair known.
            cast(coalesce(ph.liquidity_usd, ti.liquidity_usd) as real) as liquidity_usd,
            -- Workflow gap 4: Solana rolled forward from the webhook feed since the read.
-           h.human_amount_live, h.delta, h.last_transfer_at
+           h.human_amount_live, h.delta, h.last_transfer_at,
+           ${ladderColumns()}
     from holdings_live h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
@@ -216,12 +281,17 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
              row_number() over (partition by network_id, token_key order by hour desc) as rn
       from token_price_hourly
     ) ph on ph.network_id = h.network_id and ph.token_key = h.token_key and ph.rn = 1
-    where h.handle = ${t.handle}
-    -- Priced rows first, descending. Unpriced rows TRAIL rather than being dropped: they
-    -- are real holdings we simply cannot value, and hiding them would misstate the count.
-    -- Address breaks the tie among the unpriced, which would otherwise be arbitrary.
-    order by (case when h.value > 0 then h.value else null end) desc nulls last,
-             lower(tk.address)`;
+    where h.handle = ${t.handle}`;
+
+  /**
+   * Priced rows first, descending. Unpriced rows TRAIL rather than being dropped: they are
+   * real holdings we simply cannot value, and hiding them would misstate the count. Address
+   * breaks the tie among the unpriced, which would otherwise be arbitrary.
+   *
+   * The sort is in memory because the value it sorts on is the LADDER value, which the stored
+   * `h.value` the SQL used to order by no longer equals.
+   */
+  const rows = (raw as Record<string, unknown>[]).map(repriced).sort(byValueThenAddress);
 
   const [timing, costBy, coverBy] = await Promise.all([
     addrs.length ? positionTiming(addrs) : Promise.resolve([]),
@@ -274,7 +344,13 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       tier: r.balance_source === "chain" ? "verified"
         : r.balance_source === null ? "rolled_forward" : "reported",
       priceUsd: n(r.price),
-      /** pegged | token_info | token_prices | fomo_reported_entry (vocabulary `positions[].priceSource`) */
+      /**
+       * Which rung priced it, AT REQUEST TIME (v5 fixes, A1/N1/R7):
+       * pegged | token_price_stats | token_prices | token_info | fomo_reported_entry.
+       * `token_price_stats` is the hourly DexScreener price and is new here -- this row used
+       * to serve the price frozen into `holdings` at the last balance read, so a coin priced
+       * an hour ago still came back null until the trader's next read, up to nine hours later.
+       */
       priceSource: (r.price_source as string) ?? null,
       /** When that price was true. A reported entry price can be weeks old and says so. */
       pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
@@ -285,7 +361,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       /** Why there is no value, rather than an unexplained null. */
       whyNoPrice: v !== null ? null
         : n(r.price) !== null ? "price refused by the valuation ceilings; see priceSuspectReason"
-        : "no price for this token in any source we hold",
+        : "no price for this token on any rung of the ladder: no peg, no hourly sample, no " +
+          "daily close inside seven days, and nothing from token_info",
       /** V1: the price fails a check a consumer cannot run alone (price x supply, concentration). The row keeps its figures; the totals do not. */
       priceSuspect: suspect !== null,
       priceSuspectReason: suspect,
@@ -358,6 +435,12 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     partialReason: positionsPartialReason(unsellableUsd > 0, coverageLow(chains), suspectPositions > 0),
     coverage: {
       pricedPositions: priced, suspectPositions,
+      /**
+       * A1/A4: the share of the wallet `totalValueUsd` is built from, the same figure
+       * `/aum/history` points and `/aum/now` carry, so the three are comparable at a glance.
+       * A total under a quarter is a fragment of a portfolio, not a portfolio.
+       */
+      pricedShare: all.length ? Number((priced / all.length).toFixed(4)) : null,
       unpricedPositions: all.filter((r: Record<string, unknown>) => r.valueUsd === null).length, chains,
     },
     /** T1.1. See docs/DECISIONS.md#d075 */
@@ -387,17 +470,19 @@ post("/v1/traders/positions", async (_p, _url, body) => {
   /** THE FULL ENVELOPE IS THE DEFAULT. See docs/DECISIONS.md#d077 */
   const v2 = Number((body as { contractVersion?: number })?.contractVersion) !== 1;
 
-  const rows = await sql`
+  const raw = await sql`
     select h.handle, ch.name as chain, h.network_id, h.token_key,
            tk.address as token_address,
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
            h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
            cast(coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0)) as real) as total_supply,
-           cast(coalesce(ph.liquidity_usd, ti.liquidity_usd) as real) as liquidity_usd
+           cast(coalesce(ph.liquidity_usd, ti.liquidity_usd) as real) as liquidity_usd,
+           ${ladderColumns()}
     from holdings_current h
     join chains ch using (network_id)
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
+    left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
     -- The lateral's order by hour desc limit 1 is the rn = 1 row of the same ordering.
@@ -406,14 +491,20 @@ post("/v1/traders/positions", async (_p, _url, body) => {
              row_number() over (partition by network_id, token_key order by hour desc) as rn
       from token_price_hourly
     ) ph on ph.network_id = h.network_id and ph.token_key = h.token_key and ph.rn = 1
-    where h.handle in (${handles})
-    order by h.handle, h.value desc nulls last`;
+    where h.handle in (${handles})`;
 
-  const by = new Map<string, any[]>();
+  /**
+   * Same ladder as the single route (v5 fixes, A1). This route reads `holdings_current`, not
+   * `holdings_live`: rolling Solana forward per row for fifty traders at once exceeded D1's
+   * per-query CPU budget, so a batch row carries the balance as read and says so with `tier`.
+   */
+  const rows = (raw as Record<string, unknown>[]).map(repriced);
+  const by = new Map<string, Record<string, unknown>[]>();
   for (const r of rows) {
     if (!by.has(String(r.handle))) by.set(String(r.handle), []);
     by.get(String(r.handle))!.push(r);
   }
+  for (const own of by.values()) own.sort(byValueThenAddress);
 
   /*
    * The newest balance read across the traders asked for -- taken from the rows already in
@@ -441,10 +532,11 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     /** §3: the moment the balance was read, not the moment you asked. */
     balanceAt: r.captured_at ? new Date(String(r.captured_at)).toISOString() : null,
     priceUsd: n(r.price),
+    /** pegged | token_price_stats | token_prices | token_info | fomo_reported_entry */
     priceSource: (r.price_source as string) ?? null,
     pricedAt: r.priced_at ? new Date(String(r.priced_at)).toISOString() : null,
     drawdownShare: n(r.drawdown_share),
-    valueUsd: n(r.value),
+    valueUsd: round(n(r.value)),
     /** null, never 0 — an unpriceable coin is not a worthless one. */
     whyNoPrice: n(r.value) !== null ? null
       : n(r.price) !== null ? "price refused by the valuation ceilings; see priceSuspectReason"
