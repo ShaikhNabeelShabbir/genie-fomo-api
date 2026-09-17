@@ -15,7 +15,8 @@ export interface Env {
   readonly ROUTE_TIMEOUT_MS?: string;
   readonly HELIUS_WEBHOOK_SECRET?: string;
   readonly HELIUS_SOLANA_KEY?: string;
-  /** Wall-clock budget for a cron job (`jobs/*`), ms. */
+  /** Traders per chain-balance run (`jobs/balances.ts`); default 25. */
+  readonly BALANCE_SLICE?: string;
   /** fomoapi bearer for the scorecard refresh (`jobs/scorecards.ts`). */
   readonly FOMOAPI_KEY?: string;
 }
