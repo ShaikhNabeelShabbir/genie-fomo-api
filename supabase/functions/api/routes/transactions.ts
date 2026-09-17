@@ -56,10 +56,10 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
       ${kind === null ? sql`` : sql`and upper(tx.tx_type) = ${kind.toUpperCase()}`}
       ${
     after === null ? sql`` : sql`and (
-        tx.block_time < ${String(after[0])}::timestamptz
-        or (tx.block_time = ${String(after[0])}::timestamptz
+        tx.block_time < ${String(after[0])}
+        or (tx.block_time = ${String(after[0])}
             and (tx.tx_hash, tx.network_id, tx.address_key, tx.transfer_key)
-              > (${String(after[1])}, ${Number(after[2])}::bigint, ${String(after[3])}, ${String(after[4])}))
+              > (${String(after[1])}, ${Number(after[2])}, ${String(after[3])}, ${String(after[4])}))
       )`
   }
     -- The full primary key is the tiebreak. 23,916 (block_time, tx_hash) pairs carry more
@@ -73,15 +73,15 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
   // "we never fetched this chain". A count of zero with a populated store is a real
   // finding; a count of zero with an empty store is a gap in ingestion.
   const storedQ = sql`
-    select count(*)::int as total, max(block_time) as newest, min(block_time) as oldest
+    select count(*) as total, max(block_time) as newest, min(block_time) as oldest
     from transactions where address_key in (${keys})`;
 
   /** T2.1. See docs/DECISIONS.md#d111 */
   const moneyQ = sql`
-    select coalesce(sum(value_usd) filter (where direction = 'out'), 0) as spent,
-           coalesce(sum(value_usd) filter (where direction = 'in'),  0) as received,
-           count(*) filter (where tx_type = 'SWAP')::int             as swap_legs,
-           count(value_usd) filter (where tx_type = 'SWAP')::int     as swap_legs_priced
+    select coalesce(sum(case when direction = 'out' then value_usd end), 0) as spent,
+           coalesce(sum(case when direction = 'in'  then value_usd end), 0) as received,
+           count(case when tx_type = 'SWAP' then 1 end)              as swap_legs,
+           count(case when tx_type = 'SWAP' then value_usd end)      as swap_legs_priced
     from transactions
     where address_key in (${keys})
       ${net === null ? sql`` : sql`and network_id = ${net}`}`;
@@ -239,12 +239,12 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
       left join token_info ti on ti.network_id = ws.network_id and ti.token_key = ws.token_key
       left join quote_assets qa on qa.network_id = ws.network_id and qa.token_key = ws.quote_key
       where ws.address_key in (${addrs})
-        and (${chainQ}::text is null or c.name = ${chainQ})
-        and (${since}::timestamptz is null or ws.block_time >= ${since}::timestamptz)
-        and (${until}::timestamptz is null or ws.block_time <= ${until}::timestamptz)
-        and (${curAt}::timestamptz is null
-             or ws.block_time < ${curAt}::timestamptz
-             or (ws.block_time = ${curAt}::timestamptz and ws.tx_hash > ${curHash}))
+        and (${chainQ} is null or c.name = ${chainQ})
+        and (${since} is null or ws.block_time >= ${since})
+        and (${until} is null or ws.block_time <= ${until})
+        and (${curAt} is null
+             or ws.block_time < ${curAt}
+             or (ws.block_time = ${curAt} and ws.tx_hash > ${curHash}))
       order by ws.block_time desc nulls last, ws.tx_hash
       limit ${limit + 1}`,
       sql`
