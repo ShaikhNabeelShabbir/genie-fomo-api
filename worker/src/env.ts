@@ -19,4 +19,6 @@ export interface Env {
   readonly BALANCE_SLICE?: string;
   /** fomoapi bearer for the scorecard refresh (`jobs/scorecards.ts`). */
   readonly FOMOAPI_KEY?: string;
+  /** GMGN key for the token fundamentals refresh (`jobs/tokens.ts`). */
+  readonly GMGN_API_KEY?: string;
 }
