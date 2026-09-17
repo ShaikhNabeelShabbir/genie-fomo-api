@@ -35,6 +35,7 @@ v1: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`. v2: `https://ge
 | `/:handle/transactions`, `/:handle/trades` | `routes/transactions.ts` |
 | `/v1/tokens`, `/:address`, `/:address/activity`, `/momentum` | `routes/tokens.ts` |
 | `/:handle/aum`, `POST /traders/aum` | `routes/aum.ts` (rules in `shared/aum-rules.ts`) |
+| `/:handle/aum/history`, `POST /traders/aum/history` | `routes/aum-history.ts` (built series over `aum_history` + rollup views; step/window rules in `shared/aum-history-rules.ts`) |
 | `GET /v1/fields` | `routes/fields.ts` (data in `shared/vocabulary.ts`) |
 | `GET /v1/health` | `routes/health.ts` |
 | `GET /v1/events` | `routes/events.ts` (keyset feed over transfers, swaps, readings) |

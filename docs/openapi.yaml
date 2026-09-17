@@ -5401,6 +5401,305 @@ components:
             type: array
             items:
               $ref: '#/components/schemas/FlowBatchTrader'
+    AumHistoryPoint:
+      type: object
+      description: 'One bucket. Hourly points (`step: 1h`) carry `basis`, `reason`, `pricedPositions`
+        and `totalPositions`; rolled-up points (`1d`, `1w`, `1mo`) carry `highUsd`, `lowUsd` and
+        `valuedHours`, with `totalUsd` the close (last valued hour in the bucket). `null` is absent,
+        never 0.'
+      required:
+      - at
+      - totalUsd
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: Bucket start, UTC.
+        totalUsd:
+          type: number
+          nullable: true
+          description: Value held, or `null` when the bucket was not valued.
+        basis:
+          type: string
+          enum:
+          - reading
+          - priced
+          description: Hourly only. `reading` when a sampled reading stood in that hour; `priced` when
+            built from holdings and prices.
+        reason:
+          type: string
+          nullable: true
+          enum:
+          - no_holdings
+          - no_prices
+          - too_little_priced
+          - null
+          description: Hourly only. Why `totalUsd` is `null`; `null` when it is valued.
+        pricedPositions:
+          type: integer
+          description: Hourly only.
+        totalPositions:
+          type: integer
+          description: Hourly only.
+        highUsd:
+          type: number
+          nullable: true
+          description: Rolled-up only. Highest valued hour in the bucket.
+        lowUsd:
+          type: number
+          nullable: true
+          description: Rolled-up only. Lowest valued hour in the bucket.
+        valuedHours:
+          type: integer
+          description: Rolled-up only. Hours in the bucket that carried a value.
+    AumHistorySeries:
+      type: object
+      required:
+      - handle
+      - id
+      - step
+      - window
+      - from
+      - to
+      - points
+      - count
+      - valued
+      - latest
+      - asOf
+      properties:
+        handle:
+          type: string
+          description: The trader's display handle.
+        id:
+          type: string
+          nullable: true
+          description: The trader's stable id.
+        step:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+        window:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+        from:
+          type: string
+          format: date-time
+          nullable: true
+          description: The lower bound applied; `null` for `window=all` with no `from`.
+        to:
+          type: string
+          format: date-time
+          description: The upper bound applied.
+        points:
+          type: array
+          description: Ascending, newest last; at most `limit` (the newest) points.
+          items:
+            $ref: '#/components/schemas/AumHistoryPoint'
+        count:
+          type: integer
+          description: Points returned.
+        valued:
+          type: integer
+          description: Points whose `totalUsd` is not `null`.
+        latest:
+          nullable: true
+          description: The newest valued point, or `null` when none in range.
+          type: object
+          required:
+          - at
+          - totalUsd
+          properties:
+            at:
+              type: string
+              format: date-time
+            totalUsd:
+              type: number
+        asOf:
+          type: string
+          format: date-time
+          nullable: true
+          description: When this trader's history was last built; `null` when never.
+    AumHistoryResponse:
+      allOf:
+      - $ref: '#/components/schemas/AumHistorySeries'
+      - type: object
+        required:
+        - links
+        properties:
+          links:
+            type: object
+            required:
+            - self
+            - aum
+            - trader
+            properties:
+              self:
+                type: string
+              aum:
+                type: string
+              trader:
+                type: string
+    AumHistoryBatchRequest:
+      type: object
+      required:
+      - ids
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items:
+            type: string
+          description: Handles, display handles or `trd_` ids. Empty or absent is 400 `bad_request`; over
+            50 is 400 `bad_request` (refused, not trimmed); a repeated id, or an id and its handle naming
+            the same trader, is 400 `duplicate_identifier`.
+        step:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+          description: Defaults from `window`.
+        window:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+          default: 1w
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+    AumHistoryBatchTrader:
+      type: object
+      description: One entry per requested id, in the order sent. When `ok` is true the entry carries
+        the whole `AumHistorySeries` shape; when false only `error`.
+      required:
+      - ok
+      - requested
+      - handle
+      properties:
+        ok:
+          type: boolean
+        requested:
+          type: string
+          description: The id exactly as the caller sent it.
+        handle:
+          type: string
+          nullable: true
+          description: The resolved display handle; `null` when `ok` is false.
+        id:
+          type: string
+          nullable: true
+        step:
+          type: string
+        window:
+          type: string
+        from:
+          type: string
+          format: date-time
+          nullable: true
+        to:
+          type: string
+          format: date-time
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/AumHistoryPoint'
+        count:
+          type: integer
+        valued:
+          type: integer
+        latest:
+          nullable: true
+          type: object
+          properties:
+            at:
+              type: string
+              format: date-time
+            totalUsd:
+              type: number
+        asOf:
+          type: string
+          format: date-time
+          nullable: true
+        error:
+          allOf:
+          - $ref: '#/components/schemas/FlowBatchTraderError'
+          description: Only when `ok` is false.
+    AumHistoryBatchResponse:
+      type: object
+      required:
+      - limit
+      - asked
+      - capped
+      - asOf
+      - step
+      - window
+      - from
+      - to
+      - traders
+      properties:
+        limit:
+          type: integer
+          enum:
+          - 50
+          description: The batch cap.
+        asked:
+          type: integer
+          description: How many ids were sent; this call's rate-limit cost.
+        capped:
+          type: boolean
+          description: Always `false` here — over the cap is refused with 400, never trimmed.
+        asOf:
+          type: string
+          format: date-time
+          nullable: true
+          description: The newest build time across the traders answered; `null` when none has history.
+        step:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+        window:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+        from:
+          type: string
+          format: date-time
+          nullable: true
+        to:
+          type: string
+          format: date-time
+        traders:
+          type: array
+          items:
+            $ref: '#/components/schemas/AumHistoryBatchTrader'
     MarketRule:
       type: object
       required:
@@ -10960,6 +11259,367 @@ paths:
                   code: timeout
                   detail: this route did not answer within 15s — retry
                   requestId: req_5f1c9a2b7e3d4c60
+                  retryAfterSeconds: 5
+  /v1/traders/{handle}/aum/history:
+    get:
+      operationId: getTraderAumHistory
+      tags:
+      - AUM
+      summary: Built balance history for one trader at an hourly, daily, weekly or monthly grain
+      description: 'Balance over time BUILT from stored holdings and prices (the `aum_history` table,
+        hourly grain, and its daily / weekly / monthly rollup views), so a chart can show any grain
+        including the past. Distinct from `/aum`, which serves the sampled readings. The range is a
+        `window` ending now, or an explicit `from`/`to`; `step` defaults from the window (1d, 1w → 1h;
+        1m, 3m → 1d; 1y → 1w; all → 1mo). Points are ascending, newest last; `limit` keeps the NEWEST
+        points. There is no cursor: the range is bounded. `totalUsd` is `null` when the hour was not
+        valued (`reason` says why on hourly points); `null` means absent, never 0. Hourly points carry
+        `basis`, `reason`, `pricedPositions`, `totalPositions`; rolled-up points carry `highUsd`,
+        `lowUsd`, `valuedHours` and `totalUsd` is the close (last valued hour in the bucket).'
+      parameters:
+      - name: handle
+        in: path
+        required: true
+        description: The trader's handle, display handle (case-insensitive), `@handle`, or stable id with
+          or without the `trd_` prefix. Unknown answers 404 `not_found`.
+        schema:
+          type: string
+        example: 0xAvast
+      - name: step
+        in: query
+        required: false
+        description: 'Grain. Defaults from `window`. Any other word answers 400 `bad_request` with
+          `parameter: "step"`.'
+        schema:
+          type: string
+          enum:
+          - 1h
+          - 1d
+          - 1w
+          - 1mo
+      - name: window
+        in: query
+        required: false
+        description: 'Range ending now; default `1w`. `all` has no lower bound. Any other word answers 400
+          `bad_request` with `parameter: "window"`.'
+        schema:
+          type: string
+          enum:
+          - 1d
+          - 1w
+          - 1m
+          - 3m
+          - 1y
+          - all
+          default: 1w
+      - name: from
+        in: query
+        required: false
+        description: 'ISO-8601 lower bound (inclusive) overriding the window''s. Unparseable answers 400
+          with `parameter: "from"`; `from` at or after `to` answers 400 with `parameter: "from"`.'
+        schema:
+          type: string
+          format: date-time
+      - name: to
+        in: query
+        required: false
+        description: 'ISO-8601 upper bound (inclusive) overriding the window''s (now). Unparseable answers
+          400 with `parameter: "to"`.'
+        schema:
+          type: string
+          format: date-time
+      - name: limit
+        in: query
+        required: false
+        description: Most points to return; the NEWEST ones are kept. Above 2000 is clamped to 2000.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 2000
+          default: 2000
+      responses:
+        '200':
+          description: The series at the chosen grain
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+            RateLimit-Scope:
+              $ref: '#/components/headers/RateLimitScope'
+            x-request-id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AumHistoryResponse'
+              example:
+                handle: 0xAvast
+                id: 2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+                step: 1h
+                window: 1d
+                from: '2026-09-17T12:00:00.000Z'
+                to: '2026-09-18T12:00:00.000Z'
+                points:
+                - at: '2026-09-18T10:00:00.000Z'
+                  totalUsd: 4416026.98
+                  basis: priced
+                  reason: null
+                  pricedPositions: 198
+                  totalPositions: 216
+                - at: '2026-09-18T11:00:00.000Z'
+                  totalUsd: null
+                  basis: priced
+                  reason: no_prices
+                  pricedPositions: 0
+                  totalPositions: 216
+                count: 2
+                valued: 1
+                latest:
+                  at: '2026-09-18T10:00:00.000Z'
+                  totalUsd: 4416026.98
+                asOf: '2026-09-18T11:05:12.000Z'
+                links:
+                  self: /v1/traders/0xAvast/aum/history?step=1h&window=1d
+                  aum: /v1/traders/0xAvast/aum
+                  trader: /v1/traders/0xAvast
+        '400':
+          description: '`step` or `window` not a published word; `from` / `to` unparseable or inverted;
+            `limit` not a whole number'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: bad_request
+                  detail: '''step'' must be one of 1h, 1d, 1w, 1mo — got ''5m'''
+                  requestId: req_5f1c9a3d2b7e4a10
+                  parameter: step
+        '401':
+          description: X-API-Key missing or wrong (only when the deployment sets GENIE_API_KEY)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unauthorized
+                  detail: invalid or missing X-API-Key
+                  requestId: req_5f1c9a3d2b7e4a10
+        '404':
+          description: No such trader
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: not_found
+                  detail: no trader 'nobody' in the directory
+                  requestId: req_5f1c9a3d2b7e4a10
+        '429':
+          description: Rate limit exceeded; `Retry-After` header is set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: rate_limited
+                  detail: too many requests — retry after the stated delay
+                  requestId: req_5f1c9a3d2b7e4a10
+                  retryAfterSeconds: 57
+        '500':
+          description: Unclassified failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: internal_error
+                  detail: the service failed to answer this request
+                  requestId: req_5f1c9a3d2b7e4a10
+        '503':
+          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
+            the `Retry-After` header is 5
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unavailable
+                  detail: the database is not answering — retry shortly
+                  requestId: req_5f1c9a3d2b7e4a10
+                  retryAfterSeconds: 5
+  /v1/traders/aum/history:
+    post:
+      operationId: batchTraderAumHistory
+      tags:
+      - AUM
+      summary: Built balance history for up to 50 traders at one grain
+      description: 'The batch form of `GET /v1/traders/{handle}/aum/history`. Takes up to 50 ids (handles,
+        display handles or `trd_` ids) and one `step` / `window` / `from` / `to` (same defaults and
+        rules as the GET; `limit` is fixed at 2000 newest points per trader), and answers one
+        `traders[]` entry per requested id in the order sent: `ok: true` with that trader''s series
+        (the GET shape minus `links`), or `ok: false` with a `not_found` error object for an id the
+        directory does not hold. Over 50 ids is a 400 refusal, never a silent trim, and a duplicate id
+        (or an id and its handle naming the same trader) is a 400 `duplicate_identifier`. One SQL read
+        serves every id. The envelope''s `asOf` is the newest build time across the traders answered,
+        `null` when none has history. The response''s `x-cost-units` header equals `asked`.'
+      requestBody:
+        required: true
+        description: Must be JSON; a body that does not parse answers 400 `bad_request` ("body must be
+          JSON").
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AumHistoryBatchRequest'
+            example:
+              ids:
+              - 0xAvast
+              - trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+              window: 1m
+      responses:
+        '200':
+          description: One entry per requested id
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+            RateLimit-Scope:
+              $ref: '#/components/headers/RateLimitScope'
+            x-request-id:
+              $ref: '#/components/headers/RequestId'
+            x-cost-units:
+              description: How many rate-limit units this call cost — the number of ids asked for (at
+                most 50).
+              schema:
+                type: integer
+                minimum: 1
+                maximum: 50
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AumHistoryBatchResponse'
+              example:
+                limit: 50
+                asked: 2
+                capped: false
+                asOf: '2026-09-18T11:05:12.000Z'
+                step: 1d
+                window: 1m
+                from: '2026-08-19T12:00:00.000Z'
+                to: '2026-09-18T12:00:00.000Z'
+                traders:
+                - ok: true
+                  requested: 0xAvast
+                  handle: 0xAvast
+                  id: 2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+                  step: 1d
+                  window: 1m
+                  from: '2026-08-19T12:00:00.000Z'
+                  to: '2026-09-18T12:00:00.000Z'
+                  points:
+                  - at: '2026-09-17T00:00:00.000Z'
+                    totalUsd: 4380112.4
+                    highUsd: 4501200.11
+                    lowUsd: 4299870.02
+                    valuedHours: 24
+                  - at: '2026-09-18T00:00:00.000Z'
+                    totalUsd: 4416026.98
+                    highUsd: 4420000
+                    lowUsd: 4380112.4
+                    valuedHours: 11
+                  count: 2
+                  valued: 2
+                  latest:
+                    at: '2026-09-18T00:00:00.000Z'
+                    totalUsd: 4416026.98
+                  asOf: '2026-09-18T11:05:12.000Z'
+                - ok: false
+                  requested: trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+                  handle: null
+                  error:
+                    code: not_found
+                    detail: no trader 'trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f' in the directory
+        '400':
+          description: '`ids` missing, empty, over 50 or duplicated; `step` / `window` not a published word;
+            `from` / `to` unparseable or inverted; body not JSON'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: bad_request
+                  detail: '''window'' must be one of 1d, 1w, 1m, 3m, 1y, all — got ''2w'''
+                  requestId: req_5f1c9a3d2b7e4a10
+                  parameter: window
+        '401':
+          description: X-API-Key missing or wrong (only when the deployment sets GENIE_API_KEY)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unauthorized
+                  detail: invalid or missing X-API-Key
+                  requestId: req_5f1c9a3d2b7e4a10
+        '404':
+          description: Never for a known route; an unknown id is reported inside `traders[]`, not as a
+            404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: not_found
+                  detail: no route for POST /v1/traders/aum/histories
+                  requestId: req_5f1c9a3d2b7e4a10
+        '429':
+          description: Rate limit exceeded; `Retry-After` header is set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: rate_limited
+                  detail: too many requests — retry after the stated delay
+                  requestId: req_5f1c9a3d2b7e4a10
+                  retryAfterSeconds: 57
+        '500':
+          description: Unclassified failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: internal_error
+                  detail: the service failed to answer this request
+                  requestId: req_5f1c9a3d2b7e4a10
+        '503':
+          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
+            the `Retry-After` header is 5
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unavailable
+                  detail: the database is not answering — retry shortly
+                  requestId: req_5f1c9a3d2b7e4a10
                   retryAfterSeconds: 5
   /v1/traders/{handle}/flow:
     get:

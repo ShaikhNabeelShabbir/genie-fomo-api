@@ -2917,6 +2917,27 @@ which ones answered. A reading that answered no chain is `null`, always. A chain
 says how many points came back, so a consumer renders whatever exists rather than waiting
 for a full window.
 
+### `GET /traders/:handle/aum/history` and `POST /traders/aum/history { ids, step?, window?, from?, to? }`
+
+Added 18 Sep 2026. Balance history **built** from stored holdings and prices (table
+`aum_history`, hourly grain; daily / weekly / monthly rollup views), so a chart can show
+hourly, daily, weekly and monthly values including the past. `/aum` above stays the sampled
+series. `step` is `1h | 1d | 1w | 1mo` and defaults from `window` (`1d`, `1w` → `1h`; `1m`,
+`3m` → `1d`; `1y` → `1w`; `all` → `1mo`); `from` / `to` override the window's bounds; `limit`
+(≤ 2000) keeps the newest points and the answer is ascending, newest last. No cursor: the
+range is bounded. `totalUsd` is null when the bucket was not valued (`reason` says why on
+hourly points), never 0. Hourly points carry `basis`, `reason`, `pricedPositions`,
+`totalPositions`; rolled-up points carry `highUsd`, `lowUsd`, `valuedHours` and `totalUsd` is
+the close. The batch form takes up to 50 ids under the §11 rules, reads them in one query,
+and answers one `traders[]` entry per id (`ok: false` with `not_found` for unknown ones),
+each the GET shape minus `links`.
+
+```bash
+curl -s "$B/traders/0xAvast/aum/history?window=1d" | jq '{step, count, valued, latest, last: .points[-1]}'
+curl -s -X POST "$B/traders/aum/history" -H 'content-type: application/json' \
+  -d '{"ids":["0xAvast","frankdegods"],"window":"1y"}' | jq '.traders[] | {handle, ok, count, latest}'
+```
+
 ---
 
 ## 10. Trades, both sides
