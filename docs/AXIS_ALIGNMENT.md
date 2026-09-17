@@ -841,7 +841,7 @@ Beyond speed, three things come free that the spec has no way to produce:
 **Cohort size.** The spec assumes 100 traders; we now carry **144**. Percentile ranks shift
 with cohort size, so any scores computed against the old assumption are not comparable.
 
-**The demo key.** `gmgn_solbscbaseethmonadtron` is in the spec as a public demo key. Our own
+**The demo key.** `<your-gmgn-api-key>` is in the spec as a public demo key. Our own
 GMGN key is already configured server-side for G7–G12 — the frontend should not need one at
 all if it reads from us.
 

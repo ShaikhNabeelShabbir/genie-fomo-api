@@ -6,7 +6,7 @@ rank within the 100-trader cohort. Null input → axis renders hollow, never zer
 Setup for testing (public read-only demo key, replace with our key after dashboard setup):
 
     npm i -g gmgn-cli
-    export GMGN_API_KEY=gmgn_solbscbaseethmonadtron      # demo; personal key from gmgn.ai/ai
+    export GMGN_API_KEY=<your-gmgn-api-key>      # demo; personal key from gmgn.ai/ai
     # IPv4 only — 401/403 with a valid key usually means IPv6 egress
 
 Add `--raw` to every command for single-line JSON to pipe into jq / the scorer.
