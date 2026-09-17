@@ -128,16 +128,11 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
       done += chunk.length;
     }
     if (attempted > 0 && failedBatches === attempted) throw new Error(`prices: all ${attempted} batches failed`);
-    // New prices move every trader's current AUM: one set-based revaluation (aum_live, migration 20260918030000).
-    let liveRefreshed: number | null = null;
-    if (priced > 0) {
-      if (Date.now() - started > budgetMs) {
-        console.log("prices: budget spent, aum_live refresh skipped (aum_history will catch up)");
-      } else {
-        const [row] = await longStatement(sql, 60_000, (tx) => tx<{ n: number }[]>`select aum_live_refresh(null::text[], 'prices') as n`);
-        liveRefreshed = Number(row?.n ?? 0);
-      }
-    }
+    // New prices move every trader's current AUM, but a whole-roster `aum_live_refresh` after
+    // every price run (450 x holdings_live) hammered the database on 18 Sep 2026. The :25 build
+    // revalues anyone older than an hour and the minute cron revalues traders whose wallet moved;
+    // the summary keeps the field (null) so dashboards need not change.
+    const liveRefreshed: number | null = null;
     return { hour, tokens: list.length, priced, batches: attempted, failedBatches, remaining: list.length - done, stoppedEarly, liveRefreshed, elapsedMs: Date.now() - started };
   } finally {
     await sql.end({ timeout: 5 });
