@@ -477,3 +477,15 @@ Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its 
 | `asOf` | both | `latest.at` (batch: the newest across the answered tokens); `null` when none is sampled. |
 | `tokens[].ok`, `error` | POST | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error: "ambiguous_chain"` (address on several chains and no `chain`; `chains[]` names them). `ok: true` rows carry `address`, `chain`, `symbol`, `points`, `count`, `latest`. At most 50 addresses; a duplicate is 400 `duplicate_identifier`. |
 
+
+## v3 fixes — scorecards
+
+| Field | Route | Contract |
+|---|---|---|
+| `scorecard.loadOutcome` | /scorecard, /traders?include=scorecard | Adds `unchanged`: fomo answered but the newest snapshot (`loadedAt` = `trades.captured_at`) did not advance (re-served or empty document). The loader targets `loadedAt` older than 72 h and retries a trader at most once per 6 h, whatever the last outcome; every attempt writes a row, so `loadAttemptedAt`/`loadOutcome` stop being null after the first six-hourly run. |
+| `scorecard.nextLoadAt`, `nextLoadBasis` | same | `nextLoadAt` is the next 00/06/12/18 UTC tick of the Worker cron; `nextLoadBasis: six_hourly_slot`. `nightly_slot` stays published for one version and is no longer emitted. |
+| `scorecard.staleness.fallback` | /scorecard | `on_chain` only when the record is `stale` or `never` AND `onChain.coverage.share >= 0.5` (the swap store holds at least half the profile's swap-shaped transactions). Otherwise `null`. |
+| `scorecard.staleness.fallbackReason` | /scorecard | `swap_store_incomplete` when the record is `stale` or `never` and `fallback` is null because coverage is under 0.5 (or `onChain.swaps` is 0). `null` when current, when `fallback` is set, and always on the embedded scorecard. |
+| `health.staleTraders.scorecardStale` | /health | Now counts `source = fomoapi.io` traders only (the set the loader owns); `scorecardStaleGmgn` counts the rest, refreshed by the nightly gmgn job. |
+| `health.staleTraders.scorecardLoadFailed` | /health | Of the stale, the last attempt's outcome is anything but `loaded`; a never-attempted trader now counts. `scorecardNeverAttempted` is the subset with no `trade_loads` row at all. |
+| `fields.cachedForSeconds` | /fields | The body is memoised per isolate for 300 s (fill rates move hourly at most); `asOf` is when it was counted. |

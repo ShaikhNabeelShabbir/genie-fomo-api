@@ -212,6 +212,39 @@ export function chainExitsFrom(swaps: Swap[], entries: Map<string, number>): num
   return out;
 }
 
+// The next six-hourly UTC tick (00, 06, 12, 18), the scorecards cron in `worker/wrangler.toml`.
+export const nextSixHourlySlot = (now: number = Date.now()): string => {
+  const d = new Date(now);
+  d.setUTCMinutes(0, 0, 0);
+  d.setUTCHours(Math.floor(d.getUTCHours() / 6) * 6 + 6);
+  return d.toISOString();
+};
+
+/** T3. The on-chain block stands in for a stale record only when the swap store holds at least this share of the profile's swaps. */
+export const FALLBACK_COVERAGE_FLOOR = 0.5;
+
+/** A VERDICT ON THIS RECORD'S AGE, not just the date it was loaded. See docs/DECISIONS.md#d166 */
+export function stalenessFrom(loadedAtIso: string | null, onChain: OnChainBlock | null | undefined, now: number = Date.now()) {
+  const t = loadedAtIso ? Date.parse(loadedAtIso) : NaN;
+  const ageSeconds = Number.isFinite(t) ? Math.max(0, Math.round((now - t) / 1000)) : null;
+  const staleAfterHours = 72;
+  const state = ageSeconds === null
+    ? "never"
+    : (ageSeconds > staleAfterHours * 3600 ? "stale" : "current");
+  /* `on_chain` only when the store covers enough of the profile's swaps to stand in for it; 4 rows against 1,254 is not a record. */
+  const covered = (onChain?.swaps ?? 0) > 0 && (onChain?.coverage.share ?? 0) >= FALLBACK_COVERAGE_FLOOR;
+  const wanted = state !== "current" && !!onChain;
+  return {
+    state,
+    ageSeconds,
+    staleAfterHours,
+    /** T3. Which block to draw: `on_chain` when this record is behind and `onChain` covers enough of it. */
+    fallback: wanted && covered ? "on_chain" : null,
+    /** Why `fallback` is null although the record is behind: the swap store has too little of this trader. */
+    fallbackReason: wanted && !covered ? "swap_store_incomplete" : null,
+  };
+}
+
 /**
  * T3 (bounded). The block a consumer draws when fomoapi is behind: the same swap rows and the
  * same average-cost pairing as `perExit`, summed. Null figures when nothing resolved; `swaps`
@@ -438,10 +471,11 @@ export async function scorecardBody(
   /**
    * T1. `loadedAt` is fomo's snapshot time (`captured_at`); it cannot say whether WE asked
    * since, nor what fomo answered. `trade_loads` can: the newest attempt and its outcome,
-   * `null` when never attempted. `nextLoadAt` is the nightly slot, not a per-trader schedule.
+   * `null` when never attempted. `nextLoadAt` is the next six-hourly slot, not a per-trader schedule.
    */
   const loadAttemptedAt = t.load_attempted_at ? new Date(String(t.load_attempted_at)).toISOString() : null;
   const loadOutcome = t.load_outcome ?? null;
+  const nextLoadAt = nextSixHourlySlot();
 
   const closed = rows.filter((r) => r.status === "closed");
   const realized = closed.map((r) => n(r.realized_pnl_usd)).filter((x): x is number => x !== null);
@@ -995,13 +1029,8 @@ export async function scorecardBody(
       loadedAt: loadedAtIso,
       loadAttemptedAt,
       loadOutcome,
-      nextLoadAt: (() => {
-        const d = new Date();
-        d.setUTCHours(6, 0, 0, 0);
-        if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
-        return d.toISOString();
-      })(),
-      nextLoadBasis: "nightly_slot",
+      nextLoadAt,
+      nextLoadBasis: "six_hourly_slot",
       note: "no cap is applied: every position stored for this trader is used. `returned` " +
             "counts positions, `reportedTrades` counts fills, and they are not comparable.",
     },
@@ -1018,29 +1047,9 @@ export async function scorecardBody(
     loadedAt: loadedAtIso,
     loadAttemptedAt,
     loadOutcome,
-    nextLoadAt: (() => {
-      const d = new Date();
-      d.setUTCHours(6, 0, 0, 0);
-      if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
-      return d.toISOString();
-    })(),
-    nextLoadBasis: "nightly_slot",
-    /** A VERDICT ON THIS RECORD'S AGE, not just the date it was loaded. See docs/DECISIONS.md#d166 */
-    staleness: (() => {
-      const t = loadedAtIso ? Date.parse(loadedAtIso) : NaN;
-      const ageSeconds = Number.isFinite(t) ? Math.max(0, Math.round((Date.now() - t) / 1000)) : null;
-      const staleAfterHours = 72;
-      const state = ageSeconds === null
-        ? "never"
-        : (ageSeconds > staleAfterHours * 3600 ? "stale" : "current");
-      return {
-        state,
-        ageSeconds,
-        staleAfterHours,
-        /** T3. Which block to draw: `on_chain` when this record is behind and `onChain` has rows. */
-        fallback: state !== "current" && (onChain?.swaps ?? 0) > 0 ? "on_chain" : null,
-      };
-    })(),
+    nextLoadAt,
+    nextLoadBasis: "six_hourly_slot",
+    staleness: stalenessFrom(loadedAtIso, onChain),
     onChain: onChain ?? null,
     onChainNote: onChain
       ? null

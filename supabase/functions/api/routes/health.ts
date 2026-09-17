@@ -67,10 +67,16 @@ async function healthBody(): Promise<Record<string, unknown>> {
     select
       count(*) filter (where n.reading_at is null)::int                       as no_reading,
       count(*) filter (where n.reading_at < now() - interval '36 hours')::int as reading_stale,
-      count(*) filter (where l.scorecard_at < now() - interval '72 hours')::int
-                                                                             as scorecard_stale,
       count(*) filter (where l.scorecard_at < now() - interval '72 hours'
-                         and a.outcome <> 'loaded')::int                     as scorecard_load_failed,
+                         and t.source = 'fomoapi.io')::int                   as scorecard_stale,
+      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
+                         and t.source is distinct from 'fomoapi.io')::int    as scorecard_stale_gmgn,
+      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
+                         and t.source = 'fomoapi.io'
+                         and a.outcome is distinct from 'loaded')::int       as scorecard_load_failed,
+      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
+                         and t.source = 'fomoapi.io' and a.handle is null)::int
+                                                                             as scorecard_never_attempted,
       max(extract(epoch from (now() - n.reading_at)) / 3600.0)::int           as oldest_reading_h,
       max(extract(epoch from (now() - l.scorecard_at)) / 3600.0)::int         as oldest_scorecard_h
     from traders t left join newest n using (handle) left join loads l using (handle)
@@ -212,10 +218,15 @@ async function healthBody(): Promise<Record<string, unknown>> {
       noReading: Number(st?.no_reading ?? 0),
       oldestReadingHours: st?.oldest_reading_h === null || st?.oldest_reading_h === undefined
         ? null : Number(st.oldest_reading_h),
+      /** Stale is judged on `trades.captured_at`, the same column the scorecards loader targets; fomoapi.io traders only. */
       scorecardStale: Number(st?.scorecard_stale ?? 0),
+      /** Stale traders the fomoapi loader does not own (`source` gmgn); the nightly gmgn job refreshes them. */
+      scorecardStaleGmgn: Number(st?.scorecard_stale_gmgn ?? 0),
       scorecardStaleAfterHours: 72,
-      /** T1. Of the stale, how many the loader last asked about and did not get back. */
+      /** T1. Of the stale, how many the loader's last attempt did not bring back — a never-attempted trader counts. */
       scorecardLoadFailed: Number(st?.scorecard_load_failed ?? 0),
+      /** Of the stale, how many have no `trade_loads` row at all: the loader never asked. */
+      scorecardNeverAttempted: Number(st?.scorecard_never_attempted ?? 0),
       oldestScorecardHours: st?.oldest_scorecard_h === null || st?.oldest_scorecard_h === undefined
         ? null : Number(st.oldest_scorecard_h),
       of: Number(c.traders),

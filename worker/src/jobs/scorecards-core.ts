@@ -4,7 +4,7 @@
  * No imports and no I/O, so `tests/scorecards_core_test.ts` runs it under Deno.
  */
 
-export type Outcome = "loaded" | "unavailable" | "degraded" | "not_found" | "error";
+export type Outcome = "loaded" | "unchanged" | "unavailable" | "degraded" | "not_found" | "error";
 export interface Load { readonly outcome: Outcome; readonly detail: string | null }
 
 /** fomo's `/v2/users/:handle/trades` envelope; `available: false` is its degraded answer. */
@@ -65,15 +65,27 @@ export const when = (v: unknown): Date | null => {
   return Number.isNaN(d.getTime()) ? null : d;
 };
 
-/** The `trade_loads` row for one fetch. See the table comment in migration 20260917140000. */
-export function outcomeOf(f: Fetched, source: string | null): Load {
+/** The snapshot time the rows of a document carry: fomo's `capturedAt`, else the fetch time. */
+export const capturedOf = (doc: FomoDoc, now: Date): Date => when(doc.capturedAt) ?? now;
+
+/**
+ * The `trade_loads` row for one fetch. See the table comment in migration 20260917140000.
+ * `prev` is the trader's `max(trades.captured_at)` before this fetch: a document whose
+ * snapshot does not advance it (re-served, or empty so nothing is written) is `unchanged`.
+ */
+export function outcomeOf(f: Fetched, source: string | null, prev: Date | null, now: Date): Load {
   if (f.kind === "error") return { outcome: "error", detail: f.detail };
   if (f.kind === "not_found") return { outcome: "not_found", detail: "HTTP 404" };
   if (f.doc.available === false) {
     /* fomo answers {available:false} both when it sheds load and for anyone outside its leaderboard; the directory source tells the two apart. */
     return { outcome: source === "fomoapi.io" ? "degraded" : "unavailable", detail: null };
   }
-  return { outcome: "loaded", detail: `${f.doc.trades?.length ?? 0} trades` };
+  const n = f.doc.trades?.length ?? 0;
+  const captured = capturedOf(f.doc, now);
+  const advanced = n > 0 && (prev === null || captured.getTime() > prev.getTime());
+  return advanced
+    ? { outcome: "loaded", detail: `${n} trades` }
+    : { outcome: "unchanged", detail: `${n} trades, snapshot ${captured.toISOString()} not newer` };
 }
 
 /**

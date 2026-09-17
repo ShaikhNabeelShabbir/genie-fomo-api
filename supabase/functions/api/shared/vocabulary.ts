@@ -36,12 +36,16 @@ export const VOCABULARY = {
     "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
     "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards"],
     /* 17 Sep 2026, v4: second wave (items 10, 11, 12, R6). */
-    "scorecard.loadOutcome": ["loaded", "unavailable", "degraded", "not_found", "error"],
-    "scorecard.nextLoadBasis": ["nightly_slot"],
+    /* `unchanged`: fomo answered but the newest `captured_at` did not advance (v3 fixes, 18 Sep). */
+    "scorecard.loadOutcome": ["loaded", "unchanged", "unavailable", "degraded", "not_found", "error"],
+    /* `nightly_slot` is kept one version for consumers; the Worker emits `six_hourly_slot`. */
+    "scorecard.nextLoadBasis": ["nightly_slot", "six_hourly_slot"],
     "pnl.openPositionsBasis.*": ["trade_records", "trade_records_still_held_on_chain"],
     "trades.status": ["open", "closed", "closed_by_balance"],
     /* 17 Sep 2026, v5: T3 bounded on-chain scorecard fallback. */
     "scorecard.staleness.fallback": ["on_chain"],
+    /* Why `fallback` is null on a stale record: the swap store covers under half of the profile's swaps. */
+    "scorecard.staleness.fallbackReason": ["swap_store_incomplete"],
     "scorecard.onChain.basis": ["wallet_swaps"],
     /* 17 Sep 2026, v6: workflow gaps 1-5 (price history, events, launch metadata, live holdings, creators, linked wallets). */
     "events[].kind": ["transfer", "swap", "reading"],
