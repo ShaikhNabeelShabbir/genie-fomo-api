@@ -1,6 +1,8 @@
 {
   "tasks": {
-    "check": "./scripts/typecheck_gate.sh",
-    "test": "deno test --allow-env --allow-read tests/"
+    "check": "deno run --allow-run --allow-read --allow-write scripts/typecheck_gate.ts",
+    "test": "deno test --allow-env --allow-read tests/",
+    "smoke": "deno run --allow-net --allow-env scripts/smoke.ts",
+    "capture": "deno run --allow-net --allow-env --allow-read --allow-write scripts/acceptance_capture.ts"
   }
 }

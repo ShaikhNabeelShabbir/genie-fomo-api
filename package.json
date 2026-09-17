@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "smoke": "./scripts/smoke.sh"
+    "smoke": "deno task smoke"
   },
   "dependencies": {
     "@types/pg": "^8.23.1",
