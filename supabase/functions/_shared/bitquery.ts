@@ -19,29 +19,53 @@ const ENDPOINT = "https://streaming.bitquery.io/graphql";
 interface Reply { readonly data?: unknown; readonly errors?: readonly unknown[] }
 
 const isRec = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+// Bitquery answers a GraphQL error with `{"data": null, "errors": [...]}` and HTTP 200, so a null
+// `data` is a well-formed reply: rejecting it here threw "unexpected reply shape" and hid every real
+// error message (all EVM swap batches and 694 token supplies, 17 Sep 2026).
 const isReply = (v: unknown): v is Reply =>
-  isRec(v) && (v.errors === undefined || Array.isArray(v.errors)) && (v.data === undefined || isRec(v.data));
+  isRec(v) && (v.errors === undefined || Array.isArray(v.errors)) && (v.data === undefined || v.data === null || isRec(v.data));
+
+/**
+ * Per-minute rate limit, which Bitquery reports as a GraphQL error with HTTP 200
+ * ("access restricted by rate limit: too many requests per minute"). It is not a failure of the
+ * query, so it is waited out rather than counted: the host throttle paces requests but cannot know
+ * the plan's minute budget, and a fan-out of supply reads tripped it on every token (17 Sep 2026).
+ * The points/quota error is different and permanent for the day, so it is not retried.
+ */
+/** About 50 requests a minute. The plan's ceiling is per minute, and the default per-host pacing
+ *  (~230/min) tripped it on every fan-out. */
+const GAP_MS = 1_200;
+const RATE_LIMITED = /rate limit|too many requests/i;
+const RETRY_WAITS_MS = [2_000, 6_000, 15_000] as const;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** One POST, throttled per host; a GraphQL error is thrown, a points/quota one under a fixed message. */
 export async function bitquery(key: string, query: string, variables: Record<string, unknown> = {}): Promise<unknown> {
   if (!key) throw new Error("BITQUERY_KEY is not set");
-  const r = await throttled(ENDPOINT, () => fetch(ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ query, variables }),
-    signal: AbortSignal.timeout(45_000),
-  }));
-  const text = await r.text();
-  let j: unknown;
-  try { j = JSON.parse(text); } catch { throw new Error(`Bitquery HTTP ${r.status}: ${text.slice(0, 160)}`); }
-  if (!isReply(j)) throw new Error(`Bitquery HTTP ${r.status}: unexpected reply shape`);
-  if (j.errors?.length) {
-    const first = j.errors[0];
-    const msg = isRec(first) && typeof first.message === "string" ? first.message : String(first);
-    throw new Error(/points limit|quota/i.test(msg) ? "Bitquery quota reached" : msg.slice(0, 160));
+  for (let attempt = 0; ; attempt++) {
+    const r = await throttled(ENDPOINT, () => fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(45_000),
+    }), GAP_MS);
+    const text = await r.text();
+    let j: unknown;
+    try { j = JSON.parse(text); } catch { throw new Error(`Bitquery HTTP ${r.status}: ${text.slice(0, 160)}`); }
+    if (!isReply(j)) throw new Error(`Bitquery HTTP ${r.status}: unexpected reply shape`);
+    if (j.errors?.length) {
+      const first = j.errors[0];
+      const msg = isRec(first) && typeof first.message === "string" ? first.message : String(first);
+      if (/points limit|quota/i.test(msg)) throw new Error("Bitquery quota reached");
+      if (RATE_LIMITED.test(msg) && attempt < RETRY_WAITS_MS.length) {
+        await sleep(RETRY_WAITS_MS[attempt]);
+        continue;
+      }
+      throw new Error(msg.slice(0, 160));
+    }
+    if (!r.ok) throw new Error(`Bitquery HTTP ${r.status}`);
+    return j.data;
   }
-  if (!r.ok) throw new Error(`Bitquery HTTP ${r.status}`);
-  return j.data;
 }
 
 export interface BitqueryBalance {

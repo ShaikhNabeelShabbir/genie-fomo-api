@@ -214,7 +214,10 @@ async function resolveSolanaBatch(sql: Sql, url: string, quotes: ReadonlyMap<str
 /**
  * Every decoded DEX trade in a batch of transactions, grouped by hash (lower-case). Fields per
  * https://docs.bitquery.io/docs/schema/evm/dextrades/ (`Trade { Buy { Amount Buyer Seller
- * Currency { SmartContract Native } } Sell { ... } }`, `Transaction { Hash From }`) and
+ * Currency { SmartContract } } Sell { ... } }`, `Transaction { Hash From }`) and
+ * NOT `Native`: the DEXTrades currency type has no such field (the Balances cube does), and asking
+ * for it failed every EVM batch with a GraphQL error until 17 Sep 2026. Native shows as
+ * `SmartContract: "0x"` here, which `tokenOf` already reads.
  * https://docs.bitquery.io/docs/examples/dextrades/trades-of-an-address-api/ (`Buy.Buyer` /
  * `Buy.Seller` are the two roles a wallet can hold); `Amount` is in human units, as every
  * Bitquery amount is. The hash filter is `Transaction: { Hash: { in: $hashes } }` per
@@ -227,8 +230,8 @@ async function tradesByHash(ctx: Ctx, hashes: readonly string[]): Promise<Map<st
       DEXTrades(where: { Transaction: { Hash: { in: $hashes } } }, limit: { count: ${hashes.length * TRADES_PER_TX} }) {
         Transaction { Hash From }
         Trade {
-          Buy { Amount Buyer Seller Currency { SmartContract Native } }
-          Sell { Amount Buyer Seller Currency { SmartContract Native } }
+          Buy { Amount Buyer Seller Currency { SmartContract } }
+          Sell { Amount Buyer Seller Currency { SmartContract } }
         }
       }
     }

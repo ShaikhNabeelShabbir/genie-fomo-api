@@ -20,12 +20,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** One in-flight request per host, with a floor on the gap between them. See docs/DECISIONS.md#d002 */
 const HOST_GAP_MS = 260;
 const hostQueue = new Map<string, Promise<unknown>>();
-export function throttled<T>(url: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * `gapMs` raises that floor for a host whose limit is per minute rather than per second: the
+ * default paces about 230 requests a minute, which is above what Bitquery allows on this plan.
+ */
+export function throttled<T>(url: string, fn: () => Promise<T>, gapMs: number = HOST_GAP_MS): Promise<T> {
   const host = new URL(url).host;
   const prev = hostQueue.get(host) ?? Promise.resolve();
   const next = prev.then(async () => {
     const t = Date.now();
-    try { return await fn(); } finally { await sleep(Math.max(0, HOST_GAP_MS - (Date.now() - t))); }
+    try { return await fn(); } finally { await sleep(Math.max(0, gapMs - (Date.now() - t))); }
   });
   hostQueue.set(host, next.catch(() => {}));
   return next as Promise<T>;
