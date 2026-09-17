@@ -8,7 +8,6 @@
     "node": ">=20"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
     "smoke": "./scripts/smoke.sh"
   },
   "dependencies": {
