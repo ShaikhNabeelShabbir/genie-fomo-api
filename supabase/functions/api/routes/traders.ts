@@ -4,7 +4,7 @@ import { get, post } from "../router.ts";
 import { notFound, badRequest, ApiError, includeUnavailable } from "../errors.ts";
 import { asOfHoldings } from "../shared/asof.ts";
 import { intParam, numParam, sortParam, nonEmpty } from "../shared/params.ts";
-import { money } from "../shared/format.ts";
+import { bool, money } from "../shared/format.ts";
 import { nativePrices } from "../shared/prices.ts";
 import { KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
@@ -92,7 +92,8 @@ get("/v1/traders", async (_p, url) => {
 
   const rows = await sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at, t.source,
-           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at, ld.*,
+           s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
+           ld.load_attempted_at, ld.load_outcome,
            case
              when ${q} = '' then 0
              when lower(t.display_handle) = ${q} or lower(coalesce(t.name,'')) = ${q} then 0
@@ -122,7 +123,7 @@ get("/v1/traders", async (_p, url) => {
     order by score, ${sortCol} ${dir} nulls last, t.handle`;
 
   const [{ window_label, captured }] = await sql`
-    select window_label, extract(epoch from captured_at)::bigint as captured
+    select window_label, cast(strftime('%s', captured_at) as integer) as captured
     from builds order by captured_at desc limit 1`;
 
   /** A range filter over a nullable column drops rows where the value is UNKNOWN, not just rows… See docs/DECISIONS.md#d095 */
@@ -131,7 +132,7 @@ get("/v1/traders", async (_p, url) => {
   const unratedCount = anyFilter
     ? Number(
       (await sql`
-        select count(*)::int as n from traders t
+        select count(*) as n from traders t
         left join trader_stats_current s using (handle) where s.handle is null`)[0].n,
     )
     : 0;
@@ -367,7 +368,7 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     select (select count(*) from holdings_current where handle = ${h})  as positions,
            (select count(*) from trades   where handle = ${h})          as trades,
            (select count(*) from transactions
-             where address_key = any(${[t.evm_address, t.sol_address]
+             where address_key in (${[t.evm_address, t.sol_address]
                .filter((a): a is string => !!a).map((a) => a.toLowerCase())})) as transfers`;
 
   return {
@@ -378,8 +379,8 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
     rank: t.rank ?? null,
     verified: !!t.verified,
     /** IS THIS TRADER STILL ON THE BOARD, and if not, why. See docs/DECISIONS.md#d101 */
-    listed: t.listed !== false,
-    ...(t.listed === false
+    listed: bool(t.listed) !== false,
+    ...(bool(t.listed) === false
       ? {
         delisted: {
           at: t.delisted_at ? new Date(String(t.delisted_at)).toISOString() : null,
@@ -418,7 +419,9 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
       ? {
         transactions: Number(act.transactions),
         /** O1. Chains present in `transactions` for these wallets; all-zeros elsewhere means "not covered". */
-        chainsCovered: (act.chains_covered as string[]) ?? [],
+        /* json_group_array returns JSON text; a null chain (no chains row) is dropped here. */
+        chainsCovered: (JSON.parse(String(act.chains_covered ?? "[]")) as unknown[])
+          .filter((c): c is string => typeof c === "string"),
         transfers: Number(act.transfers),
         inbound: Number(act.inbound),
         outbound: Number(act.outbound),
@@ -479,9 +482,10 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
 /** T1.2. See docs/DECISIONS.md#d102 */
 /** Axis 6's evenness input: how many trades on each active day. See docs/DECISIONS.md#d103 */
 const dailyTradeCounts = (addrs: string[]) => sql`
-  select date_trunc('day', block_time)::date as day, count(*)::int as trades
+  -- date_trunc('day', t)::date is the date half of the ISO text.
+  select substr(block_time, 1, 10) as day, count(*) as trades
   from transactions
-  where address_key = any(${addrs}) and block_time is not null
+  where address_key in (${addrs}) and block_time is not null
   group by 1 order by 1`;
 
 /** Gini over trades-per-day, expressed as evenness (1 − gini). See docs/DECISIONS.md#d104 */
@@ -498,19 +502,19 @@ function evennessOf(counts: number[]): number | null {
 }
 
 const walletActivity = (addrs: string[]) => sql`
-  select count(*)::int                                             as transfers,
-         count(*) filter (where direction = 'in')::int             as inbound,
-         count(*) filter (where direction = 'out')::int            as outbound,
-         count(*) filter (where tx_type = 'SWAP')::int             as swaps,
-         count(distinct tx_hash)::int                              as transactions,
-         count(distinct date_trunc('day', block_time))::int        as active_days,
-         count(distinct token_key)::int                            as tokens_touched,
+  select count(*)                                                  as transfers,
+         count(case when direction = 'in'  then 1 end)             as inbound,
+         count(case when direction = 'out' then 1 end)             as outbound,
+         count(case when tx_type = 'SWAP'  then 1 end)             as swaps,
+         count(distinct tx_hash)                                   as transactions,
+         count(distinct substr(block_time, 1, 10))                 as active_days,
+         count(distinct token_key)                                 as tokens_touched,
          min(block_time)                                           as first_at,
          max(block_time)                                           as last_at,
          -- O1: which chains the counts above actually cover.
-         coalesce(array_agg(distinct c.name) filter (where c.name is not null), '{}') as chains_covered
+         json_group_array(distinct c.name) as chains_covered
   from transactions x left join chains c using (network_id)
-  where x.address_key = any(${addrs})`;
+  where x.address_key in (${addrs})`;
 
 
 /** Wallets, each with its FAMILY and the chains it has actually been seen on. See docs/DECISIONS.md#d105 */
@@ -587,25 +591,23 @@ post("/v1/traders/:handle/wallets", async ({ handle }, _url, body) => {
    * The distinction travels with every figure the address later produces.
    */
   await sql`
-    insert into wallets (handle, evm_address, evm_address_key, evm_source, evm_confidence,
-                         sol_address, sol_address_key, sol_source, sol_confidence,
+    -- evm_address_key / sol_address_key are generated stored columns here: SQLite refuses
+    -- both an insert into them and an update of them, and follows evm_address / sol_address.
+    insert into wallets (handle, evm_address, evm_source, evm_confidence,
+                         sol_address, sol_source, sol_confidence,
                          first_seen_at, last_seen_at)
     values (${h},
-            ${evm}, ${evm ? evm.toLowerCase() : null},
-            ${evm ? "submitted" : null}, ${evm ? "reported" : null},
-            ${sol}, ${sol ? sol.toLowerCase() : null},
-            ${sol ? "submitted" : null}, ${sol ? "reported" : null},
-            now(), now())
+            ${evm}, ${evm ? "submitted" : null}, ${evm ? "reported" : null},
+            ${sol}, ${sol ? "submitted" : null}, ${sol ? "reported" : null},
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     on conflict (handle) do update set
       evm_address     = coalesce(wallets.evm_address, excluded.evm_address),
-      evm_address_key = coalesce(wallets.evm_address_key, excluded.evm_address_key),
       evm_source      = coalesce(wallets.evm_source, excluded.evm_source),
       evm_confidence  = coalesce(wallets.evm_confidence, excluded.evm_confidence),
       sol_address     = coalesce(wallets.sol_address, excluded.sol_address),
-      sol_address_key = coalesce(wallets.sol_address_key, excluded.sol_address_key),
       sol_source      = coalesce(wallets.sol_source, excluded.sol_source),
       sol_confidence  = coalesce(wallets.sol_confidence, excluded.sol_confidence),
-      last_seen_at    = now()`;
+      last_seen_at    = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`;
 
   const [now] = await sql`
     select evm_address, sol_address, evm_source, sol_source, evm_confidence, sol_confidence

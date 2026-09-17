@@ -9,7 +9,7 @@ export const walletRows = (handles: string[]) => sql`
          w.evm_address, w.sol_address, w.evm_source, w.sol_source,
          w.evm_confidence, w.sol_confidence, w.last_seen_at
   from traders t left join wallets w using (handle)
-  where t.handle = any(${handles})`;
+  where t.handle in (${handles})`;
 
 /** Gap 5b. Wallets this trader funded from his known one (`linked_wallets`), watched by the webhook. */
 export const linkedRows = (handle: string) => sql`

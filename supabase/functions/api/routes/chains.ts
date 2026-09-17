@@ -8,26 +8,26 @@ import { money } from "../shared/format.ts";
 get("/v1/chains", async () => {
   const rows = await sql`
     select c.network_id, c.name, c.history_provider,
-           count(h.*)                                   as positions,
+           count(*)                                     as positions,
            count(distinct h.handle)                     as traders,
-           count(distinct h.token_key) filter (
-             where q.token_key is null)                 as tokens,
-           count(h.value) filter (where h.value > 0)    as priced,
-           sum(h.value)   filter (where h.value > 0)    as total_value
+           count(distinct case when q.token_key is null
+                               then h.token_key end)    as tokens,
+           count(case when h.value > 0 then h.value end) as priced,
+           sum(case when h.value > 0 then h.value end)   as total_value
     from chains c
     join holdings_current h on h.network_id = c.network_id
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     group by c.network_id, c.name, c.history_provider
     order by positions desc`;
 
-  const [{ traders: traderCount }] = await sql`select count(*)::int as traders from traders`;
-  const [{ total }] = await sql`select count(*)::int as total from holdings_current`;
+  const [{ traders: traderCount }] = await sql`select count(*) as traders from traders`;
+  const [{ total }] = await sql`select count(*) as total from holdings_current`;
 
   /** C3 — realized profit per chain. See docs/DECISIONS.md#d060 */
   const profit = await sql<ProfitRow[]>`
     select t.network_id,
-           count(*) filter (where t.status = 'closed')::int as closed,
-           coalesce(sum(t.realized_pnl_usd) filter (where t.status = 'closed'), 0) as realized
+           count(case when t.status = 'closed' then 1 end) as closed,
+           coalesce(sum(case when t.status = 'closed' then t.realized_pnl_usd end), 0) as realized
     from trades t group by t.network_id`;
   type ProfitRow = { network_id: number | null; closed: number; realized: unknown };
   const byNet = new Map<number, ProfitRow>(profit.filter((r: ProfitRow) => r.network_id !== null)

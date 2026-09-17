@@ -8,7 +8,7 @@ export async function resolveTrader(key: string): Promise<string> {
   // A uuid, with or without the `trd_` prefix the plugin team uses.
   const bare = k.replace(/^trd_/, "");
   if (UUID_RE.test(bare)) {
-    const [r] = await sql`select handle from traders where id = ${bare}::uuid`;
+    const [r] = await sql`select handle from traders where id = ${bare}`;
     if (r) return r.handle as string;
   }
 

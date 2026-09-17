@@ -64,7 +64,7 @@ export async function batchIds(
   if (uuidish.length) {
     const bare = uuidish.map((k) => k.trim().replace(/^trd_/, ""));
     const found = await sql`
-      select id, handle from traders where id = any(${bare}::uuid[])`;
+      select id, handle from traders where id in (${bare})`;
     for (const r of found) byId.set(String(r.id).toLowerCase(), String(r.handle));
   }
   let handles = wanted.map((k) => {
@@ -79,13 +79,13 @@ export async function batchIds(
   const missed = [...new Set(handles)];
   if (missed.length) {
     const known = await sql`
-      select handle, display_handle, id from traders where handle = any(${missed})`;
+      select handle, display_handle, id from traders where handle in (${missed})`;
     for (const r of known) remember(r);
     const unknown = missed.filter((h) => !traders.has(h));
     if (unknown.length) {
       const byDisplay = await sql`
         select lower(display_handle) as display, handle, display_handle, id from traders
-         where lower(display_handle) = any(${unknown})`;
+         where lower(display_handle) in (${unknown})`;
       if (byDisplay.length) {
         const dmap = new Map<string, string>(byDisplay.map((r: Record<string, unknown>) => [String(r.display), String(r.handle)]));
         handles = handles.map((h) => dmap.get(h) ?? h);

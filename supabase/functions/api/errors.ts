@@ -53,13 +53,14 @@ export function classify(e: unknown): ApiError {
   if (e instanceof ApiError) return e;
   const msg = e instanceof Error ? e.message : String(e);
 
-  // Pool exhaustion is BACK OFF, not "broken". 429 with Retry-After tells a client to pace
-  // itself; a 500 tells it to give up, and a 503 tells it nothing actionable.
-  if (/too many clients|ECHECKOUTTIMEOUT|max client connections|remaining connection slots/i.test(msg)) {
-    console.error("pool saturated:", msg.slice(0, 200));
+  // Contention is BACK OFF, not "broken". 429 with Retry-After tells a client to pace
+  // itself; a 500 tells it to give up, and a 503 tells it nothing actionable. D1 reports a
+  // busy or overloaded database inside a `D1_ERROR:` wrapper, so this test runs first.
+  if (/too many|SQLITE_BUSY|database is locked|overloaded|ECHECKOUTTIMEOUT|max client connections|remaining connection slots/i.test(msg)) {
+    console.error("database saturated:", msg.slice(0, 200));
     return rateLimited(5);
   }
-  if (/timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|connection|terminated|shutdown/i.test(msg)) {
+  if (/D1_ERROR|timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|connection|terminated|shutdown/i.test(msg)) {
     console.error("database unavailable:", msg.slice(0, 200));
     return unavailable("the database is not answering — retry shortly");
   }
@@ -90,11 +91,28 @@ const unlimited = (): RateState => ({
 
 /** Counts the request against the shared window and returns the state, or throws 429. */
 export async function checkRate(key: string): Promise<RateState> {
-  let row: { hit_count: number; reset_seconds: number } | undefined;
+  // bump_rate_limit() is gone with Postgres (worker/d1/SCHEMA_MAP.md): one atomic upsert keeps
+  // the fixed window — the cutoff is computed here and bound, so the read-modify-write is still
+  // a single statement and cannot interleave between instances.
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const cutoff = new Date(nowMs - WINDOW_SECONDS * 1000).toISOString();
+  let row: { count: number; window_start: string } | undefined;
   try {
-    [row] = await sql<{ hit_count: number; reset_seconds: number }[]>`
-      select * from bump_rate_limit(${key}, ${WINDOW_SECONDS})
+    [row] = await sql<{ count: number; window_start: string }[]>`
+      insert into rate_limits (key, window_start, count) values (${key}, ${nowIso}, 1)
+      on conflict (key) do update
+        set count        = case when rate_limits.window_start < ${cutoff} then 1
+                                else rate_limits.count + 1 end,
+            window_start = case when rate_limits.window_start < ${cutoff} then ${nowIso}
+                                else rate_limits.window_start end
+      returning count, window_start
     `;
+    // Keys are mostly client IPs, so the table would otherwise grow without bound. Pruning on
+    // ~1% of calls keeps it small without needing a scheduled job (was inside the function).
+    if (Math.random() < 0.01) {
+      await sql`delete from rate_limits where window_start < ${new Date(nowMs - 600_000).toISOString()}`;
+    }
   } catch (e) {
     // Fail open, but say so out loud — a silently disabled limiter is how you find out
     // months later that it has been off the whole time.
@@ -105,8 +123,11 @@ export async function checkRate(key: string): Promise<RateState> {
   }
   if (!row) return unlimited();
 
-  const count = Number(row.hit_count);
-  const reset = Number(row.reset_seconds);
+  const count = Number(row.count);
+  const reset = Math.max(
+    1,
+    Math.ceil((Date.parse(String(row.window_start)) + WINDOW_SECONDS * 1000 - nowMs) / 1000),
+  );
   if (count > maxPerWindow()) throw rateLimited(reset);
   return {
     limit: maxPerWindow(),

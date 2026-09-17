@@ -11,7 +11,8 @@ import { pnlAgg, pnlBody } from "../shared/pnl-core.ts";
 
 get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   const [t] = await sql`
-    select t.handle, t.display_handle, t.name, t.source, s.volume_usd, s.trade_count, ld.*,
+    select t.handle, t.display_handle, t.name, t.source, s.volume_usd, s.trade_count,
+           ld.load_attempted_at, ld.load_outcome,
            w.sol_address, w.evm_address_key
     from traders t left join trader_stats_current s using (handle) ${latestLoad()}
     left join wallets w using (handle)
@@ -19,7 +20,7 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
 
   const h = t.handle as string;
-  // Address keys resolved here, not in a join: `address_key = any(...)` hits the index where
+  // Address keys resolved here, not in a join: `address_key in (...)` hits the index where
   // an OR over two wallet columns forced a BitmapOr plus a heap filter per row.
   const addrs = [t.sol_address ? String(t.sol_address).toLowerCase() : null, t.evm_address_key]
     .filter((a): a is string => !!a);
@@ -33,9 +34,9 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     nativePrices().then((nat) => feesFor([h], nat)),
     /** T3. Swap-shaped groups in `transactions` — the denominator of `onChain.coverage`. */
     addrs.length
-      ? sql`select count(*)::int as n from (
+      ? sql`select count(*) as n from (
               select network_id, tx_hash from transactions
-              where address_key = any(${addrs}) and tx_type = 'SWAP'
+              where address_key in (${addrs}) and tx_type = 'SWAP'
               group by network_id, tx_hash) g`
       : Promise.resolve([{ n: 0 }]),
     monthStartCapital([h]),
@@ -53,25 +54,25 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
 
 /** T2.2. See docs/DECISIONS.md#d078 */
 const chainPnl = (addrs: string[]) => sql`
-  select count(*)::int                                             as swaps,
-         count(distinct token_key)::int                            as tokens,
+  select count(*)                                                  as swaps,
+         count(distinct token_key)                                 as tokens,
          coalesce(sum(quote_usd), 0)                               as net_cash_usd,
-         count(*) filter (where quote_usd is null)::int            as unvalued,
+         count(case when quote_usd is null then 1 end)             as unvalued,
          min(block_time)                                           as first_at,
          max(block_time)                                           as last_at
-  from wallet_swaps where address_key = any(${addrs})`;
+  from wallet_swaps where address_key in (${addrs})`;
 
 /** Positions the wallet opened AND fully closed on chain — where the token quantity nets to a… See docs/DECISIONS.md#d079 */
 const chainRoundTrips = (addrs: string[]) => sql`
-  select count(*)::int                          as closed_positions,
-         coalesce(sum(net_usd), 0)              as realized_usd,
-         count(*) filter (where net_usd > 0)::int as winners
+  select count(*)                            as closed_positions,
+         coalesce(sum(net_usd), 0)            as realized_usd,
+         count(case when net_usd > 0 then 1 end) as winners
   from (
     select token_key,
            sum(quote_usd)  as net_usd,
            sum(token_delta) as residual
     from wallet_swaps
-    where address_key = any(${addrs}) and quote_usd is not null
+    where address_key in (${addrs}) and quote_usd is not null
     group by token_key
     having abs(sum(token_delta)) < 1e-6 and count(*) > 1
   ) s`;
@@ -89,10 +90,10 @@ get("/v1/traders/:handle/pnl", async ({ handle }) => {
     addrs.length ? chainPnl(addrs) : Promise.resolve([undefined]),
     addrs.length ? chainRoundTrips(addrs) : Promise.resolve([undefined]),
     addrs.length
-      ? sql`select count(*)::int as n from (
+      ? sql`select count(*) as n from (
               select tx_hash from transactions
                where network_id = 1399811149 and tx_type = 'SWAP'
-                 and address_key = any(${addrs}) group by tx_hash) x`
+                 and address_key in (${addrs}) group by tx_hash) x`
       : Promise.resolve([{ n: 0 }]),
   ]);
 

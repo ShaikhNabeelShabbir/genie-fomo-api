@@ -25,16 +25,17 @@ get("/v1/health", async (_p, url) => {
 });
 
 async function healthBody(): Promise<Record<string, unknown>> {
-  /** Exact counts everywhere except `transactions`, which is an estimate and says so. See docs/DECISIONS.md#d063 */
+  /** Exact counts throughout: SQLite has no planner estimate to substitute. See docs/DECISIONS.md#d063 */
   /** FOUR SEQUENTIAL AWAITS, DELIBERATELY. See docs/DECISIONS.md#d064 */
   const [c] = await sql`
-    select (select count(*) from traders where listed)           as traders,
-           (select count(*) from traders where not listed)       as delisted,
+    select (select count(*) from traders where listed = 1)       as traders,
+           (select count(*) from traders where listed = 0)       as delisted,
            (select count(*) from holdings_current)               as holdings,
            (select count(*) from tokens)                         as tokens,
            (select count(*) from trades)                         as trades,
-           (select greatest(reltuples, 0)::bigint from pg_class
-             where oid = 'public.transactions'::regclass)        as transactions,
+           -- SQLite has no planner row estimate, so transactions is now COUNTED like the
+           -- rest; estimatedRows is empty because nothing on this route is an estimate.
+           (select count(*) from transactions)                   as transactions,
            (select count(distinct handle) from wallets)          as wallets,
            (select count(distinct captured_at) from holdings)    as generations`;
   const [b] = await sql`
@@ -53,50 +54,60 @@ async function healthBody(): Promise<Record<string, unknown>> {
            (select max(at)          from aum_samples
               where basis = 'sampled' and total_usd is not null)         as aum_accepted_at,
            (select max(last_seen_at) from wallets)                       as wallets_at,
-           (select count(*) from aum_samples)::int                       as aum_rows,
-           (select count(distinct handle) from aum_samples)::int         as aum_traders`;
+           (select count(*) from aum_samples)                            as aum_rows,
+           (select count(distinct handle) from aum_samples)               as aum_traders`;
   /** HOW MANY TRADERS ARE THEMSELVES STALE. See docs/DECISIONS.md#d066 */
   const [st] = await sql`
     with newest as (
-      select handle, max(at) filter (where total_usd is not null) as reading_at
+      select handle, max(case when total_usd is not null then at end) as reading_at
       from aum_samples group by handle
     ), loads as (
       select handle, max(captured_at) as scorecard_at from trades group by handle
     ), attempts as (
-      select distinct on (handle) handle, outcome from trade_loads order by handle, attempted_at desc
+      -- distinct on (handle) ... order by handle, attempted_at desc.
+      select handle, outcome from (
+        select handle, outcome,
+               row_number() over (partition by handle order by attempted_at desc) as rn
+        from trade_loads) where rn = 1
     )
     select
-      count(*) filter (where n.reading_at is null)::int                       as no_reading,
-      count(*) filter (where n.reading_at < now() - interval '36 hours')::int as reading_stale,
-      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
-                         and t.source = 'fomoapi.io')::int                   as scorecard_stale,
-      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
-                         and t.source is distinct from 'fomoapi.io')::int    as scorecard_stale_gmgn,
-      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
-                         and t.source = 'fomoapi.io'
-                         and a.outcome is distinct from 'loaded')::int       as scorecard_load_failed,
-      count(*) filter (where l.scorecard_at < now() - interval '72 hours'
-                         and t.source = 'fomoapi.io' and a.handle is null)::int
-                                                                             as scorecard_never_attempted,
-      max(extract(epoch from (now() - n.reading_at)) / 3600.0)::int           as oldest_reading_h,
-      max(extract(epoch from (now() - l.scorecard_at)) / 3600.0)::int         as oldest_scorecard_h
+      count(case when n.reading_at is null then 1 end)                    as no_reading,
+      count(case when n.reading_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-36 hours') then 1 end) as reading_stale,
+      count(case when l.scorecard_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-72 hours')
+                  and t.source = 'fomoapi.io' then 1 end)                 as scorecard_stale,
+      -- 'is not' is SQLite's null-safe comparison, i.e. is distinct from.
+      count(case when l.scorecard_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-72 hours')
+                  and t.source is not 'fomoapi.io' then 1 end)            as scorecard_stale_gmgn,
+      count(case when l.scorecard_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-72 hours')
+                  and t.source = 'fomoapi.io'
+                  and a.outcome is not 'loaded' then 1 end)               as scorecard_load_failed,
+      count(case when l.scorecard_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-72 hours')
+                  and t.source = 'fomoapi.io' and a.handle is null then 1 end)
+                                                                          as scorecard_never_attempted,
+      -- extract(epoch from (now() - t)) / 3600.0 is a julianday difference in hours;
+      -- the ::int rounded, so round() keeps the figure rather than truncating it.
+      cast(round(max((julianday('now') - julianday(n.reading_at)) * 24.0)) as integer)
+                                                                          as oldest_reading_h,
+      cast(round(max((julianday('now') - julianday(l.scorecard_at)) * 24.0)) as integer)
+                                                                          as oldest_scorecard_h
     from traders t left join newest n using (handle) left join loads l using (handle)
       left join attempts a using (handle)
-    where t.listed`;
+    where t.listed = 1`;
 
   /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
   const [m] = await sql`
-    select count(*)::int as traders,
-           (select count(distinct handle) from trades where status = 'closed')::int
+    select count(*) as traders,
+           (select count(distinct handle) from trades where status = 'closed')
              as measurable
     from traders`;
 
   /** PER-CHAIN SAMPLER HEALTH, so "bsc stopped answering on the 14th" needs no sweep. */
   const chainRows = await sql`
     /*
-     * Laterals so each chain is one range on aum_chain_samples_net_at_idx (network_id, at
-     * desc) where basis = 'sampled'; the history counts come from trader_chain_history, the
-     * one definition knownChainsFor also reads, aggregated once for all chains.
+     * One grouped pass per block so each chain is one range on aum_chain_samples_net_at_idx
+     * (network_id, at desc) where basis = 'sampled'; the history counts come from
+     * trader_chain_history, the one definition knownChainsFor also reads, aggregated once
+     * for all chains. The two Postgres laterals became these joins.
      */
     select c.name,
            coalesce(r.accepted_36h, 0) as accepted_36h,
@@ -106,24 +117,27 @@ async function healthBody(): Promise<Record<string, unknown>> {
            coalesce(h.warming, 0)      as hist_warming,
            coalesce(h.none, 0)         as hist_none
     from chains c
-    left join lateral (
-      select count(*) filter (where s.total_usd is not null
-                                and s.at >= now() - interval '36 hours')::int as accepted_36h,
-             count(*) filter (where s.reason is not null
-                                and s.at >= now() - interval '24 hours')::int as failed_24h
+    left join (
+      select s.network_id,
+             count(case when s.total_usd is not null
+                         and s.at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-36 hours') then 1 end) as accepted_36h,
+             count(case when s.reason is not null
+                         and s.at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours') then 1 end) as failed_24h
       from aum_chain_samples s
-      where s.network_id = c.network_id and s.basis = 'sampled'
-        and s.at >= now() - interval '36 hours') r on true
-    left join lateral (
-      select s.at as newest_accepted_at
+      where s.basis = 'sampled'
+        and s.at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-36 hours')
+      group by s.network_id) r on r.network_id = c.network_id
+    left join (
+      select s.network_id, s.at as newest_accepted_at,
+             row_number() over (partition by s.network_id order by s.at desc) as rn
       from aum_chain_samples s
-      where s.network_id = c.network_id and s.basis = 'sampled' and s.total_usd is not null
-      order by s.at desc limit 1) a on true
+      where s.basis = 'sampled' and s.total_usd is not null) a
+      on a.network_id = c.network_id and a.rn = 1
     left join (
       select network_id,
-             count(*) filter (where history_state = 'ready')::int   as ready,
-             count(*) filter (where history_state = 'warming')::int as warming,
-             count(*) filter (where history_state = 'none')::int    as none
+             count(case when history_state = 'ready'   then 1 end) as ready,
+             count(case when history_state = 'warming' then 1 end) as warming,
+             count(case when history_state = 'none'    then 1 end) as none
       from trader_chain_history group by network_id) h on h.network_id = c.network_id
     order by c.name`;
   const histOf = (r: Record<string, unknown>) => ({
@@ -253,8 +267,8 @@ async function healthBody(): Promise<Record<string, unknown>> {
       note: "not deleted — their holdings, trades and history are intact, and the flag " +
             "reverses if the source lists them again. Ask for them with ?includeDelisted=true",
     },
-    /** Which entries in `rows` are planner estimates rather than counted. */
-    estimatedRows: ["transactions"],
+    /** Which entries in `rows` are planner estimates rather than counted: none, on SQLite. */
+    estimatedRows: [] as string[],
     /** HOW MANY EXTERNAL CALLS A REQUEST CAN COST — no longer flatly zero. See docs/DECISIONS.md#d069 */
     externalCallsPerRequest: {
       typical: 0,

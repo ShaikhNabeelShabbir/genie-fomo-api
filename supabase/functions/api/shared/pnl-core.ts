@@ -13,17 +13,17 @@ import { scorecardBody } from "../shared/scorecard-core.ts";
  */
 export const pnlAgg = (handles: string[]) => sql`
   select handle,
-         count(*) filter (where status = 'closed')::int  as closed,
-         count(*) filter (where status not in ('closed', 'closed_by_balance'))::int as open,
+         count(case when status = 'closed' then 1 end)  as closed,
+         count(case when status not in ('closed', 'closed_by_balance') then 1 end) as open,
          -- Item 10: open trade records whose token the wallet still holds per holdings_current.
-         count(*) filter (where status not in ('closed', 'closed_by_balance') and exists (
+         count(case when status not in ('closed', 'closed_by_balance') and exists (
            select 1 from holdings_current hc
            where hc.handle = trades.handle and hc.network_id = trades.network_id
-             and hc.token_key = trades.token_key and hc.human_amount > 0))::int as open_held,
-         coalesce(sum(realized_pnl_usd)   filter (where status = 'closed'), 0)  as realized,
-         coalesce(sum(unrealized_pnl_usd) filter (where status not in ('closed', 'closed_by_balance')), 0) as unrealized,
+             and hc.token_key = trades.token_key and hc.human_amount > 0) then 1 end) as open_held,
+         coalesce(sum(case when status = 'closed' then realized_pnl_usd end), 0)  as realized,
+         coalesce(sum(case when status not in ('closed', 'closed_by_balance') then unrealized_pnl_usd end), 0) as unrealized,
          max(captured_at) as captured
-  from trades where handle = any(${handles}) group by handle`;
+  from trades where handle in (${handles}) group by handle`;
 
 /**
  * Split out for ISSUE-8, same reasoning as `scorecardBody`: the bulk route runs this exact

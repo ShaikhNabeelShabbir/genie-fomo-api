@@ -82,9 +82,9 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
           select handle, hour as at, total_usd, suspect_usd, unsellable_usd, priced_positions, total_positions, basis, reason,
                  row_number() over (partition by handle order by hour desc) as rn
           from aum_history
-          where handle = any(${handles})
-            and hour <= ${o.to}::timestamptz
-            and (${o.from}::timestamptz is null or hour >= ${o.from}::timestamptz)
+          where handle in (${handles})
+            and hour <= ${o.to}
+            and (${o.from} is null or hour >= ${o.from})
         ) x where rn <= ${o.limit}
         order by handle, at`
     : await sql<BucketRow[]>`
@@ -92,9 +92,9 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
           select handle, bucket as at, total_usd, high_usd, low_usd, valued_hours,
                  row_number() over (partition by handle order by bucket desc) as rn
           from ${sql(VIEW[o.step])}
-          where handle = any(${handles})
-            and bucket <= ${o.to}::timestamptz
-            and (${o.from}::timestamptz is null or bucket >= ${o.from}::timestamptz)
+          where handle in (${handles})
+            and bucket <= ${o.to}
+            and (${o.from} is null or bucket >= ${o.from})
         ) x where rn <= ${o.limit}
         order by handle, at`;
   const by = new Map<string, Point[]>();
@@ -114,7 +114,7 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
 /** When each handle's history was last built; the series' `asOf`. */
 async function computedAt(handles: string[]): Promise<Map<string, string>> {
   const rows = await sql<{ handle: string; at: Date | string }[]>`
-    select handle, max(computed_at) as at from aum_history where handle = any(${handles}) group by handle`;
+    select handle, max(computed_at) as at from aum_history where handle in (${handles}) group by handle`;
   const by = new Map<string, string>();
   for (const r of rows) by.set(r.handle, iso(r.at));
   return by;
@@ -134,7 +134,7 @@ type Live = {
 async function live(handles: string[]): Promise<Map<string, Live>> {
   const rows = await sql<LiveRow[]>`
     select handle, at, total_usd, suspect_usd, unsellable_usd, priced_positions, total_positions, reason, source
-    from aum_live where handle = any(${handles})`;
+    from aum_live where handle in (${handles})`;
   const now = new Date();
   const by = new Map<string, Live>();
   for (const r of rows) {

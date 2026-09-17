@@ -7,12 +7,14 @@ import { NativePrice } from "../shared/prices.ts";
 
 /**
  * T1. The newest `trade_loads` row per trader, as the two columns `scorecardBody` reads
- * (`load_attempted_at`, `load_outcome`). Join after `from traders t`; select `ld.*`.
+ * (`load_attempted_at`, `load_outcome`). Join after `from traders t`; select those two by
+ * name — the derived table also carries `handle` and `rn`, so `ld.*` would clobber `handle`.
  */
 export const latestLoad = () => sql`
-  left join lateral (
-    select attempted_at as load_attempted_at, outcome as load_outcome
-    from trade_loads l where l.handle = t.handle order by attempted_at desc limit 1) ld on true`;
+  left join (
+    select handle, attempted_at as load_attempted_at, outcome as load_outcome,
+           row_number() over (partition by handle order by attempted_at desc) as rn
+    from trade_loads) ld on ld.handle = t.handle and ld.rn = 1`;
 
 /**
  * The trade rows a scorecard is computed from. One statement, so the bulk route can ask for
@@ -49,7 +51,7 @@ export const scorecardRows = (handles: string[]) => sql`
          -- Axis 5 wants the token's age at entry, which needs its creation time. GMGN carries
          -- it and we already store the whole document, so this is a read rather than a fetch.
          -- 0 means "they did not tell us" and is nulled here, not published as 1970.
-         nullif((ti.raw->>'creation_timestamp')::bigint, 0) as token_created_unix,
+         nullif(cast(json_extract(ti.raw, '$.creation_timestamp') as integer), 0) as token_created_unix,
          -- C3. Latest honeypot read, when it first flipped, and how many OTHER tracked
          -- traders have a trade in the coin (self is always one of holders).
          ti.is_honeypot, ti.can_not_sell, ti.honeypot_since,
@@ -60,13 +62,13 @@ export const scorecardRows = (handles: string[]) => sql`
   left join tokens tk on tk.network_id = tr.network_id and tk.token_key = tr.token_key
   left join token_info ti on ti.network_id = tr.network_id and ti.token_key = tr.token_key
   left join (
-    select network_id, token_key, count(distinct handle)::int as holders
+    select network_id, token_key, count(distinct handle) as holders
     from trades
-    where (network_id, token_key) in (select network_id, token_key from trades where handle = any(${handles}))
+    where (network_id, token_key) in (select network_id, token_key from trades where handle in (${handles}))
     group by 1, 2
   ) co on co.network_id = tr.network_id and co.token_key = tr.token_key
   left join token_price_stats ps on ps.network_id = tr.network_id and ps.token_key = tr.token_key
-  where tr.handle = any(${handles})`;
+  where tr.handle in (${handles})`;
 
 
 /** Dollars for a FEE, which is often a fraction of a cent. See docs/DECISIONS.md#d138 */
@@ -89,13 +91,13 @@ export async function feesFor(
   if (!handles.length) return out;
   const rows = await sql`
     select handle, network_id,
-           sum(fee_native) filter (where day > (now() at time zone 'utc')::date - 1)  as w24h,
-           sum(fee_native) filter (where day > (now() at time zone 'utc')::date - 7)  as w7d,
-           sum(fee_native) filter (where day > (now() at time zone 'utc')::date - 30) as w30d,
+           sum(case when day > date('now', '-1 day')  then fee_native end) as w24h,
+           sum(case when day > date('now', '-7 days') then fee_native end) as w7d,
+           sum(case when day > date('now', '-30 days') then fee_native end) as w30d,
            sum(fee_native)  as wall,
-           sum(tx_count)::int as txs
+           sum(tx_count) as txs
     from trader_fees_daily
-    where handle = any(${handles})
+    where handle in (${handles})
     group by handle, network_id`;
 
   for (const r of rows) {
@@ -159,7 +161,7 @@ export async function swapsFor(handles: string[]): Promise<Map<string, Swap[]>> 
   const handleByAddr = new Map<string, string[]>();
   for (const w of await sql`
     select handle, lower(sol_address) as sol, evm_address_key as evm
-    from wallets where handle = any(${handles})`) {
+    from wallets where handle in (${handles})`) {
     for (const a of [w.sol, w.evm]) {
       if (!a) continue;
       const k = String(a);
@@ -169,7 +171,7 @@ export async function swapsFor(handles: string[]): Promise<Map<string, Swap[]>> 
   if (!handleByAddr.size) return out;
   const rows = await sql`
     select address_key, network_id, token_key, tx_hash, block_time, token_delta, quote_usd
-    from wallet_swaps where address_key = any(${[...handleByAddr.keys()]})
+    from wallet_swaps where address_key in (${[...handleByAddr.keys()]})
     order by block_time asc`;
   for (const r of rows) {
     for (const h of handleByAddr.get(String(r.address_key)) ?? []) {
@@ -420,14 +422,17 @@ export async function monthStartCapital(handles: string[]): Promise<Map<string, 
   const out = new Map<string, Map<string, number>>();
   if (!handles.length) return out;
   const rows = await sql`
-    select distinct on (handle, month)
-           handle,
-           to_char(date_trunc('month', at at time zone 'utc'), 'YYYY-MM') as month,
-           total_usd,
-           extract(day from (at at time zone 'utc'))::int as day_of_month
-    from aum_samples
-    where handle = any(${handles}) and total_usd is not null
-    order by handle, month, at asc`;
+    select handle, month, total_usd, day_of_month from (
+      select handle,
+             strftime('%Y-%m', at) as month,
+             total_usd,
+             cast(strftime('%d', at) as integer) as day_of_month,
+             row_number() over (
+               partition by handle, strftime('%Y-%m', at) order by at asc) as rn
+      from aum_samples
+      where handle in (${handles}) and total_usd is not null)
+    where rn = 1
+    order by handle, month`;
   for (const r of rows) {
     if (Number(r.day_of_month) > START_CAPITAL_WINDOW_DAYS) continue;
     const h = String(r.handle);
