@@ -8,10 +8,24 @@ import { chainWhere } from "../shared/chains.ts";
 import { encodeCursor, resumeAfter } from "../shared/cursor.ts";
 import { ledgerBody } from "../shared/creators-core.ts";
 import { exitTimingScoreFrom } from "../shared/scorecard-core.ts";
+import { ttlCache, urlKey } from "../shared/cache.ts";
+
+/**
+ * L2 (v5 fixes, 17 Sep 2026). The board and the momentum list aggregate the whole holdings
+ * view before any limit applies, so `?limit=5` costs what `?limit=500` costs: both answered
+ * 503 `timeout` under load, twice in a row, at 15.8 s and 16.5 s. Neither depends on who is
+ * asking, so one caller pays and everyone inside the TTL is served from memory.
+ *
+ * This does not save the FIRST caller into a cold isolate, and the honest fix for that is the
+ * query itself (docs/REVIEW_EFFICIENCY_17_SEP.md item 6) -- see the v5 reply, L2.
+ */
+const BOARD_TTL_MS = 60_000;
+const boardCache = ttlCache<unknown>(BOARD_TTL_MS);
+const momentumCache = ttlCache<unknown>(BOARD_TTL_MS);
 
 // ------------------------------------------------------- K1/K3/K4/K9 board
 
-get("/v1/tokens", async (_p, url) => {
+get("/v1/tokens", (_p, url) => boardCache(urlKey(url), async () => {
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
   const net = await chainWhere(chainQ);
   const minHolders = intParam(url, "minHolders", { min: 1, fallback: 1 }) ?? 1;
@@ -236,7 +250,7 @@ get("/v1/tokens", async (_p, url) => {
         : `${r.holders} of ${traderCount} leaders hold this.`,
     })),
   };
-});
+}));
 
 // ------------------------------------------------------------ token detail
 
@@ -825,7 +839,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
 
 // -------------------------------------------------------------- K2 (SQL)
 
-get("/v1/tokens/momentum", async (_p, url) => {
+get("/v1/tokens/momentum", (_p, url) => momentumCache(urlKey(url), async () => {
   // Validate the input BEFORE checking whether there is data. Otherwise a typo is silently
   // accepted whenever the archive happens to be too short to answer, so the same bad
   // request 400s or 200s depending on how much history exists.
@@ -934,7 +948,7 @@ get("/v1/tokens/momentum", async (_p, url) => {
         `${moved.filter((r) => r.change < 0).length} lost them since the previous snapshot.`
       : "No holder changes between the two most recent generations.",
   };
-});
+}));
 
 // ------------------------------------------------------------ dev ledger (gap 5a)
 

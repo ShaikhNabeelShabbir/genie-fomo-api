@@ -1,0 +1,41 @@
+import { assertEquals } from "jsr:@std/assert@1";
+import { ttlCache, urlKey } from "../supabase/functions/api/shared/cache.ts";
+
+Deno.test("ttlCache: one build per key inside the TTL", async () => {
+  let built = 0;
+  const cache = ttlCache<number>(60_000);
+  const work = () => Promise.resolve(++built);
+  assertEquals(await cache("a", work), 1);
+  assertEquals(await cache("a", work), 1);
+  assertEquals(await cache("b", work), 2);
+  assertEquals(built, 2);
+});
+
+Deno.test("ttlCache: a lapsed slot is rebuilt", async () => {
+  let built = 0;
+  const cache = ttlCache<number>(0);
+  const work = () => Promise.resolve(++built);
+  assertEquals(await cache("a", work), 1);
+  assertEquals(await cache("a", work), 2);
+});
+
+Deno.test("ttlCache: the slot count is bounded, because the key is caller-supplied", async () => {
+  let built = 0;
+  const cache = ttlCache<number>(60_000);
+  const work = () => Promise.resolve(++built);
+  for (let i = 0; i < 100; i++) await cache(`k${i}`, work);
+  assertEquals(built, 100);
+  /* The newest key is still held; the oldest was evicted, so it rebuilds. */
+  assertEquals(await cache("k99", work), 100);
+  assertEquals(await cache("k0", work), 101);
+});
+
+Deno.test("urlKey: parameter order cannot miss a hit", () => {
+  assertEquals(
+    urlKey(new URL("https://x/v2/tokens?limit=5&chain=bsc")),
+    urlKey(new URL("https://x/v2/tokens?chain=bsc&limit=5")),
+  );
+  assertEquals(urlKey(new URL("https://x/v2/tokens")), "/v2/tokens?");
+  /* A different path is a different answer, whatever the query. */
+  assertEquals(urlKey(new URL("https://x/v2/tokens/momentum?a=1")), "/v2/tokens/momentum?a=1");
+});
