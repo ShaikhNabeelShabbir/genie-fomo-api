@@ -1,7 +1,7 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { jobSql, type Sql } from "../sql";
 import { type Fetched, type Load, type TradeRow, capturedOf, isFomoDoc, outcomeOf, tradeRow } from "./scorecards-core";
+import { chunk } from "./directory-core";
 
 /**
  * Scorecard refresh, the Worker successor of `load_trades.py --stale-hours 72 --source
@@ -10,8 +10,8 @@ import { type Fetched, type Load, type TradeRow, capturedOf, isFomoDoc, outcomeO
  * The python's comments carry the measurements; only the one-line reasons are repeated here.
  */
 
-type Sql = postgres.Sql;
-type Target = { handle: string; display_handle: string; source: string | null; captured_at: Date | null };
+/** `captured_at` is the ISO-8601 UTC text D1 stores. */
+type Target = { handle: string; display_handle: string; source: string | null; captured_at: string | null };
 
 const API = "https://api.fomoapi.io";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
@@ -26,8 +26,14 @@ const FETCH_TIMEOUT_MS = 90_000;
 const RETRY_MS = 1_500;
 /** The longest one chunk can take (two attempts, each at the timeout): the budget stops a chunk that could not finish in time. */
 const CHUNK_WORST_MS = 2 * FETCH_TIMEOUT_MS + RETRY_MS;
-/** 15 columns a row; Postgres allows 65,535 bind parameters a statement. */
-const INSERT_CHUNK = 1000;
+/** 15 columns a row; D1 allows 100 bind parameters a statement, so 6 rows fit. */
+const INSERT_CHUNK = 6;
+/** 3 columns a row, same limit. */
+const LOAD_CHUNK = 30;
+/** Statements queued before a flush: the shim runs a whole queue as ONE d1 batch, one round trip. */
+const BATCH_STATEMENTS = 50;
+/** The epoch, as `coalesce(x, 'epoch')` spelled it; ISO text sorts before every real timestamp. */
+const EPOCH = "1970-01-01T00:00:00.000Z";
 
 export interface ScorecardsSummary {
   /** Traders due: snapshot older than STALE_HOURS (or none) and not asked within RETRY_HOURS. */
@@ -55,20 +61,37 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * `ingested_at` let a re-served snapshot satisfy the job while the API stayed stale.
  */
 const stale = (sql: Sql) => sql`
-  select t.handle, t.display_handle, t.source, x.captured_at
-  from traders t
-  left join lateral (select max(captured_at) as captured_at from trades where handle = t.handle) x on true
-  where t.source = ${SOURCE} and coalesce(x.captured_at, 'epoch') < now() - (${STALE_HOURS} * interval '1 hour')`;
+  select * from (
+    select t.handle, t.display_handle, t.source,
+           (select max(captured_at) from trades where handle = t.handle) as captured_at
+    from traders t
+    where t.source = ${SOURCE}
+  )
+  where coalesce(captured_at, ${EPOCH})
+        < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ${`-${STALE_HOURS} hours`})`;
 
 /** The stale traders not asked within RETRY_HOURS, whatever the last answer was. */
 const selectTargets = (sql: Sql) => sql<Target[]>`
   select * from (${stale(sql)}) s
-  where coalesce((select max(attempted_at) from trade_loads where handle = s.handle), 'epoch')
-        < now() - (${RETRY_HOURS} * interval '1 hour')
+  where coalesce((select max(attempted_at) from trade_loads where handle = s.handle), ${EPOCH})
+        < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ${`-${RETRY_HOURS} hours`})
   order by s.handle`;
 
 const countStale = async (sql: Sql): Promise<number> =>
-  Number((await sql<{ n: number }[]>`select count(*)::int as n from (${stale(sql)}) s`)[0].n);
+  Number((await sql<{ n: number }[]>`select count(*) as n from (${stale(sql)}) s`)[0].n);
+
+/**
+ * Issue one statement per item inside a `begin`, flushing every BATCH_STATEMENTS. The shim queues
+ * statements between awaits and runs the queue as one d1 batch, so a flush is one round trip.
+ */
+async function issueBatched<T>(items: readonly T[], issue: (item: T) => PromiseLike<unknown>): Promise<void> {
+  let last: PromiseLike<unknown> | undefined;
+  for (const [i, item] of items.entries()) {
+    last = issue(item);
+    if ((i + 1) % BATCH_STATEMENTS === 0) { await last; last = undefined; }
+  }
+  if (last) await last;
+}
 
 /** One trader's trades, with a single retry on transport, non-2xx, or fomo's degraded envelope. */
 async function fetchTrades(handle: string, key: string): Promise<Fetched> {
@@ -117,7 +140,7 @@ async function writePass(sql: Sql, targets: Target[], fetched: Fetched[], netOf:
   const now = new Date();
   fetched.forEach((f, i) => {
     const { handle, source, captured_at } = targets[i];
-    const load = outcomeOf(f, source, captured_at ? new Date(captured_at) : null, now);
+    const load = outcomeOf(f, source, captured_at === null ? null : new Date(captured_at), now);
     loads.push({ handle, ...load });
     if (f.kind === "error") { c.errored++; return; }
     if (f.kind === "not_found") { c.notFound++; return; }
@@ -135,26 +158,35 @@ async function writePass(sql: Sql, targets: Target[], fetched: Fetched[], netOf:
     }
   });
   /* Written BEFORE the trades so a fetch that returned nothing still leaves a trace. */
-  if (loads.length) await sql`insert into trade_loads ${sql(loads, "handle", "outcome", "detail")}`;
+  if (loads.length) {
+    await sql.begin((tx) => issueBatched(chunk(loads, LOAD_CHUNK), (part) => tx.unsafe(
+      `insert into trade_loads (handle, outcome, detail) values ${part.map(() => "(?,?,?)").join(",")}`,
+      part.flatMap((l) => [l.handle, l.outcome, l.detail]),
+    )));
+  }
   if (!rows.length) return c;
   await sql.begin(async (tx) => {
-    for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
-      await tx`
-        insert into trades ${tx(rows.slice(i, i + INSERT_CHUNK),
-          "trade_id", "handle", "network_id", "token_address", "token_key",
-          "token_symbol", "status", "amount", "avg_entry_price", "avg_exit_price",
-          "realized_pnl_usd", "unrealized_pnl_usd", "opened_at", "closed_at", "captured_at")}
-        on conflict (trade_id) do update set
-          status = excluded.status, amount = excluded.amount,
-          avg_entry_price = excluded.avg_entry_price, avg_exit_price = excluded.avg_exit_price,
-          realized_pnl_usd = excluded.realized_pnl_usd,
-          unrealized_pnl_usd = excluded.unrealized_pnl_usd,
-          closed_at = excluded.closed_at, captured_at = excluded.captured_at,
-          ingested_at = now()`;
-    }
-    for (const s of symbols.values()) {
-      await tx`update tokens set symbol = ${s.sym} where network_id = ${s.net} and token_key = ${s.key}`;
-    }
+    await issueBatched(chunk(rows, INSERT_CHUNK), (part) => tx.unsafe(
+      `insert into trades
+         (trade_id, handle, network_id, token_address, token_key,
+          token_symbol, status, amount, avg_entry_price, avg_exit_price,
+          realized_pnl_usd, unrealized_pnl_usd, opened_at, closed_at, captured_at)
+       values ${part.map(() => "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").join(",")}
+       on conflict (trade_id) do update set
+         status = excluded.status, amount = excluded.amount,
+         avg_entry_price = excluded.avg_entry_price, avg_exit_price = excluded.avg_exit_price,
+         realized_pnl_usd = excluded.realized_pnl_usd,
+         unrealized_pnl_usd = excluded.unrealized_pnl_usd,
+         closed_at = excluded.closed_at, captured_at = excluded.captured_at,
+         ingested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+      part.flatMap((r) => [
+        r.trade_id, r.handle, r.network_id, r.token_address, r.token_key,
+        r.token_symbol, r.status, r.amount, r.avg_entry_price, r.avg_exit_price,
+        r.realized_pnl_usd, r.unrealized_pnl_usd, r.opened_at, r.closed_at, r.captured_at,
+      ]),
+    ));
+    await issueBatched([...symbols.values()], (s) =>
+      tx`update tokens set symbol = ${s.sym} where network_id = ${s.net} and token_key = ${s.key}`);
   });
   c.trades = rows.length;
   return c;
@@ -166,7 +198,7 @@ export async function runScorecards(env: Env, budgetMs: number): Promise<Scoreca
   if (!key) throw new Error("FOMOAPI_KEY is not set; refusing to run the scorecard refresh");
   const started = Date.now();
   const outOfTime = () => Date.now() - started + CHUNK_WORST_MS > budgetMs;
-  const sql = db(env);
+  const sql = jobSql(env);
   const s: ScorecardsSummary = {
     targeted: 0, refreshed: 0, unchanged: 0, degraded: 0, notFound: 0, errored: 0,
     trades: 0, remaining: 0, stoppedEarly: false, elapsedMs: 0,
@@ -174,8 +206,8 @@ export async function runScorecards(env: Env, budgetMs: number): Promise<Scoreca
   try {
     /* token_key -> network_id: the trades feed carries a token address but no networkId. */
     const netOf = new Map<string, number>(
-      (await sql<{ token_key: string; network_id: string | number }[]>`select token_key, network_id from tokens`)
-        .map((r) => [r.token_key, Number(r.network_id)]),
+      (await sql<{ token_key: string; network_id: number }[]>`select token_key, network_id from tokens`)
+        .map((r) => [r.token_key, r.network_id]),
     );
     const targets = await selectTargets(sql);
     s.targeted = targets.length;

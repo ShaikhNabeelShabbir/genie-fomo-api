@@ -1,10 +1,10 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { jobSql, type Sql } from "../sql";
 import { rpc, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
 import { type BatchRead, type Fee, readBatch, readBitqueryFees } from "./fees-core";
+import { chunk } from "./directory-core";
 
 /**
  * Transaction fees, the Worker half of the three "Read transaction fees" steps and "Refresh
@@ -15,12 +15,13 @@ import { type BatchRead, type Fee, readBatch, readBitqueryFees } from "./fees-co
  * each chain gets a SLICE of its oldest unpriced transactions per run under a wall-clock budget
  * (the anti-join makes the next run continue), a failed batch is counted rather than fatal, and
  * the rollup rebuilds only the traders this run touched, in place (the script's one-trader
- * path), instead of the whole table behind a swap. And the EVM fee is Bitquery's
- * `Fee.SenderFee` rather than gasUsed x effectiveGasPrice from a public node: since 17 Sep 2026
- * no free JSON-RPC endpoint is called from the Worker. Solana stays on Helius.
+ * path), instead of the whole table behind a swap. The script's whole-table rollup branch is
+ * gone with it: D1 runs one statement at a time, so every rollup statement is scoped to a chunk.
+ * And the EVM fee is Bitquery's `Fee.SenderFee` rather than gasUsed x effectiveGasPrice from a
+ * public node: since 17 Sep 2026 no free JSON-RPC endpoint is called from the Worker. Solana
+ * stays on Helius.
  */
 
-type Sql = postgres.Sql;
 interface Chain { readonly network_id: number; readonly name: string; readonly native_symbol: string }
 interface Step { readonly chain: string; readonly batch: number; readonly swapsOnly: boolean }
 interface Pending { readonly hashes: readonly string[]; readonly addresses: ReadonlySet<string>; readonly total: number }
@@ -37,8 +38,10 @@ const STEPS: readonly Step[] = [
 ];
 /** ponytail: oldest unpriced transactions per chain per run; raise when the backlog is measured to lag the cron. */
 const SLICE = 1000;
-/** Traders per rollup statement, as the script: a 25-trader chunk finishes inside the statement timeout. */
+/** Traders per rollup statement, as the script: a 25-trader chunk stays inside D1's 30 s a statement. */
 const ROLLUP_CHUNK = 25;
+/** Rows per `transaction_fees` insert: 5 columns x 18 rows = 90 of D1's 100 bind parameters. */
+const FEE_WRITE_CHUNK = 18;
 /** Share of the budget the reads leave for phase 2. */
 const ROLLUP_SHARE = 0.25;
 const EVM_SOURCE = "bitquery EVM.Transactions Fee.SenderFee";
@@ -66,9 +69,9 @@ export interface FeesSummary {
 }
 
 async function chains(sql: Sql): Promise<Map<string, Chain>> {
-  const rows = await sql<{ network_id: string; name: string; native_symbol: string }[]>`
-    select network_id, name, native_symbol from chains where name = any(${STEPS.map((s) => s.chain)})`;
-  return new Map(rows.map((r) => [r.name, { ...r, network_id: Number(r.network_id) }]));
+  const rows = await sql<{ network_id: number; name: string; native_symbol: string }[]>`
+    select network_id, name, native_symbol from chains where name in (${STEPS.map((s) => s.chain)})`;
+  return new Map(rows.map((r) => [r.name, r]));
 }
 
 /**
@@ -78,35 +81,40 @@ async function chains(sql: Sql): Promise<Map<string, Chain>> {
  * so phase 2 knows which traders to roll up.
  */
 async function pending(sql: Sql, net: number, swapsOnly: boolean): Promise<Pending> {
-  const rows = await sql<{ tx_hash: string; addrs: string[]; total: string }[]>`
-    select t.tx_hash, array_agg(distinct t.address_key) as addrs, count(*) over () as total
+  /* `union all`, not `union`: the group by already collapses a transaction's repeated legs. */
+  const rows = await sql<{ tx_hash: string; addrs: string; total: number }[]>`
+    select t.tx_hash, json_group_array(distinct t.address_key) as addrs, count(*) over () as total
       from (
         select tx_hash, address_key, block_time from wallet_swaps
          where network_id = ${net}
-        union
+        ${swapsOnly ? sql`` : sql`union all
         select tx_hash, address_key, block_time from transactions
-         where network_id = ${net} and ${swapsOnly}::bool is false
+         where network_id = ${net}`}
       ) t
      where not exists (
        select 1 from transaction_fees f where f.network_id = ${net} and f.tx_hash = t.tx_hash)
      group by t.tx_hash
-     order by min(t.block_time) nulls last
+     order by min(t.block_time) is null, min(t.block_time)
      limit ${SLICE}`;
   return {
     hashes: rows.map((r) => r.tx_hash),
-    addresses: new Set(rows.flatMap((r) => r.addrs)),
-    total: Number(rows[0]?.total ?? 0),
+    addresses: new Set(rows.flatMap((r) => JSON.parse(r.addrs) as string[])),
+    total: rows[0]?.total ?? 0,
   };
 }
 
 async function writeFees(sql: Sql, net: number, fees: readonly Fee[], symbol: string, source: string): Promise<void> {
   if (!fees.length) return;
-  await sql`
-    insert into transaction_fees (network_id, tx_hash, fee_native, fee_native_symbol, source)
-    select ${net}, h, f::numeric, s, src
-    from unnest(${fees.map((f) => f.hash)}::text[], ${fees.map((f) => f.fee)}::text[],
-                ${fees.map(() => symbol)}::text[], ${fees.map(() => source)}::text[]) as u(h, f, s, src)
-    on conflict (network_id, tx_hash) do nothing`;
+  await sql.begin(async (tx) => {
+    /* Issued with no await between them, so the shim flushes the whole set as ONE atomic d1 batch. */
+    await Promise.all(chunk(fees, FEE_WRITE_CHUNK).map((part) =>
+      tx.unsafe(
+        `insert into transaction_fees (network_id, tx_hash, fee_native, fee_native_symbol, source)
+         values ${part.map(() => "(?,?,?,?,?)").join(",")}
+         on conflict (network_id, tx_hash) do nothing`,
+        part.flatMap((f) => [net, f.hash, Number(f.fee), symbol, source]),
+      )));
+  });
 }
 
 /** Helius `getTransaction` for a slice of signatures, one JSON-RPC batch. */
@@ -178,16 +186,19 @@ async function readChain(sql: Sql, c: Chain, step: Step, hashes: readonly string
   return answered;
 }
 
-/** The traders behind a set of address keys: the inverse of the rollup's `w` CTE. */
+/**
+ * The traders behind a set of address keys: the inverse of the rollup's `w` CTE. `wallets` holds
+ * one row per trader, so the whole (small) table is matched here instead of binding a set of
+ * addresses that would not fit D1's 100 parameters a statement.
+ */
 async function handlesOf(sql: Sql, addresses: ReadonlySet<string>): Promise<string[]> {
   if (!addresses.size) return [];
-  const rows = await sql<{ handle: string }[]>`
-    select distinct t.handle
-      from traders t
-      join wallets wl using (handle),
-      lateral (values (wl.evm_address_key), (lower(wl.sol_address))) x(addr)
-     where lower(x.addr) = any(${[...addresses]})`;
-  return rows.map((r) => r.handle).sort();
+  const rows = await sql<{ handle: string; evm_address_key: string | null; sol_address_key: string | null }[]>`
+    select handle, evm_address_key, sol_address_key from wallets`;
+  return rows
+    .filter((r) => (r.evm_address_key !== null && addresses.has(r.evm_address_key))
+      || (r.sol_address_key !== null && addresses.has(r.sol_address_key)))
+    .map((r) => r.handle).sort();
 }
 
 /**
@@ -197,38 +208,38 @@ async function handlesOf(sql: Sql, addresses: ReadonlySet<string>): Promise<stri
  */
 async function rollupChunk(sql: Sql, handles: readonly string[]): Promise<number> {
   return await sql.begin(async (tx) => {
-    await tx`delete from trader_fees_daily where handle = any(${handles})`;
-    const r = await tx`
+    /* Issued with no await between them, so the shim flushes both as ONE atomic d1 batch. */
+    void tx`delete from trader_fees_daily where handle in (${handles})`;
+    const r = tx`
       insert into trader_fees_daily (handle, network_id, day, fee_native, tx_count)
       with w as (
-        select t.handle, lower(x.addr) as address_key
-        from traders t
-        join wallets wl using (handle),
-        lateral (values (wl.evm_address_key), (lower(wl.sol_address))) x(addr)
-        where x.addr is not null
-          and (${handles}::text[] is null or t.handle = any(${handles}))
+        select handle, evm_address_key as address_key from wallets
+         where evm_address_key is not null and handle in (${handles})
+        union all
+        select handle, sol_address_key as address_key from wallets
+         where sol_address_key is not null and handle in (${handles})
       ),
       tx as (
         select distinct w.handle, t.network_id, t.tx_hash, t.block_time
         from w
         join transactions t on t.address_key = w.address_key
       )
-      select tx.handle, tx.network_id, (tx.block_time at time zone 'utc')::date as day,
+      select tx.handle, tx.network_id, substr(tx.block_time, 1, 10) as day,
              sum(f.fee_native) as fee_native,
-             count(*)::int     as tx_count
+             count(*)          as tx_count
       from tx
       join transaction_fees f
         on f.network_id = tx.network_id and f.tx_hash = tx.tx_hash
       where tx.block_time is not null
-      group by 1, 2, 3`;
-    return r.count;
+      group by tx.handle, tx.network_id, substr(tx.block_time, 1, 10)`;
+    return (await r).count;
   });
 }
 
 /**
  * Phase 1: one slice per chain in the workflow's order, under the read share of the budget.
  * Phase 2: the daily rollup for the traders those receipts belong to. Phase 2 is bounded by
- * its chunks (statement timeout each), not by the budget: a trader whose fees landed but
+ * its chunks (one D1 statement each), not by the budget: a trader whose fees landed but
  * whose days were not rebuilt would keep stale totals for good, since the anti-join never
  * offers those transactions again. Throws only when batches were sent and every one failed.
  */
@@ -238,7 +249,7 @@ export async function runFees(env: Env, budgetMs: number): Promise<FeesSummary> 
   const helius = (env.HELIUS_SOLANA_KEY ?? "").trim();
   const bitqueryKey = (env.BITQUERY_KEY ?? "").trim();
   if (!bitqueryKey) throw new Error("fees: BITQUERY_KEY is not set");
-  const sql = db(env);
+  const sql = jobSql(env);
   try {
     const byName = await chains(sql);
     const perChain: Record<string, ChainCount> = {};
