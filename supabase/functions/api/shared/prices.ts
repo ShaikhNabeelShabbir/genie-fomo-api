@@ -11,10 +11,13 @@ export async function nativePrices(): Promise<Map<number, NativePrice>> {
   const rows = await sql`
     with native as (
       select c.network_id, c.name, c.native_symbol,
+             -- The key that HAS a price first: the native sentinel (0x000…0) must not shadow a priced WETH/WBNB.
              (select q.token_key from quote_assets q
+               left join lateral (select 1 as priced from token_prices p
+                 where p.network_id = q.network_id and p.token_key = q.token_key limit 1) tp on true
                where q.network_id = c.network_id
                  and upper(q.symbol) in ('W' || upper(c.native_symbol), upper(c.native_symbol))
-               order by (upper(q.symbol) = upper(c.native_symbol)) desc
+               order by (tp.priced is not null) desc, (upper(q.symbol) = upper(c.native_symbol)) desc
                limit 1) as token_key
       from chains c)
     select n.network_id, n.native_symbol,

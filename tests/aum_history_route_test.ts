@@ -1,6 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
-  HISTORY_STEPS, HISTORY_WINDOWS, HistoryWindow, ageSeconds, defaultStep, windowRange, isHistoryStep, isHistoryWindow,
+  HISTORY_STEPS, HISTORY_WINDOWS, HistoryWindow, ageSeconds, defaultStep, latestValued, windowRange, isHistoryStep,
+  isHistoryWindow,
 } from "../supabase/functions/api/shared/aum-history-rules.ts";
 
 Deno.test("ageSeconds: whole seconds since `at`, from a Date or an ISO string, never negative", () => {
@@ -37,4 +38,15 @@ Deno.test("isHistoryStep / isHistoryWindow: only the published words", () => {
   assertEquals(isHistoryStep("1mo"), true);
   assertEquals(isHistoryWindow("2w"), false);
   assertEquals(isHistoryWindow("all"), true);
+});
+
+Deno.test("latestValued: the newest point with a value; a refused newest point (price_suspect) never stands in", () => {
+  const pts = [
+    { at: "2026-09-17T10:00:00.000Z", totalUsd: 12.5, reason: null },
+    { at: "2026-09-17T11:00:00.000Z", totalUsd: 13, reason: null },
+    { at: "2026-09-17T12:00:00.000Z", totalUsd: null, reason: "price_suspect" },
+  ];
+  assertEquals(latestValued(pts)?.at, "2026-09-17T11:00:00.000Z");
+  assertEquals(latestValued([pts[2]]), undefined);
+  assertEquals(latestValued([]), undefined);
 });

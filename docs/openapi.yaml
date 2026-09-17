@@ -5433,8 +5433,19 @@ components:
           - no_holdings
           - no_prices
           - too_little_priced
+          - price_suspect
           - null
           description: Hourly only. Why `totalUsd` is `null`; `null` when it is valued.
+        suspectUsd:
+          type: number
+          nullable: true
+          description: Hourly only. Gross value of positions whose price failed the suspect rule, kept
+            out of `totalUsd`; `null` when none (never 0).
+        unsellableUsd:
+          type: number
+          nullable: true
+          description: Hourly only. Gross value of honeypot / cannot-sell positions, kept out of
+            `totalUsd`; `null` when none (never 0).
         pricedPositions:
           type: integer
           description: Hourly only.
@@ -5571,8 +5582,19 @@ components:
           - no_holdings
           - no_prices
           - too_little_priced
+          - price_suspect
           - null
           description: Why `totalUsd` is `null`; `null` when valued (`aumHistory.now.reason`).
+        suspectUsd:
+          type: number
+          nullable: true
+          description: Gross value of positions whose price failed the suspect rule, kept out of
+            `totalUsd`; `null` when none (never 0).
+        unsellableUsd:
+          type: number
+          nullable: true
+          description: Gross value of honeypot / cannot-sell positions, kept out of `totalUsd`;
+            `null` when none (never 0).
         source:
           type: string
           enum:

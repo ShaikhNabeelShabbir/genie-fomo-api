@@ -35,3 +35,7 @@ export const windowRange = (window: HistoryWindow, now: Date): { from: string | 
 /** Whole seconds between a live figure's `at` and `now`; never negative (clock skew reads as 0). */
 export const ageSeconds = (at: Date | string, now: Date): number =>
   Math.max(0, Math.floor((now.getTime() - new Date(at).getTime()) / 1000));
+
+/** The newest point that carries a value: a `null` total (price_suspect, no_prices, ...) never stands in for the latest. */
+export const latestValued = <P extends { at: string; totalUsd: number | null }>(points: readonly P[]): P | undefined =>
+  points.filter((p) => p.totalUsd !== null).at(-1);
