@@ -1,4 +1,4 @@
-// Twin of scripts/lib/ts/settings.ts (the chain table and headers only): edit both.
+// The only copy since 18 Sep 2026 (the scripts/ twin was deleted with the GitHub loaders).
 /**
  * Provider constants shared by the transfer fetch. No env reads here: keys are passed in by
  * the caller (`ProviderKeys` in transactions.ts), so the same module runs under Deno and the

@@ -8,7 +8,7 @@ import { type Decoded, type NativeQuote, type Quote, type Receipt, type SwapRow,
  * A4, the wallet's OWN two-sided swaps on the EVM chains, read from receipts: the Worker half
  * of refresh.yml "Resolve EVM swaps from receipts".
  *
- * TWIN OF `scripts/resolve_evm_swaps_from_receipts.mjs`: edit both. Same candidate query, same
+ * Ported from `scripts/resolve_evm_swaps_from_receipts.mjs` (deleted 18 Sep 2026; the Worker is the only copy). Same candidate query, same
  * batch sizes, same decode and pricing rules (`swaps-core.ts`), same insert. Differs only where
  * the platform does: a wall-clock budget stops between batches and reports what is left, a
  * failed batch (transport, or a node refusing the batch) is counted and its transactions stay

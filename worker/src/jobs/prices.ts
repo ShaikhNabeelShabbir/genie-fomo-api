@@ -10,7 +10,7 @@ import {
  * Hourly DexScreener price per held token, on every chain, with a rolling ATH: the Worker half
  * of `.github/workflows/prices.yml`.
  *
- * TWIN OF `scripts/load_token_prices.mjs`: edit both. Same SQL, same 30-address batches under
+ * Ported from `scripts/load_token_prices.mjs` (deleted 18 Sep 2026; the Worker is the only copy). Same SQL, same 30-address batches under
  * the shared per-host throttle; differs only where the platform does — a wall-clock budget
  * (a cron killed mid-write records nothing, stopping early and saying so is better), a
  * failed DexScreener batch is counted rather than fatal, and no `--dry-run`/`--token` flags.

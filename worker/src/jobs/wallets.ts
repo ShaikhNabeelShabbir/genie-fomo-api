@@ -12,7 +12,7 @@ import { DENY, DUST_SOL, MIN_SOL, resolveCase } from "./wallets-core";
  * the case-preserved spelling back from the evidence transaction (Helius refuses a
  * lowercased base58 address) so the row can join the webhook registration.
  *
- * TWIN OF `scripts/link_wallets.mjs`: edit both. Same SQL and constants; differs only where
+ * Ported from `scripts/link_wallets.mjs` (deleted 18 Sep 2026; the Worker is the only copy). Same SQL and constants; differs only where
  * the platform does — a wall-clock budget checked before every insert and every RPC, a
  * failed unit is counted rather than fatal, the candidate scan runs under the job budget
  * instead of `statement_timeout = 0`, and no `--dry-run`/`--min-sol` flags.

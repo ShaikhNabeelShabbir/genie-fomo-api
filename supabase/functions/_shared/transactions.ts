@@ -1,4 +1,4 @@
-// Twin of scripts/lib/ts/transactions.ts: edit both. Differs only in how keys arrive (passed
+// The only copy since 18 Sep 2026 (the scripts/ twin was deleted with the GitHub loaders).
 // in as `ProviderKeys`, never read from the environment) and in typing third-party JSON as
 // `unknown` narrowed by the helpers below instead of `any`.
 import { EVM_CHAINS, HEADERS, type EvmChain } from "./settings.ts";

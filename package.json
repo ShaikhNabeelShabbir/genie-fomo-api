@@ -8,19 +8,15 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "smoke": "./scripts/smoke.sh"
   },
   "dependencies": {
-    "@types/pg": "^8.23.1",
-    "pg": "^8.23.0",
     "postgres": "^3.4.9"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260916.1",
     "@types/node": "^22.10.0",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.0",
     "wrangler": "^4.130.0"
   }

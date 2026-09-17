@@ -1,3 +1,0 @@
-# requests: build_directory_fomoapi.py. psycopg: load_to_db.py and load_trades.py.
-requests>=2.32
-psycopg[binary]>=3.1

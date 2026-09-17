@@ -1,4 +1,4 @@
-// Twin of scripts/lib/dexscreener.mjs: edit both.
+// The only copy since 18 Sep 2026 (the scripts/ twin was deleted with the GitHub loaders).
 /**
  * DexScreener's keyless token endpoint, for chains GMGN does not price (R4: robinhood).
  * docs/R4_ROBINHOOD_PRICES.md has the measurement; 30 addresses per call, 300 calls/min.
