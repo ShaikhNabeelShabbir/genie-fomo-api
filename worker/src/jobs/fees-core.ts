@@ -1,12 +1,11 @@
 /**
- * Pure half of the fee loader (`./fees.ts`): the fee arithmetic and the batch-reply reader,
- * ported one-for-one from `scripts/load_transaction_fees.mjs`. No imports and no I/O, so
- * `tests/fees_core_test.ts` runs it under Deno.
+ * Pure half of the fee loader (`./fees.ts`): the Solana batch-reply reader (ported from
+ * `scripts/load_transaction_fees.mjs`) and the Bitquery `EVM.Transactions` reader. No imports
+ * and no I/O, so `tests/fees_core_test.ts` runs it under Deno.
  */
 
-export type FeeKind = "evm" | "solana";
 export interface Fee { readonly hash: string; readonly fee: string }
-/** What one JSON-RPC batch reply yielded. `null` means the node REFUSED the batch. */
+/** What one reply yielded. `null` means the provider REFUSED the batch (a non-list reply). */
 export interface BatchRead { readonly fees: readonly Fee[]; readonly missing: number }
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -20,14 +19,6 @@ function scaled(units: bigint, decimals: number): string {
   return frac ? `${whole}.${frac}` : whole;
 }
 
-/** gasUsed x effectiveGasPrice, exact in wei, then scaled to the native coin (18 decimals). */
-export function evmFee(receipt: unknown): string | null {
-  if (!isRecord(receipt)) return null;
-  const g = receipt.gasUsed, p = receipt.effectiveGasPrice;
-  if (typeof g !== "string" || typeof p !== "string") return null;
-  try { return scaled(BigInt(g) * BigInt(p), 18); } catch { return null; }
-}
-
 /** `meta.fee` in lamports, scaled to SOL (9 decimals), as a string so nothing rounds. */
 export function solanaFee(tx: unknown): string | null {
   if (!isRecord(tx) || !isRecord(tx.meta)) return null;
@@ -37,12 +28,12 @@ export function solanaFee(tx: unknown): string | null {
 }
 
 /**
- * Read one batch reply against the hashes it was sent for (ids are indexes into `hashes`).
- * A reply that is not an array is a REFUSAL, not an empty answer: base once returned HTTP 200
- * carrying "maximum 10 calls in 1 batch", and reading that as "no fee" would write a silent
- * hole across a whole chain. An id never sent is never trusted; a null result is `missing`.
+ * Read one Helius `getTransaction` batch reply against the hashes it was sent for (ids are
+ * indexes into `hashes`). A reply that is not an array is a REFUSAL, not an empty answer:
+ * reading it as "no fee" would write a silent hole across the chain. An id never sent is never
+ * trusted; a null result is `missing`.
  */
-export function readBatch(reply: unknown, hashes: readonly string[], kind: FeeKind): BatchRead | null {
+export function readBatch(reply: unknown, hashes: readonly string[]): BatchRead | null {
   if (!Array.isArray(reply)) return null;
   const fees: Fee[] = [];
   let missing = 0;
@@ -50,11 +41,37 @@ export function readBatch(reply: unknown, hashes: readonly string[], kind: FeeKi
     if (!isRecord(r) || typeof r.id !== "number") continue;
     const hash = hashes[r.id];
     if (!hash) continue;
-    const res = r.result;
-    if (!res) { missing += 1; continue; }
-    const fee = kind === "solana" ? solanaFee(res) : evmFee(res);
+    const fee = r.result ? solanaFee(r.result) : null;
     if (fee === null) { missing += 1; continue; }
     fees.push({ hash, fee });
   }
   return { fees, missing };
+}
+
+/** A non-negative decimal in native units, as Bitquery scales it; anything else is absent. */
+function nativeDecimal(v: unknown): string | null {
+  if (typeof v !== "string" && typeof v !== "number") return null;
+  const s = String(v);
+  return /^\d+(\.\d+)?$/.test(s) ? s : null;
+}
+
+/**
+ * Read one Bitquery `EVM.Transactions` reply (`{ EVM: { Transactions: [{ Transaction: { Hash
+ * Cost }, Fee: { SenderFee } }] } }`) against the hashes it was asked for. `Fee.SenderFee` is
+ * what the sender paid in the chain's coin; `Transaction.Cost` (gas used x gas price) stands in
+ * when it is absent. A hash not in the reply is `missing`; a reply without the list is a refusal.
+ */
+export function readBitqueryFees(data: unknown, hashes: readonly string[]): BatchRead | null {
+  const evm = isRecord(data) && isRecord(data.EVM) ? data.EVM : null;
+  if (!evm || !Array.isArray(evm.Transactions)) return null;
+  const wanted = new Map(hashes.map((h) => [h.toLowerCase(), h]));
+  const fees = new Map<string, string>();
+  for (const row of evm.Transactions) {
+    if (!isRecord(row) || !isRecord(row.Transaction) || typeof row.Transaction.Hash !== "string") continue;
+    const hash = wanted.get(row.Transaction.Hash.toLowerCase());
+    if (!hash || fees.has(hash)) continue;
+    const fee = nativeDecimal(isRecord(row.Fee) ? row.Fee.SenderFee : undefined) ?? nativeDecimal(row.Transaction.Cost);
+    if (fee !== null) fees.set(hash, fee);
+  }
+  return { fees: [...fees].map(([hash, fee]) => ({ hash, fee })), missing: hashes.length - fees.size };
 }
