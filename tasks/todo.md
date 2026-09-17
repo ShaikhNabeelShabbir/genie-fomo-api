@@ -66,8 +66,16 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `clo
       suspect exclusion + priceSource + R6, Solana swap writer + quote pricing + feeds.swaps, scorecard reload
       semantics + fields cache, logoUrl); docs corrected (dates, P1, handles, B3); vocabulary v11; deployed.
       Reply: `docs/consumer/reply-to-genie-v3.md` (bundle: `v2-handoff/reply-v3.md`).
-- [ ] User: push migrations 20260918050000–090000; set WALLET_SUBMIT_SECRET; then I run quote_prices/swaps/balances/
-      aum_history on demand and rebuild the three suspect traders; merge to main; rotate secrets; prune worktrees.
+- [x] 17 Sep, v3 fixes deployed and the three suspect traders rebuilt.
+- [x] 17 Sep 09:30-10:40 UTC: **the database moved from Postgres (Supabase) to Cloudflare D1**, permanently.
+      Supabase saturated twice and took v1 and v2 down; the user called it. D1 `genie-copy-trading` (APAC),
+      30 tables + 12 views, 31 tables exported (724 MB CSV) and imported, counts verified (only drift is rows
+      the webhook wrote during the copy). Every API route (116 statements) and all 15 jobs (~120 statements)
+      rewritten to SQLite by two agents; the two valuation SQL functions are now `worker/src/jobs/valuation.ts`.
+      Worker holds only the `DB` binding; Hyperdrive deleted. Tuning found on the way: `holdings_current`
+      rewritten as a correlated maximum (253k rows -> 5.5k per trader), live refresh in fours, 10 MB import files.
+- [ ] Open: retire the Supabase project once the app team is on v2 (it kills v1); rotate every secret pasted in
+      chat; `/tokens` and `/market/regime` take ~7 s on D1 and want work; merge to main; prune worktrees.
 
 ## Status for the morning (17 Sep 2026)
 

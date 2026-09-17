@@ -10,8 +10,8 @@ a thousand visitors cost what one does and a request never waits on a third part
 
 | Deployment | Base URL | Status |
 |---|---|---|
-| **v2** Cloudflare Worker `genie-copy-trading-api` | `https://genie-copy-trading-api.agent-73b.workers.dev/v2/…` | **the product**, live since 17 Sep 2026 |
-| v1 Supabase Edge Function | `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api` | frozen at the 16 Sep 2026 deploy; kept until consumers have moved |
+| **v2** Cloudflare Worker `genie-copy-trading-api` on Cloudflare D1 | `https://genie-copy-trading-api.agent-73b.workers.dev/v2/…` | **the product**, live since 17 Sep 2026 |
+| v1 Supabase Edge Function | `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api` | frozen, and no longer written to since the D1 move on 17 Sep 2026; kept until consumers have moved |
 
 The app team's migration bundle is [`docs/consumer/v2-handoff/`](docs/consumer/v2-handoff/):
 a guide, the OpenAPI spec, the v1-to-v2 diff and the live vocabulary snapshot.
@@ -44,9 +44,10 @@ a guide, the OpenAPI spec, the v1-to-v2 diff and the live vocabulary snapshot.
 
 ## How it is put together
 
-One Cloudflare Worker and one Postgres database. The Worker serves the API, receives Solana
-pushes, and runs every loader as a cron job. Postgres stays on Supabase, reached through a
-Hyperdrive connection to the direct host with query caching off. GitHub Actions is CI/CD only.
+One Cloudflare Worker and one Cloudflare D1 database. The Worker serves the API, receives Solana
+pushes, and runs every loader as a cron job. Nothing outside Cloudflare is in the request path:
+the database moved off Postgres on 17 Sep 2026, after Supabase saturated twice in one morning and
+took both deployments down with it. GitHub Actions is CI/CD only.
 
 ```
                      ┌──────────────────────────────────────────────────────┐
@@ -54,9 +55,9 @@ Hyperdrive connection to the direct host with query caching off. GitHub Actions 
                      │  fetch:     /v2/*  ·  /webhook (Helius)  ·  /jobs/* │
   Helius ──/webhook─▶│  scheduled: 14 loader jobs on staggered crons        │
                      └───────────────────────────┬──────────────────────────┘
-                                                 │ Hyperdrive (direct host, no cache)
+                                                 │ D1 binding (DB)
                      ┌───────────────────────────▼──────────────────────────┐
-                     │ Postgres (Supabase)  traders · wallets · trades       │
+                     │ D1: genie-copy-trading   traders · wallets · trades   │
                      │   holdings · transactions · token_price_hourly        │
                      │   aum_history · aum_live · token_info · …            │
                      └──────────────────────────────────────────────────────┘
@@ -107,7 +108,8 @@ GitHub workflow were retired on 17 Sep 2026 when their ports landed in `worker/s
 | `worker/src/jobs/` | `directory`, `gmgn`, `scorecards`, `tokens`, `launches`, `transfers`, `wallets`, `quote_prices`, `prices`, `balances`, `fees`, `swaps`, `timing`, `aum_history`; each with a `-core.ts` of pure, tested helpers |
 | `supabase/functions/api/` | The read API: `app.ts` (auth, rate limit, 15 s timeout race, version rewrite), `router.ts`, `errors.ts`, `db.ts`, `config.ts`, `routes/*.ts` (one module per family), `shared/*.ts` (rules, `vocabulary.ts`, batch and cursor envelopes) |
 | `supabase/functions/_shared/` | Providers and chain helpers used by the jobs: `bitquery.ts`, `transactions.ts`, `dexscreener.ts`, `pumpfun.ts`, `solana_pda.ts`, `settings.ts`, `chain_reads.ts` (legacy RPC readers, v1 only) |
-| `supabase/migrations/` | 49 migrations, all applied. Check constraints are the only SQL-enforced vocabulary |
+| `worker/d1/migrations/` | The live schema: 30 tables, 12 views, all applied to D1. `SCHEMA_MAP.md` maps every Postgres object to its D1 form |
+| `supabase/migrations/` | History only: the Postgres schema the D1 one was folded from |
 | `scripts/` | Deno tools: `smoke.ts`, `acceptance_capture.ts`, `typecheck_gate.ts`, `lib/normalise.ts` |
 | `tests/` | 166 pure-function tests, no database (`deno task test`) |
 | `docs/` | `openapi.yaml` (the reference), design docs, runbooks, `DECISIONS.md` (the long rationale the code points at) |

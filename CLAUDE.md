@@ -4,9 +4,12 @@ Read this before exploring. It answers what past sessions spent ~500k tokens red
 
 ## What is live
 
-One Cloudflare Worker (`genie-copy-trading-api`) and one Postgres on Supabase, reached through Hyperdrive
-`genie-copy-trading-db` (direct IPv6 host, caching disabled). **v2 is the product:** `https://genie-copy-trading-api.agent-73b.workers.dev/v2`.
-v1 (`https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`) is the frozen 16 Sep 2026 Supabase deploy; nothing new lands there.
+One Cloudflare Worker (`genie-copy-trading-api`) and one Cloudflare D1 database (`genie-copy-trading`,
+binding `DB`). **v2 is the product:** `https://genie-copy-trading-api.agent-73b.workers.dev/v2`.
+Postgres, Supabase and Hyperdrive are GONE from the request path as of 17 Sep 2026: the data was
+exported and imported into D1 (31 tables, 1.29M transactions), every statement is SQLite dialect,
+and the Worker holds only the `DB` binding. v1 (`…supabase.co/functions/v1/api`) still answers from
+the old Postgres but is frozen and no longer written to; retire it once consumers have moved.
 Every loader is a Worker cron job (`worker/src/jobs/*`, table in `worker/src/index.ts`); GitHub Actions is CI/CD only.
 Balance history is BUILT (`aum_history`, hourly) and the current value is live (`aum_live`), not sampled.
 EVM data: Bitquery. Solana: Helius. Prices: DexScreener (+ Binance for quote assets). No free public RPC from the Worker.
@@ -20,7 +23,10 @@ EVM data: Bitquery. Solana: Helius. Prices: DexScreener (+ Binance for quote ass
 | `supabase/functions/helius-webhook/` | Solana transfer push receiver |
 | `worker/` | THE deployment (`npx wrangler deploy` from `worker/`; CI deploys on push when `CLOUDFLARE_DEPLOY=true`). `src/index.ts`: `JOBS` cron table (strings must match `wrangler.toml` [triggers]) and `POST /jobs/<name>` behind `JOB_SECRET`; `src/api.ts` runs the `supabase/functions/api` modules inside `runWith({ sql, env })`; `src/webhook.ts` Helius push (+ `aum_live_refresh`); `src/jobs/*.ts` one sliced, resumable loader per source with a `-core.ts` of pure helpers. Keep postgres.js `fetch_types` on: arrays break without it |
 | `supabase/functions/_shared/` | providers for the jobs: `bitquery.ts` (client + EVM balances), `transactions.ts` (transfers), `dexscreener.ts`, `pumpfun.ts`, `solana_pda.ts`, `settings.ts` (EVM_CHAINS); `chain_reads.ts` is LEGACY RPC for v1 only |
-| `supabase/migrations/` | schema, all applied; check constraints are the only SQL-enforced vocabulary. `aum_history_build` and `aum_live_refresh` hold valuation SQL |
+| `worker/d1/migrations/` | THE schema: `0001_schema.sql` (30 tables), `0002_views.sql` (12 views), then fixes. Apply with `npx wrangler d1 migrations apply genie-copy-trading --remote`. `worker/d1/SCHEMA_MAP.md` maps every Postgres object to its D1 form |
+| `supabase/migrations/` | HISTORY only: the Postgres schema the D1 one was folded from. Do not add to it |
+| `worker/src/d1.ts`, `worker/src/sql.ts` | the postgres.js-shaped shim over D1 (`jobSql(env)`); `docs/D1_MIGRATION.md` holds its rules and the SQLite dialect cheatsheet |
+| `worker/src/jobs/valuation.ts` | `buildAumHistory` and `refreshAumLive` — the two Postgres SQL functions, now TypeScript |
 | `scripts/` | Deno tools: `smoke.ts`, `acceptance_capture.ts`, `typecheck_gate.ts` (`deno task smoke|capture|check`) |
 | `docs/` | design docs and runbooks; `openapi.yaml` is the API reference (lint: `npx @redocly/cli lint docs/openapi.yaml`); `API_VALIDATION_FLAGS_17_SEP.md` the open validation gaps; `REVIEW_EFFICIENCY_17_SEP.md` is the ranked optimisation list; `LAUNCH_METADATA.md`, `R4_ROBINHOOD_PRICES.md` record measured sources; `docs/DECISIONS.md` holds the long rationale comments moved out of the code (`See docs/DECISIONS.md#dNNN`) |
 | `docs/consumer/` | acceptance suites, field contracts, the Genie app team's reports; `v2-handoff/` is what they receive |
@@ -95,4 +101,6 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
 - `null` means absent, zero means zero. Never coerce a missing figure to 0.
 - No tool can edit `.env.example` here; ask the user.
 - Jobs never call a free public RPC; EVM goes through `_shared/bitquery.ts`, Solana through Helius. Job strings in `index.ts` and `wrangler.toml` must match character for character.
-- Current state: v2 handed to the app team 17 Sep 2026 (`docs/consumer/v2-handoff/`). Open: rotate secrets, retire v1 when consumers have moved.
+- SQLite dialect only: no `::` casts, `filter (where`, `distinct on`, `lateral`, `unnest`, `array_agg`, `= any(`, `interval`, `now()`, `date_trunc`, `numeric`, `ctid`. Timestamps are ISO-8601 UTC TEXT, booleans 0/1, JSON is TEXT. 100 bound parameters and 30 s per statement; D1 runs one statement at a time, so small and many beats large and few.
+- D1 charges CPU per query and has no planner hints: a view that aggregates the whole table before the caller's filter will exceed the limit (`holdings_current`, 17 Sep). Write correlated maxima that an index can seek.
+- Current state: v2 on D1, handed to the app team 17 Sep 2026 (`docs/consumer/v2-handoff/`). Open: rotate secrets, retire the Supabase project once the app team is on v2.
