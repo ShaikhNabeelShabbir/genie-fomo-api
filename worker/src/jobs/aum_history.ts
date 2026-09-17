@@ -23,7 +23,8 @@ import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_histo
  * Rebuilding one moves its `computed_at` past its `hour`, so the predicate stops matching and
  * this converges and then costs nothing. The date bound keeps it a bounded scan rather than a
  * full pass over `aum_history` for ever; DELETE THIS FUNCTION AND ITS CALL once the count is 0
- * (`select count(*) from aum_history where basis='priced' and substr(computed_at,1,13)=substr(hour,1,13)`).
+ * (`select count(*) from aum_history where basis='priced' and computed_at < '2026-09-17T15:45:00.000Z'
+ * and substr(computed_at,1,13)=substr(hour,1,13)`).
  *
  * This exists because the on-demand rebuild endpoint needs `JOB_SECRET`, which nobody on the
  * team currently holds. The cron can heal it without one.
@@ -32,6 +33,13 @@ const HEAL_PER_RUN = 100;
 /** The only day the old ladder ever wrote; nothing outside it can match. */
 const HEAL_FROM = "2026-09-17T00:00:00.000Z";
 const HEAL_TO = "2026-09-18T00:00:00.000Z";
+/**
+ * Written BEFORE the ladder fix deployed. This, not "built inside its own hour", is what marks
+ * a poisoned row: the current hour is always built during itself, so that test matches every
+ * fresh row too and the pass could never converge — the count rose from 2,078 to 2,102 on the
+ * first run precisely because it kept re-selecting the hour it had just written.
+ */
+const HEAL_WRITTEN_BEFORE = "2026-09-17T15:45:00.000Z";
 /** Share of the run's budget the heal may spend before the ordinary build starts. */
 const HEAL_BUDGET_SHARE = 0.5;
 
@@ -41,6 +49,7 @@ async function healClockBuiltHours(sql: Sql, started: number, budgetMs: number):
       from aum_history
      where basis = 'priced'
        and hour >= ${HEAL_FROM} and hour < ${HEAL_TO}
+       and computed_at < ${HEAL_WRITTEN_BEFORE}
        and substr(computed_at, 1, 13) = substr(hour, 1, 13)
      group by handle
      order by min(hour)
