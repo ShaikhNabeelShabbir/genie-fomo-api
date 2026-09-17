@@ -34,15 +34,22 @@ export interface PricesSummary {
   readonly elapsedMs: number;
 }
 
-/** Every held, non-native token with the chain word DexScreener wants. */
+/**
+ * Every held, non-native token with the chain word DexScreener wants, MOST-HELD FIRST, then
+ * stalest first. ~26k tokens are held and one run prices ~20k at the DexScreener pace, so the
+ * order decides what an hourly run guarantees: the tokens most balances depend on are always
+ * priced this hour; the one-holder dust tail rotates by `token_price_stats.last_at`.
+ */
 async function targets(sql: Sql): Promise<Target[]> {
   const rows = await sql<{ network_id: string; chain: string; token_key: string; address: string }[]>`
-    select distinct h.network_id, ch.name as chain, h.token_key, tk.address
+    select h.network_id, ch.name as chain, h.token_key, tk.address
       from holdings_current h
       join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
       join chains ch on ch.network_id = h.network_id
+      left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
      where h.human_amount > 0 and h.token_key not in (${ZERO_ADDRESS}, ${SOL_MINT})
-     order by h.network_id, h.token_key`;
+     group by h.network_id, ch.name, h.token_key, tk.address, ps.last_at
+     order by count(distinct h.handle) desc, ps.last_at asc nulls first, h.network_id, h.token_key`;
   return rows.map((r) => ({ ...r, network_id: Number(r.network_id) }));
 }
 

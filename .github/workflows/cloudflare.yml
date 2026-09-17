@@ -75,7 +75,7 @@ jobs:
           curl -sf "$WORKER_URL/healthz"
       - name: API smoke (fails until /v1/* is ported — migration §5)
         continue-on-error: true
-        run: API_VERSION=v2 ./scripts/smoke.sh "$WORKER_URL"
+        run: API_VERSION=v2 deno task smoke "$WORKER_URL"
 
   acceptance-diff:
     # The §12 gate: the same capture against both deployments must diff empty.
@@ -88,8 +88,8 @@ jobs:
         env:
           GENIE_API_KEY: ${{ secrets.GENIE_API_KEY }}
         run: |
-          ./scripts/acceptance_capture.sh "${{ inputs.supabase_base }}" captures/supabase
-          API_VERSION=v2 ./scripts/acceptance_capture.sh "${{ inputs.worker_base }}" captures/worker
+          deno task capture "${{ inputs.supabase_base }}" captures/supabase
+          API_VERSION=v2 deno task capture "${{ inputs.worker_base }}" captures/worker
           diff -r captures/supabase captures/worker > captures/diff.txt || true
       - uses: actions/upload-artifact@v4
         if: always()
