@@ -62,18 +62,38 @@ export async function runAumLiveFlush(env: Env, _budgetMs: number): Promise<AumL
     // 20, not 40: a 40-trader run measured 373 s against a 5-minute cron, so it overlapped itself
     // and competed with every read for D1's single thread (17 Sep 2026). 20 a run is 240 an hour,
     // well above the rate wallets are marked at.
+    /**
+     * A2. ORDERED BY THE AGE OF THE VALUE, NOT THE AGE OF THE MARK.
+     *
+     * `order by marked_at` served whoever was marked longest ago — and a busy wallet is
+     * re-marked on every webhook push, so its mark is always seconds old and it sat at the back
+     * of the queue for ever. The most active traders held the stalest figures, which is exactly
+     * backwards. Measured 17 Sep: `bertluvv` carried a value from 12:25 with a mark refreshed
+     * at 16:47, and was one of 34 traders in that state.
+     *
+     * `l.at` ascending puts the longest-unvalued first, and SQLite sorts NULL first, so a
+     * trader with no figure at all leads.
+     */
     const marked = (await sql<{ handle: string; marked_at: string }[]>`
-      select handle, marked_at from aum_live_dirty order by marked_at limit 20`);
+      select d.handle, d.marked_at from aum_live_dirty d
+      left join aum_live l on l.handle = d.handle
+      order by l.at limit 20`);
     if (!marked.length) {
       return { marked: 0, refreshed: 0, toppedUp: await topUpUnmoved(sql, TOP_UP_PER_RUN), elapsedMs: Date.now() - started };
     }
     const handles = marked.map((m) => m.handle);
     const refreshed = await refreshAumLive(sql, handles, "webhook");
-    const newest = marked[marked.length - 1].marked_at;
-    // 80 ids plus `newest` stays under D1's 100 bound parameters a statement.
-    for (const part of chunk(handles, 80)) {
-      await sql`delete from aum_live_dirty where handle in (${part}) and marked_at <= ${newest}`;
-    }
+    /*
+     * Each mark is cleared against ITS OWN captured value, so a trader re-marked while the
+     * refresh ran keeps the newer mark and comes back next run. The single `newest` bound this
+     * replaced was only sound while the rows came back in `marked_at` order, which they no
+     * longer do.
+     */
+    await sql.begin(async (tx) => {
+      for (const m of marked) {
+        await tx`delete from aum_live_dirty where handle = ${m.handle} and marked_at <= ${m.marked_at}`;
+      }
+    });
     return {
       marked: handles.length,
       refreshed,
