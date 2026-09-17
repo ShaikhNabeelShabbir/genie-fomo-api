@@ -101,6 +101,15 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
 - `null` means absent, zero means zero. Never coerce a missing figure to 0.
 - No tool can edit `.env.example` here; ask the user.
 - Jobs never call a free public RPC; EVM goes through `_shared/bitquery.ts`, Solana through Helius. Job strings in `index.ts` and `wrangler.toml` must match character for character.
+- Provider traps, all three diagnosed 17 Sep 2026 and all three silent until then:
+  **Bitquery** reports a GraphQL error as `{"data": null, "errors": […]}` with HTTP 200 — the reply
+  guard must accept a null `data` or every message is lost; its cubes differ, so `Currency { Native }`
+  exists on Balances and NOT on DEXTrades; and its plan limits requests per minute, so
+  `bitquery()` paces at ~50/min and waits out a rate-limit reply.
+  **Binance answers 403 to this Worker** (it refuses Cloudflare egress), so `quote_prices` falls back
+  to Bybit, whose candle rows carry the open at index 0 and the close at index 4 exactly as a kline does.
+- A job that counts "errored" must count "unresolved" apart from it: a source answering "nothing here"
+  is not a failure, and lumping the two tripped the all-failed guard and hid a real bug (`tokens`, 17 Sep).
 - SQLite dialect only: no `::` casts, `filter (where`, `distinct on`, `lateral`, `unnest`, `array_agg`, `= any(`, `interval`, `now()`, `date_trunc`, `numeric`, `ctid`. Timestamps are ISO-8601 UTC TEXT, booleans 0/1, JSON is TEXT. 100 bound parameters and 30 s per statement; D1 runs one statement at a time, so small and many beats large and few.
 - D1 charges CPU per query and has no planner hints: a view that aggregates the whole table before the caller's filter will exceed the limit (`holdings_current`, 17 Sep). Write correlated maxima that an index can seek.
 - Current state: v2 on D1, handed to the app team 17 Sep 2026 (`docs/consumer/v2-handoff/`). Open: rotate secrets, retire the Supabase project once the app team is on v2.
