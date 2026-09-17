@@ -9,6 +9,10 @@ below quoted as current was read back from production after the deploy, not from
 **One of your asks is NOT fixed, and we want to be plain about it: V1d** (§1). Our first draft
 of this reply said it was; reading production back after the deploy showed it was not.
 
+**What we need from you: run the ten reads in "Verify the deployment" below** — each one says
+what it should return — then re-run your comparisons and send the next batch whenever it suits
+you. If a read disagrees with the table, that is the most useful thing you can send us.
+
 **Vocabulary goes to 12.** Three new words — `token_price_stats` (`positions[].priceSource`),
 `not_built` (`aumHistory.points[].reason`), `truncated` (`trades.coverage.byChain[].state`).
 **Three fields are renamed**: `coverage.chains.*.share` → `rowsPerSentTx`,
@@ -331,18 +335,47 @@ positions held. They were never meant to agree, and nothing said so.
 
 ---
 
-## What we would ask of you
+## Verify the deployment
 
-1. **Re-read `pricedShare` before `totalUsd`** on `/aum/history`, `/aum/now` and
-   `/positions.coverage`. It is the field that answers "is this a balance or a fragment", and it
-   is the one we should have published from the start.
-2. **Three renames land together**: `share` → `rowsPerSentTx`, `rowsHeld` → `transferRowsHeld`,
-   `onChain.swaps` → `swapsAppearedIn` (+ `ownSwaps`). You said you match on none of our `source`
-   strings; please confirm the same for these three. They are already live, so if any of them
-   does break something on your side, tell us and we will serve both spellings for a version.
-3. **`complete` gets stricter**, so lists that read `complete: true` today will read false with
-   an `incompleteReason`. That is the point, but it will change what your warning-sign counter
-   sees — it should now refuse to score a trader whose `/trades` is not `complete`.
+Ten reads, with what each should say. All against `$BASE = https://genie-copy-trading-api.agent-73b.workers.dev`,
+and **send a `User-Agent` that names your app** or Cloudflare will answer 403 `error code: 1010`.
+
+| # | Read | What you should see |
+|---|---|---|
+| 1 | `GET /v2/fields` | `vocabulary.version: 12`; `positions[].priceSource` includes `token_price_stats` |
+| 2 | `GET /v2/traders/gmgn_0xf80d7961/positions?limit=5` | `totalValueUsd` about **2,889** (it moves with the ETH close), `suspectUsd: 0`; the ethereum native priced `token_prices`, **not null** — it was null for you (N1) |
+| 3 | `GET /v2/traders/397397/aum/history?window=1d` | no flat $43,780.82 rung: those hours are `totalUsd: null`, `reason: too_little_priced`, `partialUsd: 43780.82`, `pricedShare: 0.0069` (A4) |
+| 4 | the same read | 08:00 and 09:00 present as `totalUsd: null`, `reason: not_built` (A3) |
+| 5 | `GET /v2/traders/cupseyy/aum/history?window=1d` | 12:00 withheld, 13:00 `partial: true`; **07:00 still $2.5B — this is the one we have not fixed** (V1d) |
+| 6 | `GET /v2/traders/smokey0x/trades?limit=50` | `complete: false`, `incompleteReason: chains_unresolved_and_chains_truncated`; solana `state: truncated` with a `horizonAt` that moves EARLIER on later reads as the backfill walks (W2) |
+| 7 | `GET /v2/traders/smokey0x` | `onChain.swapsAppearedIn` about **593** and `onChain.ownSwaps` about **6** — both rise as transfers land, the point is the gap between them, not the figures; **`onChain.swaps` is gone** |
+| 8 | `GET /v2/traders/397397/positions?limit=500` | all four honeypot rows `isHoneypot: true, canSell: false` (H2) |
+| 9 | `GET /v2/traders/tdmilky/positions?limit=500` | `coverage.chains.bsc` reads `transferRowsHeld: 200, rowsPerSentTx: 2.2989` — **the same 2.2989 you flagged, under a name that makes it correct**; `rowsHeld` and `share` are gone (C1). His four natives all price `token_prices` (N1) |
+| 10 | `GET /v2/health` | `feeds.aum` current, with `sampler.retired: true`; `staleTraders.liveStale` present (A2) |
+
+Three of those are breaking renames (7, 9, and `share`/`rowsHeld`). If any of them breaks your
+build, tell us and we will serve both spellings for a version rather than make you rush a fix.
+
+## What we need back from you
+
+1. **Confirm the ten reads above**, or tell us which one disagrees and what you saw.
+2. **Re-run the 450-trader comparison and the 397397 comparison now**, not tomorrow — N1, A1 and
+   R7 all moved with this deploy, and R7's numbers in particular should change a lot.
+3. **Send the next batch of feedback whenever it suits you.** The measurement style in v5 — two
+   timed read sets, an appendix with every status and duration, and the figures quoted back —
+   is what let us find the price-ladder bug in an afternoon. Please keep it.
+
+## Two changes that will move numbers on your side
+
+- **Read `pricedShare` before `totalUsd`** on `/aum/history`, `/aum/now` and
+  `/positions.coverage`. It answers "is this a balance or a fragment", and it is the field we
+  should have published from the start. Your $1B ceiling and your "one hour below a fiftieth of
+  its neighbours" rule are both subsumed by it — except on cupseyy, where §1 means the $1B guard
+  still earns its place.
+- **`complete` is stricter**, so a `/trades` list that read `complete: true` yesterday reads
+  false today with an `incompleteReason`. That is the point, but it changes what your
+  warning-sign counter sees: it should now refuse to score a trader whose list is not
+  `complete`, rather than scoring a record we have told you is partial.
 
 ## Still open, with dates
 
@@ -350,7 +383,7 @@ positions held. They were never meant to agree, and nothing said so.
 |---|---|---|
 | **V1d** — cupseyy's 07:00 $2.5B hour (45% coverage; no wallet-level check) | **NOT FIXED** | 22 Sep |
 | `/tokens` query rewrite (the cold-isolate timeout) | planned | 24 Sep |
-| Solana backfill reaching every wallet's first trade | running after deploy | ~7 days |
+| Solana backfill reaching every wallet's first trade (184 wallets hold a Solana address; 0 finished) | starts on the :40 run | ~1 week |
 | `truncated` for EVM chains (no end-of-history signal from Bitquery) | open, no date | — |
 | `liveBasis.evm: nightly_read` → the true interval | planned, vocabulary 13 | next bump |
 | Retire the v1 Supabase deployment | waiting on you being fully on v2 | — |
