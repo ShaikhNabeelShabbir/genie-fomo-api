@@ -59,8 +59,11 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `clo
       = CI/CD only; JS/Python/shell removed; `aum_history` (built, hourly, back to 11 Aug) + `aum_live` (webhook/
       balances/prices refresh) + price rollups + `/aum/history`, `/aum/now`, `/tokens/:address/prices`; vocabulary v10;
       `POST /jobs/<name>`; Bitquery for EVM balances (public RPC 429s). Handoff bundle `docs/consumer/v2-handoff/`.
-- [ ] In flight: tokens/fees/swaps/transfers off public RPC + Etherscan onto Bitquery; then merge to main, rotate secrets,
-      retire v1 when the app team has moved.
+- [x] Every EVM read on Bitquery (`dataset: realtime`; the plan has no archive tier), Blockscout/Etherscan/public RPC
+      gone from the Worker. Incident 05:00-05:15 UTC: per-push `aum_live_refresh` saturated Postgres (v1 26 s/query);
+      fixed with `aum_live_dirty` + minute flush cron, per-client max 2, Hyperdrive origin limit 35 (was 20 from Free).
+- [ ] User: push `20260918050000_aum_live_dirty`; merge to main; rotate every secret; retire v1 after the app team moves;
+      prune `.claude/worktrees`; consider Bitquery archive tier and a bigger Supabase compute (connection ceiling).
 
 ## Status for the morning (17 Sep 2026)
 

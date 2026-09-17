@@ -520,6 +520,12 @@ The Worker opens one postgres.js client per request with `max: 5`, prepared stat
 **Read `coverage`, `partial` and `reason` before trusting an empty answer.** `count: 0` with
 no error is "no activity"; `count: 0` with a reason is "we could not look".
 
+**The connection budget is the database's, not the Worker's.** Hyperdrive holds at most 35
+origin connections (`wrangler hyperdrive update … --origin-connection-limit`), each Worker
+client opens at most 2, and nothing runs a whole-roster valuation per event: the Helius
+receiver only marks traders in `aum_live_dirty`, a one-minute cron revalues them in one call.
+On 18 Sep a per-push revaluation at 40 pushes a minute took the database to 26 s per query.
+
 **A job's summary is its health.** `remaining` that never reaches zero across runs means the
 budget or the provider quota is the ceiling; `stoppedEarly` on every run means the slice is
 too big. Bitquery is metered in points; the balances job asks one query per EVM chain per
