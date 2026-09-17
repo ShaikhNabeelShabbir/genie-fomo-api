@@ -491,7 +491,6 @@ Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its 
 | `asOf` | both | `latest.at` (batch: the newest across the answered tokens); `null` when none is sampled. |
 | `tokens[].ok`, `error` | POST | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error: "ambiguous_chain"` (address on several chains and no `chain`; `chains[]` names them). `ok: true` rows carry `address`, `chain`, `symbol`, `points`, `count`, `latest`. At most 50 addresses; a duplicate is 400 `duplicate_identifier`. |
 
-<<<<<<< HEAD
 
 
 ## v3 fixes — valuation
@@ -521,7 +520,6 @@ Migration `20260918060000_valuation_v3.sql` (17 Sep 2026, fix request v3 V1 / N1
 | `health.staleTraders.scorecardStale` | /health | Now counts `source = fomoapi.io` traders only (the set the loader owns); `scorecardStaleGmgn` counts the rest, refreshed by the nightly gmgn job. |
 | `health.staleTraders.scorecardLoadFailed` | /health | Of the stale, the last attempt's outcome is anything but `loaded`; a never-attempted trader now counts. `scorecardNeverAttempted` is the subset with no `trade_loads` row at all. |
 | `fields.cachedForSeconds` | /fields | The body is memoised per isolate for 300 s (fill rates move hourly at most); `asOf` is when it was counted. |
-=======
 ## v3 fixes — swaps
 
 | Field | Route | Contract |
@@ -531,4 +529,3 @@ Migration `20260918060000_valuation_v3.sql` (17 Sep 2026, fix request v3 V1 / N1
 | `health.feeds.swaps` | /health | `max(wallet_swaps.block_time)`, the newest resolved swap on any chain; `staleAfterHours: 6`. Stale or never puts `swaps` in `staleFeeds[]` (`health.staleFeeds[]` gains the word). Carries `description`. |
 | `health.feeds.trades.description` | /health | `"fomoapi trade records, load time"`: this clock is fomoapi's scorecard load (`trades.captured_at`), not the on-chain swaps. |
 
->>>>>>> worktree-agent-a4c36b77e7d28c5c8

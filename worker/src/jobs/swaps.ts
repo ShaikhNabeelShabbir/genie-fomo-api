@@ -7,18 +7,9 @@ import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
 import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaDecode, toRow } from "./swaps-core";
 
 /**
-<<<<<<< HEAD
- * A4, the wallet's OWN two-sided swaps on the EVM chains: the Worker half of refresh.yml
- * "Resolve EVM swaps from receipts", now read from Bitquery's decoded `DEXTrades` rather than
- * receipts off a public node (no free JSON-RPC endpoint is called from the Worker since
- * 17 Sep 2026). Ported from `scripts/resolve_evm_swaps_from_receipts.mjs` (deleted 17 Sep 2026;
- * the Worker is the only copy). Same candidate query, same decode and pricing rules
- * (`swaps-core.ts`), same insert. A wall-clock budget stops between batches and reports what
- * is left; a failed batch is counted and its transactions stay unresolved for the next run.
-=======
  * A4, the wallet's OWN two-sided swaps, written to `wallet_swaps`. Phase 1 is Solana: every
  * `transactions` row tagged SWAP, resolved through Helius `getTransaction` pre/post balances
- * (ported from `scripts/resolve_wallet_swaps.mjs`, deleted 18 Sep 2026). Phase 2 is the EVM
+ * (ported from `scripts/resolve_wallet_swaps.mjs`, deleted 17 Sep 2026). Phase 2 is the EVM
  * chains from Bitquery's decoded `DEXTrades` (ported from
  * `scripts/resolve_evm_swaps_from_receipts.mjs`; no free JSON-RPC endpoint is called from the
  * Worker). Same decode and pricing rules (`swaps-core.ts`), same insert. Candidates are read
@@ -27,7 +18,6 @@ import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaD
  * it was a swap (95% are not), so the next run asks the next slice. A failed batch is counted
  * and its transactions stay unmarked for the next run. The run ends with a re-price pass over
  * the last 30 days for rows whose money leg got a daily close after they were written.
->>>>>>> worktree-agent-a4c36b77e7d28c5c8
  */
 
 type Sql = postgres.Sql;
