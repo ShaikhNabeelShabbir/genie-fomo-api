@@ -13,4 +13,8 @@ export interface Env {
   readonly ROUTE_TIMEOUT_MS?: string;
   readonly HELIUS_WEBHOOK_SECRET?: string;
   readonly HELIUS_SOLANA_KEY?: string;
+  /** Wall-clock budget for a cron job (`jobs/*`), ms. */
+  readonly JOB_BUDGET_MS?: string;
+  /** fomoapi bearer for the scorecard refresh (`jobs/scorecards.ts`). */
+  readonly FOMOAPI_KEY?: string;
 }
