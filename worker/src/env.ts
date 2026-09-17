@@ -18,4 +18,6 @@ export interface Env {
   /** Wall-clock budget for a cron job (`jobs/*`), ms. */
   /** fomoapi bearer for the scorecard refresh (`jobs/scorecards.ts`). */
   readonly FOMOAPI_KEY?: string;
+  /** GMGN openapi key for the directory load (`jobs/gmgn.ts`). */
+  readonly GMGN_API_KEY?: string;
 }
