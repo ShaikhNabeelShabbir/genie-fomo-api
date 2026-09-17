@@ -6,7 +6,7 @@ import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import {
   HISTORY_STEPS, HISTORY_WINDOWS, type HistoryStep, type HistoryWindow,
-  defaultStep, isHistoryStep, isHistoryWindow, windowRange,
+  ageSeconds, defaultStep, isHistoryStep, isHistoryWindow, windowRange,
 } from "../shared/aum-history-rules.ts";
 
 /**
@@ -16,6 +16,9 @@ import {
  *
  * The range is bounded (a window or from/to), so there is no cursor: `limit` keeps the
  * NEWEST points and the answer is ascending, newest last.
+ *
+ * `now` is the live figure from `aum_live`, refreshed when a watched wallet transacts, when a
+ * balance slice reads the wallet, and when prices land; /aum/now serves it alone.
  */
 const LIMIT_MAX = 2000;
 
@@ -111,7 +114,38 @@ async function computedAt(handles: string[]): Promise<Map<string, string>> {
   return by;
 }
 
-const series = (display: string, id: string | null, o: Options, pts: Point[], asOf: string | null) => {
+type LiveRow = {
+  handle: string; at: Date | string; total_usd: string | null; priced_positions: number;
+  total_positions: number; reason: string | null; source: string;
+};
+type Live = {
+  at: string; totalUsd: number | null; pricedPositions: number; totalPositions: number;
+  reason: string | null; source: string; ageSeconds: number;
+};
+
+/** The live figure per handle from `aum_live`, one query; a handle with no row is absent. */
+async function live(handles: string[]): Promise<Map<string, Live>> {
+  const rows = await sql<LiveRow[]>`
+    select handle, at, total_usd, priced_positions, total_positions, reason, source
+    from aum_live where handle = any(${handles})`;
+  const now = new Date();
+  const by = new Map<string, Live>();
+  for (const r of rows) {
+    by.set(r.handle, {
+      at: iso(r.at), totalUsd: round(n(r.total_usd)), pricedPositions: Number(r.priced_positions),
+      totalPositions: Number(r.total_positions), reason: r.reason ?? null, source: r.source,
+      ageSeconds: ageSeconds(r.at, now),
+    });
+  }
+  return by;
+}
+
+/** The newest `at` across live figures: the batch envelope's `asOf` for /aum/now. */
+const newestAt = (figures: Map<string, Live>): string | null =>
+  [...figures.values()].map((f) => f.at).sort().at(-1) ?? null;
+
+const series = (display: string, id: string | null, o: Options, pts: Point[], asOf: string | null,
+                now: Live | null) => {
   const valued = pts.filter((p) => p.totalUsd !== null);
   const last = valued.at(-1);
   return {
@@ -126,6 +160,7 @@ const series = (display: string, id: string | null, o: Options, pts: Point[], as
     valued: valued.length,
     latest: last ? { at: last.at, totalUsd: last.totalUsd } : null,
     asOf,
+    now,
   };
 };
 
@@ -136,21 +171,58 @@ get("/v1/traders/:handle/aum/history", async ({ handle }, url) => {
   const [t] = await sql<{ id: string | null; handle: string; display_handle: string }[]>`
     select id, handle, display_handle from traders where handle = ${await resolveTrader(handle)}`;
   if (!t) throw notFound(`no trader '${handle}' in the directory`);
-  const [pts, built] = await Promise.all([points([t.handle], o), computedAt([t.handle])]);
+  const [pts, built, figures] = await Promise.all([points([t.handle], o), computedAt([t.handle]), live([t.handle])]);
   return {
-    ...series(t.display_handle, t.id ?? null, o, pts.get(t.handle) ?? [], built.get(t.handle) ?? null),
+    ...series(t.display_handle, t.id ?? null, o, pts.get(t.handle) ?? [], built.get(t.handle) ?? null,
+              figures.get(t.handle) ?? null),
     links: {
       self: `/v1/traders/${t.display_handle}/aum/history?step=${o.step}&window=${o.window}`,
+      now: `/v1/traders/${t.display_handle}/aum/now`,
       aum: `/v1/traders/${t.display_handle}/aum`,
       trader: `/v1/traders/${t.display_handle}`,
     },
   };
 });
 
+get("/v1/traders/:handle/aum/now", async ({ handle }) => {
+  const [t] = await sql<{ id: string | null; handle: string; display_handle: string }[]>`
+    select id, handle, display_handle from traders where handle = ${await resolveTrader(handle)}`;
+  if (!t) throw notFound(`no trader '${handle}' in the directory`);
+  const figures = await live([t.handle]);
+  return {
+    handle: t.display_handle,
+    id: t.id ?? null,
+    now: figures.get(t.handle) ?? null,
+    links: {
+      self: `/v1/traders/${t.display_handle}/aum/now`,
+      history: `/v1/traders/${t.display_handle}/aum/history`,
+      aum: `/v1/traders/${t.display_handle}/aum`,
+      trader: `/v1/traders/${t.display_handle}`,
+    },
+  };
+});
+
+post("/v1/traders/aum/now", async (_p, _url, body) => {
+  const { requested, handles, asked, capped, traders } = await batchIds(body);
+  const figures = await live(handles);
+  return {
+    ...batchEnvelope(asked, capped, newestAt(figures)),
+    traders: requested.map((req, i) => {
+      const h = handles[i];
+      const t = traders.get(h);
+      if (!t) {
+        return { ok: false as const, requested: req, handle: null,
+                 error: { code: "not_found", detail: `no trader '${req}' in the directory` } };
+      }
+      return { ok: true as const, requested: req, handle: t.display_handle, id: t.id, now: figures.get(h) ?? null };
+    }),
+  };
+});
+
 post("/v1/traders/aum/history", async (_p, _url, body) => {
   const { requested, handles, asked, capped, traders } = await batchIds(body);
   const o = options((body ?? {}) as RawOptions, LIMIT_MAX);
-  const [pts, built] = await Promise.all([points(handles, o), computedAt(handles)]);
+  const [pts, built, figures] = await Promise.all([points(handles, o), computedAt(handles), live(handles)]);
   const asOf = [...built.values()].sort().at(-1) ?? null;
   return {
     ...batchEnvelope(asked, capped, asOf),
@@ -167,7 +239,7 @@ post("/v1/traders/aum/history", async (_p, _url, body) => {
                  error: { code: "not_found", detail: `no trader '${req}' in the directory` } };
       }
       return { ok: true as const, requested: req,
-               ...series(t.display_handle, t.id, o, pts.get(h) ?? [], built.get(h) ?? null) };
+               ...series(t.display_handle, t.id, o, pts.get(h) ?? [], built.get(h) ?? null, figures.get(h) ?? null) };
     }),
   };
 });

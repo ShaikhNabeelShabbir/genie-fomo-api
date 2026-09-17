@@ -5466,6 +5466,7 @@ components:
       - valued
       - latest
       - asOf
+      - now
       properties:
         handle:
           type: string
@@ -5528,6 +5529,182 @@ components:
           format: date-time
           nullable: true
           description: When this trader's history was last built; `null` when never.
+        now:
+          description: The live figure from `aum_live`; `null` when the trader has none yet.
+          anyOf:
+          - $ref: '#/components/schemas/AumLiveNow'
+          - type: object
+            nullable: true
+            enum:
+            - null
+            description: absent
+    AumLiveNow:
+      type: object
+      description: 'The trader''s current value, refreshed when a watched wallet transacts (Solana push),
+        when a balance slice reads the wallet, and when prices land. The hourly series'' last point is
+        refreshed with it. `totalUsd` is `null` when not valued (`reason` says why), never 0.'
+      required:
+      - at
+      - totalUsd
+      - pricedPositions
+      - totalPositions
+      - reason
+      - source
+      - ageSeconds
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: When the figure was last refreshed.
+        totalUsd:
+          type: number
+          nullable: true
+          description: Value held in USD; `null` when not valued, never 0.
+        pricedPositions:
+          type: integer
+        totalPositions:
+          type: integer
+        reason:
+          type: string
+          nullable: true
+          enum:
+          - no_holdings
+          - no_prices
+          - too_little_priced
+          - null
+          description: Why `totalUsd` is `null`; `null` when valued (`aumHistory.now.reason`).
+        source:
+          type: string
+          enum:
+          - webhook
+          - balances
+          - prices
+          - build
+          description: What last refreshed the figure (`aumHistory.now.source`).
+        ageSeconds:
+          type: integer
+          minimum: 0
+          description: Whole seconds since `at`, at the time of the answer.
+    AumNowResponse:
+      type: object
+      required:
+      - handle
+      - id
+      - now
+      - links
+      properties:
+        handle:
+          type: string
+          description: The trader's display handle.
+        id:
+          type: string
+          nullable: true
+          description: The trader's stable id.
+        now:
+          description: The live figure; `null` when the trader has none yet.
+          anyOf:
+          - $ref: '#/components/schemas/AumLiveNow'
+          - type: object
+            nullable: true
+            enum:
+            - null
+            description: absent
+        links:
+          type: object
+          required:
+          - self
+          - history
+          - aum
+          - trader
+          properties:
+            self:
+              type: string
+            history:
+              type: string
+            aum:
+              type: string
+            trader:
+              type: string
+    AumNowBatchTrader:
+      type: object
+      description: One entry per requested id, in the order sent. When `ok` is true the entry carries
+        `handle`, `id` and `now`; when false only `error`.
+      required:
+      - ok
+      - requested
+      - handle
+      properties:
+        ok:
+          type: boolean
+        requested:
+          type: string
+          description: The id exactly as the caller sent it.
+        handle:
+          type: string
+          nullable: true
+          description: The resolved display handle; `null` when `ok` is false.
+        id:
+          type: string
+          nullable: true
+        now:
+          description: The live figure; `null` when the trader has none yet.
+          anyOf:
+          - $ref: '#/components/schemas/AumLiveNow'
+          - type: object
+            nullable: true
+            enum:
+            - null
+            description: absent
+        error:
+          allOf:
+          - $ref: '#/components/schemas/FlowBatchTraderError'
+          description: Only when `ok` is false.
+    AumNowBatchRequest:
+      type: object
+      required:
+      - ids
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          description: Handles, display handles or `trd_` ids. Empty or absent is 400 `bad_request`; over
+            50 is a 400 refusal; a duplicate (after resolution) is 400 `duplicate_identifier`.
+          items:
+            type: string
+          example:
+          - 0xAvast
+          - trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+    AumNowBatchResponse:
+      type: object
+      required:
+      - limit
+      - asked
+      - capped
+      - asOf
+      - traders
+      properties:
+        limit:
+          type: integer
+          enum:
+          - 50
+          description: The batch cap.
+        asked:
+          type: integer
+          description: How many ids were sent; this call's rate-limit cost.
+        capped:
+          type: boolean
+          description: Always `false` here — over the cap is refused with 400, never trimmed.
+        asOf:
+          type: string
+          format: date-time
+          nullable: true
+          description: The newest `now.at` across the traders answered; `null` when none has a live figure.
+        traders:
+          type: array
+          items:
+            $ref: '#/components/schemas/AumNowBatchTrader'
     AumHistoryResponse:
       allOf:
       - $ref: '#/components/schemas/AumHistorySeries'
@@ -5539,10 +5716,13 @@ components:
             type: object
             required:
             - self
+            - now
             - aum
             - trader
             properties:
               self:
+                type: string
+              now:
                 type: string
               aum:
                 type: string
@@ -5640,6 +5820,15 @@ components:
           type: string
           format: date-time
           nullable: true
+        now:
+          description: The live figure; `null` when the trader has none yet.
+          anyOf:
+          - $ref: '#/components/schemas/AumLiveNow'
+          - type: object
+            nullable: true
+            enum:
+            - null
+            description: absent
         error:
           allOf:
           - $ref: '#/components/schemas/FlowBatchTraderError'
@@ -11671,8 +11860,17 @@ paths:
                   at: '2026-09-18T10:00:00.000Z'
                   totalUsd: 4416026.98
                 asOf: '2026-09-18T11:05:12.000Z'
+                now:
+                  at: '2026-09-18T11:58:41.000Z'
+                  totalUsd: 4418902.15
+                  pricedPositions: 198
+                  totalPositions: 214
+                  reason: null
+                  source: webhook
+                  ageSeconds: 79
                 links:
                   self: /v1/traders/0xAvast/aum/history?step=1h&window=1d
+                  now: /v1/traders/0xAvast/aum/now
                   aum: /v1/traders/0xAvast/aum
                   trader: /v1/traders/0xAvast
         '400':
@@ -11834,6 +12032,14 @@ paths:
                     at: '2026-09-18T00:00:00.000Z'
                     totalUsd: 4416026.98
                   asOf: '2026-09-18T11:05:12.000Z'
+                  now:
+                    at: '2026-09-18T11:58:41.000Z'
+                    totalUsd: 4418902.15
+                    pricedPositions: 198
+                    totalPositions: 214
+                    reason: null
+                    source: webhook
+                    ageSeconds: 79
                 - ok: false
                   requested: trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
                   handle: null
@@ -11875,6 +12081,264 @@ paths:
                 error:
                   code: not_found
                   detail: no route for POST /v1/traders/aum/histories
+                  requestId: req_5f1c9a3d2b7e4a10
+        '429':
+          description: Rate limit exceeded; `Retry-After` header is set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: rate_limited
+                  detail: too many requests — retry after the stated delay
+                  requestId: req_5f1c9a3d2b7e4a10
+                  retryAfterSeconds: 57
+        '500':
+          description: Unclassified failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: internal_error
+                  detail: the service failed to answer this request
+                  requestId: req_5f1c9a3d2b7e4a10
+        '503':
+          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
+            the `Retry-After` header is 5
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unavailable
+                  detail: the database is not answering — retry shortly
+                  requestId: req_5f1c9a3d2b7e4a10
+                  retryAfterSeconds: 5
+  /v1/traders/{handle}/aum/now:
+    get:
+      operationId: getTraderAumNow
+      tags:
+      - AUM
+      summary: The trader's live value, without the series
+      description: 'The `now` block of `GET /v1/traders/{handle}/aum/history` on its own, for callers that
+        only want the current figure. Read from `aum_live`, which is refreshed when a watched wallet
+        transacts (Solana push), when a balance slice reads the wallet, and when prices land; the
+        hourly series'' last point is refreshed with it. `now` is `null` when the trader has no live
+        figure yet; `now.totalUsd` is `null` when not valued (`reason` says why), never 0. `ageSeconds`
+        is how old the figure was when answered.'
+      parameters:
+      - name: handle
+        in: path
+        required: true
+        description: The trader's handle, display handle (case-insensitive), `@handle`, or stable id with
+          or without the `trd_` prefix. Unknown answers 404 `not_found`.
+        schema:
+          type: string
+        example: 0xAvast
+      responses:
+        '200':
+          description: The live figure
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+            RateLimit-Scope:
+              $ref: '#/components/headers/RateLimitScope'
+            x-request-id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AumNowResponse'
+              example:
+                handle: 0xAvast
+                id: 2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+                now:
+                  at: '2026-09-18T11:58:41.000Z'
+                  totalUsd: 4418902.15
+                  pricedPositions: 198
+                  totalPositions: 214
+                  reason: null
+                  source: webhook
+                  ageSeconds: 79
+                links:
+                  self: /v1/traders/0xAvast/aum/now
+                  history: /v1/traders/0xAvast/aum/history
+                  aum: /v1/traders/0xAvast/aum
+                  trader: /v1/traders/0xAvast
+        '401':
+          description: X-API-Key missing or wrong (only when the deployment sets GENIE_API_KEY)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unauthorized
+                  detail: invalid or missing X-API-Key
+                  requestId: req_5f1c9a3d2b7e4a10
+        '404':
+          description: No such trader
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: not_found
+                  detail: no trader 'nobody' in the directory
+                  requestId: req_5f1c9a3d2b7e4a10
+        '429':
+          description: Rate limit exceeded; `Retry-After` header is set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: rate_limited
+                  detail: too many requests — retry after the stated delay
+                  requestId: req_5f1c9a3d2b7e4a10
+                  retryAfterSeconds: 57
+        '500':
+          description: Unclassified failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: internal_error
+                  detail: the service failed to answer this request
+                  requestId: req_5f1c9a3d2b7e4a10
+        '503':
+          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
+            the `Retry-After` header is 5
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unavailable
+                  detail: the database is not answering — retry shortly
+                  requestId: req_5f1c9a3d2b7e4a10
+                  retryAfterSeconds: 5
+  /v1/traders/aum/now:
+    post:
+      operationId: batchTraderAumNow
+      tags:
+      - AUM
+      summary: The live value of up to 50 traders
+      description: 'The batch form of `GET /v1/traders/{handle}/aum/now`. Takes up to 50 ids (handles,
+        display handles or `trd_` ids) and answers one `traders[]` entry per requested id in the order
+        sent: `ok: true` with `handle`, `id` and `now` (`null` when the trader has no live figure yet),
+        or `ok: false` with a `not_found` error object for an id the directory does not hold. Over 50
+        ids is a 400 refusal, never a silent trim, and a duplicate id is a 400 `duplicate_identifier`.
+        One SQL read serves every id. The envelope''s `asOf` is the newest `now.at` across the traders
+        answered, `null` when none has one. The response''s `x-cost-units` header equals `asked`.'
+      requestBody:
+        required: true
+        description: Must be JSON; a body that does not parse answers 400 `bad_request` ("body must be
+          JSON").
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AumNowBatchRequest'
+            example:
+              ids:
+              - 0xAvast
+              - trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+      responses:
+        '200':
+          description: One entry per requested id
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+            RateLimit-Scope:
+              $ref: '#/components/headers/RateLimitScope'
+            x-request-id:
+              $ref: '#/components/headers/RequestId'
+            x-cost-units:
+              description: How many rate-limit units this call cost — the number of ids asked for (at
+                most 50).
+              schema:
+                type: integer
+                minimum: 1
+                maximum: 50
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AumNowBatchResponse'
+              example:
+                limit: 50
+                asked: 2
+                capped: false
+                asOf: '2026-09-18T11:58:41.000Z'
+                traders:
+                - ok: true
+                  requested: 0xAvast
+                  handle: 0xAvast
+                  id: 2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+                  now:
+                    at: '2026-09-18T11:58:41.000Z'
+                    totalUsd: 4418902.15
+                    pricedPositions: 198
+                    totalPositions: 214
+                    reason: null
+                    source: webhook
+                    ageSeconds: 79
+                - ok: false
+                  requested: trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f
+                  handle: null
+                  error:
+                    code: not_found
+                    detail: no trader 'trd_2f6d1c0e-8a7b-4c3d-9e1f-0a1b2c3d4e5f' in the directory
+        '400':
+          description: '`ids` missing, empty, over 50 or duplicated; body not JSON'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: bad_request
+                  detail: 'body must be { "ids": [...] } with at least one id or handle'
+                  requestId: req_5f1c9a3d2b7e4a10
+                  parameter: ids
+        '401':
+          description: X-API-Key missing or wrong (only when the deployment sets GENIE_API_KEY)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unauthorized
+                  detail: invalid or missing X-API-Key
+                  requestId: req_5f1c9a3d2b7e4a10
+        '404':
+          description: Never for a known route; an unknown id is reported inside `traders[]`, not as a
+            404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: not_found
+                  detail: no route for POST /v1/traders/aum/nows
                   requestId: req_5f1c9a3d2b7e4a10
         '429':
           description: Rate limit exceeded; `Retry-After` header is set

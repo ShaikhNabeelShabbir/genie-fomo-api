@@ -12,7 +12,7 @@ client, and how to verify. Everything in it is live now.
 | Path prefix | `/v1/…` | `/v2/…` (the same route names; `/v1/…` on the v2 host answers 404 with a hint) |
 | Code | frozen at the 16 Sep deploy | every fix from your 16 Sep report, the workflow routes, and the new history routes |
 | Data | the same Postgres, read live | the same Postgres, read live; every table is filled by scheduled jobs, never by a request |
-| Vocabulary (`/fields`) | version 2 | **version 9** |
+| Vocabulary (`/fields`) | version 2 | **version 10** |
 
 v1 stays up unchanged until you have moved. Nothing on v1 gains the new fields.
 
@@ -26,7 +26,7 @@ parameters and the same response keys; v2 only **adds** keys and words. Links in
 
 - `null` means absent, zero means zero. Never coerce.
 - Every enumerated value is a word published by `GET /v2/fields`. Your build should fail on a
-  word it has not seen; the list below is what you need to add for version 9.
+  word it has not seen; the list below is what you need to add for version 10.
 - Every error is `{ "error": { "code", "detail", "requestId", "hint"? } }` with a stable `code`.
 - Rate limit 240 requests a minute, reported in `RateLimit-Limit`, `RateLimit-Remaining`,
   `RateLimit-Reset`, `RateLimit-Scope`. A batch of 50 ids costs 50 units, shown in the
@@ -34,7 +34,7 @@ parameters and the same response keys; v2 only **adds** keys and words. Links in
 - Batch routes take at most 50 ids and answer per id, `ok: false` for an unknown one.
 - No API key is required today. If `X-API-Key` is switched on you will be told first.
 
-## 3. Words to add before switching (vocabulary v9)
+## 3. Words to add before switching (vocabulary v10)
 
 Add these to your allow-list, then point at v2. The complete list is `GET /v2/fields`.
 
@@ -44,6 +44,8 @@ Add these to your allow-list, then point at v2. The complete list is `GET /v2/fi
 | `aumHistory.step`, `tokenPrices.step` | `1h`, `1d`, `1w`, `1mo` |
 | `aumHistory.points[].basis` | `reading`, `priced` |
 | `aumHistory.points[].reason` | `no_holdings`, `no_prices`, `too_little_priced` |
+| `aumHistory.now.reason` | `no_holdings`, `no_prices`, `too_little_priced` (v10) |
+| `aumHistory.now.source` | `webhook`, `balances`, `prices`, `build` (v10) |
 | `aum.points[].refused` | adds `nothing_answered`, `price_suspect`, `no_tokens_known` |
 | `aum.coverage.partialReason` | `chains_missing`, `unpriced_positions`, `unsellable_positions` |
 | `positions[].priceSuspectReason` | `implied_mcap_over_ceiling`, `concentration_over_ceiling` |
@@ -138,6 +140,16 @@ ascending, at most 2000, newest kept. Draw `null` as a gap, never as zero.
 deploy while the table backfills (18 Sep 2026, from about 04:25 UTC); expect the past 14 days
 to be present within a few hours and history to extend as far back as balance captures exist.
 
+Every history answer (and each batch row) also carries `now`: the trader's live value,
+`{ at, totalUsd, pricedPositions, totalPositions, reason, source, ageSeconds }` or `null` when
+the trader has none yet. It is refreshed when a watched wallet transacts (Solana push), when a
+balance slice reads the wallet, and when prices land; `source` (`webhook`, `balances`, `prices`,
+`build`) says which, `ageSeconds` how old the figure was when answered, and the hourly series'
+last point is refreshed with it. `now.totalUsd` is `null` when not valued (`reason` uses the
+same three words as `points[].reason`), never 0. For the figure alone, without the series, call
+`GET /v2/traders/:handle/aum/now` or `POST /v2/traders/aum/now { "ids": [...] }` (up to 50,
+one row per id, envelope `asOf` = the newest `now.at`).
+
 ## 6. Price history: `/tokens/:address/prices`
 
 Hourly prices are stored for every token the directory holds (from 17 Sep 2026) with a running
@@ -163,7 +175,7 @@ its threshold shows `stale` in `/health` before it shows in a chart.
 
 ## 8. Verification checklist for the switch
 
-1. `GET /v2/fields` answers `version: 9` and your allow-list build passes.
+1. `GET /v2/fields` answers `version: 10` and your allow-list build passes.
 2. `GET /v2/chains` and `GET /v2/traders?limit=5` answer 200 with the same shapes as v1.
 3. `GET /v2/traders/397397/aum/history?window=1w` answers 200; `count > 0` once `asOf` is set.
 4. `GET /v2/traders/397397/positions` rows carry `tokenAddress` and `priceSuspect`.
