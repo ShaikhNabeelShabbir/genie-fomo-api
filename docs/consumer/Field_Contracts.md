@@ -477,3 +477,16 @@ Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its 
 | `asOf` | both | `latest.at` (batch: the newest across the answered tokens); `null` when none is sampled. |
 | `tokens[].ok`, `error` | POST | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error: "ambiguous_chain"` (address on several chains and no `chain`; `chains[]` names them). `ok: true` rows carry `address`, `chain`, `symbol`, `points`, `count`, `latest`. At most 50 addresses; a duplicate is 400 `duplicate_identifier`. |
 
+
+
+## v3 fixes — valuation
+
+Migration `20260918060000_valuation_v3.sql` (17 Sep 2026, fix request v3 V1 / N1 / Z1b). No new vocabulary version: `price_suspect` is added to two existing lists; two nullable fields are added. The rules are the ones `/positions` applies (`aum-sample/value.ts`), now run in SQL for `/aum/now` and every hourly `/aum/history` point.
+
+| Field | Route | Contract |
+|---|---|---|
+| `now.suspectUsd`, `points[].suspectUsd` | /aum/now, /aum/history (`1h` only; also the batch rows) | Gross value of positions whose price failed the suspect rule (implied market cap over $20B; one position over 90 % of the wallet's sellable gross with an unknown cap or a gross over $1B; a position over $1B with an unknown cap). Kept OUT of `totalUsd`. `null` when no position was suspect, never 0. Absent on rolled-up steps and null on `basis: reading` |
+| `now.unsellableUsd`, `points[].unsellableUsd` | same | Gross value of honeypot / cannot-sell positions (`token_info.is_honeypot` or `can_not_sell`). Kept OUT of `totalUsd`. `null` when none, never 0 |
+| `now.reason`, `points[].reason` | same | Gains `price_suspect`: nothing counted and at least one position was suspect. `no_prices` remains "nothing priced at all". A price `<= 0` is unpriced at every rung (a $0 token never counts as priced, so `1 of 1 priced` with `totalUsd: 0` cannot occur) |
+| `now.totalUsd`, `points[].totalUsd` | same | Stored unrounded, rounded to 2 dp at the route: a sub-cent real value reads `0` only after rounding, and `null` still means not valued. `latest` is the newest point with a non-null `totalUsd` |
+| `now.pricedPositions`, `points[].pricedPositions` | same | Counts positions with a value `> 0` that are neither suspect nor unsellable |

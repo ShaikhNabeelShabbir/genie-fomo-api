@@ -6,7 +6,7 @@ import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import {
   HISTORY_STEPS, HISTORY_WINDOWS, type HistoryStep, type HistoryWindow,
-  ageSeconds, defaultStep, isHistoryStep, isHistoryWindow, windowRange,
+  ageSeconds, defaultStep, isHistoryStep, isHistoryWindow, latestValued, windowRange,
 } from "../shared/aum-history-rules.ts";
 
 /**
@@ -19,6 +19,9 @@ import {
  *
  * `now` is the live figure from `aum_live`, refreshed when a watched wallet transacts, when a
  * balance slice reads the wallet, and when prices land; /aum/now serves it alone.
+ *
+ * `suspectUsd` / `unsellableUsd` (valuation v3, migration 20260918060000) is value the SQL kept
+ * OUT of `totalUsd`: prices that failed value.ts's suspect rule, and honeypot positions.
  */
 const LIMIT_MAX = 2000;
 
@@ -50,8 +53,9 @@ function options(raw: RawOptions, limit: number): Options {
 }
 
 type HourRow = {
-  handle: string; at: Date | string; total_usd: string | null; priced_positions: number;
-  total_positions: number; basis: string; reason: string | null;
+  handle: string; at: Date | string; total_usd: string | null; suspect_usd: string | null;
+  unsellable_usd: string | null; priced_positions: number; total_positions: number; basis: string;
+  reason: string | null;
 };
 type BucketRow = {
   handle: string; at: Date | string; total_usd: string | null; high_usd: string | null;
@@ -59,6 +63,7 @@ type BucketRow = {
 };
 type Point = {
   at: string; totalUsd: number | null; basis?: string; reason?: string | null;
+  suspectUsd?: number | null; unsellableUsd?: number | null;
   pricedPositions?: number; totalPositions?: number;
   highUsd?: number | null; lowUsd?: number | null; valuedHours?: number;
 };
@@ -73,8 +78,8 @@ const iso = (v: Date | string): string => new Date(v).toISOString();
 async function points(handles: string[], o: Options): Promise<Map<string, Point[]>> {
   const rows: (HourRow | BucketRow)[] = o.step === "1h"
     ? await sql<HourRow[]>`
-        select handle, at, total_usd, priced_positions, total_positions, basis, reason from (
-          select handle, hour as at, total_usd, priced_positions, total_positions, basis, reason,
+        select handle, at, total_usd, suspect_usd, unsellable_usd, priced_positions, total_positions, basis, reason from (
+          select handle, hour as at, total_usd, suspect_usd, unsellable_usd, priced_positions, total_positions, basis, reason,
                  row_number() over (partition by handle order by hour desc) as rn
           from aum_history
           where handle = any(${handles})
@@ -96,6 +101,7 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
   for (const r of rows) {
     const p: Point = "basis" in r
       ? { at: iso(r.at), totalUsd: round(n(r.total_usd)), basis: r.basis, reason: r.reason ?? null,
+          suspectUsd: round(n(r.suspect_usd)), unsellableUsd: round(n(r.unsellable_usd)),
           pricedPositions: Number(r.priced_positions), totalPositions: Number(r.total_positions) }
       : { at: iso(r.at), totalUsd: round(n(r.total_usd)), highUsd: round(n(r.high_usd)),
           lowUsd: round(n(r.low_usd)), valuedHours: Number(r.valued_hours) };
@@ -115,24 +121,26 @@ async function computedAt(handles: string[]): Promise<Map<string, string>> {
 }
 
 type LiveRow = {
-  handle: string; at: Date | string; total_usd: string | null; priced_positions: number;
-  total_positions: number; reason: string | null; source: string;
+  handle: string; at: Date | string; total_usd: string | null; suspect_usd: string | null;
+  unsellable_usd: string | null; priced_positions: number; total_positions: number;
+  reason: string | null; source: string;
 };
 type Live = {
-  at: string; totalUsd: number | null; pricedPositions: number; totalPositions: number;
-  reason: string | null; source: string; ageSeconds: number;
+  at: string; totalUsd: number | null; suspectUsd: number | null; unsellableUsd: number | null;
+  pricedPositions: number; totalPositions: number; reason: string | null; source: string; ageSeconds: number;
 };
 
 /** The live figure per handle from `aum_live`, one query; a handle with no row is absent. */
 async function live(handles: string[]): Promise<Map<string, Live>> {
   const rows = await sql<LiveRow[]>`
-    select handle, at, total_usd, priced_positions, total_positions, reason, source
+    select handle, at, total_usd, suspect_usd, unsellable_usd, priced_positions, total_positions, reason, source
     from aum_live where handle = any(${handles})`;
   const now = new Date();
   const by = new Map<string, Live>();
   for (const r of rows) {
     by.set(r.handle, {
-      at: iso(r.at), totalUsd: round(n(r.total_usd)), pricedPositions: Number(r.priced_positions),
+      at: iso(r.at), totalUsd: round(n(r.total_usd)), suspectUsd: round(n(r.suspect_usd)),
+      unsellableUsd: round(n(r.unsellable_usd)), pricedPositions: Number(r.priced_positions),
       totalPositions: Number(r.total_positions), reason: r.reason ?? null, source: r.source,
       ageSeconds: ageSeconds(r.at, now),
     });
@@ -147,7 +155,7 @@ const newestAt = (figures: Map<string, Live>): string | null =>
 const series = (display: string, id: string | null, o: Options, pts: Point[], asOf: string | null,
                 now: Live | null) => {
   const valued = pts.filter((p) => p.totalUsd !== null);
-  const last = valued.at(-1);
+  const last = latestValued(pts);
   return {
     handle: display,
     id,

@@ -80,10 +80,10 @@ export const VOCABULARY = {
     /* 17 Sep 2026, v9: /aum/history, built from stored holdings and prices (table aum_history). */
     "aumHistory.step": ["1h", "1d", "1w", "1mo"],
     "aumHistory.points[].basis": ["reading", "priced"],
-    "aumHistory.points[].reason": ["no_holdings", "no_prices", "too_little_priced"],
+    "aumHistory.points[].reason": ["no_holdings", "no_prices", "too_little_priced", "price_suspect"],
     /* The live figure (`now` on /aum/history and /aum/now): what last refreshed it, why unvalued. */
     "aumHistory.now.source": ["webhook", "balances", "prices", "build"],
-    "aumHistory.now.reason": ["no_holdings", "no_prices", "too_little_priced"],
+    "aumHistory.now.reason": ["no_holdings", "no_prices", "too_little_priced", "price_suspect"],
     /* GET /tokens/:address/prices and POST /tokens/prices: the bucket a point covers. */
     "tokenPrices.step": ["1h", "1d", "1w", "1mo"],
   },
