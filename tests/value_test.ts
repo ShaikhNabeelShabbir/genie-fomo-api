@@ -1,7 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
-  IMPLIED_MCAP_CEILING_USD, MAX_POSITION_USD, MAX_PRICE_PER_TOKEN,
-  concentrationSuspect, decideTotal, priceSuspectReason, suspectRows, value,
+  IMPLIED_MCAP_CEILING_USD, MAX_POSITION_USD, MAX_PRICE_PER_TOKEN, NO_MARKET_CEILING_USD,
+  concentrationSuspect, decideTotal, noMarketSuspect, priceSuspectReason, suspectRows, value,
 } from "../supabase/functions/aum-sample/value.ts";
 
 Deno.test("value: no price is a coverage gap, not a zero", () => {
@@ -47,21 +47,48 @@ Deno.test("priceSuspectReason: names the failed check on a /positions row, or nu
 
 Deno.test("suspectRows: two absurd coins in one wallet are both flagged, the sane remainder is not (V1b)", () => {
   const rows = [
-    { price: 8923.86, supply: null, usd: 291e9 },   // cupseyy's $291B coin, no supply row
-    { price: 1019.42, supply: null, usd: 182e9 },   // the second absurd one, 38 % of the gross
-    { price: 1.18, supply: 1e9, usd: 27e6 },
-    { price: null, supply: null, usd: null },
+    { price: 8923.86, supply: null, usd: 291e9, liquidityUsd: null },   // cupseyy's $291B coin, no supply row
+    { price: 1019.42, supply: null, usd: 182e9, liquidityUsd: null },   // the second absurd one, 38 % of the gross
+    { price: 1.18, supply: 1e9, usd: 27e6, liquidityUsd: 40e6 },
+    { price: null, supply: null, usd: null, liquidityUsd: null },
   ];
   assertEquals(suspectRows(rows), ["concentration_over_ceiling", "concentration_over_ceiling", null, null]);
   // Under the USD ceiling the iteration alone catches the second: 95 of 100 with cap unknown, then 4.6 of 5.
-  assertEquals(suspectRows([{ price: 1, supply: null, usd: 95 }, { price: 1, supply: null, usd: 4.6 }, { price: 1, supply: 1e6, usd: 0.4 }]),
+  assertEquals(suspectRows([{ price: 1, supply: null, usd: 95, liquidityUsd: 1e4 }, { price: 1, supply: null, usd: 4.6, liquidityUsd: 1e4 }, { price: 1, supply: 1e6, usd: 0.4, liquidityUsd: 1e4 }]),
     ["concentration_over_ceiling", "concentration_over_ceiling", null]);
   // A known cap and a sane total: nothing is flagged, however concentrated.
-  assertEquals(suspectRows([{ price: 1, supply: 1e6, usd: 95 }, { price: 1, supply: 1e6, usd: 5 }]), [null, null]);
+  assertEquals(suspectRows([{ price: 1, supply: 1e6, usd: 95, liquidityUsd: 1e4 }, { price: 1, supply: 1e6, usd: 5, liquidityUsd: 1e4 }]), [null, null]);
   // An implied-cap failure is flagged first and leaves the base to the rest.
-  assertEquals(suspectRows([{ price: 100, supply: 1e9, usd: 10 }, { price: 1, supply: null, usd: 50 }, { price: 1, supply: 1e6, usd: 40 }]),
+  assertEquals(suspectRows([{ price: 100, supply: 1e9, usd: 10, liquidityUsd: 1e4 }, { price: 1, supply: null, usd: 50, liquidityUsd: 1e4 }, { price: 1, supply: 1e6, usd: 40, liquidityUsd: 1e4 }]),
     ["implied_mcap_over_ceiling", null, null]);
   assertEquals(suspectRows([]), []);
+});
+
+Deno.test("noMarketSuspect: over 10x the pool, or over the ceiling with no pool known", () => {
+  assertEquals(noMarketSuspect(14.7e6, 12e3), true);
+  assertEquals(noMarketSuspect(5e6, 40e6), false);
+  assertEquals(noMarketSuspect(NO_MARKET_CEILING_USD + 1, null), true);
+  assertEquals(noMarketSuspect(500e3, null), false);
+  assertEquals(noMarketSuspect(null, null), false);
+});
+
+Deno.test("suspectRows: no market behind the price is flagged on every row, not only the largest (V1d)", () => {
+  // cupseyy-shaped: three absurd coins, each under 90 % of the remaining base, no pair anywhere.
+  assertEquals(suspectRows([
+    { price: 10, supply: null, usd: 800e6, liquidityUsd: null },
+    { price: 10, supply: null, usd: 800e6, liquidityUsd: null },
+    { price: 10, supply: null, usd: 800e6, liquidityUsd: null },
+  ]), ["no_market_over_ceiling", "no_market_over_ceiling", "no_market_over_ceiling"]);
+  // shahh-shaped: supply known, cap under $20B, 99.5 % of the wallet, but a $12k pool.
+  assertEquals(suspectRows([
+    { price: 1019.42, supply: 1e6, usd: 14.7e6, liquidityUsd: 12e3 },
+    { price: 1, supply: 1e9, usd: 70e3, liquidityUsd: 5e6 },
+  ]), ["no_market_over_ceiling", null]);
+  // A real whale in a deep pool, and a mid-size position with no pair known: neither is flagged.
+  assertEquals(suspectRows([
+    { price: 2, supply: 1e9, usd: 5e6, liquidityUsd: 40e6 },
+    { price: 1, supply: null, usd: 500e3, liquidityUsd: null },
+  ]), [null, null]);
 });
 
 Deno.test("decideTotal: nothing asked is null with the most common failure word, never 0", () => {

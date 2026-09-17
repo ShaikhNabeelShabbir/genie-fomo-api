@@ -26,7 +26,9 @@ const gross = (r: Record<string, unknown>): number | null => {
 
 /** V1b: one trader's rows judged together; an unsellable row is already out of the total and never enters the base. */
 const suspectVerdicts = (rows: readonly Record<string, unknown>[]): (PriceSuspectReason | null)[] =>
-  suspectRows(rows.map((r) => ({ price: n(r.price), supply: n(r.total_supply), usd: unsellable(r) ? null : gross(r) })));
+  suspectRows(rows.map((r) => ({
+    price: n(r.price), supply: n(r.total_supply), usd: unsellable(r) ? null : gross(r), liquidityUsd: n(r.liquidity_usd),
+  })));
 
 get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
   const [t] = await sql`
@@ -198,6 +200,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            (q.token_key is not null) as is_quote,
            ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
            coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0))::float8 as total_supply,
+           -- V1d: the best pair's liquidity, latest hourly sample first, else GMGN's; null = no pair known.
+           coalesce(ph.liquidity_usd, ti.liquidity_usd)::float8 as liquidity_usd,
            -- Workflow gap 4: Solana rolled forward from the webhook feed since the read.
            h.human_amount_live, h.delta, h.last_transfer_at
     from holdings_live h
@@ -206,6 +210,11 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
+    left join lateral (
+      select liquidity_usd from token_price_hourly
+       where network_id = h.network_id and token_key = h.token_key
+       order by hour desc limit 1
+    ) ph on true
     where h.handle = ${t.handle}
     -- Priced rows first, descending. Unpriced rows TRAIL rather than being dropped: they
     -- are real holdings we simply cannot value, and hiding them would misstate the count.
@@ -383,12 +392,18 @@ post("/v1/traders/positions", async (_p, _url, body) => {
            coalesce(ti.symbol, tk.symbol) as symbol,
            h.human_amount, h.price, h.value, h.source, h.captured_at,
            h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
-           coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0))::float8 as total_supply
+           coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0))::float8 as total_supply,
+           coalesce(ph.liquidity_usd, ti.liquidity_usd)::float8 as liquidity_usd
     from holdings_current h
     join chains ch using (network_id)
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
+    left join lateral (
+      select liquidity_usd from token_price_hourly
+       where network_id = h.network_id and token_key = h.token_key
+       order by hour desc limit 1
+    ) ph on true
     where h.handle = any(${handles})
     order by h.handle, h.value desc nulls last`;
 
