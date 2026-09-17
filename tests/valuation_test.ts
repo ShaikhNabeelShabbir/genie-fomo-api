@@ -171,14 +171,20 @@ Deno.test("buildAumHistory: ladder is peg, then hourly within 24 h, then that da
   assertEquals(history(db, "a").map((r) => [r.total_usd, r.priced_positions, r.total_positions]), [[13, 3, 4]]);
 });
 
-Deno.test("buildAumHistory: token_info prices the current hour only", async () => {
+Deno.test("buildAumHistory: token_info prices NO hour, not even the current one (V1d)", async () => {
+  /*
+   * This test asserted the opposite until 17 Sep 2026, and the behaviour it locked in was the
+   * bug: `token_info.price_usd` is GMGN's CURRENT price with no time attached, so pricing the
+   * current hour with it made an hour's value depend on when it was built. Both hours below
+   * hold the same coin and neither has a dated price, so neither may be valued.
+   */
   const { sql, db } = await open();
   trader(db, "a");
   token(db, 1, "0xaa");
   run(db, "insert into token_info (network_id, token_key, price_usd) values (1,'0xaa',4)");
   capture(db, "a", 1, "0xaa", new Date(Date.now() - 2 * HOUR).toISOString(), 3);
   await buildAumHistory(sql, "a", hourIso(Date.now() - HOUR), CURRENT_HOUR);
-  assertEquals(history(db, "a").map((r) => [r.total_usd, r.reason]), [[null, "no_prices"], [12, null]]);
+  assertEquals(history(db, "a").map((r) => [r.total_usd, r.reason]), [[null, "no_prices"], [null, "no_prices"]]);
 });
 
 Deno.test("buildAumHistory: honeypot and suspect value sit beside the total, never in it", async () => {
@@ -242,4 +248,31 @@ Deno.test("refreshAumLive: a null handle list means every trader with a wallet; 
   run(db, "update aum_live set at = ? where handle = 'b'", new Date(Date.now() - 5 * HOUR).toISOString());
   assertEquals(await refreshAumLive(sql, null, "build", 1), 1);
   assertEquals(db.prepare("select handle from aum_live where source = 'build' order by handle").all().length, 2);
+});
+
+Deno.test("buildAumHistory: V1d — an hour is valued the same whenever it is built", async () => {
+  /*
+   * The ladder used to end with GMGN's `token_info.price_usd` when the hour being built was
+   * the hour we were in. That made the value depend on WHEN we computed it: on 17 Sep cupseyy's
+   * 07:00 priced 5,082 positions and read $2.5B when built at 07:33, while 08:00-10:00 rebuilt
+   * later priced 187 and read $1,686. Only timestamped rungs may price a past hour.
+   */
+  const { sql, db } = await open();
+  trader(db, "a");
+  token(db, 1, "0xaa");
+  capture(db, "a", 1, "0xaa", "2026-09-10T03:10:00.000Z", 10);
+  /* GMGN carries an absurd current price and no timestamp; nothing else prices this token. */
+  run(db, "insert into token_info (network_id, token_key, price_usd, total_supply) values (1,'0xaa',28160,1e9)");
+
+  const thisHour = new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000).toISOString();
+  await buildAumHistory(sql, "a", thisHour, thisHour);
+  const [current] = history(db, "a");
+  assertEquals([current.total_usd, current.priced_positions, current.reason],
+    [null, 0, "no_prices"], "the CURRENT hour must not borrow an untimestamped price either");
+
+  /* The same holdings with a dated close: priced, and priced identically whenever built. */
+  run(db, "insert into token_prices (network_id, token_key, day, usd, source) values (1,'0xaa','2026-09-10',2,'t')");
+  await buildAumHistory(sql, "a", "2026-09-10T03:00:00.000Z", "2026-09-10T03:00:00.000Z");
+  const dated = history(db, "a").find((r) => r.hour === "2026-09-10T03:00:00.000Z");
+  assertEquals([dated?.total_usd, dated?.priced_positions], [20, 1]);
 });

@@ -320,7 +320,6 @@ export async function buildAumHistory(sql: Sql, handle: string, fromIso: string,
     }
   }
 
-  const currentHour = hourIso(Date.now());
   const out = hours.map((t, i) => {
     const hour = new Date(t).toISOString();
     const reading = readings.get(hour);
@@ -344,10 +343,28 @@ export async function buildAumHistory(sql: Sql, handle: string, fromIso: string,
         (best, r) => (r.hour <= hour && new Date(r.hour).getTime() > t - HOURLY_STALE_MS && (!best || r.hour > best.hour) ? r : best),
         null,
       );
+      /**
+       * V1d / A4 (v5 fixes, 17 Sep 2026). EVERY RUNG HERE CARRIES A TIMESTAMP.
+       *
+       * There used to be a fourth: `hour === currentHour ? f.infoPrice : null` — GMGN's
+       * `token_info.price_usd`, which is a CURRENT price with no time attached, applied only
+       * when the hour being built happened to be the hour we were in. An hour's value
+       * therefore depended on WHEN WE COMPUTED IT rather than on what was true, and the same
+       * hour changed retroactively the moment it was rebuilt.
+       *
+       * Measured on cupseyy, 17 Sep: hours built inside their own hour priced 5,082 / 1,131 /
+       * 1,135 of 11,278 positions; the identical hours rebuilt later priced 118 / 187 / 193.
+       * That is the sawtooth the app team charted, and the 07:00 hour that read
+       * $2,509,077,756 — GMGN prices one of his memecoins at $28,160 against a 1e9 supply, a
+       * $28 trillion implied cap. The suspect rule catches the worst of them; the survivors
+       * still summed to two and a half billion dollars.
+       *
+       * `refreshAumLive` keeps that rung, and should: `now` IS current, so a current price is
+       * the right thing to value it with. A past hour is not.
+       */
       const price = f.pegged
         ?? sample?.usd
         ?? daily.get(`${k}|${dayOf(hour)}`)
-        ?? (hour === currentHour ? f.infoPrice : null)
         ?? null;
       return { amount: b.amount, price, supply: f.supply, liquidityUsd: f.liquidity,
                unsellable: f.unsellable, quoteAsset: f.quoteAsset };
