@@ -2,31 +2,37 @@ import type postgres from "postgres";
 import type { Env } from "../env";
 import { db } from "../db";
 import { rpc, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
-import { type Fee, type FeeKind, readBatch } from "./fees-core";
+import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
+import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
+import { type BatchRead, type Fee, readBatch, readBitqueryFees } from "./fees-core";
 
 /**
  * Transaction fees, the Worker half of the three "Read transaction fees" steps and "Refresh
  * trader fees" in `.github/workflows/refresh.yml`.
  *
  * TWIN OF `scripts/load_transaction_fees.mjs` + `scripts/refresh_trader_fees.mjs`: edit all
- * three. Same pending query, same fee arithmetic, same insert, same rollup CTE. Differs only
- * where the platform does: each chain gets a SLICE of its oldest unpriced transactions per
- * run under a wall-clock budget (the anti-join makes the next run continue), a failed batch
- * is counted rather than fatal, and the rollup rebuilds only the traders this run touched,
- * in place (the script's one-trader path), instead of the whole table behind a swap.
+ * three. Same pending query, same insert, same rollup CTE. Differs where the platform does:
+ * each chain gets a SLICE of its oldest unpriced transactions per run under a wall-clock budget
+ * (the anti-join makes the next run continue), a failed batch is counted rather than fatal, and
+ * the rollup rebuilds only the traders this run touched, in place (the script's one-trader
+ * path), instead of the whole table behind a swap. And the EVM fee is Bitquery's
+ * `Fee.SenderFee` rather than gasUsed x effectiveGasPrice from a public node: since 18 Sep 2026
+ * no free JSON-RPC endpoint is called from the Worker. Solana stays on Helius.
  */
 
 type Sql = postgres.Sql;
-interface Chain { readonly network_id: number; readonly name: string; readonly native_symbol: string; readonly rpc: string }
+interface Chain { readonly network_id: number; readonly name: string; readonly native_symbol: string }
 interface Step { readonly chain: string; readonly batch: number; readonly swapsOnly: boolean }
 interface Pending { readonly hashes: readonly string[]; readonly addresses: ReadonlySet<string>; readonly total: number }
-interface ChainCount { receipts: number; failed: number }
+interface ChainCount { receipts: number; failed: number; bitqueryQueries: number }
 
-/** The workflow's steps, in its order and at its batch sizes (base refuses more than 10). */
+/** Hashes per Bitquery query: one `in` list, one reply, ≤ 100 records. */
+const BITQUERY_BATCH = 100;
+/** The workflow's steps, in its order; EVM chains take a Bitquery batch, Solana Helius's 10. */
 const STEPS: readonly Step[] = [
-  { chain: "bsc", batch: 100, swapsOnly: false },
-  { chain: "ethereum", batch: 100, swapsOnly: false },
-  { chain: "base", batch: 10, swapsOnly: false },
+  { chain: "bsc", batch: BITQUERY_BATCH, swapsOnly: false },
+  { chain: "ethereum", batch: BITQUERY_BATCH, swapsOnly: false },
+  { chain: "base", batch: BITQUERY_BATCH, swapsOnly: false },
   { chain: "solana", batch: 10, swapsOnly: true },
 ];
 /** ponytail: oldest unpriced transactions per chain per run; raise when the backlog is measured to lag the cron. */
@@ -35,6 +41,8 @@ const SLICE = 1000;
 const ROLLUP_CHUNK = 25;
 /** Share of the budget the reads leave for phase 2. */
 const ROLLUP_SHARE = 0.25;
+const EVM_SOURCE = "bitquery EVM.Transactions Fee.SenderFee";
+const SOLANA_SOURCE = "helius getTransaction";
 
 export interface RollupSummary {
   /** Traders touched by this run's receipts. */
@@ -46,9 +54,11 @@ export interface RollupSummary {
 }
 
 export interface FeesSummary {
-  /** Per chain: fees written and batches that failed or were refused. */
+  /** Per chain: fees written, batches that failed or were refused, Bitquery queries sent. */
   readonly perChain: Record<string, ChainCount>;
   readonly rollup: RollupSummary;
+  /** Bitquery queries sent across the EVM chains. */
+  readonly bitqueryQueries: number;
   /** Unpriced transactions left across the chains. Zero means the backlog is clear. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
@@ -56,8 +66,8 @@ export interface FeesSummary {
 }
 
 async function chains(sql: Sql): Promise<Map<string, Chain>> {
-  const rows = await sql<{ network_id: string; name: string; native_symbol: string; rpc: string }[]>`
-    select network_id, name, native_symbol, rpc from chains where name = any(${STEPS.map((s) => s.chain)})`;
+  const rows = await sql<{ network_id: string; name: string; native_symbol: string }[]>`
+    select network_id, name, native_symbol from chains where name = any(${STEPS.map((s) => s.chain)})`;
   return new Map(rows.map((r) => [r.name, { ...r, network_id: Number(r.network_id) }]));
 }
 
@@ -99,28 +109,64 @@ async function writeFees(sql: Sql, net: number, fees: readonly Fee[], symbol: st
     on conflict (network_id, tx_hash) do nothing`;
 }
 
-const batchBody = (hashes: readonly string[], kind: FeeKind): unknown[] =>
-  hashes.map((h, id) => kind === "solana"
-    ? { jsonrpc: "2.0", id, method: "getTransaction", params: [h, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed" }] }
-    : { jsonrpc: "2.0", id, method: "eth_getTransactionReceipt", params: [h] });
+/** Helius `getTransaction` for a slice of signatures, one JSON-RPC batch. */
+async function solanaFees(url: string, hashes: readonly string[]): Promise<BatchRead | null> {
+  const body = hashes.map((h, id) =>
+    ({ jsonrpc: "2.0", id, method: "getTransaction", params: [h, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed" }] }));
+  return readBatch(await rpc(url, body), hashes);
+}
 
-/** One chain's slice, in batches, until the slice ends, the node refuses, or `deadline` passes. Returns how many hashes got an answer. */
-async function readChain(sql: Sql, c: Chain, step: Step, hashes: readonly string[], url: string, count: ChainCount, deadline: number): Promise<number> {
-  const kind: FeeKind = c.network_id === SOLANA_NETWORK_ID ? "solana" : "evm";
-  const source = kind === "solana" ? "helius getTransaction" : "eth_getTransactionReceipt";
+/**
+ * The paid fee of each hash from Bitquery's transaction cube, in the chain's coin. `Fee.SenderFee`
+ * (with `SenderFeeInUSD`) is the fee the sender paid per
+ * https://docs.bitquery.io/docs/blockchain/Ethereum/fees/fees-api/ and
+ * https://docs.bitquery.io/docs/usecases/mempool-transaction-fee/ (`Fee { Burnt SenderFee
+ * PriorityFeePerGas MinerReward GasRefund EffectiveGasPrice Savings }`); `Transaction.Cost` is
+ * "gas used multiplied by the gas price" per
+ * https://docs.bitquery.io/docs/examples/transactions/transaction-api/ and the fallback. The hash
+ * filter is `Transaction: { Hash: { in: $hashes } }` per
+ * https://docs.bitquery.io/docs/graphql/filters/ (string operators `is, not, in, notIn, ...`) and
+ * https://docs.bitquery.io/docs/blockchain/Ethereum/ethers-library/eth_getTransactionReceipt/.
+ * `network` is a GraphQL enum, so it goes in the query text; `limit` is explicit because the
+ * cube's default is smaller than a batch.
+ */
+async function evmFees(key: string, network: string, hashes: readonly string[]): Promise<BatchRead | null> {
+  const query = `query ($hashes: [String!]) {
+    EVM(network: ${network}, dataset: combined) {
+      Transactions(where: { Transaction: { Hash: { in: $hashes } } }, limit: { count: ${hashes.length} }) {
+        Transaction { Hash Cost }
+        Fee { SenderFee }
+      }
+    }
+  }`;
+  return readBitqueryFees(await bitquery(key, query, { hashes }), hashes);
+}
+
+/** Bitquery's word for an EVM chain in `chains`; a chain it has no word for is a configuration error. */
+function networkWord(c: Chain): string {
+  const w = EVM_CHAINS[c.network_id]?.bitquery;
+  if (!w || !/^[a-z0-9_]+$/.test(w)) throw new Error(`fees: no Bitquery network word for chain '${c.name}' (${c.network_id})`);
+  return w;
+}
+
+interface Reader { readonly source: string; readonly read: (hashes: readonly string[]) => Promise<BatchRead | null> }
+
+/** One chain's slice, in batches, until the slice ends, the provider refuses, or `deadline` passes. Returns how many hashes got an answer. */
+async function readChain(sql: Sql, c: Chain, step: Step, hashes: readonly string[], reader: Reader, count: ChainCount, deadline: number): Promise<number> {
   let answered = 0;
   for (let i = 0; i < hashes.length; i += step.batch) {
     if (Date.now() > deadline) break;
     const slice = hashes.slice(i, i + step.batch);
     try {
-      const read = readBatch(await rpc(url, batchBody(slice, kind)), slice, kind);
+      if (c.network_id !== SOLANA_NETWORK_ID) count.bitqueryQueries += 1;
+      const read = await reader.read(slice);
       if (read === null) {
         /* A refusal, not an empty answer: stop this chain rather than write a hole. */
         count.failed += 1;
-        console.error(`fees: ${c.name} node refused a batch of ${slice.length}`);
+        console.error(`fees: ${c.name} provider refused a batch of ${slice.length}`);
         break;
       }
-      await writeFees(sql, c.network_id, read.fees, c.native_symbol, source);
+      await writeFees(sql, c.network_id, read.fees, c.native_symbol, reader.source);
       count.receipts += read.fees.length;
       answered += slice.length;
     } catch (e) {
@@ -190,6 +236,8 @@ export async function runFees(env: Env, budgetMs: number): Promise<FeesSummary> 
   const started = Date.now();
   const readDeadline = started + budgetMs * (1 - ROLLUP_SHARE);
   const helius = (env.HELIUS_SOLANA_KEY ?? "").trim();
+  const bitqueryKey = (env.BITQUERY_KEY ?? "").trim();
+  if (!bitqueryKey) throw new Error("fees: BITQUERY_KEY is not set");
   const sql = db(env);
   try {
     const byName = await chains(sql);
@@ -199,12 +247,14 @@ export async function runFees(env: Env, budgetMs: number): Promise<FeesSummary> 
     for (const step of STEPS) {
       const c = byName.get(step.chain);
       if (!c) throw new Error(`fees: chain '${step.chain}' is not in \`chains\``);
-      const count: ChainCount = { receipts: 0, failed: 0 };
+      const count: ChainCount = { receipts: 0, failed: 0, bitqueryQueries: 0 };
       perChain[c.name] = count;
       if (c.network_id === SOLANA_NETWORK_ID && !helius) { console.log(`fees: ${c.name} skipped, HELIUS_SOLANA_KEY is not set`); continue; }
-      const url = c.network_id === SOLANA_NETWORK_ID ? `https://mainnet.helius-rpc.com/?api-key=${helius}` : c.rpc;
+      const reader: Reader = c.network_id === SOLANA_NETWORK_ID
+        ? { source: SOLANA_SOURCE, read: (h) => solanaFees(`https://mainnet.helius-rpc.com/?api-key=${helius}`, h) }
+        : { source: EVM_SOURCE, read: (h) => evmFees(bitqueryKey, networkWord(c), h) };
       const p = await pending(sql, c.network_id, step.swapsOnly);
-      const answered = p.hashes.length ? await readChain(sql, c, step, p.hashes, url, count, readDeadline) : 0;
+      const answered = p.hashes.length ? await readChain(sql, c, step, p.hashes, reader, count, readDeadline) : 0;
       if (answered < p.hashes.length && Date.now() > readDeadline) stoppedEarly = true;
       remaining += p.total - answered;
       if (count.receipts > 0) for (const a of p.addresses) touched.add(a);
@@ -226,7 +276,8 @@ export async function runFees(env: Env, budgetMs: number): Promise<FeesSummary> 
         console.error(`fees: rollup chunk of ${chunk.length} failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    return { perChain, rollup, remaining, stoppedEarly, elapsedMs: Date.now() - started };
+    const bitqueryQueries = counts.reduce((n, c) => n + c.bitqueryQueries, 0);
+    return { perChain, rollup, bitqueryQueries, remaining, stoppedEarly, elapsedMs: Date.now() - started };
   } finally {
     await sql.end({ timeout: 5 });
   }

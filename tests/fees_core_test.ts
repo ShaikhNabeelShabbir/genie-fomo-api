@@ -1,25 +1,8 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { evmFee, readBatch, solanaFee } from "../worker/src/jobs/fees-core.ts";
+import { readBatch, readBitqueryFees, solanaFee } from "../worker/src/jobs/fees-core.ts";
 
-/* Cases derived from scripts/load_transaction_fees.mjs: evmFee, the lamport scaling and the batch reader. */
-
-Deno.test("evmFee: gasUsed x effectiveGasPrice, exact, scaled to 18 decimals with trailing zeros dropped", () => {
-  // 21000 gas x 1 gwei = 0.000021 ETH
-  assertEquals(evmFee({ gasUsed: "0x5208", effectiveGasPrice: "0x3b9aca00" }), "0.000021");
-  // 1 gas x 1 wei = 1e-18
-  assertEquals(evmFee({ gasUsed: "0x1", effectiveGasPrice: "0x1" }), "0.000000000000000001");
-  // exactly 1 ETH: no fractional part at all
-  assertEquals(evmFee({ gasUsed: "0xde0b6b3a7640000", effectiveGasPrice: "0x1" }), "1");
-  assertEquals(evmFee({ gasUsed: "0x0", effectiveGasPrice: "0x1" }), "0");
-});
-
-Deno.test("evmFee: a receipt without string gas fields is absent, never zero", () => {
-  assertEquals(evmFee({ gasUsed: 21000, effectiveGasPrice: "0x1" }), null);
-  assertEquals(evmFee({ gasUsed: "0x5208" }), null);
-  assertEquals(evmFee({ gasUsed: "nope", effectiveGasPrice: "0x1" }), null);
-  assertEquals(evmFee(null), null);
-  assertEquals(evmFee("0x5208"), null);
-});
+/* Solana cases derived from scripts/load_transaction_fees.mjs; the EVM cases are one Bitquery
+   `EVM.Transactions` reply (https://docs.bitquery.io/docs/usecases/mempool-transaction-fee/). */
 
 Deno.test("solanaFee: meta.fee lamports scaled to SOL, kept as a string", () => {
   assertEquals(solanaFee({ meta: { fee: 5000 } }), "0.000005");
@@ -32,27 +15,51 @@ Deno.test("solanaFee: meta.fee lamports scaled to SOL, kept as a string", () => 
   assertEquals(solanaFee(null), null);
 });
 
-Deno.test("readBatch: ids index the hashes sent; null results are missing; unknown ids are ignored", () => {
-  const hashes = ["0xa", "0xb", "0xc"];
+Deno.test("readBatch: ids index the signatures sent; null or fee-less results are missing; unknown ids are ignored", () => {
   const reply = [
-    { id: 0, result: { gasUsed: "0x5208", effectiveGasPrice: "0x3b9aca00" } },
+    { id: 0, result: { meta: { fee: 5000 } } },
     { id: 1, result: null },
-    { id: 7, result: { gasUsed: "0x5208", effectiveGasPrice: "0x1" } },
-    { id: 2, result: { gasUsed: "0x1", effectiveGasPrice: "0x1" } },
+    { id: 7, result: { meta: { fee: 5000 } } },
+    { id: 2, result: { meta: {} } },
   ];
-  assertEquals(readBatch(reply, hashes, "evm"), {
-    fees: [{ hash: "0xa", fee: "0.000021" }, { hash: "0xc", fee: "0.000000000000000001" }],
-    missing: 1,
-  });
-});
-
-Deno.test("readBatch: solana reads meta.fee; a result without one is missing", () => {
-  const reply = [{ id: 0, result: { meta: { fee: 5000 } } }, { id: 1, result: { meta: {} } }];
-  assertEquals(readBatch(reply, ["s1", "s2"], "solana"), { fees: [{ hash: "s1", fee: "0.000005" }], missing: 1 });
+  assertEquals(readBatch(reply, ["s1", "s2", "s3"]), { fees: [{ hash: "s1", fee: "0.000005" }], missing: 2 });
 });
 
 Deno.test("readBatch: a non-array reply is a refusal, not an empty answer", () => {
-  assertEquals(readBatch({ jsonrpc: "2.0", error: { message: "maximum 10 calls in 1 batch" } }, ["0xa"], "evm"), null);
-  assertEquals(readBatch(null, ["0xa"], "evm"), null);
-  assertEquals(readBatch([], ["0xa"], "evm"), { fees: [], missing: 0 });
+  assertEquals(readBatch({ jsonrpc: "2.0", error: { message: "maximum 10 calls in 1 batch" } }, ["s1"]), null);
+  assertEquals(readBatch(null, ["s1"]), null);
+  assertEquals(readBatch([], ["s1"]), { fees: [], missing: 0 });
+});
+
+const HASHES = ["0xAAA1", "0xbbb2", "0xccc3", "0xddd4", "0xeee5"];
+/** One reply: SenderFee for A, Cost only for B, a stray hash, C twice, D with junk, E absent. */
+const reply = {
+  EVM: {
+    Transactions: [
+      { Transaction: { Hash: "0xaaa1", Cost: "0.001" }, Fee: { SenderFee: "0.000021" } },
+      { Transaction: { Hash: "0xbbb2", Cost: 0.0005 }, Fee: null },
+      { Transaction: { Hash: "0xffff", Cost: "9" }, Fee: { SenderFee: "9" } },
+      { Transaction: { Hash: "0xccc3", Cost: "1" }, Fee: { SenderFee: "1" } },
+      { Transaction: { Hash: "0xccc3", Cost: "2" }, Fee: { SenderFee: "2" } },
+      { Transaction: { Hash: "0xddd4", Cost: "-1" }, Fee: { SenderFee: "1e-5" } },
+    ],
+  },
+};
+
+Deno.test("readBitqueryFees: SenderFee first, Cost as the fallback; hashes match case-insensitively and keep the sent spelling", () => {
+  assertEquals(readBitqueryFees(reply, HASHES), {
+    fees: [{ hash: "0xAAA1", fee: "0.000021" }, { hash: "0xbbb2", fee: "0.0005" }, { hash: "0xccc3", fee: "1" }],
+    missing: 2,
+  });
+});
+
+Deno.test("readBitqueryFees: a hash never asked for is never trusted; a non-decimal fee is absent, never zero", () => {
+  const { fees } = readBitqueryFees(reply, HASHES)!;
+  assertEquals(fees.some((f) => f.hash === "0xffff" || f.hash === "0xddd4"), false);
+});
+
+Deno.test("readBitqueryFees: a reply without the Transactions list is a refusal; an empty list is all missing", () => {
+  assertEquals(readBitqueryFees({ EVM: {} }, HASHES), null);
+  assertEquals(readBitqueryFees(undefined, HASHES), null);
+  assertEquals(readBitqueryFees({ EVM: { Transactions: [] } }, ["0xa"]), { fees: [], missing: 1 });
 });
