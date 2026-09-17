@@ -18,6 +18,7 @@ Deno.test("NETWORK_OF: solana plus every EVM chain by name", () => {
   assertEquals(NETWORK_OF.get("robinhood"), 4663);
   assertEquals(providerOf("solana"), "helius");
   assertEquals(providerOf("base"), "bitquery");
+  assertEquals(providerOf("ethereum"), "bitquery");
   assertEquals(providerOf("robinhood"), "blockscout");
 });
 
@@ -34,7 +35,7 @@ Deno.test("toRows: a native leg is stored under SOL's quote_assets key; evm rows
   assertEquals(native[0][6], SOL);
   const evm = toRows(w, [{ ...base, chain: "ethereum", tx_hash: "0xh", time_iso: "2026-01-01T00:00:00.000Z", type: undefined, source: undefined }]);
   assertEquals(evm[0].slice(0, 4), [1, "0xh", "0xabc", "2026-01-01T00:00:00.000Z"]);
-  assertEquals(evm[0].slice(9), ["blockscout", null, null]);
+  assertEquals(evm[0].slice(9), ["bitquery", null, null]);
 });
 
 Deno.test("toRows: skips an unknown chain, a missing hash, and a chain the wallet has no address on", () => {

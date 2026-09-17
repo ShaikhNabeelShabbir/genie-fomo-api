@@ -13,7 +13,6 @@ export interface EvmChain {
   readonly blockscout: string | null;
   readonly rpc: string;
   readonly explorer: string;
-  readonly etherscanChainId: number | null;
   /** Gas token — what a fee is denominated in, and the native leg of a swap. */
   readonly nativeSymbol: string;
 }
@@ -25,7 +24,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
     blockscout: "https://robinhoodchain.blockscout.com",
     rpc: "https://rpc.mainnet.chain.robinhood.com",
     explorer: "https://robinhoodchain.blockscout.com",
-    etherscanChainId: null,
     nativeSymbol: "ETH",
   },
   1: {
@@ -34,7 +32,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
     blockscout: "https://eth.blockscout.com",
     rpc: "https://ethereum-rpc.publicnode.com",
     explorer: "https://etherscan.io",
-    etherscanChainId: 1,
     nativeSymbol: "ETH",
   },
   56: {
@@ -43,7 +40,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
     blockscout: null,
     rpc: "https://bsc-dataseed.binance.org",
     explorer: "https://bscscan.com",
-    etherscanChainId: 56,
     nativeSymbol: "BNB",
   },
   8453: {
@@ -52,7 +48,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
     blockscout: null,
     rpc: "https://mainnet.base.org",
     explorer: "https://basescan.org",
-    etherscanChainId: 8453,
     nativeSymbol: "ETH",
   },
 };

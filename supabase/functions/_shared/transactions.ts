@@ -7,12 +7,9 @@ import { bitquery } from "./bitquery.ts";
 /**
  * Live transaction fetching for a resolved wallet.
  *
- *   Robinhood  Blockscout   free, no key
- *   Ethereum   Etherscan    free tier covers chainid 1
- *   BSC/Base   Bitquery     Etherscan's free tier refuses both, and there is no free
- *                           alternative — no BSC Blockscout, the Base one 500s, public
- *                           RPCs need an archive token for historical logs
- *   Solana     Helius       Enhanced Transactions (legacy, but the free decoded source)
+ *   Robinhood          Blockscout   free, no key
+ *   Ethereum/BSC/Base  Bitquery     every EVM chain since 18 Sep 2026 (Etherscan dropped)
+ *   Solana             Helius       Enhanced Transactions (legacy, but the free decoded source)
  *
  * Every chain reports its own status: `count: 0, error: null` means the wallet genuinely
  * has no activity there, while `count: 0, error: "..."` means we could not look.
@@ -22,7 +19,7 @@ import { bitquery } from "./bitquery.ts";
  *   default        newest first, token transfers only — what /transactions has always done
  *   includeNative  adds native-currency movements and per-tx gas, and can page oldest-first
  *
- * The second exists because `tokentx` and Blockscout's `/token-transfers` are ERC-20 only.
+ * The second exists because Blockscout's `/token-transfers` is ERC-20 only.
  * An ETH -> memecoin buy therefore arrives with NO counter-leg, indistinguishable from an
  * airdrop, and with no fee attached. Without the native side, most EVM swaps cannot be
  * priced or paired at all.
@@ -60,7 +57,6 @@ export interface FetchOptions {
 /** Provider keys, trimmed by the caller. An empty or absent key makes that chain report an error. */
 export interface ProviderKeys {
   readonly helius?: string;
-  readonly etherscan?: string;
   readonly bitquery?: string;
 }
 
@@ -203,87 +199,7 @@ async function blockscoutNative(
   return { rows, gas };
 }
 
-// ------------------------------------------------------------------- Ethereum
-
-async function etherscanCall(key: string, chainId: number, action: string, wallet: string,
-  limit: number, order: "asc" | "desc", page: number): Promise<Rec[]> {
-  const cfg = chainOf(chainId);
-  if (!key) throw new Error("ETHERSCAN_KEY is not set");
-  const url =
-    `https://api.etherscan.io/v2/api?chainid=${cfg.etherscanChainId}` +
-    `&module=account&action=${action}&address=${wallet}` +
-    `&startblock=0&endblock=99999999&page=${page}&offset=${limit}&sort=${order}` +
-    `&apikey=${key}`;
-  const d = rec(await (await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(30_000) })).json());
-  // Etherscan reports plan/key problems inside `result`, with HTTP 200.
-  if (typeof d.result === "string") {
-    if (/no transactions found/i.test(d.result)) return [];
-    throw new Error(d.result.slice(0, 160));
-  }
-  return recs(d.result);
-}
-
-async function etherscanTx(
-  key: string, chainId: number, wallet: string, limit: number, order: "asc" | "desc", pages: number,
-): Promise<Transfer[]> {
-  // pages > 1 is opt-in; the plain transfer listing has always been a single call.
-  const cfg = chainOf(chainId);
-  const out: Transfer[] = [];
-  const per = Math.min(limit, 1000);
-  for (let p = 1; p <= pages && out.length < limit; p++) {
-    const rows = await etherscanCall(key, chainId, "tokentx", wallet, per, order, p);
-    for (const t of rows) {
-      let amount: number | null = null;
-      try {
-        amount = Number(big(t.value)) / 10 ** Number(t.tokenDecimal ?? 0);
-      } catch {
-        amount = null;
-      }
-      out.push(row(wallet, cfg.name, str(t.hash), int(t.timeStamp), str(t.tokenSymbol),
-        str(t.contractAddress), amount, str(t.from), str(t.to), cfg.explorer));
-    }
-    if (rows.length < per) break;
-  }
-  return out.slice(0, limit);
-}
-
-/** Native ETH/BNB legs and gas — the half of a swap that `tokentx` never returns. */
-async function etherscanNative(
-  key: string, chainId: number, wallet: string, limit: number, order: "asc" | "desc", pages: number,
-): Promise<{ rows: Transfer[]; gas: GasMap }> {
-  const cfg = chainOf(chainId);
-  const rows: Transfer[] = [];
-  const gas: GasMap = new Map();
-  const per = Math.min(limit, 1000);
-
-  for (let p = 1; p <= pages; p++) {
-    const items = await etherscanCall(key, chainId, "txlist", wallet, per, order, p);
-    for (const t of items) {
-      const hash = str(t.hash);
-      const from = str(t.from);
-      const ts = int(t.timeStamp);
-
-      // A reverted tx moves no value but still burns gas.
-      const failed = str(t.isError ?? "0") === "1";
-      let value = 0;
-      try { value = Number(big(t.value)) / 1e18; } catch { value = 0; }
-      if (value > 0 && !failed) {
-        rows.push(row(wallet, cfg.name, hash, ts, cfg.nativeSymbol, "native",
-          value, from, str(t.to), cfg.explorer));
-      }
-      if (from.toLowerCase() === wallet.toLowerCase()) {
-        try {
-          const fee = Number(big(t.gasUsed) * big(t.gasPrice)) / 1e18;
-          if (fee > 0) gas.set(hash, fee);
-        } catch { /* ignore malformed fee fields */ }
-      }
-    }
-    if (items.length < per) break;
-  }
-  return { rows, gas };
-}
-
-// ------------------------------------------------------------------ BSC / Base
+// ------------------------------------------------- Ethereum / BSC / Base
 
 async function bitqueryTx(key: string, chainId: number, wallet: string, limit: number): Promise<Transfer[]> {
   const cfg = chainOf(chainId);
@@ -404,26 +320,15 @@ async function evmChain(
   const gas: GasMap = new Map();
   try {
     let rows: Transfer[];
-    if (cfg.name === "bsc" || cfg.name === "base") {
-      rows = await bitqueryTx(keys.bitquery ?? "", chainId, wallet, limit);
-    } else if (cfg.name === "robinhood" && cfg.blockscout) {
+    if (cfg.name === "robinhood" && cfg.blockscout) {
       rows = await blockscoutTx(chainId, wallet, limit, opts.pages);
       if (opts.includeNative) {
         const n = await blockscoutNative(chainId, wallet, limit, opts.pages);
         rows = rows.concat(n.rows);
         for (const [h, f] of n.gas) gas.set(h, f);
       }
-    } else if (cfg.etherscanChainId) {
-      const key = keys.etherscan ?? "";
-      rows = await etherscanTx(key, chainId, wallet, limit, opts.order,
-        opts.includeNative ? opts.pages : 1);
-      if (opts.includeNative) {
-        const n = await etherscanNative(key, chainId, wallet, limit, opts.order, opts.pages);
-        rows = rows.concat(n.rows);
-        for (const [h, f] of n.gas) gas.set(h, f);
-      }
     } else {
-      throw new Error("no transaction source configured");
+      rows = await bitqueryTx(keys.bitquery ?? "", chainId, wallet, limit);
     }
     return { rows, gas, status: { chain: cfg.name, count: rows.length, error: null } };
   } catch (e) {

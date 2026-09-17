@@ -31,6 +31,7 @@ export function throttled<T>(url: string, fn: () => Promise<T>): Promise<T> {
   return next as Promise<T>;
 }
 
+/** LEGACY: the v1 Supabase functions only. The Worker calls no public JSON-RPC; EVM goes through `bitquery.ts`, Solana through Helius. */
 // deno-lint-ignore no-explicit-any
 export async function rpc(url: string, body: unknown, tries = 5): Promise<any> {
   for (let i = 1; ; i++) {
@@ -116,7 +117,7 @@ export async function solanaBalances(
  * holds" primitive without a paid indexer, and a token they never traded is one we could not
  * price or name anyway. It is the honest superset of their positions here.
  *
- * LEGACY: the Supabase v1 sampler only. The Worker reads EVM through `bitquery.ts`
+ * LEGACY: the v1 Supabase functions only. The Worker reads EVM through `bitquery.ts`
  * `evmBalancesBitquery` (public RPCs 429 Cloudflare's egress); nothing under worker/ may call this.
  */
 export async function evmBalances(
@@ -181,6 +182,7 @@ export async function evmBalances(
 /**
  * The wallet's outgoing-transaction count (its nonce): what the chain says he did, to set
  * against the rows the indexer holds (R6). Null when the node will not say; never a 0 by default.
+ * LEGACY: the v1 Supabase sampler only; the Worker sampler writes no nonce (see sampler.ts).
  */
 export async function evmTxCount(rpcUrl: string, wallet: string): Promise<number | null> {
   try {

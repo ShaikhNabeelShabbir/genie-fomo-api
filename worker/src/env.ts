@@ -18,8 +18,7 @@ export interface Env {
   readonly HELIUS_SOLANA_KEY?: string;
   /** Traders per chain-balance run (`jobs/balances.ts`); default 25. */
   readonly BALANCE_SLICE?: string;
-  /** Transfer backfill providers (`jobs/transfers.ts`): Etherscan V2 for Ethereum, Bitquery for BSC/Base. */
-  readonly ETHERSCAN_KEY?: string;
+  /** Every EVM chain read (`jobs/transfers.ts`, `jobs/balances.ts`, `sampler.ts`); Robinhood transfers alone go to Blockscout. */
   readonly BITQUERY_KEY?: string;
   /** Where Helius delivers; the watch-list sync registers this URL. Defaults to the Supabase receiver. */
   readonly WEBHOOK_URL?: string;

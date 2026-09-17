@@ -140,7 +140,6 @@ export async function runTransfers(env: Env, budgetMs: number): Promise<Transfer
   const started = Date.now();
   const keys: ProviderKeys = {
     helius: (env.HELIUS_SOLANA_KEY ?? "").trim(),
-    etherscan: (env.ETHERSCAN_KEY ?? "").trim(),
     bitquery: (env.BITQUERY_KEY ?? "").trim(),
   };
   const sql = db(env);

@@ -1,7 +1,7 @@
 import type postgres from "postgres";
 import type { Env } from "./env";
 import { db } from "./db";
-import { SOLANA_NETWORK_ID, solanaBalances, evmTxCount } from "../../supabase/functions/_shared/chain_reads.ts";
+import { SOLANA_NETWORK_ID, solanaBalances } from "../../supabase/functions/_shared/chain_reads.ts";
 import { evmBalancesBitquery } from "../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS } from "../../supabase/functions/_shared/settings.ts";
 import { concentrationSuspect, decideTotal, value } from "../../supabase/functions/aum-sample/value.ts";
@@ -25,7 +25,7 @@ const json = (body: unknown, status = 200) =>
 
 
 type Position = { network_id: number; token_key: string; address: string; amount: number };
-type Chain = { network_id: number; name: string; rpc: string };
+type Chain = { network_id: number; name: string };
 type Trader = { handle: string; sol_address: string | null; evm_address: string | null };
 /** One chain's answer: what it held, or why it could not be asked. Never both. `nonce`: the wallet's tx count on an EVM chain that answered (R6). */
 type ChainRead = { positions: Position[] | null; reason: string | null; nonce?: number | null };
@@ -80,7 +80,12 @@ async function readChain(keys: { helius: string; bitquery: string }, t: Trader, 
     const word = EVM_CHAINS[net]?.bitquery;
     if (!word) throw new Error(`no Bitquery network for chain ${net}`);
     const res = await evmBalancesBitquery(keys.bitquery, word, t.evm_address ?? "");
-    return { positions: res.balances.map(pos), reason: null, nonce: await evmTxCount(c.rpc, t.evm_address ?? "") };
+    // ponytail: no nonce on v2 — the public-RPC eth_getTransactionCount is gone and a Bitquery
+    // `Transactions(where: {Transaction: {From: {is: $wallet}}}) { count }` (dataset: combined,
+    // https://docs.bitquery.io/docs/evm/transactions/) would double this 5-minute cron's paid
+    // calls for a diagnostic. R6 chain_coverage therefore goes stale under v2; add that query
+    // in bitquery.ts if R6 is wanted back.
+    return { positions: res.balances.map(pos), reason: null, nonce: null };
   } catch (e) {
     console.error(`aum-sample: ${t.handle} ${c.name}: ${(e as Error).message}`);
     return { positions: null, reason: "wallet_unreadable" };
@@ -244,7 +249,7 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
     if (!targets.length) return { sampled: 0, refused: 0, traders: [], note: "no trader matched" };
 
     const chains = await sql`
-      select network_id::bigint, name, rpc from chains order by network_id`;
+      select network_id::bigint, name from chains order by network_id`;
 
     const handles = targets.map((t) => String(t.handle));
 
