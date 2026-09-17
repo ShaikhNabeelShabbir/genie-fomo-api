@@ -11,6 +11,52 @@ import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_histo
  * prices.ts: one client, a budget check per unit of work, a summary that says how far it got.
  */
 
+/**
+ * V1d (v5 fixes, 17 Sep 2026). ONE-OFF HEAL OF THE HOURS BUILT UNDER THE CLOCK-DEPENDENT LADDER.
+ *
+ * Until this morning the builder could price an hour with GMGN's untimestamped `token_info`
+ * price, but only when the hour being built was the hour we were in. Those rows are exactly the
+ * ones whose `computed_at` falls inside their own `hour`, and they are wrong: cupseyy's 07:00
+ * reads $2,509,077,756 that way. 2,078 of them exist across 443 traders, all written on
+ * 17 Sep between 07:00 and 17:00, because D1 is a day old.
+ *
+ * Rebuilding one moves its `computed_at` past its `hour`, so the predicate stops matching and
+ * this converges and then costs nothing. The date bound keeps it a bounded scan rather than a
+ * full pass over `aum_history` for ever; DELETE THIS FUNCTION AND ITS CALL once the count is 0
+ * (`select count(*) from aum_history where basis='priced' and substr(computed_at,1,13)=substr(hour,1,13)`).
+ *
+ * This exists because the on-demand rebuild endpoint needs `JOB_SECRET`, which nobody on the
+ * team currently holds. The cron can heal it without one.
+ */
+const HEAL_PER_RUN = 100;
+/** The only day the old ladder ever wrote; nothing outside it can match. */
+const HEAL_FROM = "2026-09-17T00:00:00.000Z";
+const HEAL_TO = "2026-09-18T00:00:00.000Z";
+/** Share of the run's budget the heal may spend before the ordinary build starts. */
+const HEAL_BUDGET_SHARE = 0.5;
+
+async function healClockBuiltHours(sql: Sql, started: number, budgetMs: number): Promise<number> {
+  const rows = await sql<{ handle: string; from_hour: string; to_hour: string }[]>`
+    select handle, min(hour) as from_hour, max(hour) as to_hour
+      from aum_history
+     where basis = 'priced'
+       and hour >= ${HEAL_FROM} and hour < ${HEAL_TO}
+       and substr(computed_at, 1, 13) = substr(hour, 1, 13)
+     group by handle
+     order by min(hour)
+     limit ${HEAL_PER_RUN}`;
+  let healed = 0;
+  for (const r of rows) {
+    if (Date.now() - started > budgetMs) break;
+    try {
+      healed += await buildAumHistory(sql, r.handle, r.from_hour, r.to_hour);
+    } catch (e) {
+      console.error(`aum_history: heal ${r.handle} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return healed;
+}
+
 export interface AumHistorySummary {
   /** Traders with at least one hour to build this run. */
   readonly traders: number;
@@ -19,6 +65,8 @@ export interface AumHistorySummary {
   /** Hours planned but not built because the budget ran out (or the call failed). */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
+  /** V1d: hours rewritten by the one-off heal above. Zero for good once it has converged. */
+  readonly healed: number;
   readonly elapsedMs: number;
 }
 
@@ -62,6 +110,9 @@ export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistory
       const resumeFrom = new Date(opts.from.getTime() - 3_600_000);
       traders = traders.filter((t) => wanted.has(t.handle)).map((t) => ({ ...t, lastBuilt: resumeFrom, firstBuilt: null }));
     }
+    /* V1d: the wrong rows go first — they are being served to consumers right now. */
+    const healed = await healClockBuiltHours(sql, started, budgetMs * HEAL_BUDGET_SHARE);
+
     const work = planWork(traders, new Date(started), CHUNK_HOURS);
     const planned = work.reduce((n, c) => n + c.hours, 0);
     let hours = 0, attempted = 0, failed = 0, stoppedEarly = false;
@@ -81,6 +132,7 @@ export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistory
       hours,
       remaining: planned - hours,
       stoppedEarly,
+      healed,
       elapsedMs: Date.now() - started,
     };
   } finally {
