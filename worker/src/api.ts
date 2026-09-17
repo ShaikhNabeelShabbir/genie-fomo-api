@@ -26,7 +26,7 @@ export async function api(req: Request, env: Env, ctx: ExecutionContext): Promis
   }
   const sql = db(env);
   // The store carries string vars only; the binding stays on `env` for `db()`.
-  const { HYPERDRIVE: _binding, ...vars } = env;
+  const { HYPERDRIVE: _binding, DB: _db, ...vars } = env;
   try {
     return await runWith({ sql, env: vars }, () => handle(req));
   } finally {
