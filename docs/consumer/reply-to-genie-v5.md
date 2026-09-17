@@ -157,7 +157,7 @@ so their only price is the daily close in `token_prices` — which **exists**, a
 Verified against production for the trader you named:
 
 ```
-gmgn_0xf80d7961  ethereum native  1.1720  →  daily close 2026-09-17 = $2,450.22
+gmgn_0xf80d7961  ethereum native  1.1720  →  daily close 2026-09-17 = $2,464.97
 ```
 
 With the request-time ladder that row prices on the next request. **The "427 of 450 waiting for
@@ -338,7 +338,8 @@ positions held. They were never meant to agree, and nothing said so.
    is the one we should have published from the start.
 2. **Three renames land together**: `share` → `rowsPerSentTx`, `rowsHeld` → `transferRowsHeld`,
    `onChain.swaps` → `swapsAppearedIn` (+ `ownSwaps`). You said you match on none of our `source`
-   strings; please confirm the same for these three before we deploy.
+   strings; please confirm the same for these three. They are already live, so if any of them
+   does break something on your side, tell us and we will serve both spellings for a version.
 3. **`complete` gets stricter**, so lists that read `complete: true` today will read false with
    an `incompleteReason`. That is the point, but it will change what your warning-sign counter
    sees — it should now refuse to score a trader whose `/trades` is not `complete`.
