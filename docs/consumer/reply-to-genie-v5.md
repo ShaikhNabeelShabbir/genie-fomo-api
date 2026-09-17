@@ -6,10 +6,12 @@ read in it was reproducible from the figures you gave, and four of them found th
 **Deployed to v2 on 17 Sep 2026, ~15:05 UTC**, migration `0005` applied first. Every figure
 below quoted as current was read back from production after the deploy, not from a test.
 
-**Two asks are not closed, and we want to be plain about both.** **V1d is NOT fixed** (§1) —
-our first draft of this reply said it was, and reading production back after the deploy showed
-it was not. **A2 is partly fixed** (§2): the stuck six-hour figures are gone, but "every trader
-hourly" is not met, and we have the measured numbers rather than a promise.
+**Two asks need reading carefully rather than skimming.** **V1d — we found it after the first
+deploy and fixed it** (§1); the cause turned out to be one line, and it is the same line behind
+A4's sawtooth. Hours already stored keep their old figures until they are rebuilt, so cupseyy's
+07:00 still reads $2.5B as you check this. **A2 is partly fixed** (§2): the stuck six-hour
+figures are gone, but "every trader hourly" is not met, and we give you the measured numbers
+rather than a promise.
 
 **What we need from you: run the ten reads in "Verify the deployment" below** — each one says
 what it should return — then re-run your comparisons and send the next batch whenever it suits
@@ -81,32 +83,63 @@ published them as though they were.
   price at request time. The batch `POST /traders/positions` still reads `holdings_current`
   (rolling Solana forward for 50 traders at once exceeds D1's per-query CPU limit) and says so
   with `tier`; it uses the same ladder.
-- **V1d, rebuild 07:00, 12:00 and 13:00 — NOT FIXED. Keep your $1B guard on for cupseyy.**
+- **V1d — found and fixed, one line. It is also the cause of A4.**
 
-  12:00 is fixed: it was built from 1.71% of his wallet and is now withheld
-  (`totalUsd: null`, `reason: too_little_priced`, `partialUsd: 229388.66`). 13:00 stands at
-  $229,589.32 with `partial: true` and `pricedShare: 0.1004`.
+  Our first draft of this reply said V1d was fixed by the coverage rule; it was not, because
+  that hour was built from 45.06% of his wallet, comfortably above the floor. So we went and
+  found it. The builder's ladder ended like this:
 
-  **07:00 still reads $2,509,077,756.02.** The coverage rule does not reach it: that hour was
-  built from **45.06%** of his wallet, well above our floor, so nothing about its coverage is
-  wrong. The figure is.
+  ```
+  pegged  ->  hourly sample (<= 24 h)  ->  that day's close  ->  token_info IF the hour
+                                                                 being built is the hour
+                                                                 we are in right now
+  ```
 
-  What we established: it is not the hourly price samples. Summing every position carrying a
-  07:00 DexScreener sample gives about **$7,000**, the largest single one $4,331. So the $2.5B
-  enters through a different rung of the history builder's ladder — the daily close, or a sample
-  carried forward from up to 24 hours earlier — and no single position trips the per-row
-  ceilings, because 5,082 positions each in the hundreds of thousands sum to billions without
-  any one of them looking absurd. **We have no wallet-level sanity check**, and that is the real
-  gap your $1B guard has been covering for us.
+  That last rung is GMGN's `token_info.price_usd`: a **current** price with no time attached.
+  So an hour's value depended on **when we computed it**, and changed retroactively when it was
+  rebuilt. `aum_history.computed_at` shows it exactly:
 
-  We are not going to guess at it. Finding which rung and which positions is a day's work, and
-  we would rather tell you this now than ship a threshold that hides it. **Date: 22 Sep.**
+  | hour | built | priced of 11,278 | `totalUsd` |
+  |---|---|---|---|
+  | 07:00 | **07:33 — same hour** | 5,082 | **2,509,077,756** |
+  | 08:00 | 11:38 — later | 187 | 1,686 |
+  | 11:00 | **11:38 — same hour** | 1,131 | 2,950 |
+  | 12:00 | 13:28 — later | 193 | 229,389 |
+  | 13:00 | **13:32 — same hour** | 1,135 | 229,589 |
+
+  Every jump lines up with whether the build ran inside its own hour. **That is your sawtooth
+  and the $2.5B in one mechanism** — and your instinct that "two builds take turns" was right,
+  it just was not two builders. GMGN prices one of his memecoins at **$28,160 against a 1e9
+  supply**, a $28 trillion implied cap; the suspect rule catches the worst of them, and the
+  survivors still summed to two and a half billion dollars.
+
+  Fixed: only a rung that carries a timestamp may value a past hour. `/aum/now` keeps the
+  `token_info` rung and should — `now` IS current, so a current price is the right thing to
+  value it with. A past hour is not.
+
+  **Two things you need to know about the state of the data.**
+
+  1. **Hours already stored keep their old figures until they are rebuilt.** The builder only
+     recomputes the last two hours, so cupseyy's 07:00 still reads $2.5B right now. We are
+     running a targeted rebuild; until it lands, **keep your $1B guard on**.
+  2. **Expect more nulls, and that is the honest answer.** With the untimestamped rung gone,
+     a wallet of 11,278 dust memecoins has dated prices for only about 190 of them — under our
+     5% floor — so many of cupseyy's hours will come back `totalUsd: null` with
+     `reason: too_little_priced` and a `partialUsd`. We would rather hand you a gap you can see
+     than a number built from 1.7% of a wallet. Traders with fewer, better-covered positions are
+     unaffected.
 
 ## 2. The sawtooth and the missing hours — A4, A3, A2
 
-- **A4 — fixed.** Your instinct that "two builds take turns" was right; the mechanism is
-  coverage, not two builders. 397397's `01:00` is `basis: reading`, **217 of 279** priced,
-  $351,321.95. His `00:00` is `basis: priced`, **2 of 289** priced, $43,780.82.
+- **A4 — fixed twice over, and your instinct was right.** "Two builds take turns" is almost
+  exactly what was happening: not two builders, but one builder that priced an hour differently
+  depending on whether it ran inside that hour. §1 has the mechanism and the evidence — it is
+  the same single line as V1d, and it is now gone. What follows is the second half of the
+  answer, which stands on its own: even with a consistent ladder, an hour built from a fraction
+  of a wallet must say so.
+
+  397397's `01:00` is `basis: reading`, **217 of 279** priced, $351,321.95. His `00:00` is
+  `basis: priced`, **2 of 289** priced, $43,780.82.
 
   **Which figure is his?** Neither, as published. $43,780.82 is 0.7% of his wallet. The ~$354,000
   hours are 78% and are the better figure, but they come from the retired sampler and will not
@@ -364,7 +397,7 @@ and **send a `User-Agent` that names your app** or Cloudflare will answer 403 `e
 | 2 | `GET /v2/traders/gmgn_0xf80d7961/positions?limit=5` | `totalValueUsd` about **2,889** (it moves with the ETH close), `suspectUsd: 0`; the ethereum native priced `token_prices`, **not null** — it was null for you (N1) |
 | 3 | `GET /v2/traders/397397/aum/history?window=1d` | no flat $43,780.82 rung: those hours are `totalUsd: null`, `reason: too_little_priced`, `partialUsd: 43780.82`, `pricedShare: 0.0069` (A4) |
 | 4 | the same read | 08:00 and 09:00 present as `totalUsd: null`, `reason: not_built` (A3) |
-| 5 | `GET /v2/traders/cupseyy/aum/history?window=1d` | 12:00 withheld, 13:00 `partial: true`; **07:00 still $2.5B — this is the one we have not fixed** (V1d) |
+| 5 | `GET /v2/traders/cupseyy/aum/history?window=1d` | 12:00 withheld, 13:00 `partial: true`. **07:00 reads $2.5B until the rebuild lands** — the cause is fixed and deployed, the stored row is not yet rewritten (V1d, §1). Expect more `null` hours here afterwards, not fewer |
 | 6 | `GET /v2/traders/smokey0x/trades?limit=50` | `complete: false`, `incompleteReason: chains_unresolved_and_chains_truncated`; solana `state: truncated` with a `horizonAt` that moves EARLIER on later reads as the backfill walks (W2) |
 | 7 | `GET /v2/traders/smokey0x` | `onChain.swapsAppearedIn` about **593** and `onChain.ownSwaps` about **6** — both rise as transfers land, the point is the gap between them, not the figures; **`onChain.swaps` is gone** |
 | 8 | `GET /v2/traders/397397/positions?limit=500` | all four honeypot rows `isHoneypot: true, canSell: false` (H2) |
@@ -399,7 +432,7 @@ build, tell us and we will serve both spellings for a version rather than make y
 
 | Ask | State | When |
 |---|---|---|
-| **V1d** — cupseyy's 07:00 $2.5B hour (45% coverage; no wallet-level check) | **NOT FIXED** | 22 Sep |
+| **V1d** — the cause is fixed and deployed; stored hours need a targeted rebuild before 07:00 stops reading $2.5B | code fixed, data pending | rebuild today |
 | **A2** — `now` hourly for EVERY trader (measured ~145 a pass, so ~3 h for an unwatched trader) | **partly fixed** | 22 Sep |
 | `/tokens` query rewrite (the cold-isolate timeout) | planned | 24 Sep |
 | Solana backfill reaching every wallet's first trade (184 wallets hold a Solana address; 0 finished) | starts on the :40 run | ~1 week |
