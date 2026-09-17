@@ -48,14 +48,20 @@ async function healthBody(): Promise<Record<string, unknown>> {
            (select max(captured_at) from holdings)                       as holdings_at,
            (select max(block_time)  from transactions)                   as transactions_at,
            (select max(fetched_at)  from token_info)                     as token_info_at,
-           (select max(at)          from aum_samples)                    as aum_at,
+           (select max(at)          from aum_samples)                    as sampler_at,
            (select max(sampled_at)  from aum_samples
-              where basis = 'sampled')                                   as aum_success_at,
-           (select max(at)          from aum_samples
-              where basis = 'sampled' and total_usd is not null)         as aum_accepted_at,
+              where basis = 'sampled')                                   as sampler_run_at,
+           -- X3 (v5 fixes): the balance clock is what BUILDS the hours now, not the retired
+           -- sampler. feeds.aum read aum_samples, whose newest row is 17 Sep 06:00, while
+           -- aum_history and aum_live went on writing every hour after it -- so /health
+           -- contradicted the data it describes. The sampler's own clocks stay, named for it.
+           (select max(computed_at) from aum_history)                     as aum_built_at,
+           (select max(hour)        from aum_history
+              where total_usd is not null)                               as aum_at,
+           (select max(at)          from aum_live)                        as aum_live_at,
            (select max(last_seen_at) from wallets)                       as wallets_at,
-           (select count(*) from aum_samples)                            as aum_rows,
-           (select count(distinct handle) from aum_samples)               as aum_traders`;
+           (select count(*) from aum_history)                             as aum_rows,
+           (select count(distinct handle) from aum_history)               as aum_traders`;
   /** HOW MANY TRADERS ARE THEMSELVES STALE. See docs/DECISIONS.md#d066 */
   const [st] = await sql`
     with newest as (
@@ -63,6 +69,8 @@ async function healthBody(): Promise<Record<string, unknown>> {
       from aum_samples group by handle
     ), loads as (
       select handle, max(captured_at) as scorecard_at from trades group by handle
+    ), live as (
+      select handle, at from aum_live
     ), attempts as (
       -- distinct on (handle) ... order by handle, attempted_at desc.
       select handle, outcome from (
@@ -71,6 +79,12 @@ async function healthBody(): Promise<Record<string, unknown>> {
         from trade_loads) where rn = 1
     )
     select
+      -- A2 (v5 fixes): a trader nobody watched kept a six-hour-old live figure while
+      -- /health said nothing about it. This is the count to watch, beside the readings.
+      count(case when v.at is null then 1 end)                            as live_never,
+      count(case when v.at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 hours') then 1 end) as live_stale,
+      cast(round(max((julianday('now') - julianday(v.at)) * 24.0)) as integer)
+                                                                          as oldest_live_h,
       count(case when n.reading_at is null then 1 end)                    as no_reading,
       count(case when n.reading_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-36 hours') then 1 end) as reading_stale,
       count(case when l.scorecard_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-72 hours')
@@ -91,7 +105,7 @@ async function healthBody(): Promise<Record<string, unknown>> {
       cast(round(max((julianday('now') - julianday(l.scorecard_at)) * 24.0)) as integer)
                                                                           as oldest_scorecard_h
     from traders t left join newest n using (handle) left join loads l using (handle)
-      left join attempts a using (handle)
+      left join live v using (handle) left join attempts a using (handle)
     where t.listed = 1`;
 
   /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
@@ -174,12 +188,25 @@ async function healthBody(): Promise<Record<string, unknown>> {
     positions:    feed(f.holdings_at, 36),
     transactions: feed(f.transactions_at, 36),
     tokenInfo:    feed(f.token_info_at, 24 * 14),
-    /** F2. The clock is the newest ACCEPTED reading; a refused row moves only `samplerLastRunAt`. */
-    aum:          feed(f.aum_accepted_at, 36, {
+    /**
+     * X3. The clock is the newest hour `aum_history` carries a figure for. The hourly sampler
+     * that used to write this feed was unscheduled on 17 Sep 2026 and its last reading is
+     * 06:00 that day; `sampler` below keeps its clocks so nobody reads them as the live ones.
+     */
+    aum:          feed(f.aum_at, 36, {
                     rowCount: Number(f.aum_rows),
                     traders: Number(f.aum_traders),
                     newestReadingAt: iso(f.aum_at),
-                    samplerLastRunAt: iso(f.aum_success_at),
+                    lastBuiltAt: iso(f.aum_built_at),
+                    newestLiveAt: iso(f.aum_live_at),
+                    description: "hours BUILT from stored holdings and prices (aum_history); `now` from aum_live",
+                    sampler: {
+                      retired: true,
+                      retiredAt: "2026-09-17T03:52:00.000Z",
+                      newestReadingAt: iso(f.sampler_at),
+                      lastRunAt: iso(f.sampler_run_at),
+                      note: "the hourly sampler was unscheduled on 17 Sep 2026; these clocks do not move",
+                    },
                     /** A1. Trader-chains by `knownChains[].historyState`, summed over chains. */
                     historyState: { ready: sumHist("ready"), warming: sumHist("warming"), none: sumHist("none") },
                     /** accepted = a chain row with a figure; failed = one carrying a reason. */
@@ -233,6 +260,12 @@ async function healthBody(): Promise<Record<string, unknown>> {
      * traders carry week-old readings. These counts are the ones to watch.
      */
     staleTraders: {
+      /** A2. Traders whose live figure (`/aum/now`) is older than an hour, and the oldest of them. */
+      liveStale: Number(st?.live_stale ?? 0),
+      liveStaleAfterHours: 1,
+      liveNever: Number(st?.live_never ?? 0),
+      oldestLiveHours: st?.oldest_live_h === null || st?.oldest_live_h === undefined
+        ? null : Number(st.oldest_live_h),
       readingStale: Number(st?.reading_stale ?? 0),
       readingStaleAfterHours: 36,
       noReading: Number(st?.no_reading ?? 0),
