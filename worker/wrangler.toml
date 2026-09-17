@@ -29,6 +29,7 @@ crons = [
 binding = "DB"
 database_name = "genie-copy-trading"
 database_id = "fa5a33dc-ed4d-48a9-8a91-ae76be85456d"
+migrations_dir = "d1/migrations"
 
 [limits]
 cpu_ms = 300000   # Workers Paid maximum; the fee and swap decoders are CPU-bound
