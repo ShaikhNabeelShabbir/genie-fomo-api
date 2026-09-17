@@ -39,25 +39,28 @@ get("/v1/market/regime", async () => {
     with leaders as (
       select handle, sum(realized_pnl_usd) as pnl
       from trades
-      where closed_at >= now() - interval '7 days'
+      where closed_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
       group by handle),
     launches as (
       select graduated from tokens
-      where network_id = ${SOLANA_NET} and created_at >= now() - interval '7 days'),
+      where network_id = ${SOLANA_NET}
+        and created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')),
     moved as (
       select token_key, count(*) as transfers
       from transactions
-      where block_time >= now() - interval '7 days' and token_key is not null
+      where block_time >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
+        and token_key is not null
       group by token_key)
-    select (select count(*) from leaders)::int                                as leaders_total,
-           (select count(*) filter (where pnl > 0) from leaders)::int         as leaders_green,
-           (select count(*) from launches)::int                               as launches_seen,
-           (select count(*) filter (where graduated) from launches)::int      as launches_graduated,
-           (select count(*) from moved)::int                                  as tokens_moved,
-           (select coalesce(sum(transfers), 0) from moved)::bigint            as transfers_total,
+    select (select count(*) from leaders)                                as leaders_total,
+           (select count(case when pnl > 0 then 1 end) from leaders)     as leaders_green,
+           (select count(*) from launches)                               as launches_seen,
+           -- `graduated` is 0/1 now; a null is still "not graduated", as `filter (where …)` was.
+           (select count(case when graduated then 1 end) from launches)  as launches_graduated,
+           (select count(*) from moved)                                  as tokens_moved,
+           (select coalesce(sum(transfers), 0) from moved)               as transfers_total,
            (select coalesce(sum(transfers), 0) from
-              (select transfers from moved order by transfers desc limit 10) top)::bigint
-                                                                              as transfers_top`;
+              (select transfers from moved order by transfers desc limit 10) top)
+                                                                         as transfers_top`;
 
   const leadersTotal = Number(r.leaders_total);
   const green = Number(r.leaders_green);

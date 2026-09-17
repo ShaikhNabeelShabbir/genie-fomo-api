@@ -32,7 +32,7 @@ const flowRows = (handles: string[], since: string) => sql`
     and t.network_id = ${SOLANA}
     and t.direction in ('in', 'out')
     and t.amount is not null
-    and t.block_time >= ${since}::timestamptz
+    and t.block_time >= ${since}
   group by w.handle, c.name, tk.address, t.token_key
   order by w.handle,
            abs(sum(case t.direction when 'in' then t.amount when 'out' then -t.amount end)) desc`;

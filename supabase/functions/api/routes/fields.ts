@@ -25,26 +25,26 @@ async function fieldsBody(): Promise<unknown> {
   const [f] = await sql`
     with sc as (
       select t.handle,
-        count(*) filter (where t.status = 'closed')::int as closed,
-        count(*) filter (where t.status = 'closed' and t.realized_pnl_usd is not null)::int as realized,
-        count(*) filter (where t.avg_entry_price is not null and t.avg_entry_price > 0)::int as entry_px,
-        count(distinct to_char(t.closed_at, 'YYYY-MM')) filter (where t.status = 'closed')::int as months,
-        count(*) filter (where t.status not in ('closed', 'closed_by_balance') and t.unrealized_pnl_usd is not null)::int as unreal
+        count(case when t.status = 'closed' then 1 end) as closed,
+        count(case when t.status = 'closed' and t.realized_pnl_usd is not null then 1 end) as realized,
+        count(case when t.avg_entry_price is not null and t.avg_entry_price > 0 then 1 end) as entry_px,
+        count(distinct case when t.status = 'closed' then strftime('%Y-%m', t.closed_at) end) as months,
+        count(case when t.status not in ('closed', 'closed_by_balance') and t.unrealized_pnl_usd is not null then 1 end) as unreal
       from trades t group by t.handle),
     w as (select handle from wallets where evm_address is not null or sol_address is not null),
-    a as (select handle, count(*) filter (where total_usd is not null)::int as pts
+    a as (select handle, count(case when total_usd is not null then 1 end) as pts
           from aum_samples group by handle)
     select
-      (select count(*) from traders)::int                                as traders,
-      (select count(*) from w)::int                                      as with_wallet,
-      (select count(*) from sc where closed > 0)::int                    as with_closed,
-      (select count(*) from sc where realized > 0)::int                  as with_realized,
-      (select count(*) from sc where closed > 0 and realized = closed)::int as realized_complete,
-      (select count(*) from sc where entry_px > 0)::int                  as with_entry_px,
-      (select count(*) from sc where entry_px >= 20)::int                as entry_px_20,
-      (select count(*) from sc where months >= 3)::int                   as months_3,
-      (select count(*) from sc where unreal > 0)::int                    as with_unrealized,
-      (select count(*) from a where pts > 0)::int                        as with_reading`;
+      (select count(*) from traders)                                as traders,
+      (select count(*) from w)                                      as with_wallet,
+      (select count(*) from sc where closed > 0)                    as with_closed,
+      (select count(*) from sc where realized > 0)                  as with_realized,
+      (select count(*) from sc where closed > 0 and realized = closed) as realized_complete,
+      (select count(*) from sc where entry_px > 0)                  as with_entry_px,
+      (select count(*) from sc where entry_px >= 20)                as entry_px_20,
+      (select count(*) from sc where months >= 3)                   as months_3,
+      (select count(*) from sc where unreal > 0)                    as with_unrealized,
+      (select count(*) from a where pts > 0)                        as with_reading`;
 
   const N = Number(f.traders);
   const rate = (of: unknown, why: string | null = null) => ({
