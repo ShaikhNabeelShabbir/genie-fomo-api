@@ -107,7 +107,7 @@ const exists = (path: string): boolean => {
  * both the name and the value are dropped before the statement is built.
  */
 const generatedColumns = (table: string): Set<string> => {
-  const schema = Deno.readTextFileSync(`${ROOT}/worker/d1/migrations/0001_schema.sql`);
+  const schema = Deno.readTextFileSync(new URL("worker/d1/migrations/0001_schema.sql", ROOT));
   const body = new RegExp(`create table(?: if not exists)? ${table} \\(([\\s\\S]*?)\\n\\);`, "i").exec(schema);
   const out = new Set<string>();
   for (const line of body?.[1].split("\n") ?? []) {
