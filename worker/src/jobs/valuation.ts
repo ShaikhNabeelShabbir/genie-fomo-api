@@ -375,7 +375,10 @@ async function liveTargets(
 }
 
 /** Handles per `holdings_live` read: the view rolls Solana balances forward per row, so it is kept small. */
-const LIVE_CHUNK = 20;
+// 4, not 20: `holdings_live` rolls transfers forward per row, and 20 traders of it in one
+// statement exceeded D1's per-query CPU budget ("D1 DB exceeded its CPU time limit and was
+// reset", 17 Sep). D1 runs one statement at a time, so small and many beats large and few.
+const LIVE_CHUNK = 4;
 /** aum_live is 9 columns; 10 rows is 90 parameters. */
 const LIVE_WRITE_CHUNK = 10;
 

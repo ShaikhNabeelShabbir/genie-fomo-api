@@ -18,8 +18,10 @@ export async function runAumLiveFlush(env: Env, _budgetMs: number): Promise<AumL
   const started = Date.now();
   const sql = jobSql(env);
   try {
+    // Oldest marks first, a bounded slice a run: the cron is every 5 minutes and each trader
+    // costs a `holdings_live` pass, which D1 charges CPU for.
     const marked = (await sql<{ handle: string; marked_at: string }[]>`
-      select handle, marked_at from aum_live_dirty order by marked_at`);
+      select handle, marked_at from aum_live_dirty order by marked_at limit 40`);
     if (!marked.length) return { marked: 0, refreshed: 0, elapsedMs: Date.now() - started };
     const handles = marked.map((m) => m.handle);
     const refreshed = await refreshAumLive(sql, handles, "webhook");
