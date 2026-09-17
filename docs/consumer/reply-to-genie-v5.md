@@ -11,10 +11,10 @@ cause was one line, and it is the same line behind A4's sawtooth. **cupseyy's 07
 `totalUsd: null`, `reason: "too_little_priced"`, `pricedShare: 0.0169`** instead of
 $2,509,077,756. You can drop the $1B guard for him once you have seen that.
 
-**A2 is now met** (§2): 445 of 446 traders carry a figure under an hour old. We cannot tell you
-what that number was when you wrote, because the field that measures it did not exist until
-this deploy — what we can tell you is that it read 308 of 446 the moment it did exist. It took
-three fixes, two of which only showed up because we kept measuring after each one.
+**A2 is now met** (§2): nothing carries a live figure more than about an hour old
+(`oldestLiveHours: 1`, against 9 when the field first existed). We cannot tell you what it was
+when you wrote, because nothing measured it until this deploy. It took three fixes, two of
+which only showed up because we kept measuring after each one.
 
 **What we need from you: run the ten reads in "Verify the deployment" below** — each one says
 what it should return — then re-run your comparisons and send the next batch whenever it suits
@@ -212,10 +212,15 @@ published them as though they were.
      for ever. **The most active traders held the stalest figures.** One of them carried a
      value from 12:25 with a mark refreshed at 16:47. The queue now serves the oldest *value*.
 
-  The remaining `liveStale: 1` is a single trader sitting on the one-hour boundary, which is
-  what a one-hour threshold looks like when it is working. `liveNever` counts only traders with
-  a wallet on record, so it reads 0; three listed traders have no wallet at all and can never
-  carry a balance.
+  **Read `oldestLiveHours`, not `liveStale`, to judge this.** `liveStale` counts traders over
+  the line at the instant you ask, and the job clears them every five minutes, so it oscillates:
+  we have seen 0 just after a pass and 31 midway through the next cycle. Both are healthy. The
+  figure that must hold is **`oldestLiveHours: 1`** — nothing is more than about an hour old. A
+  `liveStale` in the hundreds, or an `oldestLiveHours` above 2, means the five-minute job has
+  stopped, and that is worth telling us about.
+
+  `liveNever` counts only traders with a wallet on record, so it reads 0; three listed traders
+  have no wallet at all and can never carry a balance.
 
 ## 3. ETH and BNB — N1: fixed, and no sweep needed
 
@@ -416,7 +421,7 @@ and **send a `User-Agent` that names your app** or Cloudflare will answer 403 `e
 | 7 | `GET /v2/traders/smokey0x` | `onChain.swapsAppearedIn` about **593** and `onChain.ownSwaps` about **6** — both rise as transfers land, the point is the gap between them, not the figures; **`onChain.swaps` is gone** |
 | 8 | `GET /v2/traders/397397/positions?limit=500` | all four honeypot rows `isHoneypot: true, canSell: false` (H2) |
 | 9 | `GET /v2/traders/tdmilky/positions?limit=500` | `coverage.chains.bsc` reads `transferRowsHeld: 200, rowsPerSentTx: 2.2989` — **the same 2.2989 you flagged, under a name that makes it correct**; `rowsHeld` and `share` are gone (C1). His four natives all price `token_prices` (N1) |
-| 10 | `GET /v2/health` | `feeds.aum` current, with `sampler.retired: true`; **`staleTraders.liveStale` in the low single digits of 446** and `oldestLiveHours` 1 (A2). A number in the hundreds means the five-minute job has stopped — tell us |
+| 10 | `GET /v2/health` | `feeds.aum` current, with `sampler.retired: true`; **`staleTraders.oldestLiveHours: 1`** (A2). `liveStale` oscillates between 0 and a few dozen of 446 depending on where in the five-minute cycle you read — judge it by `oldestLiveHours`. Hundreds stale, or `oldestLiveHours` above 2, means the job has stopped — tell us |
 
 Three of those are breaking renames (7, 9, and `share`/`rowsHeld`). If any of them breaks your
 build, tell us and we will serve both spellings for a version rather than make you rush a fix.
