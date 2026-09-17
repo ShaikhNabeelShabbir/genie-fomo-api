@@ -425,7 +425,21 @@ get("/v1/traders/:handle", async ({ handle }, url) => {
         transfers: Number(act.transfers),
         inbound: Number(act.inbound),
         outbound: Number(act.outbound),
-        swaps: Number(act.swaps),
+        /**
+         * W2 (v5 fixes, 17 Sep 2026). `swaps` IS GONE; THESE TWO REPLACE IT.
+         *
+         * It counted every transfer leg the provider labelled SWAP that this wallet appears
+         * in — so one trade counted several times, AND a trade someone else made counted too
+         * whenever this wallet merely received tokens inside it. Measured on a random sample,
+         * 5 in 6 of a wallet's swap appearances are that. One trader read 1,260 here while
+         * `/trades` returned six, and nothing said the two counted different things.
+         *
+         * `swapsAppearedIn` is the upper bound: distinct transactions labelled SWAP that
+         * touched this wallet at all. `ownSwaps` is what we RESOLVED as his own trade, the
+         * same store `/traders/:handle/trades` serves, and it is the honest trade count.
+         */
+        swapsAppearedIn: Number(act.swaps_appeared_in),
+        ownSwaps: Number(act.own_swaps ?? 0),
         tokensTouched: Number(act.tokens_touched),
         activeDays: Number(act.active_days),
         /**
@@ -505,14 +519,18 @@ const walletActivity = (addrs: string[]) => sql`
   select count(*)                                                  as transfers,
          count(case when direction = 'in'  then 1 end)             as inbound,
          count(case when direction = 'out' then 1 end)             as outbound,
-         count(case when tx_type = 'SWAP'  then 1 end)             as swaps,
+         -- W2 (v5 fixes): DISTINCT transactions, not transfer legs. 'swaps' counted legs, so
+         -- one swap contributing four transfers counted four times.
+         count(distinct case when tx_type = 'SWAP' then tx_hash end) as swaps_appeared_in,
          count(distinct tx_hash)                                   as transactions,
          count(distinct substr(block_time, 1, 10))                 as active_days,
          count(distinct token_key)                                 as tokens_touched,
          min(block_time)                                           as first_at,
          max(block_time)                                           as last_at,
          -- O1: which chains the counts above actually cover.
-         json_group_array(distinct c.name) as chains_covered
+         json_group_array(distinct c.name) as chains_covered,
+         -- W2: the wallet's OWN resolved trades, the store /trades reads.
+         (select count(*) from wallet_swaps ws where ws.address_key in (${addrs})) as own_swaps
   from transactions x left join chains c using (network_id)
   where x.address_key in (${addrs})`;
 

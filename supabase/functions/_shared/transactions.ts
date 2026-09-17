@@ -43,7 +43,13 @@ export interface Transfer {
   gas_native?: number;
 }
 
-export interface ChainStatus { readonly chain: string; readonly count: number; readonly error: string | null }
+export interface ChainStatus {
+  readonly chain: string;
+  readonly count: number;
+  readonly error: string | null;
+  /** W2, Solana only: the provider ran out of signatures, so the backward walk is finished. */
+  readonly exhausted?: boolean;
+}
 
 export interface FetchOptions {
   /** `asc` is required for a PnL replay: a sell can only be settled against earlier buys. */
@@ -52,6 +58,12 @@ export interface FetchOptions {
   readonly includeNative?: boolean;
   /** Pages to walk per chain when the provider supports it. */
   readonly pages?: number;
+  /**
+   * W2: start the Solana walk BEFORE this signature instead of at the head. Helius pages
+   * backwards, so a caller that remembers the oldest signature it holds can carry on from
+   * there rather than re-reading the newest 500 for ever.
+   */
+  readonly solanaBefore?: string | null;
 }
 
 /** Provider keys, trimmed by the caller. An empty or absent key makes that chain report an error. */
@@ -150,7 +162,8 @@ async function bitqueryTx(key: string, chainId: number, wallet: string, limit: n
 
 async function solanaTx(
   key: string, wallet: string, limit: number, includeNative: boolean, pages: number,
-): Promise<{ rows: Transfer[]; gas: GasMap }> {
+  startBefore: string | null = null,
+): Promise<{ rows: Transfer[]; gas: GasMap; exhausted: boolean }> {
   if (!key) throw new Error("HELIUS_SOLANA_KEY is not set");
 
   // Helius caps a page at 100 and pages backwards with `before`. Depth matters more here
@@ -160,7 +173,9 @@ async function solanaTx(
   // keeps the latency and credit cost it always had.
   const maxPages = includeNative ? Math.max(1, pages) : 1;
   const txs: Rec[] = [];
-  let before = "";
+  let before = startBefore ?? "";
+  /** True when Helius ran out of signatures rather than the page budget: the walk is finished. */
+  let exhausted = false;
   for (let p = 0; p < maxPages; p++) {
     const url =
       `https://api.helius.xyz/v0/addresses/${wallet}/transactions` +
@@ -176,10 +191,10 @@ async function solanaTx(
     }
     const data: unknown = await r.json();
     const page = Array.isArray(data) ? recs(data) : recs(rec(data).transactions);
-    if (!page.length) break;
+    if (!page.length) { exhausted = true; break; }
     txs.push(...page);
     before = str(page[page.length - 1].signature);
-    if (!before || page.length < 100) break;
+    if (!before || page.length < 100) { exhausted = true; break; }
   }
 
   const out: Transfer[] = [];
@@ -222,7 +237,7 @@ async function solanaTx(
     const fee = Number(tx.fee);
     if (Number.isFinite(fee) && fee > 0 && tx.feePayer === wallet) gas.set(sig, fee / 1e9);
   }
-  return { rows: includeNative ? out : out.slice(0, limit), gas };
+  return { rows: includeNative ? out : out.slice(0, limit), gas, exhausted };
 }
 
 // ---------------------------------------------------------------- orchestration
@@ -255,6 +270,7 @@ export async function fetchTransactions(
     order: options.order ?? "desc",
     includeNative: options.includeNative ?? false,
     pages: Math.max(1, options.pages ?? 5),
+    solanaBefore: options.solanaBefore ?? null,
   };
 
   const started = Date.now();
@@ -268,9 +284,9 @@ export async function fetchTransactions(
   }
   if (solWallet && (!chains || chains.includes("solana"))) {
     jobs.push(
-      solanaTx(keys.helius ?? "", solWallet, limit, opts.includeNative, opts.pages)
-        .then(({ rows, gas }): ChainPull => ({
-          rows, gas, status: { chain: "solana", count: rows.length, error: null },
+      solanaTx(keys.helius ?? "", solWallet, limit, opts.includeNative, opts.pages, opts.solanaBefore ?? null)
+        .then(({ rows, gas, exhausted }): ChainPull => ({
+          rows, gas, status: { chain: "solana", count: rows.length, error: null, exhausted },
         }))
         .catch((e: unknown): ChainPull => ({
           rows: [], gas: new Map(), status: { chain: "solana", count: 0, error: message(e) },

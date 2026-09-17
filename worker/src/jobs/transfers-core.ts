@@ -20,6 +20,10 @@ export interface Wallet {
   readonly handle: string;
   readonly evm_address: string | null;
   readonly sol_address: string | null;
+  /** W2: 1 once the backward Solana walk reached the end of the wallet's history. */
+  readonly sol_backfill_done?: number | null;
+  /** W2: the oldest Solana signature we already hold, the `before` the next page starts at. */
+  readonly sol_oldest_signature?: string | null;
 }
 
 /** Chain word (as `Transfer.chain` names it) -> network_id. */

@@ -340,6 +340,66 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
     select chain, trades_seen from wallet_chain_presence where handle = ${h} order by trades_seen desc`;
   const resolvedChains = new Set(page.map((r: any) => r.chain as string));
 
+  /**
+   * W2. THE INGESTION FLOOR PER CHAIN, so a truncated record stops looking like a complete one.
+   *
+   * `horizonAt` is the oldest transaction we hold for this wallet on that chain. A swap list
+   * that starts there starts where OUR RECORD starts, not where the trader did. On Solana we
+   * also know whether the backward walk has finished (`wallets.sol_backfill_done`), which is
+   * the difference between "this is all of it" and "this is all of it so far".
+   */
+  const horizonRows = addrs.length
+    ? await sql`
+        select c.name as chain, min(t.block_time) as horizon_at
+          from transactions t join chains c using (network_id)
+         where t.address_key in (${addrs})
+         group by c.name`
+    : [];
+  const horizonOf = new Map<string, string | null>(
+    (horizonRows as Record<string, unknown>[]).map((r) =>
+      [String(r.chain), r.horizon_at ? new Date(String(r.horizon_at)).toISOString() : null]),
+  );
+  const [walkState] = await sql`select sol_backfill_done from wallets where handle = ${h}`;
+  const solanaWalked = Number(walkState?.sol_backfill_done ?? 0) === 1;
+
+  /** PER CHAIN, so "he made no trades there" and "we have not read that chain" stop looking ide… See docs/DECISIONS.md#d121 */
+  const byChain = (() => {
+      const span = new Map<string, { from: number; to: number; rows: number }>();
+      for (const r of allSwaps as Record<string, unknown>[]) {
+        const netName = r.chain ? String(r.chain) : null;
+        if (!netName) continue;
+        const at = r.block_time ? Date.parse(String(r.block_time)) : NaN;
+        if (!Number.isFinite(at)) continue;
+        const cur = span.get(netName);
+        if (!cur) span.set(netName, { from: at, to: at, rows: 1 });
+        else { cur.from = Math.min(cur.from, at); cur.to = Math.max(cur.to, at); cur.rows++; }
+      }
+      const named = new Set<string>([
+        ...span.keys(),
+        ...presence.map((p: any) => String(p.chain)),
+      ]);
+      return [...named].sort().map((chain) => {
+        const sp = span.get(chain) ?? null;
+        /* Only Solana can say it reached the end of the wallet's history; see `horizonAt`. */
+        const truncated = sp !== null && chain === "solana" && !solanaWalked;
+        return {
+          chain,
+          state: sp === null ? "unresolved" : truncated ? "truncated" : "complete",
+          from: sp ? new Date(sp.from).toISOString() : null,
+          to: sp ? new Date(sp.to).toISOString() : null,
+          /** W2: the oldest transaction we hold here. The record starts here, the trader may not have. */
+          horizonAt: horizonOf.get(chain) ?? null,
+          swaps: sp?.rows ?? 0,
+          why: sp === null
+            ? "this trader trades here but we hold no resolved swaps for this chain"
+            : truncated
+            ? "our record of this chain starts at horizonAt and is still being walked backwards; " +
+              "trades before it are not yet loaded"
+            : null,
+        };
+      });
+  })();
+
   return {
     handle: t.display_handle,
     count: page.length,
@@ -423,7 +483,22 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
         String(pageRaw[pageRaw.length - 1].tx_hash),
       ])
       : null,
-    complete: !capped,
+    /**
+     * W2 (v5 fixes, 17 Sep 2026). COMPLETE MEANS COMPLETE.
+     *
+     * It used to be `!capped` alone -- a pagination fact. A six-row answer that held four
+     * Solana swaps from August and named base, bsc and ethereum `unresolved` still said
+     * `complete: true`, and a consumer counting a trader's warning signs from this list was
+     * shown a cleaner record than the trader has. It is now false while the page was capped,
+     * while any chain he trades on is `unresolved`, or while any chain is still `truncated`.
+     */
+    complete: !capped && byChain.every((c) => c.state === "complete"),
+    /** Which of the three made it false, so the reason does not have to be inferred. */
+    incompleteReason: !capped && byChain.every((c) => c.state === "complete") ? null
+      : [capped && "page_capped",
+         byChain.some((c) => c.state === "unresolved") && "chains_unresolved",
+         byChain.some((c) => c.state === "truncated") && "chains_truncated"]
+        .filter(Boolean).join("_and_"),
     /**
      * How many rows the page held before `?status=` was applied. With a status filter, `count`
      * can be 0 while `nextCursor` is non-null -- that is a sparse page, not the end. Keep
@@ -440,35 +515,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
         .map((p: any) => p.chain as string)
         .filter((c: string) => !resolvedChains.has(c)),
       /** PER CHAIN, so "he made no trades there" and "we have not read that chain" stop looking ide… See docs/DECISIONS.md#d121 */
-      byChain: (() => {
-        const span = new Map<string, { from: number; to: number; rows: number }>();
-        for (const r of allSwaps as Record<string, unknown>[]) {
-          const netName = r.chain ? String(r.chain) : null;
-          if (!netName) continue;
-          const at = r.block_time ? Date.parse(String(r.block_time)) : NaN;
-          if (!Number.isFinite(at)) continue;
-          const cur = span.get(netName);
-          if (!cur) span.set(netName, { from: at, to: at, rows: 1 });
-          else { cur.from = Math.min(cur.from, at); cur.to = Math.max(cur.to, at); cur.rows++; }
-        }
-        const named = new Set<string>([
-          ...span.keys(),
-          ...presence.map((p: any) => String(p.chain)),
-        ]);
-        return [...named].sort().map((chain) => {
-          const sp = span.get(chain) ?? null;
-          return {
-            chain,
-            state: sp === null ? "unresolved" : "complete",
-            from: sp ? new Date(sp.from).toISOString() : null,
-            to: sp ? new Date(sp.to).toISOString() : null,
-            swaps: sp?.rows ?? 0,
-            why: sp === null
-              ? "this trader trades here but we hold no resolved swaps for this chain"
-              : null,
-          };
-        });
-      })(),
+      byChain,
       why: "swaps are resolved from chain on Solana and on bsc, base and ethereum. A wallet " +
            "appears in far more transactions than it trades in — measured on a random " +
            "sample, 5 in 6 are the wallet receiving tokens inside someone else's trade — so " +

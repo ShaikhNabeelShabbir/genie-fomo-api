@@ -3,6 +3,7 @@ import { jobSql, type Sql } from "../sql";
 import { transferKey } from "../../../supabase/functions/_shared/md5.ts";
 import { UA } from "../../../supabase/functions/_shared/settings.ts";
 import { fetchTransactions, type ProviderKeys } from "../../../supabase/functions/_shared/transactions.ts";
+import { SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { type Row, type Wallet, chunk, dedupe, pickWebhook, toRows, webhooksOf } from "./transfers-core";
 
 /**
@@ -50,7 +51,11 @@ export interface TransfersSummary {
  * ponytail: a wallet with genuinely no activity is re-fetched every run; fine at ~1 min a pass.
  */
 const selectTargets = (sql: Sql) => sql<Wallet[]>`
-  select w.handle, w.evm_address, w.sol_address
+  select w.handle, w.evm_address, w.sol_address, w.sol_backfill_done,
+         -- W2: the oldest Solana signature we hold IS the next 'before'; no cursor column needed.
+         (select t.tx_hash from transactions t
+           where t.address_key = w.sol_address_key and t.network_id = ${SOLANA_NETWORK_ID}
+           order by t.block_time asc limit 1)                        as sol_oldest_signature
     from wallets w join trader_stats_current s using (handle)
    where (w.evm_address is not null or w.sol_address is not null)
    order by coalesce((select max(t.ingested_at) from transactions t
@@ -87,13 +92,46 @@ async function upsert(sql: Sql, rows: readonly Row[]): Promise<void> {
   });
 }
 
-/** Fetch one wallet on every chain and upsert its rows. Returns rows written. */
+/**
+ * Fetch one wallet on every chain and upsert its rows. Returns rows written.
+ *
+ * W2 (v5 fixes, 17 Sep 2026). TWO SOLANA PULLS, NOT ONE.
+ *
+ * The head pull is what this job always did: `before` unset, the newest PAGES x 100 signatures,
+ * which keeps recent activity current. On its own it also meant the record NEVER reached past
+ * the newest 500 signatures — on an airdrop-spammed wallet that is a few weeks, and a trader
+ * active this morning had no stored Solana swap since 6 Aug.
+ *
+ * The second pull walks BACKWARDS from the oldest signature we already hold, one PAGES-deep
+ * page a run, until Helius answers with nothing and `sol_backfill_done` is set. A wallet is
+ * finished once and never walked again.
+ */
 async function backfillWallet(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<number> {
   // includeNative pulls the native SOL side of a swap; without it a spend cannot be attributed.
   const out = await fetchTransactions(keys, w.evm_address, w.sol_address, null, LIMIT, { pages: PAGES, includeNative: true });
   for (const c of out.chains) if (c.error) console.error(`transfers: ${w.handle} ${c.chain}: ${c.error}`);
   const rows = dedupe(toRows(w, out.transfers));
   for (const part of chunk(rows, INSERT_CHUNK)) await upsert(sql, part);
+  return rows.length + await walkBack(sql, keys, w);
+}
+
+/** One backward Solana page for a wallet whose history is not yet in. Returns rows written. */
+async function walkBack(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<number> {
+  const before = w.sol_oldest_signature ?? null;
+  if (!w.sol_address || w.sol_backfill_done === 1 || before === null) return 0;
+  const out = await fetchTransactions(keys, null, w.sol_address, ["solana"], LIMIT,
+    { pages: PAGES, includeNative: true, solanaBefore: before });
+  const sol = out.chains.find((c) => c.chain === "solana");
+  if (sol?.error) {
+    console.error(`transfers: ${w.handle} solana backfill: ${sol.error}`);
+    return 0;
+  }
+  const rows = dedupe(toRows(w, out.transfers));
+  for (const part of chunk(rows, INSERT_CHUNK)) await upsert(sql, part);
+  /* Helius ran out of signatures rather than out of pages: this wallet is done for good. */
+  if (sol?.exhausted) {
+    await sql`update wallets set sol_backfill_done = 1 where handle = ${w.handle}`;
+  }
   return rows.length;
 }
 
