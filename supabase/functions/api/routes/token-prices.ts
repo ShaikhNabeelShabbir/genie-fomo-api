@@ -35,7 +35,7 @@ const iso = (v: Date | string | null): string | null => (v ? new Date(String(v))
 const pairKey = (p: Pair): string => `${p.network_id}:${p.token_key}`;
 
 /** Every (chain, token) row an address list resolves to, with the latest and the high. */
-const resolveTokens = (keys: string[], net: number | null): Promise<TokenRow[]> => sql<TokenRow[]>`
+const resolveTokens = async (keys: string[], net: number | null): Promise<TokenRow[]> => await sql<TokenRow[]>`
   select t.network_id, t.token_key, t.address, c.name as chain, t.symbol,
          ps.last_usd, ps.last_at, ps.ath_usd, ps.ath_at
     from tokens t

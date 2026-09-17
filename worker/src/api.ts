@@ -1,5 +1,5 @@
 import type { Env } from "./env";
-import { db } from "./db";
+import { jobSql } from "./sql";
 import { handle } from "../../supabase/functions/api/app.ts";
 import { runWith } from "../../supabase/functions/api/db.ts";
 
@@ -21,11 +21,11 @@ export async function api(req: Request, env: Env, ctx: ExecutionContext): Promis
       },
     }, { status: 404 });
   }
-  if (!env.HYPERDRIVE) {
-    return Response.json({ error: "not_configured", detail: "HYPERDRIVE binding is parked" }, { status: 503 });
+  if (!env.DB) {
+    return Response.json({ error: "not_configured", detail: "the D1 binding DB is not configured" }, { status: 503 });
   }
-  const sql = db(env);
-  // The store carries string vars only; the binding stays on `env` for `db()`.
+  const sql = jobSql(env);
+  // The store carries string vars only; the bindings stay on `env` for `jobSql()`.
   const { HYPERDRIVE: _binding, DB: _db, ...vars } = env;
   try {
     return await runWith({ sql, env: vars }, () => handle(req));

@@ -55,7 +55,7 @@ async function runJob(req: Request, env: Env): Promise<Response> {
   if (req.method !== "POST") return Response.json({ error: "POST only" }, { status: 405 });
   if (!env.JOB_SECRET) return Response.json({ error: "JOB_SECRET is not set; refusing to run" }, { status: 503 });
   if (req.headers.get("x-job-secret") !== env.JOB_SECRET) return Response.json({ error: "unauthorized" }, { status: 401 });
-  if (!env.HYPERDRIVE) return Response.json({ error: "HYPERDRIVE binding is not configured" }, { status: 503 });
+  if (!env.DB) return Response.json({ error: "the D1 binding DB is not configured" }, { status: 503 });
   const url = new URL(req.url);
   const name = url.pathname.slice("/jobs/".length);
   const job = JOB_BY_NAME[name];
@@ -90,7 +90,7 @@ export default {
    * dashboard, not as a silently dropped promise. See docs/CLOUDFLARE_MIGRATION.md §7
    */
   async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
-    if (!env.HYPERDRIVE) { console.log("cron: HYPERDRIVE binding is parked, nothing to do"); return; }
+    if (!env.DB) { console.log("cron: the D1 binding DB is not configured, nothing to do"); return; }
     const job = JOBS[event.cron];
     if (!job) throw new Error(`no job for cron '${event.cron}'`);
     const budgetMs = Number(env.JOB_BUDGET_MS ?? 600_000);

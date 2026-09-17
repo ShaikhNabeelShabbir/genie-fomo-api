@@ -178,7 +178,7 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
     })),
     plain: Number(stored.total) === 0
       ? "Nothing stored for this trader's wallets yet — the backfill has not covered them."
-      : `${stored.total.toLocaleString()} transfers stored; showing the ${rows.length} most recent.`,
+      : `${Number(stored.total).toLocaleString()} transfers stored; showing the ${rows.length} most recent.`,
   };
 });
 

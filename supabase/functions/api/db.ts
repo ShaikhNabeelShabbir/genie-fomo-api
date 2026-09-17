@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type postgres from "https://deno.land/x/postgresjs@v3.4.4/mod.js";
 
-type Sql = postgres.Sql;
+import type { Sql } from "../../../worker/src/d1.ts";
 
 /**
  * The client is resolved PER CALL, not at import. On Deno `index.ts` builds one client for
