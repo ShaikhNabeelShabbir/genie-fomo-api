@@ -20,8 +20,13 @@ export interface DexPair {
   readonly pairAddress?: string;
   readonly dexId?: string;
   readonly labels?: readonly string[];
+  readonly info?: { readonly imageUrl?: string | null };
 }
-export interface BestPair { readonly usd: number; readonly liquidity: number; readonly pair: string; readonly dex: string }
+export interface BestPair {
+  readonly usd: number; readonly liquidity: number; readonly pair: string; readonly dex: string;
+  /** The token image DexScreener shows, null when the pair carries none. */
+  readonly logo: string | null;
+}
 export interface Ath { readonly athUsd: number; readonly athAt: string }
 export interface AthStats extends Ath { readonly drawdownShare: number }
 export interface PriceSample { readonly usd: number; readonly at: string }
@@ -47,7 +52,10 @@ export function bestPairs(pairs: readonly (DexPair | null)[]): Map<string, BestP
     const liq = Number(p?.liquidity?.usd ?? 0);
     const prev = best.get(key);
     if (!prev || liq > prev.liquidity) {
-      best.set(key, { usd, liquidity: liq, pair: String(p?.pairAddress ?? ""), dex: `${p?.dexId ?? "?"}:${(p?.labels ?? []).join("+") || "?"}` });
+      best.set(key, {
+        usd, liquidity: liq, pair: String(p?.pairAddress ?? ""), dex: `${p?.dexId ?? "?"}:${(p?.labels ?? []).join("+") || "?"}`,
+        logo: p?.info?.imageUrl || null,
+      });
     }
   }
   return best;

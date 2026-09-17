@@ -225,13 +225,13 @@ async function storeInfo(sql: Sql, t: InfoTarget, d: Rec, sec: Security | null):
   const [row] = await sql<{ flipped: boolean | null }[]>`
     insert into token_info (network_id, token_key, symbol, name, price_usd, liquidity_usd,
        market_cap_usd, total_supply, circulating_supply, max_supply, holder_count,
-       top_10_holder_rate, raw, source, fetched_at,
+       top_10_holder_rate, logo_url, raw, source, fetched_at,
        is_honeypot, buy_tax, sell_tax, is_open_source, is_renounced, renounced_mint,
        renounced_freeze, rug_ratio, burn_ratio, is_blacklisted, can_not_sell,
        security_fetched_at, honeypot_since)
      values (${t.network_id}, ${t.token_key}, ${r.symbol}, ${r.name}, ${r.price_usd}, ${r.liquidity_usd},
              ${r.market_cap_usd}, ${r.total_supply}, ${r.circulating_supply}, ${r.max_supply}, ${r.holder_count},
-             ${r.top_10_holder_rate}, ${r.raw}::jsonb, 'gmgn', now(),
+             ${r.top_10_holder_rate}, ${r.logo_url}, ${r.raw}::jsonb, 'gmgn', now(),
              ${sec?.is_honeypot ?? null}, ${sec?.buy_tax ?? null}, ${sec?.sell_tax ?? null}, ${sec?.is_open_source ?? null},
              ${sec?.is_renounced ?? null}, ${sec?.renounced_mint ?? null}, ${sec?.renounced_freeze ?? null},
              ${sec?.rug_ratio ?? null}, ${sec?.burn_ratio ?? null}, ${sec?.is_blacklisted ?? null}, ${sec?.can_not_sell ?? null},
@@ -243,6 +243,8 @@ async function storeInfo(sql: Sql, t: InfoTarget, d: Rec, sec: Security | null):
        total_supply=excluded.total_supply, circulating_supply=excluded.circulating_supply,
        max_supply=excluded.max_supply, holder_count=excluded.holder_count,
        top_10_holder_rate=excluded.top_10_holder_rate, raw=excluded.raw,
+       -- GMGN's logo wins; a DexScreener one (prices job) stands until GMGN has its own.
+       logo_url=coalesce(excluded.logo_url, token_info.logo_url),
        fetched_at=now(),
        -- Only overwrite security when this run actually fetched it: a failed call must leave yesterday's answer standing.
        is_honeypot      = case when ${has}::boolean then excluded.is_honeypot      else token_info.is_honeypot end,

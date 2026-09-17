@@ -10,7 +10,7 @@ Deno.test("bestPairs: deepest priced pool per token wins, keyed lower-case", () 
     { baseToken: { address: "0xaaa" }, priceUsd: "1.2", liquidity: { usd: 1000 }, pairAddress: "p3", dexId: "uniswap", labels: ["v3"] },
   ]);
   // A tie on liquidity keeps the first seen (strictly deeper replaces).
-  assertEquals([...best.entries()], [["0xaaa", { usd: 1.1, liquidity: 1000, pair: "p2", dex: "uniswap:v3" }]]);
+  assertEquals([...best.entries()], [["0xaaa", { usd: 1.1, liquidity: 1000, pair: "p2", dex: "uniswap:v3", logo: null }]]);
 });
 
 Deno.test("bestPairs: a pair with no positive USD price is no pair", () => {
@@ -21,12 +21,12 @@ Deno.test("bestPairs: a pair with no positive USD price is no pair", () => {
     { baseToken: { address: "0xeee" }, priceUsd: "2", liquidity: { usd: 5000 }, pairAddress: "p6", dexId: "raydium", labels: ["clmm"] },
   ]);
   assertEquals([...best.keys()], ["0xeee"]);
-  assertEquals(best.get("0xeee"), { usd: 2, liquidity: 5000, pair: "p6", dex: "raydium:clmm" });
+  assertEquals(best.get("0xeee"), { usd: 2, liquidity: 5000, pair: "p6", dex: "raydium:clmm", logo: null });
 });
 
 Deno.test("bestPairs: missing liquidity, labels and pair address fall back to 0, '?' and ''", () => {
   const best = bestPairs([{ baseToken: { address: "0xCCC" }, priceUsd: "0.5", dexId: "uniswap" }]);
-  assertEquals(best.get("0xccc"), { usd: 0.5, liquidity: 0, pair: "", dex: "uniswap:?" });
+  assertEquals(best.get("0xccc"), { usd: 0.5, liquidity: 0, pair: "", dex: "uniswap:?", logo: null });
   assertEquals(bestPairs([{ priceUsd: "0.5" }]).size, 0, "no base token address is no pair");
   assertEquals(bestPairs([null, { baseToken: { address: "x" }, priceUsd: 3, labels: ["a", "b"] }]).get("x")?.dex, "?:a+b");
 });
@@ -61,4 +61,15 @@ Deno.test("athUpdate: a higher sample resets the high and its time", () => {
 
 Deno.test("athUpdate: a sample equal to the high is the high (time moves to the sample)", () => {
   assertEquals(athUpdate({ athUsd: 2, athAt: T0 }, { usd: 2, at: T1 }), { athUsd: 2, athAt: T1, drawdownShare: 0 });
+});
+
+Deno.test("bestPairs: the winning pair's info.imageUrl is the logo; absent or empty is null", () => {
+  const best = bestPairs([
+    { baseToken: { address: "0xA" }, priceUsd: "1", liquidity: { usd: 1 }, info: { imageUrl: "https://cdn/x.png" } },
+    { baseToken: { address: "0xA" }, priceUsd: "1", liquidity: { usd: 9 } },
+    { baseToken: { address: "0xB" }, priceUsd: "1", info: { imageUrl: "" } },
+  ]);
+  assertEquals(best.get("0xa")?.logo, null, "deepest pool wins even when a shallower one had the image");
+  assertEquals(best.get("0xb")?.logo, null);
+  assertEquals(bestPairs([{ baseToken: { address: "c" }, priceUsd: 2, info: { imageUrl: "https://cdn/c.png" } }]).get("c")?.logo, "https://cdn/c.png");
 });

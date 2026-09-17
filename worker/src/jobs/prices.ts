@@ -83,6 +83,14 @@ async function writeChunk(sql: Sql, hour: string, priced: readonly Hit[], prev: 
     on conflict (network_id, token_key) do update
       set ath_usd = excluded.ath_usd, ath_at = excluded.ath_at, last_usd = excluded.last_usd, last_at = excluded.last_at,
           drawdown_share = excluded.drawdown_share, source = excluded.source, updated_at = now()`;
+  // G2: fill a missing logo from the pair; GMGN's own (tokens job) is never overwritten.
+  const withLogo = priced.filter((p) => p.b.logo !== null);
+  if (withLogo.length === 0) return;
+  await sql`
+    update token_info ti set logo_url = v.logo
+      from unnest(${withLogo.map((p) => p.t.network_id)}::bigint[], ${withLogo.map((p) => p.t.token_key)}::text[],
+                  ${withLogo.map((p) => p.b.logo)}::text[]) as v(network_id, token_key, logo)
+     where ti.network_id = v.network_id and ti.token_key = v.token_key and ti.logo_url is null`;
 }
 
 /** DexScreener's endpoint is per chain, so a batch never mixes chains. */

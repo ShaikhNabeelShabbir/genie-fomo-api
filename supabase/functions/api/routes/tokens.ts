@@ -59,6 +59,7 @@ get("/v1/tokens", async (_p, url) => {
            max(ti.market_cap_usd) as market_cap_usd,
            max(ti.liquidity_usd)  as liquidity_usd,
            max(ti.holder_count)   as holder_count,
+           max(ti.logo_url)       as logo_url,
            max(ti.fetched_at)     as info_fetched_at,
            -- T3e on the board. Only the two tags worth scanning a list by; the rest are on
            -- the token detail route with the cap disclosure attached.
@@ -188,6 +189,8 @@ get("/v1/tokens", async (_p, url) => {
       networkId: Number(r.network_id),
       chain: r.chain,
       holders: Number(r.holders),
+      /** G2. GMGN's logo, else DexScreener's pair image; null when neither source has one. */
+      logoUrl: (r.logo_url as string | null) ?? null,
       /**
        * T3d. GMGN's chain-wide figures, flat on the board row because that is where a
        * consumer scans them. `tier` says whose numbers these are; the token detail route
@@ -246,7 +249,7 @@ get("/v1/tokens/:address", async ({ address }, url) => {
            tk.created_at as launch_created_at, tk.launchpad, tk.curve_progress, tk.graduated, tk.launch_read_at,
            ti.price_usd, ti.liquidity_usd, ti.market_cap_usd, ti.total_supply,
            ti.circulating_supply, ti.holder_count, ti.top_10_holder_rate,
-           ti.symbol as gmgn_symbol, ti.source as info_source, ti.fetched_at as info_fetched_at,
+           ti.symbol as gmgn_symbol, ti.source as info_source, ti.fetched_at as info_fetched_at, ti.logo_url,
            -- T3b/T3c/T3e. Specific paths rather than the whole ti.raw document: this query
            -- returns one row per holder, so selecting all of it would ship the same ~10KB
            -- JSON once per holder — 70+ copies of an identical value on a widely-held token.
@@ -339,6 +342,8 @@ get("/v1/tokens/:address", async ({ address }, url) => {
         tokenAddress: group[0].address,
         networkId: Number(group[0].network_id),
         chain: group[0].chain,
+        /** G2. GMGN's logo, else DexScreener's pair image; null when neither source has one. */
+        logoUrl: (group[0].logo_url as string | null) ?? null,
         holders,
         holderShare: Number((holders / Number(traderCount)).toFixed(4)),
         totalValueUsd: priced.length ? round(total) : null,
@@ -829,8 +834,12 @@ get("/v1/tokens/momentum", async (_p, url) => {
     chains.set(Number(r.network_id), r.name as string);
   }
   const addrs = new Map<string, string>();
-  for (const r of await sql`select network_id, token_key, address from tokens`) {
+  const logos = new Map<string, string | null>();
+  for (const r of await sql`
+    select tk.network_id, tk.token_key, tk.address, ti.logo_url
+      from tokens tk left join token_info ti on ti.network_id = tk.network_id and ti.token_key = tk.token_key`) {
     addrs.set(`${r.network_id}:${r.token_key}`, r.address as string);
+    logos.set(`${r.network_id}:${r.token_key}`, (r.logo_url as string | null) ?? null);
   }
 
   const moved = rows.flatMap((r) => {
@@ -844,6 +853,7 @@ get("/v1/tokens/momentum", async (_p, url) => {
     return [{
       tokenAddress: addrs.get(`${net}:${r.token_key}`) ?? r.token_key,
       networkId: net, chain: chains.get(net) ?? String(net),
+      logoUrl: logos.get(`${net}:${r.token_key}`) ?? null,
       holders: Number(r.holders), previousHolders: Number(r.previous_holders), change,
       gained: gained.map((h) => disp.get(h) ?? h), lost: lost.map((h) => disp.get(h) ?? h),
       isNew: Number(r.previous_holders) === 0,

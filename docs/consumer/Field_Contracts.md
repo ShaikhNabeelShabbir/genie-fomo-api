@@ -490,3 +490,8 @@ Migration `20260918060000_valuation_v3.sql` (17 Sep 2026, fix request v3 V1 / N1
 | `now.reason`, `points[].reason` | same | Gains `price_suspect`: nothing counted and at least one position was suspect. `no_prices` remains "nothing priced at all". A price `<= 0` is unpriced at every rung (a $0 token never counts as priced, so `1 of 1 priced` with `totalUsd: 0` cannot occur) |
 | `now.totalUsd`, `points[].totalUsd` | same | Stored unrounded, rounded to 2 dp at the route: a sub-cent real value reads `0` only after rounding, and `null` still means not valued. `latest` is the newest point with a non-null `totalUsd` |
 | `now.pricedPositions`, `points[].pricedPositions` | same | Counts positions with a value `> 0` that are neither suspect nor unsellable |
+## v3 fixes — token logo
+
+| Field | Route | Contract |
+|---|---|---|
+| `logoUrl` | /tokens rows, /tokens/:address entries, /tokens/momentum rows | Token image URL (`string`), GMGN's `logo` first, DexScreener's pair `info.imageUrl` when GMGN has none. `null` when neither source has one, never `""`. Filled by the nightly tokens job and the hourly prices job, so a newly seen token is `null` for up to an hour. Not on positions rows. |
