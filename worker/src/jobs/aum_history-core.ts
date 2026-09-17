@@ -1,5 +1,5 @@
 /**
- * Pure range planner for the aum_history builder (rule 3 in the 18 Sep 2026 decision):
+ * Pure range planner for the aum_history builder (rule 3 in the 17 Sep 2026 decision):
  * hours run from the hour after the last built one (or the earliest source hour when nothing
  * is built) up to the current hour, the last two hours are always recomputed because prices
  * arrive late, and the span is cut into chunks of at most `chunkHours` so a fresh install

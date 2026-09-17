@@ -36,7 +36,7 @@ Each item is one PR on `cloudflare-migration` (or a branch off it), deployed wit
 ./scripts/acceptance_capture.sh "$BASE" captures/defects \
   gmgn_0xf80d7961 gmgn_0x08b2526b gmgn_0xcb4d28c2 gmgn_hzyjnkimyy gmgn_8gv31ab8mt \
   sadcrissy frankdegods baolingd gmgn_0x314e6555 gmgn_0x65c13772 gmgn_0xf1d07077 \
-  gmgn_0x0fde7f37 luckedhub shahh trancey smokey0x Lasercat397 ZephyrTrading
+  gmgn_0x0fde7f37 luckedhub shahh smokey0x 397397 ZephyrTrading
 ```
 
 Sizes: **S** under a day, **M** one to three days, **L** a week or a data-source decision.
@@ -268,7 +268,7 @@ counter is global.
 Fix: join the flags onto position rows (`isHoneypot`, `canSell`), exclude flagged value from
 `totalUsd` into `unsellableUsd`, and mark the reading `partial: true, partialReason:
 'unsellable_positions'`. The sampler's `pricesFor` (`aum-sample/index.ts:119-135`) gets the
-same join. Publish the word first. Repro: Lasercat397, `0x26bec…4608`.
+same join. Publish the word first. Repro: trader `397397` (display name Lasercat397), `0x26bec…4608`.
 
 ### 10. P1 — `/pnl.openPositions` ten times the `/positions` list (104 traders) · M
 

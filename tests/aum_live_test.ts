@@ -1,7 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { addressKeys, shapeRows } from "../worker/src/helius.ts";
 
-/* aum_live (18 Sep 2026): the webhook revalues the traders whose wallets a delivery touched.
+/* aum_live (17 Sep 2026): the webhook revalues the traders whose wallets a delivery touched.
    The SQL (aum_live_refresh) lives in migration 20260918030000; only the key grouping is pure. */
 
 const A = "WatchedA";

@@ -55,7 +55,7 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `clo
 - [x] Migration history repaired (30) and 14 migrations pushed by the user; `fetch_types: false` removed
       (arrays broke); v2 answers every family; smoke 7/8 (the 8th is `dataState: degraded`, by design T2).
       Worker secrets: HELIUS_WEBHOOK_SECRET, HELIUS_SOLANA_KEY set; AUM_SAMPLE_SECRET, WALLET_SUBMIT_SECRET pending.
-- [x] 18 Sep: v2 is standalone (v1 frozen, no Supabase deploy). Every loader ported to Worker crons (14 jobs), GitHub
+- [x] 17 Sep: v2 is standalone (v1 frozen, no Supabase deploy). Every loader ported to Worker crons (14 jobs), GitHub
       = CI/CD only; JS/Python/shell removed; `aum_history` (built, hourly, back to 11 Aug) + `aum_live` (webhook/
       balances/prices refresh) + price rollups + `/aum/history`, `/aum/now`, `/tokens/:address/prices`; vocabulary v10;
       `POST /jobs/<name>`; Bitquery for EVM balances (public RPC 429s). Handoff bundle `docs/consumer/v2-handoff/`.

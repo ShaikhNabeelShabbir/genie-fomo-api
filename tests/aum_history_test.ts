@@ -1,7 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { planChunks, planWork, truncHour } from "../worker/src/jobs/aum_history-core.ts";
 
-/* Rule 3 of the 18 Sep 2026 aum_history decision: resume after the last built hour, always
+/* Rule 3 of the 17 Sep 2026 aum_history decision: resume after the last built hour, always
    redo the last two hours, chunk at <= 168 h, oldest first. */
 
 const H = 3_600_000;

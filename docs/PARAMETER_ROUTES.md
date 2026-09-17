@@ -1013,7 +1013,7 @@ The flags now ride on the row, its priced value goes into `unsellableUsd` instea
 on `/portfolio`, `/positions` and `POST /traders/positions` alike:
 
 ```bash
-curl -s "$B/traders/Lasercat397/positions" | jq '{totalValueUsd, unsellableUsd, partial, partialReason}'
+curl -s "$B/traders/397397/positions" | jq '{totalValueUsd, unsellableUsd, partial, partialReason}'
 ```
 
 **`coverage.chains` says how much of a wallet's history the indexer has actually seen.** One
@@ -1841,7 +1841,7 @@ record — "nobody has ever sold" and "we have no evidence" are different claims
 121 traders have a record for a token 58 people currently hold — **63 traded it and got out
 entirely.** That is exit information a holder count alone cannot show.
 
-### Price history — `/tokens/:address/prices` (added 18 Sep 2026)
+### Price history — `/tokens/:address/prices` (added 17 Sep 2026)
 
 Served from `token_price_hourly` (one DexScreener sample per held token per UTC hour since
 17 Sep 2026) and its daily / weekly / monthly candle views; nothing is fetched live. `step`
@@ -2469,9 +2469,9 @@ the label is a floor and `observedStepMs` carries the truth.
 { "step": "1d", "bucketMs": 3600000, "observedStepMs": 302400000, "stepUnderstated": true }
 ```
 
-**`?step=1h` is the unbucketed form of `window=1w`.** The week's default 6 h buckets keep the
-last reading per bucket, so a same-day retry replaces the reading it retried and the earlier
-one is not shown. Ask `?window=1w&step=1h` and every reading in the week comes back
+**`?step=1h` is the finest step of `window=1w`, not an unbucketed form.** The readings table
+keys on the hour, so a retry inside the same hour overwrites the reading it retried; no route
+can show the earlier one. Ask `?window=1w&step=1h` and every stored reading in the week comes back
 (verified 16 Sep: readings are never closer than an hour, so the 1 h bucket holds one each);
 `count` rises to the number held and `bucketMs` reads `3600000`. Use it to see a retry
 beside the reading it replaced; use the default when a chart only needs the shape.
@@ -2938,7 +2938,7 @@ for a full window.
 
 ### `GET /traders/:handle/aum/history` and `POST /traders/aum/history { ids, step?, window?, from?, to? }`
 
-Added 18 Sep 2026. Balance history **built** from stored holdings and prices (table
+Added 17 Sep 2026. Balance history **built** from stored holdings and prices (table
 `aum_history`, hourly grain; daily / weekly / monthly rollup views), so a chart can show
 hourly, daily, weekly and monthly values including the past. `/aum` above stays the sampled
 series. `step` is `1h | 1d | 1w | 1mo` and defaults from `window` (`1d`, `1w` → `1h`; `1m`,
@@ -2959,7 +2959,7 @@ curl -s -X POST "$B/traders/aum/history" -H 'content-type: application/json' \
 
 ### `now` — the live value, and `GET /traders/:handle/aum/now` / `POST /traders/aum/now { ids }`
 
-Added 18 Sep 2026, vocabulary v10. Every `/aum/history` answer (and each batch row) carries
+Added 17 Sep 2026, vocabulary v10. Every `/aum/history` answer (and each batch row) carries
 `now: { at, totalUsd, pricedPositions, totalPositions, reason, source, ageSeconds } | null`, read
 from `aum_live`: the trader's current value, refreshed when a watched wallet transacts (Solana
 push), when a balance slice reads the wallet, and when prices land (`source` says which:

@@ -99,7 +99,7 @@ certain. Resolution happens in the directory job; `/wallets` says how (`resolved
 ## Repository layout
 
 TypeScript and SQL only. The JavaScript and Python loaders, the shell tools and the nightly
-GitHub workflow were retired on 18 Sep 2026 when their ports landed in `worker/src/jobs/`.
+GitHub workflow were retired on 17 Sep 2026 when their ports landed in `worker/src/jobs/`.
 
 | Path | What lives there |
 |---|---|
@@ -141,7 +141,7 @@ leading `@`, the stable UUID, or `trd_<uuid>`. Paths are shown with `/v2/`; v1 s
 | `GET /v2/traders/:handle/positions` | Every open position, paged: mint or contract on every row, `priceSuspect`, sell flags, per-chain indexer coverage |
 | `POST /v2/traders/positions` | The same for up to 50 traders |
 | `GET /v2/traders/:handle/scorecard` | The record: win rate with denominator, best and worst trade, hold time, money in and out, fees, per-window and monthly P&L, `byToken[]` per coin with multiples and market caps, `recent` and `career` windows, `bleeding`, `exitTimingScore`, honeypot and cohort facts |
-| `GET /v2/traders/:handle/pnl` | Banked versus on paper; `openPositions` counts what `/positions` lists |
+| `GET /v2/traders/:handle/pnl` | Banked versus on paper; `openPositionsHeld` is the count that matches `/positions`, `openPositions` counts trade records |
 | `GET /v2/traders/:handle/trades` | Resolved on-chain swaps, both sides, valued from the money side |
 | `GET /v2/traders/:handle/transactions` | Raw transfers. `?chain=` `?kind=swap` `?money=true`, keyset-paged |
 
@@ -153,7 +153,7 @@ leading `@`, the stable UUID, or `trd_<uuid>`. Paths are shown with `/v2/`; v1 s
 | `POST /v2/traders/aum/history` | The same for up to 50 traders |
 | `GET /v2/traders/:handle/aum/now` | The live value alone: `{ at, totalUsd, pricedPositions, totalPositions, reason, source, ageSeconds }` |
 | `POST /v2/traders/aum/now` | The same for up to 50 traders |
-| `GET /v2/traders/:handle/aum`, `POST /v2/traders/aum` | Legacy: the sampled readings taken until 18 Sep 2026. They still answer; they do not grow |
+| `GET /v2/traders/:handle/aum`, `POST /v2/traders/aum` | Legacy: the sampled readings taken until 17 Sep 2026. They still answer; they do not grow |
 | `GET /v2/traders/:handle/flow?since=`, `POST /v2/traders/flow` | Solana net flow since a time, from the live holdings view |
 | `GET /v2/events` | Keyset feed of transfers, swaps and readings across the directory |
 
@@ -281,7 +281,7 @@ build fails on an unpublished word by design, so the order of work is a contract
 
 ## Balance history and the live value
 
-Until 18 Sep 2026 a trader's balance was **sampled**: a rotation read wallets off chain every
+Until 17 Sep 2026 a trader's balance was **sampled**: a rotation read wallets off chain every
 few hours and stored readings. That gave one reading per trader per ~4 h, and an hourly chart
 had empty buckets. It is now **built**, and the readings that exist are folded in.
 
@@ -388,7 +388,7 @@ across five chains at that cost.
 
 49 migrations under `supabase/migrations/`, all applied to production; `supabase migration
 list` shows local and remote in step. The history table was empty until 17 Sep 2026 and was
-repaired to match the schema before the 17 and 18 Sep migrations were pushed.
+repaired to match the schema before the 17 and 17 Sep migrations were pushed.
 
 Tables that matter most: `traders`, `wallets`, `linked_wallets`, `trades`, `trade_loads`,
 `transactions` (the largest), `holdings` with the `holdings_current` and `holdings_live`
@@ -509,7 +509,7 @@ The Worker opens one postgres.js client per request with `max: 5`, prepared stat
 | **[consumer/workflow-coverage-17-sep.md](docs/consumer/workflow-coverage-17-sep.md)** · **[consumer/composite-workflows-coverage-17-sep.md](docs/consumer/composite-workflows-coverage-17-sep.md)** | Their workflows checked against the API, and what was added |
 | **[API_VALIDATION_FLAGS_17_SEP.md](docs/API_VALIDATION_FLAGS_17_SEP.md)** · **[REVIEW_EFFICIENCY_17_SEP.md](docs/REVIEW_EFFICIENCY_17_SEP.md)** | Open validation gaps with evidence; the efficiency review, applied |
 | **[DECISIONS.md](docs/DECISIONS.md)** | The numbered rationale sections the code points at (`#dNNN`) |
-| **[AUM_ROUTES.md](docs/AUM_ROUTES.md)** · **[AUM_PLAN.md](docs/AUM_PLAN.md)** · **[AUM_CHART_PRD.md](docs/AUM_CHART_PRD.md)** | The balance-history design, including the 18 Sep `aum_history` section |
+| **[AUM_ROUTES.md](docs/AUM_ROUTES.md)** · **[AUM_PLAN.md](docs/AUM_PLAN.md)** · **[AUM_CHART_PRD.md](docs/AUM_CHART_PRD.md)** | The balance-history design, including the 17 Sep `aum_history` section |
 | **[LAUNCH_METADATA.md](docs/LAUNCH_METADATA.md)** · **[R4_ROBINHOOD_PRICES.md](docs/R4_ROBINHOOD_PRICES.md)** | Measured sources for launch data and Robinhood-chain prices |
 | `tasks/todo.md` · `tasks/lessons.md` | The running status tracker and the lessons recorded from corrections |
 
@@ -524,7 +524,7 @@ no error is "no activity"; `count: 0` with a reason is "we could not look".
 origin connections (`wrangler hyperdrive update … --origin-connection-limit`), each Worker
 client opens at most 2, and nothing runs a whole-roster valuation per event: the Helius
 receiver only marks traders in `aum_live_dirty`, a one-minute cron revalues them in one call.
-On 18 Sep a per-push revaluation at 40 pushes a minute took the database to 26 s per query.
+On 17 Sep a per-push revaluation at 40 pushes a minute took the database to 26 s per query.
 
 **A job's summary is its health.** `remaining` that never reaches zero across runs means the
 budget or the provider quota is the ceiling; `stoppedEarly` on every run means the slice is

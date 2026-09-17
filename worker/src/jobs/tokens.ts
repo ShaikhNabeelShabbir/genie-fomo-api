@@ -19,7 +19,7 @@ import {
  * list), so a run cut short by the budget resumes where it stopped. Differs where the
  * platform does: writes land per chunk rather than at the end, a failed unit is counted
  * rather than fatal, no CLI flags, and chain + supply come from Bitquery, not JSON-RPC (no
- * public node is called from the Worker, decision of 18 Sep 2026; see `_shared/bitquery.ts`).
+ * public node is called from the Worker, decision of 17 Sep 2026; see `_shared/bitquery.ts`).
  */
 
 type Sql = postgres.Sql;

@@ -4,7 +4,7 @@ import { db, longStatement } from "../db";
 import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_history-core";
 
 /**
- * Hourly aum_history builder (18 Sep 2026): balance history is BUILT from stored holdings
+ * Hourly aum_history builder (17 Sep 2026): balance history is BUILT from stored holdings
  * and prices by the SQL function `aum_history_build` (migration 20260918010000), not sampled.
  * This job only decides which (trader, hour range) to build next and calls the function per
  * chunk of <= CHUNK_HOURS, oldest first, until the wall-clock budget is spent. Same shape as

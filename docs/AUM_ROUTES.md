@@ -340,7 +340,7 @@ per trader, and a page of them would be the largest response this API can produc
 
 ---
 
-## 8. aum_history (18 Sep 2026)
+## 8. aum_history (17 Sep 2026)
 
 Balance history is no longer sampled from chain on a schedule; it is **built** from stored
 data into `aum_history`, one row per trader per UTC hour, so any past hour, day, week or

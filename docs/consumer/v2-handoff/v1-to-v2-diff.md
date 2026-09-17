@@ -1,4 +1,4 @@
-# v1 → v2: route map, differences and additions (18 Sep 2026)
+# v1 → v2: route map, differences and additions (17 Sep 2026)
 
 Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is the Supabase deployment frozen at the 16 Sep 2026 deploy; v2 is the Cloudflare Worker. Same database, same route names; v2 adds. Vocabulary: v1 answers `version: 2`, v2 answers `version: 10`.
 
@@ -13,15 +13,15 @@ Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is t
 | `GET /v1/traders/:handle` | `GET /v2/traders/:handle` | extended: source, onChain per chain |
 | `GET /v1/traders/:handle/trust` | `GET /v2/traders/:handle/trust` | unchanged |
 | `GET /v1/traders/:handle/wallets` | `GET /v2/traders/:handle/wallets` | extended: resolvedBy, linked wallets |
-| `POST /v1/traders/:handle/wallets` | `POST /v2/traders/:handle/wallets` | unchanged |
+| `POST /v1/traders/:handle/wallets` | `POST /v2/traders/:handle/wallets` | unchanged in contract; answers 503 `not_configured` until the submission secret is set on the Worker (pending) |
 | `GET /v1/traders/:handle/portfolio` | `GET /v2/traders/:handle/portfolio` | extended: native coin priced, honeypot exclusion |
 | `GET /v1/traders/:handle/positions` | `GET /v2/traders/:handle/positions` | extended: tokenAddress, priceSource, priceSuspect, native rows, coverage.chains, sell flags |
 | `POST /v1/traders/positions` | `POST /v2/traders/positions` | extended: same as GET per row |
 | `GET /v1/traders/:handle/scorecard` | `GET /v2/traders/:handle/scorecard` | extended: byToken economics, recent/career, bleeding, exitTimingScore, honeypot/cohort, staleness.fallback |
-| `GET /v1/traders/:handle/pnl` | `GET /v2/traders/:handle/pnl` | changed: openPositions counts what /positions lists |
+| `GET /v1/traders/:handle/pnl` | `GET /v2/traders/:handle/pnl` | extended: `openPositionsHeld` (basis `trade_records_still_held_on_chain`) is the figure that matches `/positions`; `openPositions` still counts trade records (basis `trade_records`) |
 | `GET /v1/traders/:handle/trades` | `GET /v2/traders/:handle/trades` | extended: since/until/status filters |
 | `GET /v1/traders/:handle/transactions` | `GET /v2/traders/:handle/transactions` | unchanged |
-| `GET /v1/traders/:handle/aum` | `GET /v2/traders/:handle/aum` | LEGACY on v2: partial/chains_missing, null-not-zero, step from tracked span; readings stop at 18 Sep; live read never runs (`liveRead.state: skipped`) |
+| `GET /v1/traders/:handle/aum` | `GET /v2/traders/:handle/aum` | LEGACY on v2: partial/chains_missing, null-not-zero, step from tracked span; readings stop at 17 Sep; live read never runs (`liveRead.state: skipped`) |
 | `POST /v1/traders/aum` | `POST /v2/traders/aum` | legacy, as above |
 | `GET /v1/tokens` | `GET /v2/tokens` | extended: range filters, excludeHoneypots |
 | `GET /v1/tokens/:address` | `GET /v2/tokens/:address` | extended: price block, launch, security.honeypotSince, cohort, creator ledger, perHolder exitTimingScore |
@@ -37,9 +37,9 @@ Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is t
 
 ## 2. Behaviour that changed on the same path
 
-- `/aum` no longer performs a live chain read; `?live=true` is accepted and ignored, `liveRead.state` is always `skipped`. Its readings stop growing on 18 Sep 2026. Use `/aum/history` and `/aum/now`.
+- `/aum` no longer performs a live chain read; `?live=true` is accepted and ignored, `liveRead.state` is always `skipped`. Its readings stop growing on 17 Sep 2026. Use `/aum/history` and `/aum/now`.
 - `/aum` readings that priced nothing are `totalUsd: null` with a reason, never `0` (Z1); a reading that answered fewer chains than known is `partial: true, partialReason: chains_missing` naming them (Z2, R5).
-- `/pnl.openPositions` counts what `/positions` lists (P1).
+- `/pnl` adds `openPositionsHeld`, the count of trade records still held on chain, which is the figure that matches `/positions`; `openPositions` is unchanged and still counts trade records (`openPositionsBasis` says so) (P1).
 - `/positions` rows carry `amount` as null when unknown on the single route as on the batch route (the single route used to coerce to 0).
 - `/health.dataState` is `degraded` while any scorecard is stale (T2); `/fields.version` gates your build.
 - `error.code` publishes `unavailable`, `include_unavailable`, `internal_error` (v1 published the never-emitted `internal`).
@@ -220,16 +220,16 @@ Every line below is also in `Field_Contracts.md` with its full contract; the wav
 | `byToken[].honeypotSince` | Added 17 Sep 2026, honeypot-since and cohort | as `security.honeypotSince` above, on the coin the trader traded |
 | `byToken[].exitedBeforeFlag` | Added 17 Sep 2026, honeypot-since and cohort | `true` when `honeypotSince` is set and the trader's `lastClosedAt` is before it; `false` when set and he close |
 | `byToken[].coHolders` | Added 17 Sep 2026, honeypot-since and cohort | distinct OTHER tracked traders with a `trades` row in the same coin on the same chain; `0` when he is alone, ` |
-| `now.at` | Added 18 Sep 2026 — live value | When the figure was last refreshed, ISO-8601 UTC |
-| `now.totalUsd` | Added 18 Sep 2026 — live value | Value held in USD; `null` when not valued, never 0 |
-| `now.pricedPositions`, `now.totalPositions` | Added 18 Sep 2026 — live value | Positions priced and held at `at` |
-| `now.reason` | Added 18 Sep 2026 — live value | Why `totalUsd` is null: `no_holdings`, `no_prices`, `too_little_priced` (`aumHistory.now.reason`, the same wor |
-| `now.source` | Added 18 Sep 2026 — live value | What last refreshed the figure: `webhook`, `balances`, `prices`, `build` (`aumHistory.now.source`) |
-| `now.ageSeconds` | Added 18 Sep 2026 — live value | Whole seconds between `at` and the answer; never negative |
-| `window` | Added 18 Sep 2026 — token prices | One of `1d`, `1w`, `1m`, `3m`, `1y`, `all`; default `1w`. `from`/`to` (ISO-8601) override it; `from` after `to |
-| `from`, `to` | Added 18 Sep 2026 — token prices | The bounds actually read, UTC ISO; `from` is `null` only for `all` with no explicit start. |
-| `points[].at` | Added 18 Sep 2026 — token prices | Start of the bucket (the sampled hour for `1h`; UTC day, ISO week (Monday) or calendar month otherwise). Ascen |
-| `points[].usd` | Added 18 Sep 2026 — token prices | The hour's sample for `1h`; the bucket's close (last sampled hour) otherwise. Never 0 for "unknown": an hour w |
+| `now.at` | Added 17 Sep 2026 — live value | When the figure was last refreshed, ISO-8601 UTC |
+| `now.totalUsd` | Added 17 Sep 2026 — live value | Value held in USD; `null` when not valued, never 0 |
+| `now.pricedPositions`, `now.totalPositions` | Added 17 Sep 2026 — live value | Positions priced and held at `at` |
+| `now.reason` | Added 17 Sep 2026 — live value | Why `totalUsd` is null: `no_holdings`, `no_prices`, `too_little_priced` (`aumHistory.now.reason`, the same wor |
+| `now.source` | Added 17 Sep 2026 — live value | What last refreshed the figure: `webhook`, `balances`, `prices`, `build` (`aumHistory.now.source`) |
+| `now.ageSeconds` | Added 17 Sep 2026 — live value | Whole seconds between `at` and the answer; never negative |
+| `window` | Added 17 Sep 2026 — token prices | One of `1d`, `1w`, `1m`, `3m`, `1y`, `all`; default `1w`. `from`/`to` (ISO-8601) override it; `from` after `to |
+| `from`, `to` | Added 17 Sep 2026 — token prices | The bounds actually read, UTC ISO; `from` is `null` only for `all` with no explicit start. |
+| `points[].at` | Added 17 Sep 2026 — token prices | Start of the bucket (the sampled hour for `1h`; UTC day, ISO week (Monday) or calendar month otherwise). Ascen |
+| `points[].usd` | Added 17 Sep 2026 — token prices | The hour's sample for `1h`; the bucket's close (last sampled hour) otherwise. Never 0 for "unknown": an hour w |
 
 ### `/tokens/:address/activity`
 
@@ -247,78 +247,78 @@ Every line below is also in `Field_Contracts.md` with its full contract; the wav
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `step` | Added 18 Sep 2026 — aum history | One of `1h`, `1d`, `1w`, `1mo`. Defaults from `window`: 1d, 1w → `1h`; 1m, 3m → `1d`; 1y → `1w`; all → `1mo`.  |
-| `window` | Added 18 Sep 2026 — aum history | One of `1d`, `1w` (default), `1m`, `3m`, `1y`, `all`; the range ends now. `from` / `to` (ISO-8601) override ei |
-| `from`, `to` | Added 18 Sep 2026 — aum history | The bounds applied, ISO-8601 UTC; `from` is null for `all` with no `from` |
-| `points[]` | Added 18 Sep 2026 — aum history | Ascending, newest last; at most `limit` (≤ 2000, default 2000) NEWEST points. No cursor: the range is bounded |
-| `points[].at` | Added 18 Sep 2026 — aum history | Bucket start, UTC |
-| `points[].totalUsd` | Added 18 Sep 2026 — aum history | Value held in USD; null when the bucket was not valued, never 0. On rolled-up steps it is the close (last valu |
-| `points[].basis` | Added 18 Sep 2026 — aum history | `1h` only. `reading` when a sampled reading stood in that hour; `priced` when built from holdings and prices |
-| `points[].reason` | Added 18 Sep 2026 — aum history | `1h` only. Why `totalUsd` is null: `no_holdings`, `no_prices`, `too_little_priced`; null when valued |
-| `points[].pricedPositions`, `points[].totalPositions` | Added 18 Sep 2026 — aum history | `1h` only. Positions priced and held in that hour |
-| `points[].highUsd`, `points[].lowUsd` | Added 18 Sep 2026 — aum history | `1d` / `1w` / `1mo` only. Highest and lowest valued hour in the bucket; null when none |
-| `points[].valuedHours` | Added 18 Sep 2026 — aum history | `1d` / `1w` / `1mo` only. Hours in the bucket that carried a value |
-| `count`, `valued` | Added 18 Sep 2026 — aum history | Points returned, and those with a non-null `totalUsd` |
-| `latest` | Added 18 Sep 2026 — aum history | `{ at, totalUsd }` of the newest valued point in range; null when none |
-| `asOf` | Added 18 Sep 2026 — aum history | When this trader's history was last built (`max(computed_at)`); null when never. The batch envelope's `asOf` i |
-| `links.now` | Added 18 Sep 2026 — live value | The trader's `/aum/now` |
+| `step` | Added 17 Sep 2026 — aum history | One of `1h`, `1d`, `1w`, `1mo`. Defaults from `window`: 1d, 1w → `1h`; 1m, 3m → `1d`; 1y → `1w`; all → `1mo`.  |
+| `window` | Added 17 Sep 2026 — aum history | One of `1d`, `1w` (default), `1m`, `3m`, `1y`, `all`; the range ends now. `from` / `to` (ISO-8601) override ei |
+| `from`, `to` | Added 17 Sep 2026 — aum history | The bounds applied, ISO-8601 UTC; `from` is null for `all` with no `from` |
+| `points[]` | Added 17 Sep 2026 — aum history | Ascending, newest last; at most `limit` (≤ 2000, default 2000) NEWEST points. No cursor: the range is bounded |
+| `points[].at` | Added 17 Sep 2026 — aum history | Bucket start, UTC |
+| `points[].totalUsd` | Added 17 Sep 2026 — aum history | Value held in USD; null when the bucket was not valued, never 0. On rolled-up steps it is the close (last valu |
+| `points[].basis` | Added 17 Sep 2026 — aum history | `1h` only. `reading` when a sampled reading stood in that hour; `priced` when built from holdings and prices |
+| `points[].reason` | Added 17 Sep 2026 — aum history | `1h` only. Why `totalUsd` is null: `no_holdings`, `no_prices`, `too_little_priced`; null when valued |
+| `points[].pricedPositions`, `points[].totalPositions` | Added 17 Sep 2026 — aum history | `1h` only. Positions priced and held in that hour |
+| `points[].highUsd`, `points[].lowUsd` | Added 17 Sep 2026 — aum history | `1d` / `1w` / `1mo` only. Highest and lowest valued hour in the bucket; null when none |
+| `points[].valuedHours` | Added 17 Sep 2026 — aum history | `1d` / `1w` / `1mo` only. Hours in the bucket that carried a value |
+| `count`, `valued` | Added 17 Sep 2026 — aum history | Points returned, and those with a non-null `totalUsd` |
+| `latest` | Added 17 Sep 2026 — aum history | `{ at, totalUsd }` of the newest valued point in range; null when none |
+| `asOf` | Added 17 Sep 2026 — aum history | When this trader's history was last built (`max(computed_at)`); null when never. The batch envelope's `asOf` i |
+| `links.now` | Added 17 Sep 2026 — live value | The trader's `/aum/now` |
 
 ### `POST /traders/aum/history`
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `traders[]` | Added 18 Sep 2026 — aum history | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: tru |
+| `traders[]` | Added 17 Sep 2026 — aum history | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: tru |
 
 ### `/aum/history, /aum/now`
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `now` | Added 18 Sep 2026 — live value | The live figure; `null` when the trader has none yet (never an empty object, never 0) |
+| `now` | Added 17 Sep 2026 — live value | The live figure; `null` when the trader has none yet (never an empty object, never 0) |
 
 ### `POST /traders/aum/now`
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `asOf` | Added 18 Sep 2026 — live value | The newest `now.at` across the traders answered; `null` when none has a live figure |
-| `traders[]` | Added 18 Sep 2026 — live value | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: tru |
+| `asOf` | Added 17 Sep 2026 — live value | The newest `now.at` across the traders answered; `null` when none has a live figure |
+| `traders[]` | Added 17 Sep 2026 — live value | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: tru |
 
 ### `/tokens/:address/prices, POST /tokens/prices`
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `step` | Added 18 Sep 2026 — token prices | One of `1h`, `1d`, `1w`, `1mo` (`tokenPrices.step`, vocabulary v9). Defaults from `window`: `1d`/`1w` → `1h`,  |
+| `step` | Added 17 Sep 2026 — token prices | One of `1h`, `1d`, `1w`, `1mo` (`tokenPrices.step`, vocabulary v9). Defaults from `window`: `1d`/`1w` → `1h`,  |
 
 ### `same, step ≠ `1h``
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `points[].openUsd`, `highUsd`, `lowUsd`, `hours` | Added 18 Sep 2026 — token prices | First sampled hour, max, min, and how many hourly samples the bucket holds (a partial bucket has fewer than 24 |
+| `points[].openUsd`, `highUsd`, `lowUsd`, `hours` | Added 17 Sep 2026 — token prices | First sampled hour, max, min, and how many hourly samples the bucket holds (a partial bucket has fewer than 24 |
 
 ### `same, step `1h``
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `points[].liquidityUsd` | Added 18 Sep 2026 — token prices | DexScreener liquidity at that hour; `null` when the source gave none. Absent on other steps. |
+| `points[].liquidityUsd` | Added 17 Sep 2026 — token prices | DexScreener liquidity at that hour; `null` when the source gave none. Absent on other steps. |
 
 ### `GET`
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `count`, `limit`, `truncated` | Added 18 Sep 2026 — token prices | Points returned; the cap (`?limit=`, at most 2000, default 2000); `truncated: true` when the span held more th |
-| `ath` | Added 18 Sep 2026 — token prices | `{ usd, at }`, the running max since sampling began (not the token's lifetime high); `null` before the first s |
+| `count`, `limit`, `truncated` | Added 17 Sep 2026 — token prices | Points returned; the cap (`?limit=`, at most 2000, default 2000); `truncated: true` when the span held more th |
+| `ath` | Added 17 Sep 2026 — token prices | `{ usd, at }`, the running max since sampling began (not the token's lifetime high); `null` before the first s |
 
 ### `both`
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `latest` | Added 18 Sep 2026 — token prices | `{ at, usd }` from `token_price_stats`, the newest hourly sample; `null` before the first sample. |
-| `asOf` | Added 18 Sep 2026 — token prices | `latest.at` (batch: the newest across the answered tokens); `null` when none is sampled. |
+| `latest` | Added 17 Sep 2026 — token prices | `{ at, usd }` from `token_price_stats`, the newest hourly sample; `null` before the first sample. |
+| `asOf` | Added 17 Sep 2026 — token prices | `latest.at` (batch: the newest across the answered tokens); `null` when none is sampled. |
 
 ### `POST`
 
 | Field | Wave | Contract (first line) |
 |---|---|---|
-| `tokens[].ok`, `error` | Added 18 Sep 2026 — token prices | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error |
+| `tokens[].ok`, `error` | Added 17 Sep 2026 — token prices | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error |
 
 ## 4. Words added to the vocabulary (v2 → v10)
 

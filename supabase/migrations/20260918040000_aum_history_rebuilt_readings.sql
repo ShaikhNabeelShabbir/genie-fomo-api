@@ -1,4 +1,4 @@
--- aum_history_build v2 (18 Sep 2026): rule 1 also accepts `rebuilt` readings so the hourly
+-- aum_history_build v2 (17 Sep 2026): rule 1 also accepts `rebuilt` readings so the hourly
 -- series reaches back as far as the archive rebuild (late August) instead of the first chain
 -- capture (9 Sep). Sampled readings still win inside an hour. Body otherwise identical to
 -- 20260918010000_aum_history.sql.

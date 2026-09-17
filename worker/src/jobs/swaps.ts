@@ -10,7 +10,7 @@ import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, toRow }
  * A4, the wallet's OWN two-sided swaps on the EVM chains: the Worker half of refresh.yml
  * "Resolve EVM swaps from receipts", now read from Bitquery's decoded `DEXTrades` rather than
  * receipts off a public node (no free JSON-RPC endpoint is called from the Worker since
- * 18 Sep 2026). Ported from `scripts/resolve_evm_swaps_from_receipts.mjs` (deleted 18 Sep 2026;
+ * 17 Sep 2026). Ported from `scripts/resolve_evm_swaps_from_receipts.mjs` (deleted 17 Sep 2026;
  * the Worker is the only copy). Same candidate query, same decode and pricing rules
  * (`swaps-core.ts`), same insert. A wall-clock budget stops between batches and reports what
  * is left; a failed batch is counted and its transactions stay unresolved for the next run.

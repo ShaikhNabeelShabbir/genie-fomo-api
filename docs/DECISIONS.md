@@ -3152,7 +3152,7 @@ uses. It has to join to `quote_assets` or T2.1 cannot price the leg, which would
 the row present and valueless — no better than not having it.
      
 
-## Added 18 Sep 2026 — aum_history
+## Added 17 Sep 2026 — aum_history
 
 Balance history is built, not sampled. The sampler (`aum-sample`, then the Worker `/sample`
 cron) read every wallet from chain each pass, so a point existed only for the hours the cron

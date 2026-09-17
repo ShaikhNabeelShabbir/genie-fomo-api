@@ -421,7 +421,7 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 |---|---|---|
 | `error.code` | every route | One of `not_found`, `bad_request`, `duplicate_identifier`, `rate_limited`, `timeout`, `unavailable`, `include_unavailable`, `internal_error`, `not_configured`, `unauthorized`, `invalid_address`, `address_in_use`, `already_on_record`. v8 corrects the list: `internal` was published but the service emits `internal_error`; `unavailable` (503, Postgres not answering) and `include_unavailable` (503, `blocks[]` names the `?include=` blocks not produced) were emitted but unpublished. |
 
-## Added 18 Sep 2026 — aum history
+## Added 17 Sep 2026 — aum history
 
 Vocabulary v9. `GET /traders/:handle/aum/history` and `POST /traders/aum/history { ids, step?, window?, from?, to? }`: balance history BUILT from stored holdings and prices (table `aum_history`, hourly grain; daily / weekly / monthly rollup views), distinct from the sampled series on `/aum`.
 
@@ -443,7 +443,7 @@ Vocabulary v9. `GET /traders/:handle/aum/history` and `POST /traders/aum/history
 | `asOf` | /aum/history | When this trader's history was last built (`max(computed_at)`); null when never. The batch envelope's `asOf` is the newest across the traders answered |
 | `traders[]` | POST /traders/aum/history | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: true` entries carry the GET shape minus `links` |
 
-## Added 18 Sep 2026 — live value
+## Added 17 Sep 2026 — live value
 
 Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its own at `GET /traders/:handle/aum/now` and `POST /traders/aum/now { ids }`: the trader's current value from `aum_live`, refreshed when a watched wallet transacts (Solana push), when a balance slice reads the wallet, and when prices land. The hourly series' last point is refreshed with it.
 
@@ -460,7 +460,7 @@ Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its 
 | `traders[]` | POST /traders/aum/now | One entry per requested id in the order sent; `ok: false` with a `not_found` error for an unknown id; `ok: true` entries carry `handle`, `id`, `now` |
 | `links.now` | /aum/history | The trader's `/aum/now` |
 
-## Added 18 Sep 2026 — token prices
+## Added 17 Sep 2026 — token prices
 
 | Field | Route | Contract |
 |---|---|---|

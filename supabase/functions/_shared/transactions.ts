@@ -1,4 +1,4 @@
-// The only copy since 18 Sep 2026 (the scripts/ twin was deleted with the GitHub loaders).
+// The only copy since 17 Sep 2026 (the scripts/ twin was deleted with the GitHub loaders).
 // in as `ProviderKeys`, never read from the environment) and in typing third-party JSON as
 // `unknown` narrowed by the helpers below instead of `any`.
 import { EVM_CHAINS, HEADERS, type EvmChain } from "./settings.ts";
@@ -8,7 +8,7 @@ import { bitquery } from "./bitquery.ts";
  * Live transaction fetching for a resolved wallet.
  *
  *   Robinhood          Blockscout   free, no key
- *   Ethereum/BSC/Base  Bitquery     every EVM chain since 18 Sep 2026 (Etherscan dropped)
+ *   Ethereum/BSC/Base  Bitquery     every EVM chain since 17 Sep 2026 (Etherscan dropped)
  *   Solana             Helius       Enhanced Transactions (legacy, but the free decoded source)
  *
  * Every chain reports its own status: `count: 0, error: null` means the wallet genuinely
@@ -235,7 +235,7 @@ async function evmChain(
   const cfg = chainOf(chainId);
   const gas: GasMap = new Map();
   try {
-    // Every EVM chain, Robinhood included, comes from Bitquery (18 Sep 2026): no free explorer API.
+    // Every EVM chain, Robinhood included, comes from Bitquery (17 Sep 2026): no free explorer API.
     const rows: Transfer[] = await bitqueryTx(keys.bitquery ?? "", chainId, wallet, limit);
     return { rows, gas, status: { chain: cfg.name, count: rows.length, error: null } };
   } catch (e) {

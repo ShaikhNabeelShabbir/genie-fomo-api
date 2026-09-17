@@ -1,4 +1,4 @@
--- Real-time current AUM (18 Sep 2026). aum_history is hourly; the product wants the CURRENT
+-- Real-time current AUM (17 Sep 2026). aum_history is hourly; the product wants the CURRENT
 -- value refreshed the moment a watched wallet transacts. One row per trader, overwritten by
 -- whichever feed moved last: the Helius webhook (Solana transfers), the balances job (EVM
 -- captures), the prices job (new hourly prices) or the aum_history job (catch-up).

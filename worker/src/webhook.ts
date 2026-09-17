@@ -9,7 +9,7 @@ import { addressKeys, shapeRows } from "./helius";
 async function refreshLive(sql: ReturnType<typeof db>, keys: readonly string[]): Promise<void> {
   try {
     // Mark only. Refreshing here ran holdings_live once per push (~40/min) and saturated the
-    // database on 18 Sep; the aum_live_flush cron refreshes the marked traders every minute.
+    // database on 17 Sep; the aum_live_flush cron refreshes the marked traders every minute.
     const [row] = await sql<{ n: number }[]>`
       with marked as (
         insert into aum_live_dirty (handle)

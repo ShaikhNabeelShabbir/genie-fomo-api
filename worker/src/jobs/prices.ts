@@ -10,7 +10,7 @@ import {
  * Hourly DexScreener price per held token, on every chain, with a rolling ATH: the Worker half
  * of `.github/workflows/prices.yml`.
  *
- * Ported from `scripts/load_token_prices.mjs` (deleted 18 Sep 2026; the Worker is the only copy). Same SQL, same 30-address batches under
+ * Ported from `scripts/load_token_prices.mjs` (deleted 17 Sep 2026; the Worker is the only copy). Same SQL, same 30-address batches under
  * the shared per-host throttle; differs only where the platform does — a wall-clock budget
  * (a cron killed mid-write records nothing, stopping early and saying so is better), a
  * failed DexScreener batch is counted rather than fatal, and no `--dry-run`/`--token` flags.
@@ -129,7 +129,7 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
     }
     if (attempted > 0 && failedBatches === attempted) throw new Error(`prices: all ${attempted} batches failed`);
     // New prices move every trader's current AUM, but a whole-roster `aum_live_refresh` after
-    // every price run (450 x holdings_live) hammered the database on 18 Sep 2026. The :25 build
+    // every price run (450 x holdings_live) hammered the database on 17 Sep 2026. The :25 build
     // revalues anyone older than an hour and the minute cron revalues traders whose wallet moved;
     // the summary keeps the field (null) so dashboards need not change.
     const liveRefreshed: number | null = null;

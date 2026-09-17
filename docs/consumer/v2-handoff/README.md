@@ -1,4 +1,4 @@
-# Moving the Genie app to API v2 — guide for the app team (18 Sep 2026)
+# Moving the Genie app to API v2 — guide for the app team (17 Sep 2026)
 
 This document is written to be handed to an engineer or a coding agent. It says what changed
 between the API you integrate today (v1, Supabase) and v2 (Cloudflare), what to change in the
@@ -71,7 +71,7 @@ answer your 16 Sep asks:
 | `GET /v2/traders/:handle/portfolio` | native coin priced per chain (N1); honeypot-flagged value excluded and flagged (V2) |
 | `GET /v2/traders/:handle/aum`, `POST /v2/traders/aum` | `partial`/`partialReason: chains_missing` naming the chains (Z2, R5); `totalUsd: null` with a reason instead of `0` (Z1); the priced floor published and partial readings served above $100 (R1, R2); step from the tracked span (S1); no more live read on v2 (`liveRead.state` is always `skipped`) |
 | `GET /v2/traders/:handle/scorecard` | `byToken[]` per-coin multiples, realised share, entry/exit/peak/current market cap, `entryHoursAfterLaunch`; `recent`/`career` windows; `bleeding`; `exitTimingScore`; `isHoneypotNow`/`honeypotSince`/`exitedBeforeFlag`; `coHolders`; `staleness.fallback` (T1–T3, composite badges) |
-| `GET /v2/traders/:handle/pnl` | `openPositions` counts what `/positions` lists (P1) |
+| `GET /v2/traders/:handle/pnl` | `openPositionsHeld`, the count that matches `/positions`; `openPositions` still counts trade records, with `openPositionsBasis` naming both (P1) |
 | `GET /v2/traders/:handle/wallets` | `resolvedBy.{evm,solana}`, linked wallets (W1) |
 | `GET /v2/health` | `staleTraders` per chain, `historyState` counts, `dataState: degraded` while any scorecard is stale, `apiVersion: "v2"` (A1, F2, F3) |
 | `GET /v2/tokens/:address` | `price` block with source, `launch` block (pump.fun curve), `security.honeypotSince`, `creator` ledger, `perHolder[].exitTimingScore` |
@@ -96,7 +96,7 @@ answer your 16 Sep asks:
 
 ## 5. Balance history: use `/aum/history` for every chart
 
-`/aum` served sampled chain readings. Sampling stopped on 18 Sep: its stored readings remain and
+`/aum` served sampled chain readings. Sampling stopped on 17 Sep 2026 at about 03:52 UTC, when the rotation was unscheduled: its stored readings remain and
 still answer, but they do not grow. The chart source is now a table, `aum_history`, built every
 hour from stored balances and stored prices, so every past hour, day, week and month can be
 read back, and a trader tracked for three days still has 72 hourly points.
@@ -137,7 +137,7 @@ points carry `highUsd`, `lowUsd`, `valuedHours` and `totalUsd` is the close. Poi
 ascending, at most 2000, newest kept. Draw `null` as a gap, never as zero.
 
 `asOf` is when the trader's history was last built. It is `null` for the first hour after
-deploy while the table backfills (18 Sep 2026, from about 04:25 UTC); expect the past 14 days
+deploy while the table backfills (17 Sep 2026, from about 04:25 UTC); expect the past 14 days
 to be present within a few hours and history to extend as far back as balance captures exist.
 
 Every history answer (and each batch row) also carries `now`: the trader's live value,

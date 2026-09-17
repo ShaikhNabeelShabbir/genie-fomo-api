@@ -16,7 +16,7 @@ EVM data: Bitquery. Solana: Helius. Prices: DexScreener (+ Binance for quote ass
 | `supabase/functions/api/` | the read API: `app.ts` (`handle`: auth, rate limit, 15 s timeout race), `index.ts` (Deno entry: builds the client, serves), `router.ts`, `errors.ts`, `db.ts` (`sql` is a Proxy over the per-request `AsyncLocalStorage` store, falling back to `setDefaultSql`), `config.ts` (`cfg(name)`: store env, then `Deno.env` — the only place `Deno` is touched outside `index.ts`), `routes.ts` (barrel) |
 | `supabase/functions/api/routes/*.ts` | one module per route family (below) |
 | `supabase/functions/api/shared/*.ts` | helpers used by 2+ families; `vocabulary.ts` is the published word list; `aum-rules.ts` the pure /aum rules |
-| `supabase/functions/aum-sample/` | v1's sampler (retired: pg_cron unscheduled 18 Sep); `value.ts` still holds the price ceilings the SQL functions cite |
+| `supabase/functions/aum-sample/` | v1's sampler (retired: pg_cron unscheduled 17 Sep); `value.ts` still holds the price ceilings the SQL functions cite |
 | `supabase/functions/helius-webhook/` | Solana transfer push receiver |
 | `worker/` | THE deployment (`npx wrangler deploy` from `worker/`; CI deploys on push when `CLOUDFLARE_DEPLOY=true`). `src/index.ts`: `JOBS` cron table (strings must match `wrangler.toml` [triggers]) and `POST /jobs/<name>` behind `JOB_SECRET`; `src/api.ts` runs the `supabase/functions/api` modules inside `runWith({ sql, env })`; `src/webhook.ts` Helius push (+ `aum_live_refresh`); `src/jobs/*.ts` one sliced, resumable loader per source with a `-core.ts` of pure helpers. Keep postgres.js `fetch_types` on: arrays break without it |
 | `supabase/functions/_shared/` | providers for the jobs: `bitquery.ts` (client + EVM balances), `transactions.ts` (transfers), `dexscreener.ts`, `pumpfun.ts`, `solana_pda.ts`, `settings.ts` (EVM_CHAINS); `chain_reads.ts` is LEGACY RPC for v1 only |
@@ -95,4 +95,4 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
 - `null` means absent, zero means zero. Never coerce a missing figure to 0.
 - No tool can edit `.env.example` here; ask the user.
 - Jobs never call a free public RPC; EVM goes through `_shared/bitquery.ts`, Solana through Helius. Job strings in `index.ts` and `wrangler.toml` must match character for character.
-- Current state: v2 handed to the app team 18 Sep 2026 (`docs/consumer/v2-handoff/`). Open: rotate secrets, retire v1 when consumers have moved.
+- Current state: v2 handed to the app team 17 Sep 2026 (`docs/consumer/v2-handoff/`). Open: rotate secrets, retire v1 when consumers have moved.

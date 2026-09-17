@@ -1,5 +1,5 @@
--- Balance history, BUILT from stored data rather than sampled from chain (18 Sep 2026).
--- See docs/DECISIONS.md "Added 18 Sep 2026 — aum_history" and docs/AUM_ROUTES.md.
+-- Balance history, BUILT from stored data rather than sampled from chain (17 Sep 2026).
+-- See docs/DECISIONS.md "Added 17 Sep 2026 — aum_history" and docs/AUM_ROUTES.md.
 --
 -- One row per trader per UTC hour. A row is either a `reading` (an aum_samples measurement
 -- taken in that hour) or `priced` (the latest chain capture before the hour's end, valued at

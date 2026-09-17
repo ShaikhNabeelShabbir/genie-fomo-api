@@ -16,7 +16,7 @@ import { type BatchRead, type Fee, readBatch, readBitqueryFees } from "./fees-co
  * (the anti-join makes the next run continue), a failed batch is counted rather than fatal, and
  * the rollup rebuilds only the traders this run touched, in place (the script's one-trader
  * path), instead of the whole table behind a swap. And the EVM fee is Bitquery's
- * `Fee.SenderFee` rather than gasUsed x effectiveGasPrice from a public node: since 18 Sep 2026
+ * `Fee.SenderFee` rather than gasUsed x effectiveGasPrice from a public node: since 17 Sep 2026
  * no free JSON-RPC endpoint is called from the Worker. Solana stays on Helius.
  */
 

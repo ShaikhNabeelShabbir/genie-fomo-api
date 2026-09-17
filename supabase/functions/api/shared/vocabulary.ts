@@ -77,7 +77,7 @@ export const VOCABULARY = {
                    "not_configured", "unauthorized", "invalid_address", "address_in_use",
                    "already_on_record"],
     "walletSubmission.pricing.state": ["pending_first_read"],
-    /* 18 Sep 2026, v9: /aum/history, built from stored holdings and prices (table aum_history). */
+    /* 17 Sep 2026, v9: /aum/history, built from stored holdings and prices (table aum_history). */
     "aumHistory.step": ["1h", "1d", "1w", "1mo"],
     "aumHistory.points[].basis": ["reading", "priced"],
     "aumHistory.points[].reason": ["no_holdings", "no_prices", "too_little_priced"],

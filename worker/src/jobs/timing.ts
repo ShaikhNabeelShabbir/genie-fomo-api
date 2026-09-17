@@ -5,7 +5,7 @@ import { db } from "../db";
  * Rebuild `position_timing` from `transactions`: the Worker half of refresh.yml
  * "Refresh position timing".
  *
- * Ported from `scripts/refresh_position_timing.mjs` (deleted 18 Sep 2026; the Worker is the only copy). Same statements, same
+ * Ported from `scripts/refresh_position_timing.mjs` (deleted 17 Sep 2026; the Worker is the only copy). Same statements, same
  * build-beside-then-swap so the route never reads a half-filled table. Differs only where the
  * platform does: the rebuild runs inside ONE transaction, so `set local statement_timeout = 0`
  * beats the 14 s the client sets (db.ts) without touching session state on a pooled Hyperdrive

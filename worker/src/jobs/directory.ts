@@ -100,7 +100,7 @@ async function detectNetworks(addr: string, cache: Map<string, readonly number[]
   const key = addr.toLowerCase();
   const hit = cache.get(key);
   if (hit) return hit;
-  // Bitquery, not public RPC (18 Sep 2026): a failed probe is an empty list this run, retried next night.
+  // Bitquery, not public RPC (17 Sep 2026): a failed probe is an empty list this run, retried next night.
   const nets = (await evmChainsSeen(bitqueryKey, addr)) ?? [];
   cache.set(key, nets);
   return nets;

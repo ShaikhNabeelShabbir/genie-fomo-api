@@ -10,7 +10,7 @@ import {
 } from "../shared/aum-history-rules.ts";
 
 /**
- * Balance history BUILT from stored holdings and prices (18 Sep 2026), not sampled: the
+ * Balance history BUILT from stored holdings and prices (17 Sep 2026), not sampled: the
  * hourly `aum_history` table and its daily / weekly / monthly rollup views, so a chart can
  * show any grain including the past. The legacy sampled series stays on /aum.
  *

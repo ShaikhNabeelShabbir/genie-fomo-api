@@ -1,14 +1,14 @@
 /**
  * Bitquery GraphQL client, shared by the transfer fetch and the EVM balance read.
  *
- * Balances come from here and not from public JSON-RPC since 18 Sep 2026: Cloudflare's shared
+ * Balances come from here and not from public JSON-RPC since 17 Sep 2026: Cloudflare's shared
  * egress gets HTTP 429 from Robinhood's and Base's public nodes (the first balances cron lost
  * 4 of 28 chain reads), and Bitquery is the one paid indexer already in the bill.
  */
 import { throttled, ZERO_ADDRESS } from "./chain_reads.ts";
 
 /**
- * DATASET IS `realtime` EVERYWHERE. The plan (checked 18 Sep 2026) allows only the realtime
+ * DATASET IS `realtime` EVERYWHERE. The plan (checked 17 Sep 2026) allows only the realtime
  * dataset; `combined` and `archive` answer 403 "access restricted". Realtime `Balances`
  * still returns the full current balance per currency, and `TransactionBalances`,
  * `Transactions`, `DEXTrades` and `Transfers` answer for recent activity, which is what the
