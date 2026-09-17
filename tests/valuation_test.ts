@@ -1,7 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { DatabaseSync } from "node:sqlite";
 import { d1sql, type D1Like, type D1Statement } from "../worker/src/d1.ts";
-import { buildAumHistory, refreshAumLive, valueGroup } from "../worker/src/jobs/valuation.ts";
+import { buildAumHistory, refreshAumLive, refreshAumLiveUnmoved, valueGroup } from "../worker/src/jobs/valuation.ts";
 
 /* The port of aum_history_build / aum_live_refresh (migration 20260918100000). The schema is
    the real worker/d1/migrations/*.sql, run in SQLite, so the SQL is proved, not mocked. */
@@ -275,4 +275,60 @@ Deno.test("buildAumHistory: V1d — an hour is valued the same whenever it is bu
   await buildAumHistory(sql, "a", "2026-09-10T03:00:00.000Z", "2026-09-10T03:00:00.000Z");
   const dated = history(db, "a").find((r) => r.hour === "2026-09-10T03:00:00.000Z");
   assertEquals([dated?.total_usd, dated?.priced_positions], [20, 1]);
+});
+
+// ------------------------------------------------------- refreshAumLiveUnmoved (A2)
+
+const SOL = 1399811149;
+
+/** A Solana wallet whose balance was read, then moved by a transfer the roll-forward picks up. */
+function movedOnSolana(db: DatabaseSync, handle: string): void {
+  run(db, "update wallets set sol_address = ? where handle = ?", `S${handle}`, handle);
+  /* `sol_address_key` is a generated column; the transfer must carry whatever it derives. */
+  const key = String((db.prepare("select sol_address_key k from wallets where handle = ?").get(handle) as { k: string }).k);
+  run(db, "insert into tokens (network_id, address, token_key, total_supply) values (?,?,?,?)",
+    SOL, "soltok", "soltok", 1_000_000);
+  run(db, "insert into token_prices (network_id, token_key, day, usd, source) values (?,?,?,?,'t')",
+    SOL, "soltok", CURRENT_HOUR.slice(0, 10), 2);
+  run(db, "insert into holdings (handle, network_id, token_key, captured_at, human_amount, source) values (?,?,?,?,?,'chain')",
+    handle, SOL, "soltok", "2026-09-10T02:30:00.000Z", 10);
+  /* +5 tokens in, after the capture: holdings_live sees 15, holdings_current still 10. */
+  run(db, `insert into transactions
+             (network_id, tx_hash, address_key, transfer_key, block_time, direction, token_key, amount, source)
+           values (?,?,?,?,?,'in',?,?,'t')`,
+    SOL, "tx1", key, "k1", "2026-09-10T03:00:00.000Z", "soltok", 5);
+}
+
+Deno.test("refreshAumLiveUnmoved: values the balance as READ, where refreshAumLive rolls it forward", async () => {
+  const { sql, db } = await open();
+  trader(db, "a");
+  movedOnSolana(db, "a");
+
+  await refreshAumLive(sql, ["a"], "webhook");
+  const rolled = db.prepare("select total_usd from aum_live where handle = 'a'").get();
+  assertEquals(rolled?.total_usd, 30, "15 tokens x $2: the transfer after the read counts");
+
+  await refreshAumLiveUnmoved(sql, ["a"], "build");
+  const asRead = db.prepare("select total_usd from aum_live where handle = 'a'").get();
+  assertEquals(asRead?.total_usd, 20, "10 tokens x $2: no roll-forward, which is the cheap path");
+});
+
+Deno.test("refreshAumLiveUnmoved: agrees with refreshAumLive when nothing moved", async () => {
+  /*
+   * The whole premise of A2's cheap path: for a trader nothing has marked as moved, the
+   * roll-forward can only add zero, so the two must produce the identical figure.
+   */
+  const { sql, db } = await open();
+  trader(db, "a");
+  token(db, 1, "0xday");
+  run(db, "insert into token_prices (network_id, token_key, day, usd, source) values (1,'0xday',?,4,'t')",
+    CURRENT_HOUR.slice(0, 10));
+  capture(db, "a", 1, "0xday", "2026-09-10T02:30:00.000Z", 3);
+
+  await refreshAumLive(sql, ["a"], "webhook");
+  const rolled = db.prepare("select total_usd, priced_positions from aum_live where handle = 'a'").get();
+  await refreshAumLiveUnmoved(sql, ["a"], "build");
+  const asRead = db.prepare("select total_usd, priced_positions from aum_live where handle = 'a'").get();
+  assertEquals([asRead?.total_usd, asRead?.priced_positions], [rolled?.total_usd, rolled?.priced_positions]);
+  assertEquals(asRead?.total_usd, 12);
 });

@@ -410,19 +410,17 @@ const LIVE_CHUNK = 4;
 /** aum_live is 9 columns; 10 rows is 90 parameters. */
 const LIVE_WRITE_CHUNK = 10;
 
-/**
- * `aum_live_refresh(p_handles, p_source, p_older_than)`: revalue `holdings_live` for the
- * targets on the ladder peg -> token_price_stats -> the latest daily close within 7 days ->
- * token_info, upserting `aum_live` and the current hour of `aum_history`. Returns rows upserted.
- */
-export async function refreshAumLive(
-  sql: Sql, handles: readonly string[] | null, source: string, olderThanHours?: number,
-): Promise<number> {
-  const targets = await liveTargets(sql, handles, olderThanHours);
-  if (!targets.length) return 0;
+/** Handles per `holdings_current` read. The view is a correlated maximum, ~20x cheaper a trader. */
+const UNMOVED_CHUNK = 8;
 
+/**
+ * Balances as `holdings_live` gives them: the chain read, rolled forward on Solana by every
+ * transfer since it. Correct for a trader who has moved, and the expensive one — three
+ * correlated subqueries per row (818,851 rows / 2,111 ms on the largest trader, 17 Sep).
+ */
+async function rolledBalances(sql: Sql, targets: readonly string[]): Promise<Map<string, Balance[]>> {
   const balances = new Map<string, Balance[]>();
-  for (const part of chunk(targets, LIVE_CHUNK)) {
+  for (const part of chunk([...targets], LIVE_CHUNK)) {
     const rows = await sql<{ handle: string; network_id: number; token_key: string; human_amount: number }[]>`
       select handle, network_id, token_key, coalesce(human_amount_live, human_amount) as human_amount
         from holdings_live
@@ -432,7 +430,44 @@ export async function refreshAumLive(
         .push({ networkId: r.network_id, tokenKey: r.token_key, amount: r.human_amount });
     }
   }
+  return balances;
+}
 
+/**
+ * A2. Balances exactly as the chain read left them, with no roll-forward.
+ *
+ * Only for traders NOT in `aum_live_dirty`: nothing we hold post-dates their balance read, so
+ * the roll-forward can only ever add zero and we decline to pay for it. Measured on the same
+ * trader as above: 105,388 rows / 106 ms, about twenty times cheaper, which is the difference
+ * between revaluing ~145 traders an hour and revaluing all of them.
+ */
+async function capturedBalances(sql: Sql, targets: readonly string[]): Promise<Map<string, Balance[]>> {
+  const balances = new Map<string, Balance[]>();
+  for (const part of chunk([...targets], UNMOVED_CHUNK)) {
+    const rows = await sql<{ handle: string; network_id: number; token_key: string; human_amount: number }[]>`
+      select handle, network_id, token_key, human_amount
+        from holdings_current
+       where handle in (${part}) and human_amount > 0`;
+    for (const r of rows) {
+      (balances.get(r.handle) ?? balances.set(r.handle, []).get(r.handle)!)
+        .push({ networkId: r.network_id, tokenKey: r.token_key, amount: r.human_amount });
+    }
+  }
+  return balances;
+}
+
+/**
+ * `aum_live_refresh(p_handles, p_source, p_older_than)`: revalue the targets on the ladder
+ * peg -> token_price_stats -> the latest daily close within 7 days -> token_info, upserting
+ * `aum_live` and the current hour of `aum_history`. Returns rows upserted.
+ *
+ * The BALANCES ARE THE CALLER'S: `refreshAumLive` rolls them forward, `refreshAumLiveUnmoved`
+ * does not. A boolean here would be a flag switching the body's behaviour; two names that each
+ * say what they read is the same code and a readable call site.
+ */
+async function revalue(
+  sql: Sql, targets: readonly string[], balances: Map<string, Balance[]>, source: string,
+): Promise<number> {
   const refs: TokenRef[] = [...balances.values()].flat().map((b) => ({ networkId: b.networkId, tokenKey: b.tokenKey }));
   const facts = await loadFacts(sql, refs, true);
 
@@ -487,4 +522,32 @@ export async function refreshAumLive(
   });
   await writeHistory(sql, computed.map((c) => ({ handle: c.handle, hour, v: c.v, basis: "priced" as const })));
   return computed.length;
+}
+
+/**
+ * Revalue traders whose balances may have moved since their last chain read: the Helius flush
+ * and the balances job. Reads `holdings_live`, so Solana is rolled forward per row.
+ */
+export async function refreshAumLive(
+  sql: Sql, handles: readonly string[] | null, source: string, olderThanHours?: number,
+): Promise<number> {
+  const targets = await liveTargets(sql, handles, olderThanHours);
+  if (!targets.length) return 0;
+  return await revalue(sql, targets, await rolledBalances(sql, targets), source);
+}
+
+/**
+ * A2. Revalue traders nothing has marked as moved, from the balances as read.
+ *
+ * The caller must pass only handles absent from `aum_live_dirty` — every writer of a balance or
+ * a transfer marks that table (webhook.ts, jobs/balances.ts, jobs/transfers.ts), so absence
+ * means no transfer we hold post-dates the read and the roll-forward would add zero. Prices
+ * still move, which is why these traders need revaluing at all.
+ */
+export async function refreshAumLiveUnmoved(
+  sql: Sql, handles: readonly string[] | null, source: string,
+): Promise<number> {
+  const targets = await liveTargets(sql, handles, undefined);
+  if (!targets.length) return 0;
+  return await revalue(sql, targets, await capturedBalances(sql, targets), source);
 }

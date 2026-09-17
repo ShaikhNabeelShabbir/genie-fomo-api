@@ -70,6 +70,24 @@ const keyed = (r: Row): unknown[] => [
   r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11],
 ];
 
+/**
+ * A2 (v5 fixes, 17 Sep 2026). MARK THE TRADER WHEN WE INGEST A SOLANA TRANSFER.
+ *
+ * `aum_live_dirty` was written by the Helius receiver and the balances job, but not here — so
+ * this backfill could land Solana rows that move a wallet's balance without anything marking
+ * the trader. `holdings_live` rolls those rows forward, so the live figure was right only
+ * because every caller paid for the roll-forward on every trader, moved or not.
+ *
+ * With this mark, "not in `aum_live_dirty`" means "no transfer we hold post-dates the balance
+ * read", which is what lets the hourly catch-up value unmoved traders from `holdings_current`
+ * and skip a roll-forward that can only produce zero (see valuation.ts refreshAumLiveUnmoved).
+ */
+async function markDirty(sql: Sql, handle: string): Promise<void> {
+  await sql`
+    insert into aum_live_dirty (handle, marked_at) values (${handle}, ${new Date().toISOString()})
+    on conflict (handle) do update set marked_at = excluded.marked_at`;
+}
+
 /** One transaction: statements of `INSERT_ROWS` rows, all in one D1 batch. */
 async function upsert(sql: Sql, rows: readonly Row[]): Promise<void> {
   await sql.begin((tx) => {
@@ -112,7 +130,13 @@ async function backfillWallet(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<
   for (const c of out.chains) if (c.error) console.error(`transfers: ${w.handle} ${c.chain}: ${c.error}`);
   const rows = dedupe(toRows(w, out.transfers));
   for (const part of chunk(rows, INSERT_CHUNK)) await upsert(sql, part);
+  await markIfSolana(sql, w, rows);
   return rows.length + await walkBack(sql, keys, w);
+}
+
+/** Mark the trader when any of the rows just written is a Solana transfer. */
+async function markIfSolana(sql: Sql, w: Wallet, rows: readonly Row[]): Promise<void> {
+  if (rows.some((r) => r[0] === SOLANA_NETWORK_ID)) await markDirty(sql, w.handle);
 }
 
 /** One backward Solana page for a wallet whose history is not yet in. Returns rows written. */
@@ -128,6 +152,7 @@ async function walkBack(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<number
   }
   const rows = dedupe(toRows(w, out.transfers));
   for (const part of chunk(rows, INSERT_CHUNK)) await upsert(sql, part);
+  await markIfSolana(sql, w, rows);
   /* Helius ran out of signatures rather than out of pages: this wallet is done for good. */
   if (sol?.exhausted) {
     await sql`update wallets set sol_backfill_done = 1 where handle = ${w.handle}`;

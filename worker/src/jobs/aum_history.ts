@@ -1,6 +1,6 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
-import { buildAumHistory, refreshAumLive } from "./valuation.ts";
+import { buildAumHistory, refreshAumLiveUnmoved } from "./valuation.ts";
 import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_history-core";
 
 /**
@@ -60,12 +60,18 @@ const build = (sql: Sql, c: Chunk): Promise<number> =>
 const LIVE_BUDGET_SHARE = 0.25;
 /** Handles per statement. Slices of 40, so no single call holds the database for minutes (17 Sep 08:5x). */
 const LIVE_SLICE = 40;
-/** Never revalue more than this in one pass: the rest are stalest-first next hour. */
-const LIVE_MAX = 400;
+/** The whole roster fits in one pass now, so this is a guard against a runaway, not a throttle. */
+const LIVE_MAX = 600;
 
 /**
- * Anyone no feed has revalued in the last hour, stalest first. Returns handles refreshed.
- * `budgetMs` is this pass's own, not the job's.
+ * A2. Everyone whose live figure is over an hour old AND whom nothing has marked as moved,
+ * stalest first. Returns handles refreshed; `budgetMs` is this pass's own, not the job's.
+ *
+ * The `aum_live_dirty` exclusion is what makes this affordable. A marked trader belongs to the
+ * Helius flush and needs the Solana roll-forward; an unmarked one can be valued from the
+ * balances as read, which is about twenty times less database work per trader. Before the
+ * split this pass managed ~145 traders of 446 in its window, so a trader nobody watched was
+ * revalued every three hours rather than hourly (v5 fixes, A2).
  */
 async function catchUpLive(sql: Sql, started: number, budgetMs: number): Promise<number> {
   const anHourAgo = new Date(started - 3_600_000).toISOString();
@@ -74,10 +80,11 @@ async function catchUpLive(sql: Sql, started: number, budgetMs: number): Promise
     left join aum_live l on l.handle = t.handle
     where (l.at is null or l.at < ${anHourAgo})
       and exists (select 1 from wallets w where w.handle = t.handle)
+      and not exists (select 1 from aum_live_dirty d where d.handle = t.handle)
     order by l.at limit ${LIVE_MAX}`).map((r) => r.handle);
   let n = 0;
   for (let i = 0; i < stale.length && Date.now() - started < budgetMs; i += LIVE_SLICE) {
-    n += await refreshAumLive(sql, stale.slice(i, i + LIVE_SLICE), "build");
+    n += await refreshAumLiveUnmoved(sql, stale.slice(i, i + LIVE_SLICE), "build");
   }
   return n;
 }
