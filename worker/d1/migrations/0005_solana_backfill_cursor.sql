@@ -11,6 +11,8 @@
 -- 1 = a backward page came back empty, the wallet's history is in.
 alter table wallets add column sol_backfill_done integer;
 
--- The backward walk seeks the oldest row per address; without this it scans the address's rows.
-create index if not exists transactions_address_net_time_idx
-  on transactions (address_key, network_id, block_time);
+-- No index is added. The backward walk's `order by block_time asc limit 1` per
+-- (address_key, network_id) is served by the existing
+-- `transactions_wallet_time_idx (address_key, network_id, block_time desc)`, which SQLite walks
+-- in reverse for an ascending order. A second copy in ascending order would cost an index build
+-- over 1.39M rows and slow every insert for nothing.
