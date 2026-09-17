@@ -59,14 +59,12 @@ export interface QuotePricesSummary {
  * else `seriesStartMs` looks a year back.
  */
 const quoteAssets = (sql: Sql) => sql<QuoteAsset[]>`
-  select q.network_id, q.token_key, q.symbol,
-         min(t.block_time)::date               as first_day
+  select q.network_id, q.token_key, q.symbol, null::date as first_day
     from quote_assets q
-    left join transactions t
-      on t.network_id = q.network_id and t.token_key = q.token_key and t.tx_type = 'SWAP'
    where q.pegged_usd is null and q.symbol = any(${Object.keys(PAIR)})
-   group by 1,2,3
    order by q.network_id, q.symbol`;
+// No join to \`transactions\` for the first swap day: that scan outran the 14 s statement timeout
+// (17 Sep). A null first_day makes \`seriesStartMs\` look a year back, one Binance page.
 
 /** Daily closes from Binance, paged from `startMs`. */
 async function dailyCloses(pair: string, startMs: number): Promise<Map<string, number>> {
