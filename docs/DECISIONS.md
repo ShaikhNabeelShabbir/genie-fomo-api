@@ -3151,3 +3151,20 @@ always handled both; this receiver did not, and the two quietly disagreed.
 uses. It has to join to `quote_assets` or T2.1 cannot price the leg, which would leave
 the row present and valueless — no better than not having it.
      
+
+## Added 18 Sep 2026 — aum_history
+
+Balance history is built, not sampled. The sampler (`aum-sample`, then the Worker `/sample`
+cron) read every wallet from chain each pass, so a point existed only for the hours the cron
+ran and survived, and a missed run was a hole that nothing could fill afterwards. Everything
+a point needs is already stored: `holdings` keeps every chain capture (append-only), and
+prices exist per hour (`token_price_hourly`), per day (`token_prices`), or by peg. So a
+trader-hour is a deterministic function of stored rows and can be rebuilt for any past hour,
+re-run when a late price lands, and backfilled on a fresh install without touching a chain.
+Real measurements are not thrown away: where an `aum_samples` reading exists in the hour it
+wins (`basis='reading'`), and the rebuilt figure only fills the hours between readings
+(`basis='priced'`). The function lives in SQL (`aum_history_build`) so the same rules run
+identically from the Worker cron and from a psql backfill; the ceilings and floors are
+literals there, with `value.ts` and `aum-rules.ts` named as the source of truth, because a
+function cannot import TypeScript and a table of constants for five numbers is more to keep
+in step than one comment.

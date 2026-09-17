@@ -337,3 +337,36 @@ curl -s "$B/traders/nobody/aum"             | jq .
 
 **Not bulk-able through `?include=`**, for the same reason `/portfolio` is not: it is a series
 per trader, and a page of them would be the largest response this API can produce.
+
+---
+
+## 8. aum_history (18 Sep 2026)
+
+Balance history is no longer sampled from chain on a schedule; it is **built** from stored
+data into `aum_history`, one row per trader per UTC hour, so any past hour, day, week or
+month can be read back. Migration `20260918010000_aum_history.sql`.
+
+**Columns:** `handle`, `hour` (bucket start), `total_usd` (NULL = not valued, never zero),
+`priced_positions`, `total_positions`, `basis`, `reason`, `computed_at`.
+
+**Two bases.** `reading`: an `aum_samples` row with `basis='sampled'` and a total fell inside
+the hour; the latest one is copied as-is. `priced`: no reading, so the latest chain capture in
+`holdings` (per network, before the hour ended) is valued at that hour's stored prices —
+`quote_assets.pegged_usd`, then `token_price_hourly` (the hour, or the latest within 24 h),
+then `token_prices` for the day, then `token_info.price_usd` for the current hour only. The
+ceilings from `aum-sample/value.ts` and the floors from `api/shared/aum-rules.ts` apply.
+
+**Reasons** (why `total_usd` is NULL on a `priced` row): `no_holdings` (no chain capture yet,
+or nothing held), `no_prices` (nothing priceable), `too_little_priced` (under 25% of positions
+priced and the priced sum under $100).
+
+**Rollups.** Views `aum_history_daily`, `aum_history_weekly` (Monday start) and
+`aum_history_monthly`: `(handle, bucket, total_usd, high_usd, low_usd, valued_hours, hours)`.
+`total_usd` is the close — the last valued hour in the bucket; `valued_hours` of `hours` says
+how much of the bucket is real.
+
+**Cadence.** `worker/src/jobs/aum_history.ts` (`runAumHistory`) runs on the Worker cron: one
+query plans every trader's next range (from the hour after the last built one, or from the
+earliest capture/reading; the last two hours are always recomputed because prices arrive
+late), then calls `aum_history_build(handle, from, to)` per chunk of at most 168 hours, oldest
+first, until the budget is spent. A fresh install backfills over several runs.
