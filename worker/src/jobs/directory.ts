@@ -1,6 +1,5 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { jobSql, type Sql } from "../sql";
 import { evmChainsSeen } from "./tokens";
 import {
   SOLANA_NETWORK_ID, SOURCE, canonical, chunk, holdingRows, isRecord, mergePositions, parseBalances,
@@ -21,7 +20,6 @@ import {
  * is the primary key on holdings and trader_stats, so each run adds a generation.
  */
 
-type Sql = postgres.Sql;
 interface Target { readonly handle: string; readonly display_handle: string }
 interface Generation { readonly captured: Date; readonly targets: readonly Target[] }
 /** One trader's positions; `failed` is how many of its two fomo calls errored (its rows may be incomplete). */
@@ -37,6 +35,14 @@ const TRADE_LIMIT = 100;
 const FANOUT = 6;
 const TRIES = 3;
 const FETCH_TIMEOUT_MS = 45_000;
+
+/** Rows per multi-row insert: D1 binds at most 100 parameters a statement, 90 leaves headroom. */
+const perStatement = (columns: number): number => Math.floor(90 / columns);
+/** `(?,?,…),(?,?,…)`: D1 has no `sql(rows, ...cols)` helper, so the tuples are written out. */
+const rowValues = (columns: number, rows: number): string =>
+  Array(rows).fill(`(${Array(columns).fill("?").join(",")})`).join(",");
+/** SQLite's `now()`, spliced into the SQL text: it is an expression, never a bound parameter. */
+const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
 export interface DirectorySummary {
   /** Leaderboard traders fetched this run; 0 when the run resumed an unfinished generation. */
@@ -111,11 +117,11 @@ async function detectNetworks(addr: string, cache: Map<string, readonly number[]
  * address every night; a Worker invocation has a subrequest cap, so only unseen addresses are asked.
  */
 async function knownNetworks(sql: Sql): Promise<Map<string, readonly number[]>> {
-  const rows = await sql<{ token_key: string; network_ids: number[] }[]>`
-    select token_key, array_agg(network_id)::int[] as network_ids
+  const rows = await sql<{ token_key: string; network_ids: string }[]>`
+    select token_key, json_group_array(network_id) as network_ids
       from tokens where network_id <> ${SOLANA_NETWORK_ID} and token_key like '0x%'
      group by token_key`;
-  return new Map(rows.map((r) => [r.token_key, r.network_ids]));
+  return new Map(rows.map((r) => [r.token_key, JSON.parse(r.network_ids) as number[]]));
 }
 
 /** Current positions, the fingerprint the resolver verifies against: /trades (open, EVM + Solana) merged with /balances (Solana, live). */
@@ -142,7 +148,7 @@ async function fetchPositions(handle: string, key: string, bitqueryKey: string, 
 
 /** The generation still in progress, with the traders whose positions it lacks (rank order), or null. */
 async function openGeneration(sql: Sql): Promise<Generation | null> {
-  const [b] = await sql<{ captured_at: Date }[]>`
+  const [b] = await sql<{ captured_at: string }[]>`
     select captured_at from builds where source = ${SOURCE} and holding_count is null order by captured_at desc limit 1`;
   if (!b) return null;
   const captured = new Date(b.captured_at);
@@ -151,7 +157,7 @@ async function openGeneration(sql: Sql): Promise<Generation | null> {
       from trader_stats s join traders t using (handle)
      where s.captured_at = ${captured}
        and not exists (select 1 from holdings h where h.handle = s.handle and h.captured_at = s.captured_at and h.source = 'fomo')
-     order by s.rank nulls last, s.handle`;
+     order by s.rank is null, s.rank, s.handle`;
   return { captured, targets };
 }
 
@@ -168,46 +174,65 @@ async function writeLeaderboard(sql: Sql, captured: Date, entries: readonly Entr
   }
   const handles = traders.map((t) => t.handle);
   const delisted = await sql.begin(async (tx) => {
+    /* D1 has no interactive transaction: every statement is issued unawaited so the shim flushes
+       them as ONE atomic db.batch at the single await below, in the order written here. */
+    const queued: PromiseLike<unknown>[] = [];
     /* The build row first: it records what the row tables cannot, notably the leaderboard `window`. holding_count lands when the generation completes. */
-    await tx`
+    queued.push(tx`
       insert into builds (captured_at, window_label, source, trader_count, holding_count)
       values (${captured}, ${WINDOW}, ${SOURCE}, ${traders.length}, null)
       on conflict (captured_at) do update set
         window_label = excluded.window_label, source = excluded.source,
-        trader_count = excluded.trader_count, holding_count = excluded.holding_count`;
-    await tx`
-      insert into traders ${tx(traders, "handle", "display_handle", "name", "avatar", "bio", "twitter", "verified", "source")}
-      on conflict (handle) do update set
-        display_handle = excluded.display_handle,
-        name = excluded.name, avatar = excluded.avatar, bio = excluded.bio,
-        twitter = excluded.twitter, verified = excluded.verified,
-        last_seen_at = now()`;
-    /* An address only ever moves forward: coalesce keeps a previously known address if a later build omits it, rather than blanking the row. */
-    if (wallets.length) {
-      await tx`
-        insert into wallets ${tx(wallets, "handle", "evm_address", "evm_source", "sol_address", "sol_source")}
-        on conflict (handle) do update set
-          evm_address = coalesce(excluded.evm_address, wallets.evm_address),
-          evm_source  = coalesce(excluded.evm_source,  wallets.evm_source),
-          sol_address = coalesce(excluded.sol_address, wallets.sol_address),
-          sol_source  = coalesce(excluded.sol_source,  wallets.sol_source),
-          last_seen_at = now()`;
+        trader_count = excluded.trader_count, holding_count = excluded.holding_count`);
+    /* `traders.id` lost its gen_random_uuid() default in D1, so the insert carries one; a row that conflicts keeps the id it already has. */
+    for (const part of chunk(traders, perStatement(9))) {
+      queued.push(tx.unsafe(
+        `insert into traders (handle, display_handle, name, avatar, bio, twitter, verified, source, id)
+         values ${rowValues(9, part.length)}
+         on conflict (handle) do update set
+           display_handle = excluded.display_handle,
+           name = excluded.name, avatar = excluded.avatar, bio = excluded.bio,
+           twitter = excluded.twitter, verified = excluded.verified,
+           last_seen_at = ${NOW}`,
+        part.flatMap((t) => [t.handle, t.display_handle, t.name, t.avatar, t.bio, t.twitter, t.verified, t.source, crypto.randomUUID()]),
+      ));
     }
-    await tx`
-      insert into trader_stats ${tx(stats, "handle", "captured_at", "rank", "pnl_usd", "volume_usd", "trade_count", "followers")}
-      on conflict (handle, captured_at) do update set
-        rank = excluded.rank, pnl_usd = excluded.pnl_usd, volume_usd = excluded.volume_usd,
-        trade_count = excluded.trade_count, followers = excluded.followers`;
+    /* An address only ever moves forward: coalesce keeps a previously known address if a later build omits it, rather than blanking the row. */
+    for (const part of chunk(wallets, perStatement(5))) {
+      queued.push(tx.unsafe(
+        `insert into wallets (handle, evm_address, evm_source, sol_address, sol_source)
+         values ${rowValues(5, part.length)}
+         on conflict (handle) do update set
+           evm_address = coalesce(excluded.evm_address, wallets.evm_address),
+           evm_source  = coalesce(excluded.evm_source,  wallets.evm_source),
+           sol_address = coalesce(excluded.sol_address, wallets.sol_address),
+           sol_source  = coalesce(excluded.sol_source,  wallets.sol_source),
+           last_seen_at = ${NOW}`,
+        part.flatMap((w) => [w.handle, w.evm_address, w.evm_source, w.sol_address, w.sol_source]),
+      ));
+    }
+    for (const part of chunk(stats, perStatement(7))) {
+      queued.push(tx.unsafe(
+        `insert into trader_stats (handle, captured_at, rank, pnl_usd, volume_usd, trade_count, followers)
+         values ${rowValues(7, part.length)}
+         on conflict (handle, captured_at) do update set
+           rank = excluded.rank, pnl_usd = excluded.pnl_usd, volume_usd = excluded.volume_usd,
+           trade_count = excluded.trade_count, followers = excluded.followers`,
+        part.flatMap((r) => [r.handle, r.captured_at, r.rank, r.pnl_usd, r.volume_usd, r.trade_count, r.followers]),
+      ));
+    }
     /* Migration 20260916140000: A FLAG, NOT A DELETE. A fomoapi trader the board no longer carries AND who has no address is
-       "listed and unpriceable"; one with a wallet still has chain reads and stays. Reversed the moment the source lists them again. */
-    const gone = await tx`
-      update traders set listed = false, delisted_at = now(), delisted_reason = 'absent_from_source'
-       where source = ${SOURCE} and listed and handle <> all(${handles}::text[])
+       "listed and unpriceable"; one with a wallet still has chain reads and stays. Reversed the moment the source lists them again.
+       The board is 100 handles, over D1's parameter ceiling, so the list binds as one JSON array. */
+    const gone = tx`
+      update traders set listed = 0, delisted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), delisted_reason = 'absent_from_source'
+       where source = ${SOURCE} and listed = 1 and handle not in (select value from json_each(${handles}))
          and not exists (select 1 from wallets w where w.handle = traders.handle)`;
-    await tx`
-      update traders set listed = true, delisted_at = null, delisted_reason = null
-       where not listed and handle = any(${handles}::text[])`;
-    return gone.count;
+    queued.push(gone, tx`
+      update traders set listed = 1, delisted_at = null, delisted_reason = null
+       where listed = 0 and handle in (select value from json_each(${handles}))`);
+    await Promise.all(queued);
+    return (await gone).count;
   });
   return { targets: traders.map((t) => ({ handle: t.handle, display_handle: t.display_handle })), wallets: wallets.length, delisted };
 }
@@ -220,14 +245,28 @@ async function writePositions(sql: Sql, captured: Date, group: readonly Target[]
     .map((h) => ({ ...h, price_source: h.price === null ? null : "fomo_reported_entry", priced_at: h.price === null ? null : captured }));
   if (!holdings.length) return 0;
   await sql.begin(async (tx) => {
-    await tx`
-      insert into tokens ${tx(tokens, "network_id", "address")}
-      on conflict (network_id, token_key) do update set last_seen_at = now()`;
-    await tx`
-      insert into holdings ${tx(holdings, "handle", "network_id", "token_key", "captured_at", "human_amount", "price", "value", "price_source", "priced_at")}
-      on conflict (handle, network_id, token_key, captured_at) do update set
-        human_amount = excluded.human_amount, price = excluded.price, value = excluded.value,
-        price_source = excluded.price_source, priced_at = excluded.priced_at`;
+    const queued: PromiseLike<unknown>[] = [];
+    /* `tokens.token_key` is a plain column in D1 (SQLite refuses a generated column in a primary key), so the writer lowercases. */
+    for (const part of chunk(tokens, perStatement(3))) {
+      queued.push(tx.unsafe(
+        `insert into tokens (network_id, address, token_key)
+         values ${rowValues(3, part.length)}
+         on conflict (network_id, token_key) do update set last_seen_at = ${NOW}`,
+        part.flatMap((t) => [t.network_id, t.address, t.address.toLowerCase()]),
+      ));
+    }
+    for (const part of chunk(holdings, perStatement(9))) {
+      queued.push(tx.unsafe(
+        `insert into holdings (handle, network_id, token_key, captured_at, human_amount, price, value, price_source, priced_at)
+         values ${rowValues(9, part.length)}
+         on conflict (handle, network_id, token_key, captured_at) do update set
+           human_amount = excluded.human_amount, price = excluded.price, value = excluded.value,
+           price_source = excluded.price_source, priced_at = excluded.priced_at`,
+        part.flatMap((h) => [h.handle, h.network_id, h.token_key, h.captured_at, h.human_amount, h.price, h.value, h.price_source, h.priced_at]),
+      ));
+    }
+    /* One db.batch, in this order: the tokens land before the holdings whose foreign key needs them. */
+    await Promise.all(queued);
   });
   return holdings.length;
 }
@@ -244,7 +283,7 @@ export async function runDirectory(env: Env, budgetMs: number): Promise<Director
   if (!bitqueryKey) throw new Error("BITQUERY_KEY is not set; EVM chain detection needs it");
   const started = Date.now();
   const deadline = AbortSignal.timeout(budgetMs);
-  const sql = db(env);
+  const sql = jobSql(env);
   const s = { fetched: 0, upserted: 0, delisted: 0, wallets: 0, errored: 0, remaining: 0, stoppedEarly: false, elapsedMs: 0 };
   try {
     let gen = await openGeneration(sql);
