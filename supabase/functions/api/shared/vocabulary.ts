@@ -34,12 +34,14 @@ export const VOCABULARY = {
     "positions.partialReason": ["unsellable_positions", "unpriced_positions", "indexer_coverage_low", "unsellable_positions_and_indexer_coverage_low"],
     "positions[].priceSuspectReason": ["implied_mcap_over_ceiling", "concentration_over_ceiling"],
     "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
-    "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards"],
+    "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards", "swaps"],
     /* 17 Sep 2026, v4: second wave (items 10, 11, 12, R6). */
     "scorecard.loadOutcome": ["loaded", "unavailable", "degraded", "not_found", "error"],
     "scorecard.nextLoadBasis": ["nightly_slot"],
     "pnl.openPositionsBasis.*": ["trade_records", "trade_records_still_held_on_chain"],
     "trades.status": ["open", "closed", "closed_by_balance"],
+    /* 17 Sep 2026, v3 fixes (X2): which arm priced the money leg (`wallet_swaps.quote_source`); null with `valueUsd`. */
+    "trades[].valueSource": ["money_side_pegged", "money_side_daily_close", "money_side_market"],
     /* 17 Sep 2026, v5: T3 bounded on-chain scorecard fallback. */
     "scorecard.staleness.fallback": ["on_chain"],
     "scorecard.onChain.basis": ["wallet_swaps"],

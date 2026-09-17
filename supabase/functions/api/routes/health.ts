@@ -43,6 +43,7 @@ async function healthBody(): Promise<Record<string, unknown>> {
   /** Freshness per feed, so "the service is degraded" is distinguishable from "there is nothing… See docs/DECISIONS.md#d065 */
   const [f] = await sql`
     select (select max(captured_at) from trades)                         as trades_at,
+           (select max(block_time)  from wallet_swaps)                   as swaps_at,
            (select max(captured_at) from holdings)                       as holdings_at,
            (select max(block_time)  from transactions)                   as transactions_at,
            (select max(fetched_at)  from token_info)                     as token_info_at,
@@ -146,7 +147,9 @@ async function healthBody(): Promise<Record<string, unknown>> {
 
   const feeds = {
     traders:      feed(b?.captured_at ?? null, 36),
-    trades:       feed(f.trades_at, 72),
+    trades:       feed(f.trades_at, 72, { description: "fomoapi trade records, load time" }),
+    /** X1b. The wallet's own resolved swaps (`wallet_swaps`, what /trades and /events?kind=swap read): newest block time. */
+    swaps:        feed(f.swaps_at, 6, { description: "on-chain swaps resolved from the wallet's transactions, newest block time" }),
     wallets:      feed(f.wallets_at, 36),
     positions:    feed(f.holdings_at, 36),
     transactions: feed(f.transactions_at, 36),
