@@ -21,7 +21,7 @@ type Sql = postgres.Sql;
 interface Target { readonly address: string; readonly token_key: string; readonly created_at: Date | null }
 interface Launch extends Curve { readonly curve: string }
 
-// ponytail: 20 pages = 20,000 signatures, the deepest curve history measured (31 s public).
+// ponytail: 20 pages = 20,000 signatures, the deepest curve history measured (31 s).
 // Past it created_at stays null; raise, or move to a Helius-indexed read, if that shows up often.
 const MAX_SIG_PAGES = 20;
 /** Wall clock phase 1 leaves for the creators rebuild so a long token list cannot starve it every night. */
@@ -160,7 +160,8 @@ async function refreshCreators(sql: Sql, timeoutMs: number): Promise<number> {
 export async function runLaunches(env: Env, budgetMs: number): Promise<LaunchesSummary> {
   const started = Date.now();
   const helius = (env.HELIUS_SOLANA_KEY ?? "").trim();
-  const url = helius ? `https://mainnet.helius-rpc.com/?api-key=${helius}` : "https://api.mainnet-beta.solana.com";
+  if (!helius) throw new Error("launches: HELIUS_SOLANA_KEY is not set; Solana is read through Helius only");
+  const url = `https://mainnet.helius-rpc.com/?api-key=${helius}`;
   const sql = db(env);
   try {
     const list = await targets(sql);
