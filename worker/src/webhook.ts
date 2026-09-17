@@ -1,6 +1,22 @@
 import type { Env } from "./env";
 import { db } from "./db";
-import { shapeRows } from "./helius";
+import { addressKeys, shapeRows } from "./helius";
+
+/**
+ * Revalue the traders whose wallets just moved (aum_live, migration 20260918030000). Logged,
+ * never thrown: the transfers are already inserted and must not be reported lost.
+ */
+async function refreshLive(sql: ReturnType<typeof db>, keys: readonly string[]): Promise<void> {
+  try {
+    const handles = (await sql<{ handle: string }[]>`
+      select distinct handle from wallets where sol_address_key = any(${keys})`).map((r) => r.handle);
+    if (!handles.length) return;
+    const [row] = await sql<{ n: number }[]>`select aum_live_refresh(${handles}::text[], 'webhook') as n`;
+    console.log("webhook aum_live:", { handles: handles.length, refreshed: Number(row?.n ?? 0) });
+  } catch (e) {
+    console.error("webhook aum_live:", e instanceof Error ? e.message : String(e));
+  }
+}
 
 /** The Worker side of the Helius receiver; the payload shaping is in helius.ts. See docs/CLOUDFLARE_MIGRATION.md §9 */
 async function insert(env: Env, events: unknown): Promise<void> {
@@ -38,6 +54,7 @@ async function insert(env: Env, events: unknown): Promise<void> {
     }
     // The response no longer carries these counts (§9); the log is where they live now.
     console.log("webhook insert:", { inserted: rows.length, skipped });
+    if (rows.length) await refreshLive(sql, addressKeys(rows));
   } finally {
     // Already running under ctx.waitUntil, so awaiting the close here is the same thing.
     await sql.end({ timeout: 5 });

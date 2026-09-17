@@ -31,6 +31,8 @@ export interface BalancesSummary {
   readonly repriced: number;
   /** Open trades marked closed_by_balance for the traders read. */
   readonly tradesClosed: number;
+  /** Traders whose aum_live row was revalued after their capture (migration 20260918030000). */
+  readonly liveRefreshed: number;
   /** Traders with a wallet whose newest chain capture is older than this run. Zero means the roster is current. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
@@ -229,7 +231,7 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
 
     const capturedAt = new Date();
     const read: string[] = [];
-    let chainsRead = 0, chainsFailed = 0, rowsWritten = 0, stoppedEarly = false;
+    let chainsRead = 0, chainsFailed = 0, rowsWritten = 0, liveRefreshed = 0, stoppedEarly = false;
     // ponytail: an emptied wallet writes no row, so its capture never advances and it keeps a slot at the head of the queue; record empty reads if that ever costs slots.
     for (const t of slice) {
       if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
@@ -250,6 +252,9 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
       });
       try {
         rowsWritten += await writeRows(sql, capturedAt, rows, learned);
+        // The capture is in; revalue this trader's current AUM from it (aum_live, migration 20260918030000).
+        const [live] = await sql<{ n: number }[]>`select aum_live_refresh(${[t.handle]}::text[], 'balances') as n`;
+        liveRefreshed += Number(live?.n ?? 0);
       } catch (e) {
         console.error(`balances: ${t.handle} write failed: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -268,7 +273,7 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
       where (w.sol_address is not null or w.evm_address is not null)
         and (h.last_at is null or h.last_at < ${capturedAt}::timestamptz)`;
     return {
-      traders: read.length, chainsRead, chainsFailed, rowsWritten, repriced, tradesClosed,
+      traders: read.length, chainsRead, chainsFailed, rowsWritten, repriced, tradesClosed, liveRefreshed,
       remaining: Number(pending?.n ?? 0), stoppedEarly, elapsedMs: Date.now() - started,
     };
   } finally {

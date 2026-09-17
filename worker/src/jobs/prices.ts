@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { db, longStatement } from "../db";
 import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
 import {
   ADDRESSES_PER_CALL, athUpdate, bestPairs, fetchPairs, type Ath, type BestPair,
@@ -31,6 +31,8 @@ export interface PricesSummary {
   /** Tokens never asked because the budget ran out. Zero means the pass was complete. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
+  /** Traders whose aum_live row was revalued at the new prices; null when nothing was priced or the budget was spent. */
+  readonly liveRefreshed: number | null;
   readonly elapsedMs: number;
 }
 
@@ -126,7 +128,17 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
       done += chunk.length;
     }
     if (attempted > 0 && failedBatches === attempted) throw new Error(`prices: all ${attempted} batches failed`);
-    return { hour, tokens: list.length, priced, batches: attempted, failedBatches, remaining: list.length - done, stoppedEarly, elapsedMs: Date.now() - started };
+    // New prices move every trader's current AUM: one set-based revaluation (aum_live, migration 20260918030000).
+    let liveRefreshed: number | null = null;
+    if (priced > 0) {
+      if (Date.now() - started > budgetMs) {
+        console.log("prices: budget spent, aum_live refresh skipped (aum_history will catch up)");
+      } else {
+        const [row] = await longStatement(sql, 60_000, (tx) => tx<{ n: number }[]>`select aum_live_refresh(null::text[], 'prices') as n`);
+        liveRefreshed = Number(row?.n ?? 0);
+      }
+    }
+    return { hour, tokens: list.length, priced, batches: attempted, failedBatches, remaining: list.length - done, stoppedEarly, liveRefreshed, elapsedMs: Date.now() - started };
   } finally {
     await sql.end({ timeout: 5 });
   }
