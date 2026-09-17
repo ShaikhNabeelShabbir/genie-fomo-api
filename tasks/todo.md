@@ -62,8 +62,12 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `clo
 - [x] Every EVM read on Bitquery (`dataset: realtime`; the plan has no archive tier), Blockscout/Etherscan/public RPC
       gone from the Worker. Incident 05:00-05:15 UTC: per-push `aum_live_refresh` saturated Postgres (v1 26 s/query);
       fixed with `aum_live_dirty` + minute flush cron, per-client max 2, Hyperdrive origin limit 35 (was 20 from Free).
-- [ ] User: push `20260918050000_aum_live_dirty`; merge to main; rotate every secret; retire v1 after the app team moves;
-      prune `.claude/worktrees`; consider Bitquery archive tier and a bigger Supabase compute (connection ceiling).
+- [x] v3 fix request (17 Sep): root causes in the plan file; fixes merged from 5 streams (valuation v3 SQL, positions
+      suspect exclusion + priceSource + R6, Solana swap writer + quote pricing + feeds.swaps, scorecard reload
+      semantics + fields cache, logoUrl); docs corrected (dates, P1, handles, B3); vocabulary v11; deployed.
+      Reply: `docs/consumer/reply-to-genie-v3.md` (bundle: `v2-handoff/reply-v3.md`).
+- [ ] User: push migrations 20260918050000–090000; set WALLET_SUBMIT_SECRET; then I run quote_prices/swaps/balances/
+      aum_history on demand and rebuild the three suspect traders; merge to main; rotate secrets; prune worktrees.
 
 ## Status for the morning (17 Sep 2026)
 

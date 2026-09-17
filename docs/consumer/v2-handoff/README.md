@@ -12,7 +12,7 @@ client, and how to verify. Everything in it is live now.
 | Path prefix | `/v1/…` | `/v2/…` (the same route names; `/v1/…` on the v2 host answers 404 with a hint) |
 | Code | frozen at the 16 Sep deploy | every fix from your 16 Sep report, the workflow routes, and the new history routes |
 | Data | the same Postgres, read live | the same Postgres, read live; every table is filled by scheduled jobs, never by a request |
-| Vocabulary (`/fields`) | version 2 | **version 10** |
+| Vocabulary (`/fields`) | version 2 | **version 11** |
 
 v1 stays up unchanged until you have moved. Nothing on v1 gains the new fields.
 
@@ -26,7 +26,7 @@ parameters and the same response keys; v2 only **adds** keys and words. Links in
 
 - `null` means absent, zero means zero. Never coerce.
 - Every enumerated value is a word published by `GET /v2/fields`. Your build should fail on a
-  word it has not seen; the list below is what you need to add for version 10.
+  word it has not seen; the list below is what you need to add for version 11.
 - Every error is `{ "error": { "code", "detail", "requestId", "hint"? } }` with a stable `code`.
 - Rate limit 240 requests a minute, reported in `RateLimit-Limit`, `RateLimit-Remaining`,
   `RateLimit-Reset`, `RateLimit-Scope`. A batch of 50 ids costs 50 units, shown in the
@@ -185,5 +185,6 @@ its threshold shows `stale` in `/health` before it shows in a chart.
 
 The machine-readable reference for every operation, parameter, status code and example is
 `openapi.yaml` next to this file (OpenAPI 3.0.3, the same file as `docs/openapi.yaml` in the API
-repository); `fields-v10.json` is the live `GET /v2/fields` answer at the time of writing. `v1-to-v2-diff.md` maps every v1 route to its v2 counterpart and lists every field and word added.
+repository); `fields-v11.json` is the live `GET /v2/fields` answer at the time of writing. `v1-to-v2-diff.md` maps every v1 route to its v2 counterpart and lists every field and word added.
+`reply-v3.md` answers your 17 Sep fix request ask by ask and lists the version-11 words and fields.
 Import the spec into your client generator or hand all four files to your agent together.

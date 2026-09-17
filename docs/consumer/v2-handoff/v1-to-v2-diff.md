@@ -1,6 +1,6 @@
 # v1 → v2: route map, differences and additions (17 Sep 2026)
 
-Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is the Supabase deployment frozen at the 16 Sep 2026 deploy; v2 is the Cloudflare Worker. Same database, same route names; v2 adds. Vocabulary: v1 answers `version: 2`, v2 answers `version: 10`.
+Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is the Supabase deployment frozen at the 16 Sep 2026 deploy; v2 is the Cloudflare Worker. Same database, same route names; v2 adds. Vocabulary: v1 answers `version: 2`, v2 answers `version: 11`.
 
 ## 1. Route map
 
