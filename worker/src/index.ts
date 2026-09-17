@@ -16,6 +16,7 @@ import { runTiming } from "./jobs/timing";
 import { runSwaps } from "./jobs/swaps";
 import { runGmgn } from "./jobs/gmgn";
 import { runDirectory } from "./jobs/directory";
+import { runAumLiveFlush } from "./jobs/aum_live_flush";
 
 /**
  * Every job is a sliced, resumable loader (worker/src/jobs/*). The strings must match
@@ -37,6 +38,7 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "55 5 * * *":   runTiming,       // position timing (one aggregate)
   "15 2 * * *":   runGmgn,         // GMGN directory and its trades
   "0 1 * * *":    runDirectory,    // fomo leaderboard, wallets, fomo-reported holdings
+  "* * * * *":    runAumLiveFlush, // live value for traders whose wallet moved in the last minute
 };
 
 /** On-demand runs of the same jobs: `POST /jobs/<name>?budgetMs=` with `x-job-secret`. */
@@ -44,6 +46,7 @@ const JOB_BY_NAME: Readonly<Record<string, (env: Env, budgetMs: number) => Promi
   prices: runPrices, aum_history: runAumHistory, transfers: runTransfers, quote_prices: runQuotePrices,
   balances: runBalances, tokens: runTokens, fees: runFees, swaps: runSwaps, scorecards: runScorecards,
   launches: runLaunches, wallets: runWallets, timing: runTiming, gmgn: runGmgn, directory: runDirectory,
+  aum_live_flush: runAumLiveFlush,
 };
 const MAX_BUDGET_MS = 600_000;
 
