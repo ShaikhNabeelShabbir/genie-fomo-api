@@ -528,6 +528,3 @@ wallet.
 **Every error carries a stable `code` and a `requestId`.** Quote the id and the exact request
 can be found in `wrangler tail`.
 
-**Secrets were pasted into a working session on 17 Sep 2026.** The database password, the
-Cloudflare token and every provider key in `.env` should be rotated once the handover settles;
-none of them is in the repository.
