@@ -65,9 +65,11 @@ Deno.test("portfolioFrom: no rows / nothing sellable -> null total and top, as S
 
 Deno.test("R6: coverage share is rows / nonce, null when either is unknown; partial composes", () => {
   const thin = chainCoverage({ chain_nonce: 35487, rows_held: 24, read_at: "2026-09-17T10:00:00Z" });
-  assertEquals(thin, { chainTxCount: 35487, rowsHeld: 24, share: 0.0007, readAt: "2026-09-17T10:00:00.000Z", basis: "bitquery_realtime" });
-  assertEquals(chainCoverage({ chain_nonce: null, rows_held: 24, read_at: null }).share, null);
-  assertEquals(chainCoverage({ chain_nonce: 0, rows_held: 0, read_at: null }).share, null);
+  assertEquals(thin, { chainTxCount: 35487, transferRowsHeld: 24, rowsPerSentTx: 0.0007, readAt: "2026-09-17T10:00:00.000Z", basis: "bitquery_realtime" });
+  assertEquals(chainCoverage({ chain_nonce: null, rows_held: 24, read_at: null }).rowsPerSentTx, null);
+  assertEquals(chainCoverage({ chain_nonce: 0, rows_held: 0, read_at: null }).rowsPerSentTx, null);
+  /* C1: more transfer legs than sent transactions is normal, not a capped share. */
+  assertEquals(chainCoverage({ chain_nonce: 28, rows_held: 238, read_at: null }).rowsPerSentTx, 8.5);
   const full = chainCoverage({ chain_nonce: 10, rows_held: 9, read_at: null });
   assertEquals(coverageLow({ bsc: thin, base: full }), true);
   assertEquals(coverageLow({ base: full }), false);

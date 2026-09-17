@@ -43,7 +43,8 @@ Deno.test("toEvent: one shape per kind, gates null without a token_info row", ()
     has_info: true, is_honeypot: true, can_not_sell: null,
   }));
   assertEquals(swap.kind, "swap");
-  assertEquals((swap as { gates: unknown }).gates, { isHoneypot: true, canSell: null, priceSuspect: null });
+  /* H2 (v5 fixes): a confirmed honeypot cannot be sold, whatever `can_not_sell` says. */
+  assertEquals((swap as { gates: unknown }).gates, { isHoneypot: true, canSell: false, priceSuspect: null });
   assertEquals((swap as { quoteUsd: unknown }).quoteUsd, -210.46);
   assertEquals("direction" in swap, false);
 

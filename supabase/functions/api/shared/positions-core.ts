@@ -80,36 +80,56 @@ export function costBlock(cb: CostBasis | undefined, amount: number | null, pric
 /** V2. A confirmed honeypot or unsellable coin is held, priced, and NOT part of the total. */
 export const unsellable = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) =>
   bool(r.is_honeypot) === true || bool(r.can_not_sell) === true;
-export const sellFlags = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) => ({
-  isHoneypot: bool(r.is_honeypot) === true,
-  /** null when the security source never judged it; false when it said "cannot sell". */
-  canSell: r.can_not_sell === null || r.can_not_sell === undefined ? null : !r.can_not_sell,
-});
-
-/** R6. Per chain: the wallet's sent-transaction count against the transaction rows the indexer holds for it. */
-export type ChainCoverage = {
-  chainTxCount: number | null; rowsHeld: number | null; share: number | null; readAt: string | null;
-  basis: "bitquery_realtime";
+/**
+ * H2 (v5 fixes, 17 Sep 2026): a confirmed honeypot cannot be sold, so `canSell` says false.
+ * It used to negate `can_not_sell` alone, which left every honeypot row reading
+ * `isHoneypot: true, canSell: true` -- two fields contradicting each other on the same coin.
+ * `bool()` on both sides, because D1 stores these as 0/1 integers.
+ */
+export const sellFlags = (r: { is_honeypot?: unknown; can_not_sell?: unknown }) => {
+  const honeypot = bool(r.is_honeypot) === true;
+  const cannot = bool(r.can_not_sell);
+  return {
+    isHoneypot: honeypot,
+    /** null when no security source has judged it; false when it said "honeypot" or "cannot sell". */
+    canSell: honeypot ? false : cannot === null || cannot === undefined ? null : !cannot,
+  };
 };
+
+/**
+ * R6 / C1. Per chain, how much of a wallet's activity the indexer holds.
+ *
+ * C1 (v5 fixes, 17 Sep 2026): these two counts do not measure the same thing, so their
+ * quotient was never a share and read 2.2989 and 8.5 in the field. `chainTxCount` is the
+ * count of transactions the wallet SENT, from Bitquery's realtime window -- a lower bound on
+ * its nonce, not chain history. `transferRowsHeld` (was `rowsHeld`) is the number of transfer
+ * LEGS we store for that address on that chain, and one sent transaction produces several.
+ * The quotient is published as `rowsPerSentTx`, which is what it is, and `share` is gone.
+ */
+export type ChainCoverage = {
+  chainTxCount: number | null; transferRowsHeld: number | null; rowsPerSentTx: number | null;
+  readAt: string | null; basis: "bitquery_realtime";
+};
+/** Under this many transfer legs per sent transaction the record looks thin (R6, unchanged). */
 export const COVERAGE_FLOOR = 0.5;
 
 export const chainCoverage = (
   r: { chain_nonce?: unknown; rows_held?: unknown; read_at?: unknown },
 ): ChainCoverage => {
-  const chainTxCount = n(r.chain_nonce), rowsHeld = n(r.rows_held);
+  const chainTxCount = n(r.chain_nonce), transferRowsHeld = n(r.rows_held);
   return {
-    chainTxCount, rowsHeld,
+    chainTxCount, transferRowsHeld,
     /* null, not 0, when either side is unknown; a wallet that never sent has nothing to cover. */
-    share: chainTxCount !== null && rowsHeld !== null && chainTxCount > 0
-      ? Number((rowsHeld / chainTxCount).toFixed(4)) : null,
+    rowsPerSentTx: chainTxCount !== null && transferRowsHeld !== null && chainTxCount > 0
+      ? Number((transferRowsHeld / chainTxCount).toFixed(4)) : null,
     readAt: r.read_at ? new Date(String(r.read_at)).toISOString() : null,
-    /* The count is Bitquery's realtime window, a LOWER bound on the wallet's nonce, so `share` is an upper bound. */
+    /* Bitquery's realtime window is a LOWER bound on the nonce, so `rowsPerSentTx` is an upper bound. */
     basis: "bitquery_realtime",
   };
 };
 
 export const coverageLow = (c: Record<string, ChainCoverage>): boolean =>
-  Object.values(c).some((x) => x.share !== null && x.share < COVERAGE_FLOOR);
+  Object.values(c).some((x) => x.rowsPerSentTx !== null && x.rowsPerSentTx < COVERAGE_FLOOR);
 
 /** Which of the three made the list partial; several, joined the way aum.coverage.partialReason is. */
 export const positionsPartialReason = (unsellable: boolean, low: boolean, suspect = false): string | null =>
