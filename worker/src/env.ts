@@ -1,7 +1,6 @@
 /** Bindings, secrets (`wrangler secret put`) and vars (`wrangler.toml`). See docs/CLOUDFLARE_MIGRATION.md §5.1, §8 */
 export interface Env {
   /** Absent until the binding in wrangler.toml is uncommented with a real id. */
-  readonly HYPERDRIVE?: Hyperdrive;
   /** Cloudflare D1, the database from 18 Sep 2026. */
   readonly DB?: D1Database;
   readonly GENIE_API_KEY?: string;

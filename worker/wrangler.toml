@@ -4,14 +4,6 @@ main = "src/index.ts"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Created 17 Sep 2026 against the direct (IPv6) host with caching disabled, the id that
-# `npx wrangler hyperdrive create genie-copy-trading-db --connection-string=… --caching-disabled` prints (§8.0).
-# Until then /webhook answers 503 not_configured.
-[[hyperdrive]]
-binding = "HYPERDRIVE"
-id = "d63d855a124c463a93318e8d225f1735"
-# `wrangler dev` without --remote connects straight to this; no pooling, no caching.
-# localConnectionString = "postgresql://postgres:postgres@localhost:5432/postgres"
 
 # Every loader runs here as a sliced cron job (src/index.ts JOBS maps each string to a job).
 # GitHub Actions is CI/CD only. Balance history is BUILT into aum_history, not sampled;
@@ -23,8 +15,7 @@ crons = [
   "35 3 * * *", "50 4 * * *", "55 5 * * *", "15 2 * * *", "0 1 * * *", "*/5 * * * *",
 ]
 
-# The database from 18 Sep 2026: Cloudflare D1 (SQLite). Hyperdrive/Postgres stays bound only until
-# the D1 copy is verified, then its block goes.
+# The database since 17 Sep 2026: Cloudflare D1 (SQLite). Postgres and Hyperdrive are gone.
 [[d1_databases]]
 binding = "DB"
 database_name = "genie-copy-trading"
