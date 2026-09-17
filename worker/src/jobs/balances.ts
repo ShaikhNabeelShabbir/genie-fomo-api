@@ -270,8 +270,11 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
         rowsWritten += w.written; unknownTokens += w.unknown;
         await writeCoverage(sql, t, counted);
         // The capture is in; revalue this trader's current AUM from it (aum_live, migration 20260918030000).
-        const [live] = await sql<{ n: number }[]>`select aum_live_refresh(${[t.handle]}::text[], 'balances') as n`;
-        liveRefreshed += Number(live?.n ?? 0);
+        // Mark, do not revalue here: the 5-minute flush revalues every marked trader in one call
+        // (a per-trader revaluation inside the slice was one of the loads that saturated the
+        // database on 17 Sep 08:5x UTC).
+        await sql`insert into aum_live_dirty (handle) values (${t.handle}) on conflict (handle) do update set marked_at = now()`;
+        liveRefreshed += 1;
       } catch (e) {
         console.error(`balances: ${t.handle} write failed: ${e instanceof Error ? e.message : String(e)}`);
       }

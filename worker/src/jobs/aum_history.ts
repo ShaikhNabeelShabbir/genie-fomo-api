@@ -83,8 +83,20 @@ export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistory
     }
     if (attempted > 0 && failed === attempted) throw new Error(`aum_history: all ${attempted} chunks failed`);
     // Catch-up for the live value: anyone no feed has revalued in the last hour (aum_live, migration 20260918030000).
-    const [live] = await longStatement(sql, 60_000, (tx) =>
-      tx<{ n: number }[]>`select aum_live_refresh(null::text[], 'build', interval '1 hour') as n`);
+    // Stale live values in slices of 40, each its own statement, so no single call holds the
+    // database for minutes (the whole-roster form did, 17 Sep 08:5x UTC).
+    const stale = (await sql<{ handle: string }[]>`
+      select t.handle from traders t
+      left join aum_live l on l.handle = t.handle
+      where (l.at is null or l.at < now() - interval '1 hour')
+        and exists (select 1 from wallets w where w.handle = t.handle)
+      order by l.at nulls first limit 400`).map((r) => r.handle);
+    let liveN = 0;
+    for (let i = 0; i < stale.length && Date.now() - started < budgetMs; i += 40) {
+      const [r] = await sql<{ n: number }[]>`select aum_live_refresh(${stale.slice(i, i + 40)}::text[], 'build') as n`;
+      liveN += Number(r?.n ?? 0);
+    }
+    const live = { n: liveN };
     return {
       traders: new Set(work.map((c) => c.handle)).size,
       hours,

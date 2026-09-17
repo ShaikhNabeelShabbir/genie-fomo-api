@@ -33,6 +33,9 @@ parameters and the same response keys; v2 only **adds** keys and words. Links in
   `x-cost-units` header on the 200.
 - Batch routes take at most 50 ids and answer per id, `ok: false` for an unknown one.
 - No API key is required today. If `X-API-Key` is switched on you will be told first.
+- Cloudflare's bot protection in front of the Worker refuses requests whose `User-Agent` is a
+  library default such as `python-requests/…` or `curl/…` without a product name. Send a
+  `User-Agent` that names your app (for example `genie-app/1.0`); the app itself is unaffected.
 
 ## 3. Words to add before switching (vocabulary v10)
 
