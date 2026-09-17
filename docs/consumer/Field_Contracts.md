@@ -530,3 +530,65 @@ Migration `20260918060000_valuation_v3.sql` (17 Sep 2026, fix request v3 V1 / N1
 | `health.feeds.swaps` | /health | `max(wallet_swaps.block_time)`, the newest resolved swap on any chain; `staleAfterHours: 6`. Stale or never puts `swaps` in `staleFeeds[]` (`health.staleFeeds[]` gains the word). Carries `description`. |
 | `health.feeds.trades.description` | /health | `"fomoapi trade records, load time"`: this clock is fomoapi's scorecard load (`trades.captured_at`), not the on-chain swaps. |
 
+
+## v5 fixes — one price ladder, coverage on every figure, honest completeness
+
+Fix request v5 (17 Sep 2026): V1d/A1, A2, A3, A4, N1, R7, W2, C1, H2, X3, G2, L2.
+**Vocabulary bumps to 12.** Three fields are RENAMED (`share`, `rowsHeld`, `onChain.swaps`);
+everything else is additive.
+
+### One price ladder (A1, N1, R7)
+
+| Field | Route | Contract |
+|---|---|---|
+| `positions[].priceUsd`, `priceSource`, `pricedAt`, `valueUsd` | /positions, POST /traders/positions, /portfolio | Priced AT REQUEST TIME from one ladder, in order: `pegged` (quote_assets) → `token_price_stats` (the hourly DexScreener price) → `token_prices` (newest daily close **inside 7 days**) → `token_info` (GMGN). `fomo_reported_entry` survives as a fallback when no rung carries a price, because the ladder cannot reproduce it. Until now these served the price frozen into `holdings` at the last balance read — a sweep that takes about nine hours — so a coin priced an hour ago still read `null`, and the same token showed three different prices on three traders' lists. |
+| `positions[].priceSource` = `token_price_stats` | same | **New word** (vocabulary 12). The hourly DexScreener price, the freshest figure we hold. This is what fills the Robinhood-chain rows (R7) and re-prices anything the nightly read missed. |
+| `positions[].priceSource` = `token_info` | same | **Demoted to the last rung.** It used to outrank the daily close; it carries no staleness stamp we trust, so it is now the fallback rather than the default. |
+| `positions[].valueUsd` | /positions, /portfolio | Now `(amountLive ?? amount) × priceUsd` with the same ceilings, i.e. the same quantity the live valuation uses, so `/positions.totalValueUsd` and `/aum/now.totalUsd` are built from one priced coin list. |
+| native rows (`isNative: true`) | /positions | Priced by the same ladder, with no re-read needed: ETH, BNB and SOL carry daily closes in `token_prices`. **N1 needs no sweep** — every trader's native row prices on the next request. |
+| `/portfolio.totalValueUsd` | /portfolio | Now applies the suspect rule, which it never did. A broken price that `/positions` excluded could previously land in the portfolio total. |
+
+### How much of a wallet a figure is built from (A4, V1d)
+
+| Field | Route | Contract |
+|---|---|---|
+| `points[].pricedShare`, `now.pricedShare` | /aum/history, /aum/now | `pricedPositions / totalPositions`. Null when nothing is held. |
+| `points[].partial`, `now.partial` | same | True when `pricedShare` is under 0.25. The figure is real and drawable; it is not a balance. Label it. |
+| `points[].partialUsd`, `now.partialUsd` | same | Under `pricedShare` 0.05 the figure is WITHHELD: `totalUsd` null, `reason: too_little_priced`, and `partialUsd` keeps what it would have been. Never treat `partialUsd` as a balance. |
+| `coverage.pricedShare` | /positions | The same figure for the list, so the three routes are comparable at a glance. |
+
+The rule is applied at READ TIME, on the counts every stored row already carries, so the whole
+stored series is judged by it immediately with nothing rebuilt. Measured on 17 Sep 2026:
+25,492 of 32,866 valued hours (78%) were built from under a quarter of the wallet.
+
+### Gaps and staleness (A3, A2, X3)
+
+| Field | Route | Contract |
+|---|---|---|
+| `points[].reason` = `not_built` | /aum/history, `step=1h` | **New word** (vocabulary 12). An hour inside the window the builder never wrote. Such hours used to be ABSENT from `points[]`; they are now null points with this reason, so a gap is distinguishable from the end of the data. Only hours BETWEEN the first and last point we hold are filled — nothing is invented before a trader was tracked. |
+| `health.staleTraders.liveStale`, `liveStaleAfterHours`, `liveNever`, `oldestLiveHours` | /health | How many traders' `/aum/now` is older than an hour. The catch-up that refreshes them now runs FIRST in its hourly job with a quarter of the budget reserved, instead of on whatever the history backfill left over. |
+| `health.feeds.aum` | /health | Now watches `aum_history` (`newestReadingAt`, `lastBuiltAt`) and `aum_live` (`newestLiveAt`), which are what write the hours. The retired hourly sampler's own clocks move to `feeds.aum.sampler` with `retired: true` and `retiredAt`. This is why the feed said 06:00 while the data went on past it. |
+
+### Completeness and the trade counts (W2)
+
+| Field | Route | Contract |
+|---|---|---|
+| `complete` | /trades | True only when the page was not capped AND every chain the trader trades on is `complete` in `coverage.byChain`. It used to be `!capped` alone. |
+| `incompleteReason` | /trades | Which of the three made it false: `page_capped`, `chains_unresolved`, `chains_truncated`, joined with `_and_`. Null when `complete`. |
+| `coverage.byChain[].state` = `truncated` | /trades | **New word** (vocabulary 12). We hold trades for the chain, but our record starts at `horizonAt` and the loader is still walking backwards past it. |
+| `coverage.byChain[].horizonAt` | /trades | The oldest transaction we hold for this wallet on this chain. The record starts here; the trader may not have. |
+| `onChain.swapsAppearedIn` | /traders/{handle} | **RENAMED from `onChain.swaps`, and recounted.** Distinct transactions typed SWAP that touched this wallet at all — an upper bound on his trading. The old field counted transfer LEGS, so one trade counted several times, and it counted trades other people made whenever this wallet received tokens inside them (5 in 6 of them, measured). |
+| `onChain.ownSwaps` | /traders/{handle} | **New.** The wallet's own resolved trades, the same store `/trades` serves. This is the honest trade count. |
+
+The Solana transfer loader now keeps a cursor and walks backwards one page a run until the
+wallet's history is in. It previously re-read the newest 500 signatures on every run and never
+reached past them, which on an airdrop-spammed wallet is a few weeks.
+
+### Renames and flags (C1, H2, G2)
+
+| Field | Route | Contract |
+|---|---|---|
+| `coverage.chains.{chain}.transferRowsHeld` | /positions | **RENAMED from `rowsHeld`.** Transfer LEGS we store for the address on that chain. |
+| `coverage.chains.{chain}.rowsPerSentTx` | /positions | **REPLACES `share`**, which was never a share: its numerator counts transfer legs and its denominator counts sent transactions, so it legitimately read 2.2989 and 8.5. Same arithmetic, honest name. Still an upper bound (`chainTxCount` is a lower bound), and still makes the list partial below 0.5. |
+| `positions[].canSell` | /positions, /events | **False whenever `isHoneypot` is true.** It used to negate `can_not_sell` alone, so every honeypot row read `isHoneypot: true, canSell: true` — two fields contradicting each other on the same coin. Still null when no security source has judged the coin. |
+| `logoUrl` | openapi only | Marked NOT YET PUBLISHED in all three schemas and removed from their `required` lists, so a generated client no longer depends on a key no route serves. |

@@ -13,7 +13,12 @@ info:
     \ under a stable name: `*At` is ISO-8601, `*Share` is 0–1, `*Usd` is dollars.\n\n**Versions.** The\
     \ same routes are served as `/v1/*` by the Supabase deployment and as `/v2/*`\nby the Cloudflare Worker.\
     \ Handlers are identical; only the links inside responses are spelled\nfor the requested version.\
-    \ The Worker refuses `/v1/*` with 404.\n"
+    \ The Worker refuses `/v1/*` with 404.\n\n**Send a `User-Agent`\
+    \ that names your app.** Cloudflare's bot protection in front of the v2 Worker refuses a\n\
+    default library `User-Agent` with HTTP 403 and `error code: 1010`. Python's `urllib`\n\
+    (`Python-urllib/3.x`) is the common case; `python-requests`, `aiohttp` and browsers send\n\
+    their own names and pass. Anything like `your-app/1.0` works, and the app itself is\n\
+    unaffected.\n"
   contact:
     name: genie-fomo-api
     url: https://github.com/ShaikhNabeelShabbir/genie-fomo-api
@@ -555,7 +560,8 @@ components:
       - transfers
       - inbound
       - outbound
-      - swaps
+      - swapsAppearedIn
+      - ownSwaps
       - tokensTouched
       - activeDays
       - evenness
@@ -582,9 +588,17 @@ components:
           type: integer
         outbound:
           type: integer
-        swaps:
+        swapsAppearedIn:
           type: integer
-          description: Transfers typed SWAP.
+          description: "W2 — REPLACES `swaps` on 17 Sep 2026, which counted transfer LEGS typed SWAP and
+            so counted one trade several times. Distinct transactions typed SWAP that touched this
+            wallet AT ALL: an upper bound on his trading, because measured on a random sample 5 in 6 are
+            the wallet receiving tokens inside someone else's trade."
+        ownSwaps:
+          type: integer
+          description: "W2 — the wallet's own trades as we resolved them (`wallet_swaps`), the same
+            store `/traders/{handle}/trades` serves. This is the honest trade count; compare it with
+            `swapsAppearedIn`, never the other way round."
         tokensTouched:
           type: integer
           description: Distinct tokens across the transfers.
@@ -1809,6 +1823,22 @@ components:
       - oldestScorecardHours
       - of
       properties:
+        liveStale:
+          type: integer
+          description: "A2, new 17 Sep 2026. Traders whose live figure (`/aum/now`) is older than an
+            hour. The webhook feed refreshes anyone it sees move; this counts the ones nobody watched.
+            Two of them sat six hours old with nothing in /health saying so."
+        liveStaleAfterHours:
+          type: integer
+          enum:
+          - 1
+        liveNever:
+          type: integer
+          description: Traders with a wallet and no `/aum/now` figure at all.
+        oldestLiveHours:
+          type: integer
+          nullable: true
+          description: Age of the oldest live figure, in hours.
         readingStale:
           type: integer
           description: Traders whose newest accepted reading is past 36 h.
@@ -2438,15 +2468,20 @@ components:
           nullable: true
           description: Transactions the wallet sent within Bitquery's realtime window, a LOWER bound on
             its nonce.
-        rowsHeld:
+        transferRowsHeld:
           type: integer
           nullable: true
-        share:
+          description: "C1 — RENAMED from `rowsHeld` on 17 Sep 2026. Transfer LEGS we store for this
+            address on this chain. One sent transaction produces several, so this does not count the
+            same things `chainTxCount` counts."
+        rowsPerSentTx:
           type: number
           nullable: true
-          description: '`rowsHeld / chainTxCount`; null when either side is unknown or the wallet never
-            sent. An upper bound (the count is a lower bound) and may exceed 1. Below 0.5 makes the list
-            partial.'
+          description: "C1 — REPLACES `share`, which was never a share and read 2.2989 and 8.5 in the
+            field. `transferRowsHeld / chainTxCount`: transfer legs per sent transaction. Null when
+            either side is unknown or the wallet never sent. Legitimately above 1 — a swap moves
+            several tokens — and an upper bound, because `chainTxCount` is a lower bound. Below 0.5
+            makes the list partial."
         readAt:
           type: string
           format: date-time
@@ -2475,6 +2510,15 @@ components:
           type: integer
           minimum: 0
           description: Rows with `valueUsd` null.
+        pricedShare:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: "A1, new 17 Sep 2026. `pricedPositions / positions`: how much of the wallet
+            `totalValueUsd` is built from. The same figure `/aum/history` points and `/aum/now` carry,
+            so the three are comparable at a glance. A total under a quarter is a fragment of a
+            portfolio, not a portfolio."
         chains:
           type: object
           description: Keyed by chain name. Empty when no coverage row exists for the trader.
@@ -2633,13 +2677,19 @@ components:
             nullable: true
             enum:
             - pegged
-            - token_info
+            - token_price_stats
             - token_prices
+            - token_info
             - fomo_reported_entry
             - null
-            description: Which price ladder rung valued the holding (`pegged` = quote_assets.pegged_usd,
-              `token_info` = GMGN, `token_prices` = the newest daily row, `fomo_reported_entry` = the
-              directory build's reported price); null when unpriced.
+            description: "Which rung of the ONE price ladder valued the holding, AT REQUEST TIME. In
+              order: `pegged` = quote_assets.pegged_usd; `token_price_stats` = the hourly DexScreener
+              price, the freshest we hold; `token_prices` = the newest daily close inside seven days;
+              `token_info` = GMGN's, last because it carries no staleness stamp we trust;
+              `fomo_reported_entry` = the directory build's own reported price, the one rung the ladder
+              cannot reproduce. Null when no rung carries a price. Changed 17 Sep 2026 (A1/N1/R7): this
+              used to be the price frozen into `holdings` at the last balance read — up to nine hours
+              stale, and null for anything priced since — and `token_price_stats` is new."
           pricedAt:
             type: string
             format: date-time
@@ -2946,10 +2996,19 @@ components:
             nullable: true
             enum:
             - pegged
-            - token_info
+            - token_price_stats
             - token_prices
+            - token_info
             - fomo_reported_entry
             - null
+            description: "Which rung of the ONE price ladder valued the holding, AT REQUEST TIME. In
+              order: `pegged` = quote_assets.pegged_usd; `token_price_stats` = the hourly DexScreener
+              price, the freshest we hold; `token_prices` = the newest daily close inside seven days;
+              `token_info` = GMGN's, last because it carries no staleness stamp we trust;
+              `fomo_reported_entry` = the directory build's own reported price, the one rung the ladder
+              cannot reproduce. Null when no rung carries a price. Changed 17 Sep 2026 (A1/N1/R7): this
+              used to be the price frozen into `holdings` at the last balance read — up to nine hours
+              stale, and null for anything priced since — and `token_price_stats` is new."
           pricedAt:
             type: string
             format: date-time
@@ -4795,7 +4854,15 @@ components:
           description: Opaque cursor for the next page; `null` on the last page.
         complete:
           type: boolean
-          description: '`!capped` — true on the last page.'
+          description: "W2 — true only when the page was not capped AND every chain this trader trades
+            on is `complete` in `coverage.byChain`. Until 17 Sep 2026 this was `!capped` alone, a
+            pagination fact: a six-row answer naming three chains `unresolved` still said true."
+        incompleteReason:
+          type: string
+          nullable: true
+          description: "Which of the three made `complete` false, joined with `_and_` as
+            `positions.partialReason` is: `page_capped`, `chains_unresolved`, `chains_truncated`. Null
+            when `complete` is true."
         scanned:
           type: integer
           description: Only with `?status=`. Rows the page held before the status filter was applied.
@@ -4999,9 +5066,12 @@ components:
           type: string
           enum:
           - complete
+          - truncated
           - unresolved
-          description: '`unresolved` means we resolved none of this wallet''s own trades there, not that
-            it made none.'
+          description: "`unresolved` means we resolved none of this wallet's own trades there, not that
+            it made none. `truncated` (W2, new 17 Sep 2026) means we hold trades but our record starts
+            at `horizonAt` and the loader is still walking backwards past it, so earlier trades exist
+            and are not here yet."
         from:
           type: string
           format: date-time
@@ -5010,6 +5080,13 @@ components:
           type: string
           format: date-time
           nullable: true
+        horizonAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: "W2 — the oldest transaction we hold for this wallet on this chain. The record
+            starts here; the trader may not have. A `state` of `truncated` means the loader is still
+            walking backwards past it."
         swaps:
           type: integer
           description: Resolved swaps held for this chain over the trader's whole record.
@@ -5508,8 +5585,13 @@ components:
           - no_prices
           - too_little_priced
           - price_suspect
+          - not_built
           - null
-          description: Hourly only. Why `totalUsd` is `null`; `null` when it is valued.
+          description: "Hourly only. Why `totalUsd` is `null`; `null` when it is valued. `not_built`
+            (A3, new 17 Sep 2026) is an hour inside the window the builder never wrote: it used to be
+            absent from the series altogether, so a chart could not tell a gap from the end of the
+            data. `too_little_priced` now also covers an hour priced from under 5% of the wallet — see
+            `pricedShare`."
         suspectUsd:
           type: number
           nullable: true
@@ -5526,6 +5608,25 @@ components:
         totalPositions:
           type: integer
           description: Hourly only.
+        pricedShare:
+          type: number
+          nullable: true
+          minimum: 0
+          description: "A4, new 17 Sep 2026. `pricedPositions / totalPositions`: HOW MUCH OF THE WALLET
+            THIS FIGURE IS BUILT FROM. Null when nothing is held. At or above 0.25 the figure stands;
+            between 0.05 and 0.25 it is published with `partial: true`; below 0.05 `totalUsd` is null,
+            `reason` is `too_little_priced` and `partialUsd` keeps what it would have been. Until this
+            date any figure over $100 was published whatever the coverage, and 78% of valued hours came
+            from under a quarter of the wallet."
+        partial:
+          type: boolean
+          description: "A4. `totalUsd` is real and drawable but built from under a quarter of the
+            wallet. Label it; do not treat it as a balance."
+        partialUsd:
+          type: number
+          nullable: true
+          description: "A4. What `totalUsd` would have been when the figure is withheld for coverage.
+            NOT a balance — it is the fragment we could price. Null whenever `totalUsd` is set."
         highUsd:
           type: number
           nullable: true
@@ -5649,6 +5750,20 @@ components:
           type: integer
         totalPositions:
           type: integer
+        pricedShare:
+          type: number
+          nullable: true
+          minimum: 0
+          description: "A4, new 17 Sep 2026. The share of the wallet this figure was priced from, judged
+            by the same two floors as an `/aum/history` point — see `AumHistoryPoint.pricedShare`."
+        partial:
+          type: boolean
+          description: "A4. Built from under a quarter of the wallet: real, drawable, not a balance."
+        partialUsd:
+          type: number
+          nullable: true
+          description: "A4. What `totalUsd` would have been when the figure is withheld for coverage;
+            null whenever `totalUsd` is set. NOT a balance."
         reason:
           type: string
           nullable: true
@@ -7247,7 +7362,6 @@ components:
       - networkId
       - chain
       - holders
-      - logoUrl
       - priceUsd
       - marketCapUsd
       - liquidityUsd
@@ -7283,8 +7397,11 @@ components:
         logoUrl:
           type: string
           nullable: true
-          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
-            source has one.
+          description: "G2 — NOT YET PUBLISHED. No route serves this key today: the loaders store
+            `token_info.logo_url` but no response carries it. Documented here so the field name is
+            settled, and deliberately NOT in `required`, so a generated client does not depend on
+            it. Will be: token image URL, GMGN's `logo` else DexScreener's pair image; null when
+            neither source has one."
         priceUsd:
           type: number
           nullable: true
@@ -7382,7 +7499,6 @@ components:
       - tokenAddress
       - networkId
       - chain
-      - logoUrl
       - holders
       - holderShare
       - totalValueUsd
@@ -7411,8 +7527,11 @@ components:
         logoUrl:
           type: string
           nullable: true
-          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
-            source has one.
+          description: "G2 — NOT YET PUBLISHED. No route serves this key today: the loaders store
+            `token_info.logo_url` but no response carries it. Documented here so the field name is
+            settled, and deliberately NOT in `required`, so a generated client does not depend on
+            it. Will be: token image URL, GMGN's `logo` else DexScreener's pair image; null when
+            neither source has one."
         holders:
           type: integer
           description: Distinct tracked leaders holding it (holdings snapshot).
@@ -8270,7 +8389,6 @@ components:
       - tokenAddress
       - networkId
       - chain
-      - logoUrl
       - holders
       - previousHolders
       - change
@@ -8289,8 +8407,11 @@ components:
         logoUrl:
           type: string
           nullable: true
-          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
-            source has one.
+          description: "G2 — NOT YET PUBLISHED. No route serves this key today: the loaders store
+            `token_info.logo_url` but no response carries it. Documented here so the field name is
+            settled, and deliberately NOT in `required`, so a generated client does not depend on
+            it. Will be: token image URL, GMGN's `logo` else DexScreener's pair image; null when
+            neither source has one."
         holders:
           type: integer
         previousHolders:
@@ -9270,6 +9391,10 @@ paths:
                 dataState: current
                 staleFeeds: []
                 staleTraders:
+                  liveStale: 2
+                  liveStaleAfterHours: 1
+                  liveNever: 0
+                  oldestLiveHours: 6
                   readingStale: 14
                   readingStaleAfterHours: 36
                   noReading: 14
@@ -11423,7 +11548,8 @@ paths:
                   transfers: 931
                   inbound: 470
                   outbound: 461
-                  swaps: 388
+                  swapsAppearedIn: 388
+                  ownSwaps: 61
                   tokensTouched: 57
                   activeDays: 59
                   evenness: 0.6312
@@ -13055,8 +13181,8 @@ paths:
                   chains:
                     ethereum:
                       chainTxCount: 412
-                      rowsHeld: 380
-                      share: 0.9223
+                      transferRowsHeld: 380
+                      rowsPerSentTx: 0.9223
                       readAt: '2026-09-16T06:10:02.000Z'
                 chainHistory:
                   observedFrom: '2026-07-03T14:22:10.000Z'

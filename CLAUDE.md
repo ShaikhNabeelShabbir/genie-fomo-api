@@ -112,4 +112,15 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   is not a failure, and lumping the two tripped the all-failed guard and hid a real bug (`tokens`, 17 Sep).
 - SQLite dialect only: no `::` casts, `filter (where`, `distinct on`, `lateral`, `unnest`, `array_agg`, `= any(`, `interval`, `now()`, `date_trunc`, `numeric`, `ctid`. Timestamps are ISO-8601 UTC TEXT, booleans 0/1, JSON is TEXT. 100 bound parameters and 30 s per statement; D1 runs one statement at a time, so small and many beats large and few.
 - D1 charges CPU per query and has no planner hints: a view that aggregates the whole table before the caller's filter will exceed the limit (`holdings_current`, 17 Sep). Write correlated maxima that an index can seek.
-- Current state: v2 on D1, handed to the app team 17 Sep 2026 (`docs/consumer/v2-handoff/`). Open: rotate secrets, retire the Supabase project once the app team is on v2.
+- ONE price ladder, `shared/price-ladder.ts`, read at REQUEST time: pegged -> `token_price_stats`
+  -> `token_prices` (<= 7 days) -> `token_info`. `/positions` used to serve the price frozen into
+  `holdings` at the last balance read (a ~9 h sweep), which is why one coin showed three prices on
+  three traders' lists. Do not reintroduce a second ladder; `refreshAumLive` uses the same order.
+- A figure carries the coverage it was built from. `confidence()` in `shared/aum-history-rules.ts`
+  runs at READ time on `pricedPositions`/`totalPositions`: >= 0.25 a figure, 0.05-0.25 `partial`,
+  below 0.05 withheld with `partialUsd`. Read time is the point — the stored series is judged
+  without a rebuild. 78% of stored valued hours are under 0.25.
+- Current state: v2 on D1, handed to the app team 17 Sep 2026 (`docs/consumer/v2-handoff/`); fix
+  request v5 answered in `docs/consumer/reply-to-genie-v5.md`, vocabulary 12, NOT yet deployed —
+  migration `0005` must be applied first. Open: rotate secrets, the `/tokens` query rewrite
+  (24 Sep), retire the Supabase project once the app team is on v2.

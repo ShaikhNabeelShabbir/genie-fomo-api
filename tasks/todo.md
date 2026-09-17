@@ -1,152 +1,159 @@
-# Overnight autonomous run (2026-09-17, started ~19:30 UTC)
+# Fix request v5 (17 Sep 2026) — plan
 
-Goal: finish every to-do that needs no user input; nothing deployed. Branch `cloudflare-migration`.
+Source: `/Users/gr00t/Downloads/genie-fomo-fix-request-v5-17-sep.md`.
+Branch `cloudflare-migration`. Every finding below was traced in code and, where marked
+MEASURED, confirmed against production D1 (`wrangler d1 execute --remote`).
 
-- [x] Wave 1 (5 agents, parallel, worktrees): P1 (#10), T1 (#11), A1/F2/F3 remainder (#12),
-      R6 indexer coverage, R4 Robinhood prices (DexScreener) + refresh.yml reorder + rebuild twins.
-      Merged with 2 small conflicts; 29 tests; pushed as 67ef909.
-- [x] Merge wave 1; publish words in `shared/vocabulary.ts` (v4); update Field_Contracts.
-- [x] Wave 2 (3 agents, parallel): typecheck baseline 90 → 0; `aum-sample` ported into the
-      Worker (`worker/src/sampler.ts`, `/sample` + `scheduled`, shares chain_reads/value.ts);
-      PARAMETER_ROUTES documented, `docs/consumer/reply-to-genie-17-sep.md` drafted, phase
-      status updated. Pushed as 3840085.
-- [x] Wave 3 (1 agent): api modules are runtime-agnostic (`db.ts` Proxy over an
-      AsyncLocalStorage store, `config.ts` `cfg()`, `app.ts` handle, Deno entry `index.ts`);
-      the Worker serves `/v1/*` from the SAME modules (`worker/src/api.ts`). Verified under
-      workerd with a dead DB: 404 route list and 503 unavailable both correct. Pushed 0b3ac30.
-- [x] Comment extractor re-run: nothing new to move (agents kept comments short).
-- [x] Wave 4 (2 agents): T3 bounded (`scorecard.onChain` + `staleness.fallback`, vocabulary v5);
-      read-only review found 5 bugs + 1 twin divergence, all confirmed and fixed by a 5th agent
-      (price_suspect backfill also fixes chain rows and tier; `nothing_answered` instead of
-      `wallet_unreadable` when nothing was asked; GET /positions total null/zero contract;
-      known chains from answered rows only; dead `applyFloor` fields; MJS twin imports
-      `decideTotal`).
-- [x] Final: gate 0 errors, 32 tests, worker tsc clean, bundle 371 KB, node/py checks, loaders
-      build; pushed 1e652b4 (78 commits ahead of main, 6 new migrations).
+## Root causes (not symptoms)
 
-## Afternoon run (17 Sep 2026)
+### RC1 — three different price ladders value the same coin
+| reader | ladder | where |
+|---|---|---|
+| `/positions` rows | pegged(`is not null`) -> `token_info.price_usd` -> newest `token_prices` close, ANY age | `worker/src/jobs/balances.ts:167` — written at balance-read time and **frozen** in `holdings.price` |
+| `/aum/now`, `/aum/history` current hour | pegged(`>0`) -> `token_price_stats.last_usd` -> `token_prices` close <=7d -> `token_info` | `worker/src/jobs/valuation.ts:433` |
+| `/aum/history` past hours | pegged -> `token_price_hourly` sample <=24h -> THAT DAY's `token_prices` close -> `token_info` (current hour only) | `worker/src/jobs/valuation.ts:305-311` |
 
-- [x] Workflow coverage (`docs/consumer/workflow-coverage-17-sep.md`) → gaps 1–5 built by 5 agents
-      and merged: hourly price history + ATH, `/events`, launch metadata (pump.fun curve),
-      `holdings_live` + `/flow`, dev ledger + linked wallets. Vocabulary v6. 42 tests.
-- [x] Composite workflows coverage (`docs/consumer/composite-workflows-coverage-17-sep.md`).
-- [x] Efficiency review (`docs/REVIEW_EFFICIENCY_17_SEP.md`).
-- [x] Wave A (7 agents): A2 health scans + `trader_chain_history` view + 30 s cache; A3 `/portfolio`
-      7→2 queries; A4 sampler chains in parallel + supply loader unnest/throttle; A5 scorecard join
-      fixes + C1 per-coin multiples + C2 windows/bleeding + C5 exit-timing score; C4 `/market/regime`;
-      C3 honeypot-since + cohort. Plus a fix: the nightly re-price pass now honours the ceilings.
-      52 tests. Vocabulary v7.
-- [x] A1: `aumFor` window-bounded (+2 d anchor slack, `trackedSince`/`newest` in SQL), `Promise.all` over
-      the five independent reads, compact JSON, `statement_timeout` 14 s on both clients + `clearTimeout`,
-      malformed `%` → 400, migration `20260917220000_perf_indexes.sql`. Merged; worker `tsc` needed one
-      row-type annotation in `routes/positions.ts` (A3's query). 53 tests, gate 0, bundle 408 KB.
-      Caveat: `statement_timeout` as a startup parameter may be refused by Supavisor's transaction
-      pooler / Hyperdrive — run `scripts/smoke.sh` right after each deploy; if it fails, move it to a
-      `set local` per query.
+Consequences: V1d, A1, N1, R7 are all one bug. `/positions` can never see the hourly
+DexScreener price (`token_price_stats`), so Robinhood coins and re-priced natives stay null
+until the next balance read — and the sweep is ~9 h (25 traders x 2 runs/h, 450 traders).
 
-- [x] OpenAPI 3.0.3 reference `docs/openapi.yaml` (26 operations, 194 schemas, Redocly-clean) from 4 agents +
-      a pipeline audit; README rewritten; 64 validation flags in `docs/API_VALIDATION_FLAGS_17_SEP.md`;
-      vocabulary v8 (error codes). Worker renamed `genie-copy-trading-api`; branch renamed `cloudflare-migration`.
+### RC2 — a total is served from any price coverage above $100
+`valueGroup` (`worker/src/jobs/valuation.ts:105-109`) only refuses when the count share is
+under `PRICED_FLOOR` **and** the total is under $100. So a figure built from 2 of 289 coins is
+served as a full `totalUsd` with `reason: null`.
 
-- [x] 17 Sep evening: Hyperdrive `genie-copy-trading-db` (d63d855a…) created against the direct IPv6 host,
-      caching disabled; Worker `genie-copy-trading-api` deployed on Workers Paid (Free rejected `[limits]`);
-      `/v2/chains` and `/v2/fields` answer from production. `/v2/health` 500 until the 14 migrations land.
-      Remote migration history was EMPTY (all 44 unrecorded): repair the 30 live ones, then push 14.
-- [x] Migration history repaired (30) and 14 migrations pushed by the user; `fetch_types: false` removed
-      (arrays broke); v2 answers every family; smoke 7/8 (the 8th is `dataState: degraded`, by design T2).
-      Worker secrets: HELIUS_WEBHOOK_SECRET, HELIUS_SOLANA_KEY set; AUM_SAMPLE_SECRET, WALLET_SUBMIT_SECRET pending.
-- [x] 17 Sep: v2 is standalone (v1 frozen, no Supabase deploy). Every loader ported to Worker crons (14 jobs), GitHub
-      = CI/CD only; JS/Python/shell removed; `aum_history` (built, hourly, back to 11 Aug) + `aum_live` (webhook/
-      balances/prices refresh) + price rollups + `/aum/history`, `/aum/now`, `/tokens/:address/prices`; vocabulary v10;
-      `POST /jobs/<name>`; Bitquery for EVM balances (public RPC 429s). Handoff bundle `docs/consumer/v2-handoff/`.
-- [x] Every EVM read on Bitquery (`dataset: realtime`; the plan has no archive tier), Blockscout/Etherscan/public RPC
-      gone from the Worker. Incident 05:00-05:15 UTC: per-push `aum_live_refresh` saturated Postgres (v1 26 s/query);
-      fixed with `aum_live_dirty` + minute flush cron, per-client max 2, Hyperdrive origin limit 35 (was 20 from Free).
-- [x] v3 fix request (17 Sep): root causes in the plan file; fixes merged from 5 streams (valuation v3 SQL, positions
-      suspect exclusion + priceSource + R6, Solana swap writer + quote pricing + feeds.swaps, scorecard reload
-      semantics + fields cache, logoUrl); docs corrected (dates, P1, handles, B3); vocabulary v11; deployed.
-      Reply: `docs/consumer/reply-to-genie-v3.md` (bundle: `v2-handoff/reply-v3.md`).
-- [x] 17 Sep, v3 fixes deployed and the three suspect traders rebuilt.
-- [x] 17 Sep 09:30-10:40 UTC: **the database moved from Postgres (Supabase) to Cloudflare D1**, permanently.
-      Supabase saturated twice and took v1 and v2 down; the user called it. D1 `genie-copy-trading` (APAC),
-      30 tables + 12 views, 31 tables exported (724 MB CSV) and imported, counts verified (only drift is rows
-      the webhook wrote during the copy). Every API route (116 statements) and all 15 jobs (~120 statements)
-      rewritten to SQLite by two agents; the two valuation SQL functions are now `worker/src/jobs/valuation.ts`.
-      Worker holds only the `DB` binding; Hyperdrive deleted. Tuning found on the way: `holdings_current`
-      rewritten as a correlated maximum (253k rows -> 5.5k per trader), live refresh in fours, 10 MB import files.
-- [ ] Open: retire the Supabase project once the app team is on v2 (it kills v1); rotate every secret pasted in
-      chat; `/tokens` and `/market/regime` take ~7 s on D1 and want work; merge to main; prune worktrees.
+MEASURED, `aum_history`: 32,866 rows carry a `total_usd`; **25,492 of them (78%) are built
+from under 25% of the wallet.**
 
-## Status for the morning (17 Sep 2026)
+MEASURED, 397397's sawtooth is this and nothing else:
+- `01:00` basis `reading`, 217 of 279 priced -> $351,321.95
+- `00:00` basis `priced`, **2 of 289** priced -> $43,780.82
+Both served as facts. The flat $43,780.82 rung is a 0.7%-coverage figure.
 
-Everything that needed no input is done and pushed. Total: ~30 agents over 4 overnight waves, the workflow-gap wave and wave A.
-Vocabulary is at **v7**; the consumer reply draft is `docs/consumer/reply-to-genie-17-sep.md`.
+MEASURED, cupseyy has NO readings — every hour is `priced`, and the priced count swings
+118 / 5,082 / 187 / 187 / 187 / 1,131 / 193 / 1,135 across 06:00-13:00 on 11,278 positions.
+The $2.5B at 07:00 is the 5,082-priced hour: junk that cleared the suspect rule.
 
-Waiting on you, in order:
-1. Cloudflare token: add `Account › Workers Scripts › Edit`, then I deploy the Worker and set
-   `CLOUDFLARE_DEPLOY=true` + `WORKER_URL`.
-2. Database password (from the dev): `wrangler hyperdrive create … --caching-disabled`, paste the id
-   into `worker/wrangler.toml` (uncomment the block), `wrangler secret put HELIUS_WEBHOOK_SECRET`,
-   `AUM_SAMPLE_SECRET`, `HELIUS_SOLANA_KEY`, `WALLET_SUBMIT_SECRET`; redeploy; shadow diff.
-3. Supabase: `supabase db push` (14 migrations dated 20260917), deploy `api` + `aum-sample`;
-   re-sample `luckedhub`/`shahh`; run `scripts/acceptance_capture.sh` on main-vs-branch.
-4. Send the reply draft to the Genie team (vocabulary v7 will fail their build until they add
-   the words).
-5. `.env.example` tail by hand.
+### RC3 — the live catch-up runs on the build job's leftovers
+`runAumHistory` (cron `25 * * * *`) spends its budget on the hour-build loop, then refreshes
+stale `aum_live` rows only `while (Date.now() - started < budgetMs)`
+(`worker/src/jobs/aum_history.ts:88-99`). When the build fills the budget, nobody is refreshed.
+That is A2: gmgn_0xcb4d28c2 stuck at 07:35 with `source: build`.
 
-Not done, deliberately: full T3 (EVM receipt resolution, `/trades` from the swap stream), L2
-latency (needs measurements against a database), H1 rebuild-from-balance (declined).
+### RC4 — `complete` is a pagination fact
+`transactions.ts:426` `complete: !capped`. `coverage.byChain[].state` is `complete` iff >=1
+`wallet_swaps` row exists (`:462`). Neither knows about the ingestion horizon.
 
-Blocked on the user (not attempted): Cloudflare token `Workers Scripts: Edit`; database password
-for Hyperdrive; Supabase deploy + `db push`; Genie-team notification (vocabulary v3+);
-`.env.example`.
+### RC5 — Solana has a hard 500-signature horizon
+`worker/src/jobs/transfers.ts:19-21,93`: `PAGES=5`, Helius page size 100, and `before = null` —
+**no persisted cursor**. Every run re-pulls the newest 500 signatures per wallet, forever.
+That is smokey0x's 6 Aug wall, and it is why his profile counts 1,260 swaps while `/trades`
+returns 6.
 
----
+### RC6 — `share` divides two different things
+`positions-core.ts:99-107`: `share = rows_held / chain_nonce`, where `rows_held` is the count of
+**transfer legs** we hold and `chain_nonce` is Bitquery's **realtime-window sent-tx count**
+(`bitquery.ts:166-173`). Not a ratio of anything. Hence 8.5 and 2.2989. No 200-row cap exists
+anywhere — tdmilky's 238 vs 200 is coincidence, not a limit.
 
-# Restructure for lower token cost — plan (2026-09-17)
+### RC7 — `canSell` ignores the honeypot flag
+`positions-core.ts:83-87`: `canSell` negates `can_not_sell` alone; `is_honeypot` never touches it.
 
-Branch: `cloudflare-migration`. One commit per phase. Decisions from the user: install deno;
-retire `src/` (keep only the modules the loaders need); push only, no deploy; move comment
-blocks of 8+ lines.
+### RC8 — `/health.feeds.aum` still watches the retired sampler
+`health.ts:181-182` reads `aum_samples`. The sampler was unscheduled 17 Sep; `aum_history` and
+`aum_live` are what write the hours after 06:00. That is X3's contradiction.
 
-## Phases
+## Work items — all done
 
-- [x] A. deno installed. Baseline `deno check` has 90 pre-existing errors (postgres.js row
-      typing under TS 6), so the gate is "no new errors": `scripts/typecheck_gate.sh`.
-- [x] B. Folders: `docs/`, `docs/consumer/`, `docs/data/`, `loaders/`; `src/` retired, the
-      two loader modules live in `scripts/lib/ts` → `scripts/lib/dist`. Commit 4eeb905.
-- [x] C. `routes.ts` → 9 route modules + 13 shared modules, mechanical, 3 dead
-      declarations dropped; local run serves the route list. Commit 6372e41.
-- [x] D. 197 comment blocks → `docs/DECISIONS.md` with numbered pointers. Commit 97fb376.
-- [x] E. `shared/vocabulary.ts` + `tests/vocabulary_test.ts` (found and published two
-      storable-but-unpublished words: `service_timeout`, `price_rejected`; version 2).
-- [x] F. `shared/aum-rules.ts`, `aum-sample/value.ts`, 12 tests, `deno task test`.
-- [x] G. `CLAUDE.md`.
-- [x] H. README, dating notes on four docs; push.
+- [x] **W1 RC1, one price ladder.** `shared/price-ladder.ts` (`ladderPrice`, `oldestUsableDay`,
+      `unpackDaily`): pegged -> `token_price_stats` -> `token_prices` <= 7 days -> `token_info`.
+      Wired into `/positions`, `POST /traders/positions` and `/portfolio` as four selected
+      columns plus one packed correlated seek (`day || '|' || usd`, so the rung costs one seek
+      per row, not two). Rows are repriced and revalued in memory, then re-sorted, because the
+      stored `h.value` the SQL ordered by no longer equals the served value. `/portfolio` also
+      gains the suspect rule, which it never had. Fixes V1d, A1, N1, R7 together.
+- [x] **W2 RC2, coverage decides what is published.** `confidence()` in `shared/aum-history-rules.ts`,
+      applied at READ time in `routes/aum-history.ts` to points and to `now`. `pricedShare` on
+      every figure; `partial: true` between 0.05 and 0.25; withheld below 0.05 with `partialUsd`.
+      Read time, not build time: the whole stored series is judged on deploy with no rebuild.
+      `coverage.pricedShare` added to `/positions` so the three routes are comparable.
+- [x] **W3 A3, no holes.** `fillHourGaps()`; an hour between the first and last point with no
+      row is a null point with `reason: "not_built"`. Nothing invented before the first point.
+- [x] **W4 RC3, A2.** `catchUpLive()` extracted and moved to the FRONT of `runAumHistory` with
+      `LIVE_BUDGET_SHARE = 0.25` reserved. `/health.staleTraders` gains `liveStale`,
+      `liveStaleAfterHours`, `liveNever`, `oldestLiveHours`.
+- [x] **W5 RC4/RC5, W2.** `complete` = not capped AND no chain unresolved AND none truncated,
+      with `incompleteReason`. `coverage.byChain[].horizonAt` on every chain and `truncated` on
+      Solana until the walk finishes. `_shared/transactions.ts` gains `solanaBefore` and
+      reports `exhausted`; `transfers.ts` `walkBack()` pages backwards from the oldest signature
+      we hold. Migration `0005_solana_backfill_cursor.sql`: `wallets.sol_backfill_done` plus
+      `transactions (address_key, network_id, block_time)` for the seek.
+- [x] **W6 RC4, the trade counts.** `onChain.swaps` -> `swapsAppearedIn` (distinct tx, not legs)
+      plus `ownSwaps` from `wallet_swaps`.
+- [x] **W7 RC6, C1.** `share` -> `rowsPerSentTx`, `rowsHeld` -> `transferRowsHeld`.
+- [x] **W8 RC7, H2.** `canSell` is false whenever `isHoneypot` is true.
+- [x] **W9 RC8, X3.** `feeds.aum` watches `aum_history` / `aum_live`; the retired sampler's
+      clocks move to `feeds.aum.sampler` with `retired: true`.
+- [x] **W10 L2.** `shared/cache.ts` (`ttlCache`, `urlKey`, bounded at 64 slots); `/tokens` and
+      `/tokens/momentum` cached 60 s per query string.
+- [x] **W11 vocabulary 12.** `token_price_stats`, `not_built`, `truncated`;
+      `trades.coverage.byChain[].state` published for the first time.
+- [x] **W12 docs.** `openapi.yaml` (G2 `logoUrl` marked not-yet-published and dropped from
+      `required`; every renamed and new field; the Python `User-Agent` note in `info`),
+      `docs/consumer/Field_Contracts.md`, `docs/consumer/reply-to-genie-v5.md`.
+- [x] **W13 tests.** `tests/price_ladder_test.ts`, `tests/aum_confidence_test.ts`,
+      `tests/cache_test.ts`; `positions_core_test`, `events_test`, `vocabulary_test` updated.
 
-## Not done here
-- Deploy to Supabase and the acceptance diff: user runs
-  `npx supabase functions deploy api --project-ref <ref> --no-verify-jwt`, then
-  `./scripts/acceptance_capture.sh $BASE captures/after` and `diff -r captures/before captures/after`.
+## Not done here, deliberately
+
+- **Not deployed, and the migration is not applied.** `0005` MUST land before the deploy: the
+  new code selects `wallets.sol_backfill_done` and `/trades` will 500 without it.
+  `cd worker && npx wrangler d1 migrations apply genie-copy-trading --remote`, then
+  `npx wrangler deploy`.
+- **The `/tokens` query rewrite.** The cache does not save a cold isolate, and `/tokens`
+  aggregates the whole holdings view before any limit applies. Item 6 of
+  `docs/REVIEW_EFFICIENCY_17_SEP.md`. Promised to the app team for 24 Sep.
+- **`truncated` for EVM chains.** Bitquery gives no end-of-history signal, so only Solana can
+  say the walk finished. `horizonAt` is published for every chain; the state is not.
+- **`liveBasis.evm: nightly_read`** is wrong by a factor of twelve (the read is twice an hour).
+  Correcting it is a vocabulary bump, so it waits for 13 rather than riding on this one.
+- **`market.ts` and `fields.ts`** keep their own inline caches. `shared/cache.ts` should absorb
+  them, but converting working code with no behaviour change is churn, not a fix.
 
 ## Review (2026-09-17)
 
-Measured on `supabase/functions/api`: 393 KB in one file → 22 modules totalling ~290 KB of
-code, with 142 KB of rationale in `docs/DECISIONS.md`. Largest module now `routes/aum.ts`
-at ~48 KB (was 393 KB to read anything). Verification on every commit: typecheck gate (no new
-errors against the 90-error baseline), `deno task test` 12/12, and a local `deno run` that
-serves the route list.
+Twenty asks; every one answered in `docs/consumer/reply-to-genie-v5.md` as fixed, planned with
+a date, or open with the reason. Thirteen code changes across 14 files.
 
-Not done, deliberately:
-- **Not deployed.** User deploys with `npx supabase functions deploy api …`, then runs
-  `scripts/acceptance_capture.sh` against production and diffs with `captures/cap1` from
-  16 Sep (kept in the session scratchpad; re-capture from `main` if lost).
-- **The 90 baseline type errors** are real (postgres.js rows typed `{}` under TS 6) and are a
-  separate fix: annotate row types at each `sql<...>` call.
-- **`/v1/fields` version 2** publishes two words consumers have not seen. Tell the Genie
-  team before deploying; their build fails on an unpublished word by design.
-- `.env.example` tail still needs `=` added by hand.
+**The finding that mattered.** Five of their top asks were one bug. Three price ladders existed
+for the same coin, and `/positions` served a price frozen into the row at the last balance read
+— a sweep of about nine hours. The proof is one query: 75 traders hold the identical amount of
+`0xdad7e2...ac70`, and the stored price reads 0.000004391 for 28 of them, 0.005436 for 15, and
+null for 32, decided purely by when each wallet was last read.
 
-Lesson: the extractor's first pass produced 140-char anchors; numbered sections cost one
-re-run and cut every pointer to ~30 chars. Check the smallest output sample before running
-a scripted rewrite over 197 sites.
+**The finding that changed the product.** A total was published from any price coverage as long
+as it exceeded $100. Measured on production D1: **25,492 of 32,866 valued `aum_history` hours,
+78%, were built from under a quarter of the wallet.** 397397's flat $43,780.82 rung is a
+2-of-289 figure and his ~$354,000 hours are 217-of-279; both were served as facts, and the
+sawtooth between them is what the app team charted. Applying the rule at read time rather than
+at build time means the whole stored series is judged the moment it deploys, with no rebuild.
+
+**Verification.** `deno task check` 0 errors; `deno task test` 238 passed, 0 failed;
+`npx tsc -p worker/tsconfig.json` clean; `npx wrangler deploy --dry-run` bundles;
+`npx @redocly/cli lint docs/openapi.yaml` valid with 0 warnings (the baseline was 0; the 7 my
+renames introduced were stale response examples and are fixed). The ladder query was run
+against production D1: 33 rows / 10.7 ms on a small trader, and 2.6 s on cupseyy's 11,325 rows,
+of which the new correlated seek is ~0.83 s.
+
+**Two changed tests were the point, not collateral.** `events_test` asserted a honeypot could be
+sold, and `vocabulary_test` asserted `now.reason` and `points[].reason` are identical lists —
+the second is now a subset check, because `not_built` is a word only a series can use.
+
+**The cost we accepted.** `/positions` for the largest trader gains ~0.8 s of D1 time against a
+15 s route budget on a route that already took 13.1 s. It buys correctness on four asks. If it
+starts tripping the race, the fix is the `holdings_live` roll-forward (807k rows read for one
+trader), not the ladder.
+
+Lesson: the app team's figures were right every time and our status labels were wrong three
+times (V1d, N1, R6 said "Fixed" while data was still filling). Their suggested wording,
+"Fixed, filling by <date>", is now the rule in the reply.
