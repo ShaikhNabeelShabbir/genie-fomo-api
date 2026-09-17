@@ -2,7 +2,7 @@ import { sql, n, round } from "../db.ts";
 import { cfg } from "../config.ts";
 import { get, post } from "../router.ts";
 import { notFound, badRequest } from "../errors.ts";
-import { median, money } from "../shared/format.ts";
+import { bool, median, money } from "../shared/format.ts";
 import { NativePrice, nativePrices } from "../shared/prices.ts";
 import { resolveChain, SOLANA_NET, KnownChain, knownChainsFor } from "../shared/chains.ts";
 import { resolveTrader } from "../shared/traders.ts";
@@ -769,21 +769,24 @@ async function aumFor(
   const history = opts.chainFilter
     ? await sql`
         select handle,
-               min(at) filter (where basis = 'sampled') as tracked_since,
-               bool_or(basis = 'rebuilt') as any_rebuilt,
+               min(case when basis = 'sampled' then at end) as tracked_since,
+               -- bool_or over 0/1; basis is NOT NULL, so max() is any().
+               max(basis = 'rebuilt') as any_rebuilt,
                max(at) as freshest,
-               max(at) filter (where total_usd is not null and (priced_share is null
-                 or priced_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
+               max(case when total_usd is not null and (priced_share is null
+                 or priced_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})
+                 then at end) as freshest_figured
         from aum_chain_samples
         where handle in (${present}) and network_id = ${opts.chainFilter.network_id}
         group by handle`
     : await sql`
         select handle,
-               min(at) filter (where basis = 'sampled') as tracked_since,
-               bool_or(basis = 'rebuilt') as any_rebuilt,
+               min(case when basis = 'sampled' then at end) as tracked_since,
+               max(basis = 'rebuilt') as any_rebuilt,
                max(at) as freshest,
-               max(at) filter (where total_usd is not null and (value_share is null
-                 or value_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})) as freshest_figured
+               max(case when total_usd is not null and (value_share is null
+                 or value_share >= ${PRICED_FLOOR} or total_usd >= ${PARTIAL_SERVE_FLOOR_USD})
+                 then at end) as freshest_figured
         from aum_samples
         where handle in (${present})
         group by handle`;
@@ -796,8 +799,9 @@ async function aumFor(
     /** A minute of slack: `at` is compared whole-second in JS and exact in SQL. */
     const poolMs = h.freshest_figured ? Date.parse(String(h.freshest_figured)) - RECENT_MS - 60_000 : freshestMs;
     lh.push(String(h.handle));
+    /* No lower bound: Postgres's `-infinity` has no SQLite twin, and timestamps compare as text. */
     lo.push(span === null
-      ? "-infinity"
+      ? "0000-01-01T00:00:00.000Z"
       : new Date(Math.min(to.getTime() - span - 2 * 86_400_000, poolMs)).toISOString());
   }
 
@@ -809,13 +813,16 @@ async function aumFor(
     opts.chainFilter
       ? sql`
         select a.handle, a.at, a.total_usd, a.reason as refused_reason,
-               null::int as priced_positions, null::int as total_positions,
+               null as priced_positions, null as total_positions,
                a.priced_share as value_share, a.basis, s.tier,
-               null::int as chains_answered, null::int as chains_expected
+               null as chains_answered, null as chains_expected
         from aum_chain_samples a
         join aum_samples s
           on s.handle = a.handle and s.at = a.at and s.basis = a.basis
-        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+        -- unnest(handles, floors) is two json_each runs joined on the array index.
+        join (select jh.value as handle, jl.value as lo
+                from json_each(${lh}) jh
+                join json_each(${lo}) jl on jl.key = jh.key) u
           on u.handle = a.handle and a.at >= u.lo
         where a.network_id = ${opts.chainFilter.network_id}
         order by a.handle, a.at asc`
@@ -823,7 +830,10 @@ async function aumFor(
         select s.handle, s.at, s.total_usd, s.refused_reason, s.priced_positions, s.total_positions,
                s.value_share, s.basis, s.tier, s.chains_answered, s.chains_expected
         from aum_samples s
-        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+        -- unnest(handles, floors) is two json_each runs joined on the array index.
+        join (select jh.value as handle, jl.value as lo
+                from json_each(${lh}) jh
+                join json_each(${lo}) jl on jl.key = jh.key) u
           on u.handle = s.handle and s.at >= u.lo
         order by s.handle, s.at asc`,
     /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
@@ -831,7 +841,10 @@ async function aumFor(
         select a.handle, a.at, a.basis, c.name as chain, a.total_usd
         from aum_chain_samples a
         join chains c using (network_id)
-        join unnest(${lh}::text[], ${lo}::timestamptz[]) as u(handle, lo)
+        -- unnest(handles, floors) is two json_each runs joined on the array index.
+        join (select jh.value as handle, jl.value as lo
+                from json_each(${lh}) jh
+                join json_each(${lo}) jl on jl.key = jh.key) u
           on u.handle = a.handle and a.at >= u.lo
         order by a.handle, a.at asc`,
     /** Window-independent chain list, one query for the whole batch. */
@@ -847,9 +860,9 @@ async function aumFor(
      */
     samplerLast(),
     sql`
-    select handle, count(distinct network_id)::int as chains,
-           bool_or(network_id = ${SOLANA_NET}) as on_solana,
-           bool_or(network_id <> ${SOLANA_NET}) as on_evm
+    select handle, count(distinct network_id) as chains,
+           max(network_id = ${SOLANA_NET})  as on_solana,
+           max(network_id <> ${SOLANA_NET}) as on_evm
     from holdings_current where handle in (${present}) and human_amount > 0
     group by handle`,
   ]);
@@ -878,7 +891,11 @@ async function aumFor(
         select a.handle, c.name as chain, a.network_id, a.total_usd, a.priced_share, a.reason
         from aum_chain_samples a
         join chains c using (network_id)
-        join unnest(${nh}::text[], ${na}::timestamptz[], ${nb}::text[]) as u(handle, at, basis)
+        -- unnest(handles, ats, bases) is three json_each runs joined on the array index.
+        join (select jh.value as handle, ja.value as at, jb.value as basis
+                from json_each(${nh}) jh
+                join json_each(${na}) ja on ja.key = jh.key
+                join json_each(${nb}) jb on jb.key = jh.key) u
           on u.handle = a.handle and u.at = a.at and u.basis = a.basis
         order by a.handle, a.total_usd desc nulls last`
     : [];
@@ -900,7 +917,7 @@ async function aumFor(
   }
 
   const presBy = new Map<string, { chains: number; on_solana: boolean; on_evm: boolean }>(presenceRows.map((r: Record<string, unknown>) => [String(r.handle), {
-    chains: Number(r.chains), on_solana: r.on_solana === true, on_evm: r.on_evm === true,
+    chains: Number(r.chains), on_solana: bool(r.on_solana) === true, on_evm: bool(r.on_evm) === true,
   }]));
 
   for (const t of traders) {
@@ -914,7 +931,7 @@ async function aumFor(
       { ...opts, to, pointChains: pointChainsBy.get(h) ?? null,
         knownChains: knownBy.get(h) ?? [], natives, tracked: {
           sinceMs: hist?.tracked_since ? Date.parse(String(hist.tracked_since)) : null,
-          anyRebuilt: hist?.any_rebuilt === true,
+          anyRebuilt: bool(hist?.any_rebuilt) === true,
         }, sampler: {
         lastAt: samplerRow?.last_at ? new Date(String(samplerRow.last_at)) : null,
         lastSuccess: samplerRow?.last_success ? new Date(String(samplerRow.last_success)) : null,
