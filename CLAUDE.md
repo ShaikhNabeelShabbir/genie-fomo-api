@@ -34,6 +34,7 @@ v1: `https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api`. v2: `https://ge
 | `/:handle/scorecard`, `/:handle/pnl` | `routes/scorecard.ts` (bodies in `shared/scorecard-core.ts`, `shared/pnl-core.ts`) |
 | `/:handle/transactions`, `/:handle/trades` | `routes/transactions.ts` |
 | `/v1/tokens`, `/:address`, `/:address/activity`, `/momentum` | `routes/tokens.ts` |
+| `/:address/prices`, `POST /tokens/prices` | `routes/token-prices.ts` (step/window rules in `shared/series-rules.ts`; candle views in migration `20260918020000`) |
 | `/:handle/aum`, `POST /traders/aum` | `routes/aum.ts` (rules in `shared/aum-rules.ts`) |
 | `/:handle/aum/history`, `POST /traders/aum/history` | `routes/aum-history.ts` (built series over `aum_history` + rollup views; step/window rules in `shared/aum-history-rules.ts`) |
 | `GET /v1/fields` | `routes/fields.ts` (data in `shared/vocabulary.ts`) |

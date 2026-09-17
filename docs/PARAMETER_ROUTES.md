@@ -1841,6 +1841,25 @@ record — "nobody has ever sold" and "we have no evidence" are different claims
 121 traders have a record for a token 58 people currently hold — **63 traded it and got out
 entirely.** That is exit information a holder count alone cannot show.
 
+### Price history — `/tokens/:address/prices` (added 18 Sep 2026)
+
+Served from `token_price_hourly` (one DexScreener sample per held token per UTC hour since
+17 Sep 2026) and its daily / weekly / monthly candle views; nothing is fetched live. `step`
+defaults from `window` (`1d`,`1w` → `1h`; `1m`,`3m` → `1d`; `1y` → `1w`; `all` → `1mo`);
+`from`/`to` override the window. An address on several chains needs `?chain=`.
+
+```bash
+curl -s "$B/tokens/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump/prices?chain=solana&window=1d" \
+  | jq '{step, count, latest, ath, last: .points[-1]}'
+curl -s -X POST "$B/tokens/prices" -H 'content-type: application/json' \
+  -d '{"addresses":["Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump","0x000000000000000000000000000000000000dead"],"window":"1m"}' \
+  | jq '{step, asked, tokens: [.tokens[] | {ok, requested, count, error}]}'
+```
+
+`1h` points carry `usd` and `liquidityUsd`; coarser steps carry `usd` (close), `openUsd`,
+`highUsd`, `lowUsd` and `hours` (samples in the bucket, so a partial day shows as `< 24`).
+`ath` is the running high since sampling began, not the token's lifetime high.
+
 ---
 
 ## 5a. Token security (G12)
