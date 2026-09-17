@@ -15,7 +15,13 @@ const [url, outdir] = Deno.args;
 if (!url || !outdir) { console.error("usage: pg_export.ts <postgres url> <outdir>"); Deno.exit(2); }
 await Deno.mkdir(outdir, { recursive: true });
 
-const sql = postgres(url, { ssl: "require", max: 1, prepare: false, connect_timeout: 60 });
+/**
+ * A client PER TABLE. postgres.js leaves the connection busy after a `copy … to stdout` stream
+ * ends, so with one shared client the second table waits forever (seen 17 Sep: table 1 in 2 s,
+ * table 2 never started while the server showed no query at all).
+ */
+const client = () => postgres(url, { ssl: "require", max: 1, prepare: false, connect_timeout: 60 });
+const sql = client();
 const manifestPath = `${outdir}/manifest.json`;
 const manifest: Record<string, number> = await Deno.readTextFile(manifestPath).then(JSON.parse).catch(() => ({}));
 
@@ -38,10 +44,16 @@ try {
     await Deno.writeTextFile(`${outdir}/${t}.columns.json`, JSON.stringify(columns, null, 2));
     const started = Date.now();
     const file = await Deno.open(csv, { write: true, create: true, truncate: true });
-    const readable = await sql`copy (select * from ${sql(t)}) to stdout with (format csv, header)`.readable();
+    const copier = client();
     let bytes = 0;
-    for await (const chunk of readable) { bytes += chunk.length; await file.write(chunk); }
-    file.close();
+    try {
+      await copier.unsafe("set statement_timeout = 0");
+      const readable = await copier`copy (select * from ${copier(t)}) to stdout with (format csv, header)`.readable();
+      for await (const chunk of readable) { bytes += chunk.length; await file.write(chunk); }
+    } finally {
+      file.close();
+      await copier.end({ timeout: 5 }).catch(() => {});
+    }
     manifest[t] = count;
     await Deno.writeTextFile(manifestPath, JSON.stringify(manifest, null, 2));
     console.log(`${t}: ${count} rows, ${(bytes / 1e6).toFixed(1)} MB, ${((Date.now() - started) / 1000).toFixed(0)} s`);
