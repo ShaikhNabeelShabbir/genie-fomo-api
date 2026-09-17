@@ -6,8 +6,10 @@ read in it was reproducible from the figures you gave, and four of them found th
 **Deployed to v2 on 17 Sep 2026, ~15:05 UTC**, migration `0005` applied first. Every figure
 below quoted as current was read back from production after the deploy, not from a test.
 
-**One of your asks is NOT fixed, and we want to be plain about it: V1d** (§1). Our first draft
-of this reply said it was; reading production back after the deploy showed it was not.
+**Two asks are not closed, and we want to be plain about both.** **V1d is NOT fixed** (§1) —
+our first draft of this reply said it was, and reading production back after the deploy showed
+it was not. **A2 is partly fixed** (§2): the stuck six-hour figures are gone, but "every trader
+hourly" is not met, and we have the measured numbers rather than a promise.
 
 **What we need from you: run the ten reads in "Verify the deployment" below** — each one says
 what it should return — then re-run your comparisons and send the next batch whenever it suits
@@ -146,11 +148,27 @@ published them as though they were.
   quarter of the job's budget reserved.
 
   `/health.staleTraders` gains `liveStale`, `liveStaleAfterHours: 1`, `liveNever` and
-  `oldestLiveHours` so you can hold us to it — and right now it reads **`liveStale: 300`**,
-  because the job runs at :25 and the deploy landed at :05. That is the backlog the old code
-  left, not the new code failing. We will confirm the number after the first pass rather than
-  call it fixed on the strength of the diff. This is exactly the labelling you asked us to
-  stop doing.
+  `oldestLiveHours` so you can hold us to it.
+
+  **We watched the first pass rather than calling it fixed on the strength of the diff, and it
+  is a partial result.** Across the 15:25 run, out of 446 traders:
+
+  | 15:17 | 15:26 | 15:27 | 15:28 |
+  |---|---|---|---|
+  | `liveStale` 308 | 243 | 203 | **163** |
+
+  `oldestLiveHours` fell from **9 to 4** over the same minutes. So one pass revalues roughly
+  **145 traders**, and the stalest are always taken first.
+
+  What that means for your ask: the six-hour stuck figure you found is gone, and nobody is
+  stranded any more. **"Every trader at least hourly" is not met** — at ~145 a pass, a trader
+  the webhook never sees move is revalued about every three hours. The cost is one
+  `holdings_live` read per trader; reaching all 446 an hour needs a cron of its own or a
+  cheaper valuation, and taking more of this job's budget would only starve the history build.
+  **Date: 22 Sep**, with the V1d work.
+
+  `liveStale` sits in `/health` precisely so you can watch that number without asking us. If it
+  is not falling, we have not done it.
 
 ## 3. ETH and BNB — N1: fixed, and no sweep needed
 
@@ -382,6 +400,7 @@ build, tell us and we will serve both spellings for a version rather than make y
 | Ask | State | When |
 |---|---|---|
 | **V1d** — cupseyy's 07:00 $2.5B hour (45% coverage; no wallet-level check) | **NOT FIXED** | 22 Sep |
+| **A2** — `now` hourly for EVERY trader (measured ~145 a pass, so ~3 h for an unwatched trader) | **partly fixed** | 22 Sep |
 | `/tokens` query rewrite (the cold-isolate timeout) | planned | 24 Sep |
 | Solana backfill reaching every wallet's first trade (184 wallets hold a Solana address; 0 finished) | starts on the :40 run | ~1 week |
 | `truncated` for EVM chains (no end-of-history signal from Bitquery) | open, no date | — |
