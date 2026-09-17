@@ -13,9 +13,12 @@ id = "d63d855a124c463a93318e8d225f1735"
 # `wrangler dev` without --remote connects straight to this; no pooling, no caching.
 # localConnectionString = "postgresql://postgres:postgres@localhost:5432/postgres"
 
-# Phase 1 (shadow) keeps pg_cron as the only sampler. Uncomment in Phase 2 (§13).
-# [triggers]
-# crons = ["*/5 * * * *"]
+# Jobs on one Worker; src/index.ts dispatches on event.cron. Prices and scorecards replace
+# prices.yml and scorecards.yml. No sampler cron: balance history is BUILT from stored holdings
+# and prices into aum_history (18 Sep), not sampled; /sample stays for a manual read.
+# Every job stops on its own before JOB_BUDGET_MS.
+[triggers]
+crons = ["17 * * * *", "0 */6 * * *"]
 
 [limits]
 cpu_ms = 30000
@@ -24,6 +27,7 @@ cpu_ms = 30000
 AUM_LIVE_AFTER_MINUTES = "5"
 AUM_LIVE_WAIT_MS = "3000"
 AUM_SAMPLE_BUDGET_MS = "100000"
+JOB_BUDGET_MS = "600000"
 RATE_LIMIT_PER_MINUTE = "240"
 ROUTE_TIMEOUT_MS = "15000"
 
