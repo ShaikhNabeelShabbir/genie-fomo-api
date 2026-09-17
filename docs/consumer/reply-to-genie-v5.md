@@ -3,9 +3,11 @@
 Answering `genie-fomo-fix-request-v5-17-sep.md` ask by ask. Thank you for the appendix: every
 read in it was reproducible from the figures you gave, and four of them found the bug directly.
 
-**Everything below is written and verified in the branch, not yet deployed.** The deploy needs
-one D1 migration (`0005_solana_backfill_cursor.sql`) that must land first. We will confirm the
-deploy time separately.
+**Deployed to v2 on 17 Sep 2026, ~15:05 UTC**, migration `0005` applied first. Every figure
+below quoted as current was read back from production after the deploy, not from a test.
+
+**One of your asks is NOT fixed, and we want to be plain about it: V1d** (§1). Our first draft
+of this reply said it was; reading production back after the deploy showed it was not.
 
 **Vocabulary goes to 12.** Three new words — `token_price_stats` (`positions[].priceSource`),
 `not_built` (`aumHistory.points[].reason`), `truncated` (`trades.coverage.byChain[].state`).
@@ -15,10 +17,10 @@ new `onChain.ownSwaps`). Those three are the only breaking changes; everything e
 
 ---
 
-## The short version: five of your top asks were one bug
+## The short version: four of your top asks were one bug
 
-V1d, A1, N1 and R7 are the same defect. **We had three different price ladders**, and
-`/positions` served a price that was frozen into the row at the trader's last balance read:
+A1, N1 and R7 are the same defect (V1d is not — see §1). **We had three different price
+ladders**, and `/positions` served a price frozen into the row at its last balance read:
 
 | reader | ladder |
 |---|---|
@@ -73,8 +75,26 @@ published them as though they were.
   price at request time. The batch `POST /traders/positions` still reads `holdings_current`
   (rolling Solana forward for 50 traders at once exceeds D1's per-query CPU limit) and says so
   with `tier`; it uses the same ladder.
-- **V1d, rebuild 07:00, 12:00, 13:00 — fixed, and for every hour at once, with no rebuild.**
-  See §2: the rule is applied when we serve the row, not when we build it.
+- **V1d, rebuild 07:00, 12:00 and 13:00 — NOT FIXED. Keep your $1B guard on for cupseyy.**
+
+  12:00 is fixed: it was built from 1.71% of his wallet and is now withheld
+  (`totalUsd: null`, `reason: too_little_priced`, `partialUsd: 229388.66`). 13:00 stands at
+  $229,589.32 with `partial: true` and `pricedShare: 0.1004`.
+
+  **07:00 still reads $2,509,077,756.02.** The coverage rule does not reach it: that hour was
+  built from **45.06%** of his wallet, well above our floor, so nothing about its coverage is
+  wrong. The figure is.
+
+  What we established: it is not the hourly price samples. Summing every position carrying a
+  07:00 DexScreener sample gives about **$7,000**, the largest single one $4,331. So the $2.5B
+  enters through a different rung of the history builder's ladder — the daily close, or a sample
+  carried forward from up to 24 hours earlier — and no single position trips the per-row
+  ceilings, because 5,082 positions each in the hundreds of thousands sum to billions without
+  any one of them looking absurd. **We have no wallet-level sanity check**, and that is the real
+  gap your $1B guard has been covering for us.
+
+  We are not going to guess at it. Finding which rung and which positions is a day's work, and
+  we would rather tell you this now than ship a threshold that hides it. **Date: 22 Sep.**
 
 ## 2. The sawtooth and the missing hours — A4, A3, A2
 
@@ -115,12 +135,18 @@ published them as though they were.
   `reason: "not_built"` (new word). Hours *before* the first point are still absent: we were not
   tracking him then, and inventing them would claim knowledge we do not have.
 
-- **A2 — fixed.** The live catch-up was the tail of the hourly history job, guarded by
-  "while budget remains". The backfill loop above it spent the budget, so the catch-up was
-  reached only when there was nothing to build — and a trader the webhook never sees move is
-  exactly the one it exists for. It now runs **first**, with a quarter of the job's budget
-  reserved. `/health.staleTraders` gains `liveStale`, `liveStaleAfterHours: 1`, `liveNever` and
-  `oldestLiveHours`, so you can hold us to it.
+- **A2 — deployed, and honestly: not yet observed working.** The live catch-up was the tail of
+  the hourly history job, guarded by "while budget remains". The backfill loop above it spent
+  the budget, so the catch-up was reached only when there was nothing to build — and a trader
+  the webhook never sees move is exactly the one it exists for. It now runs **first**, with a
+  quarter of the job's budget reserved.
+
+  `/health.staleTraders` gains `liveStale`, `liveStaleAfterHours: 1`, `liveNever` and
+  `oldestLiveHours` so you can hold us to it — and right now it reads **`liveStale: 300`**,
+  because the job runs at :25 and the deploy landed at :05. That is the backlog the old code
+  left, not the new code failing. We will confirm the number after the first pass rather than
+  call it fixed on the strength of the diff. This is exactly the labelling you asked us to
+  stop doing.
 
 ## 3. ETH and BNB — N1: fixed, and no sweep needed
 
@@ -138,6 +164,22 @@ With the request-time ladder that row prices on the next request. **The "427 of 
 a fresh read" figure no longer gates anything** — there is nothing to wait for, and no reason to
 re-order the sweep. gmgn_0x314e6555, gmgn_0xcb4d28c2 and gmgn_0xf1d07077 are the same case.
 
+**A second change was needed to finish this, and you may notice it elsewhere.** Once priced, his
+ETH was immediately flagged `concentration_over_ceiling` and his total read 0 — so he still
+showed nothing, for a new reason. The native sentinel carries no `total_supply`, so our
+"we cannot check this price" test was false, and a wallet holding only ETH puts one position at
+100% of its own total, which is exactly what that rule looks for. A `quote_assets` row — a
+dollar coin or a chain's own coin — is now exempt from the concentration and no-market rules,
+and from nothing else: the implied-market-cap ceiling still applies, and the row stays in the
+concentration base so anything beside it is still judged against real value.
+
+The visible effect: a wallet that is all ETH, BNB, SOL or USDC reports a balance instead of
+moving it into `suspectUsd`. It only ever affected single-asset wallets — tdmilky holds 609
+positions, so no single one reaches 90% and his four natives were always fine.
+
+**Verified in production after the deploy:** gmgn_0xf80d7961 now reads `totalValueUsd: 2889.02`,
+`suspectUsd: 0`, his ETH at $2,464.97 from `token_prices`. He read `null` / `no_prices` for you.
+
 ## 4. `complete` on partial swap lists — W2
 
 - **`complete` — fixed.** It was `!capped`: a pagination fact. It is now false while the page
@@ -148,6 +190,11 @@ re-order the sweep. gmgn_0x314e6555, gmgn_0xcb4d28c2 and gmgn_0xf1d07077 are the
 - **`onChain.swaps` — split, as you asked.** It counted transfer **legs** typed SWAP, with no
   `distinct tx_hash`, for every transaction this wallet appears in. So one trade counted several
   times, *and* other people's trades counted whenever this wallet received tokens inside them.
+
+  smokey0x, read from production after the deploy: **`swapsAppearedIn: 593`** (your 1,260 was
+  that same wallet counted by legs) and **`ownSwaps: 6`** — which is exactly the six rows
+  `/trades` returns. The two numbers were never comparable, and now they do not have to be.
+
   Replaced by two fields:
   - `onChain.swapsAppearedIn` — distinct transactions typed SWAP that touched the wallet at all.
     The upper bound. This is the honest version of the old number.
@@ -229,11 +276,12 @@ positions held. They were never meant to agree, and nothing said so.
   staleness — about 20k of 26k held tokens an hour. A Robinhood coin still on a bonding curve
   with no pool has no price from any source, and stays null.
 
-- **H2, `canSell` on honeypots — fixed.** `canSell` is now false whenever `isHoneypot` is true.
-  It previously negated the separate `can_not_sell` column alone, so the two fields contradicted
-  each other on the same coin. Still `null` when no security source has judged it. Thank you for
-  the correction on the totals — your reading of `unsellableUsd` was right and ours was not
-  clearly documented.
+- **H2, `canSell` on honeypots — fixed and verified.** 397397's four honeypot rows all read
+  `canSell: false` in production, with `unsellableUsd: 102147.12` unchanged. `canSell` is now false whenever `isHoneypot` is true.
+  `canSell` previously negated the separate `can_not_sell` column alone, so the two fields
+  contradicted each other on the same coin. Still `null` when no security source has judged it.
+  Thank you for the correction on the totals — your reading of `unsellableUsd` was right and
+  ours was not clearly documented.
 
 - **E1, the EVM read interval — 25 traders at :03 and :33, so 50 an hour, ~9 hours for 450.**
   That is the regular interval today, not a backfill rate; it is set by Bitquery's per-minute
@@ -299,6 +347,7 @@ positions held. They were never meant to agree, and nothing said so.
 
 | Ask | State | When |
 |---|---|---|
+| **V1d** — cupseyy's 07:00 $2.5B hour (45% coverage; no wallet-level check) | **NOT FIXED** | 22 Sep |
 | `/tokens` query rewrite (the cold-isolate timeout) | planned | 24 Sep |
 | Solana backfill reaching every wallet's first trade | running after deploy | ~7 days |
 | `truncated` for EVM chains (no end-of-history signal from Bitquery) | open, no date | — |
