@@ -15,6 +15,11 @@ export interface Env {
   readonly ROUTE_TIMEOUT_MS?: string;
   readonly HELIUS_WEBHOOK_SECRET?: string;
   readonly HELIUS_SOLANA_KEY?: string;
+  /** Transfer backfill providers (`jobs/transfers.ts`): Etherscan V2 for Ethereum, Bitquery for BSC/Base. */
+  readonly ETHERSCAN_KEY?: string;
+  readonly BITQUERY_KEY?: string;
+  /** Where Helius delivers; the watch-list sync registers this URL. Defaults to the Supabase receiver. */
+  readonly WEBHOOK_URL?: string;
   /** Wall-clock budget for a cron job (`jobs/*`), ms. */
   /** fomoapi bearer for the scorecard refresh (`jobs/scorecards.ts`). */
   readonly FOMOAPI_KEY?: string;
