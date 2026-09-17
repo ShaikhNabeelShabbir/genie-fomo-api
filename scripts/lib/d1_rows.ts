@@ -116,7 +116,10 @@ export const insertStatements = (
   rows: readonly (readonly Cell[])[],
   maxBytes = 90_000,
 ): string[] => {
-  const head = `insert into ${quoteId(table)} (${columnNames.map(quoteId).join(",")}) values `;
+  // `or ignore`, so a re-run over rows that already landed is a no-op rather than a UNIQUE
+  // failure: a D1 import that resets mid-file can leave rows behind (17 Sep, `transactions`),
+  // and source and target rows are identical by construction.
+  const head = `insert or ignore into ${quoteId(table)} (${columnNames.map(quoteId).join(",")}) values `;
   const headBytes = bytes(head);
   const out: string[] = [];
   let tuples: string[] = [];

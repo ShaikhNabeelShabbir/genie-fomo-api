@@ -86,7 +86,7 @@ Deno.test("convertRow: rejects what it cannot represent", () => {
 Deno.test("insertStatements: literals, quoting, NULL", () => {
   assertEquals(
     insertStatements("traders", ["handle", "n", "at"], [["o'neil", 1, null], ["b", 2.5, "x"]]),
-    [`insert into "traders" ("handle","n","at") values ('o''neil',1,NULL),('b',2.5,'x');`],
+    [`insert or ignore into "traders" ("handle","n","at") values ('o''neil',1,NULL),('b',2.5,'x');`],
   );
   assertEquals(insertStatements("t", ["a"], []), []);
 });
