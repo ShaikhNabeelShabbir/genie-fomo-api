@@ -67,3 +67,8 @@ export function shapeRows(
   }
   return { rows, skipped };
 }
+
+/** The distinct wallet keys (`transactions.address_key`, lowercased) a batch of rows touches; the webhook revalues their traders. Pure. */
+export function addressKeys(rows: readonly Row[]): string[] {
+  return [...new Set(rows.map((r) => r[2]))];
+}

@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { db, longStatement } from "../db";
 import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_history-core";
 
 /**
@@ -21,6 +21,8 @@ export interface AumHistorySummary {
   /** Hours planned but not built because the budget ran out (or the call failed). */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
+  /** Traders whose aum_live row was missing or older than an hour and got revalued after the build. */
+  readonly liveRefreshed: number;
   readonly elapsedMs: number;
 }
 
@@ -69,11 +71,15 @@ export async function runAumHistory(env: Env, budgetMs: number): Promise<AumHist
       }
     }
     if (attempted > 0 && failed === attempted) throw new Error(`aum_history: all ${attempted} chunks failed`);
+    // Catch-up for the live value: anyone no feed has revalued in the last hour (aum_live, migration 20260918030000).
+    const [live] = await longStatement(sql, 60_000, (tx) =>
+      tx<{ n: number }[]>`select aum_live_refresh(null::text[], 'build', interval '1 hour') as n`);
     return {
       traders: new Set(work.map((c) => c.handle)).size,
       hours,
       remaining: planned - hours,
       stoppedEarly,
+      liveRefreshed: Number(live?.n ?? 0),
       elapsedMs: Date.now() - started,
     };
   } finally {
