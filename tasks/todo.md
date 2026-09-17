@@ -48,6 +48,13 @@ Goal: finish every to-do that needs no user input; nothing deployed. Branch `clo
       a pipeline audit; README rewritten; 64 validation flags in `docs/API_VALIDATION_FLAGS_17_SEP.md`;
       vocabulary v8 (error codes). Worker renamed `genie-copy-trading-api`; branch renamed `cloudflare-migration`.
 
+- [x] 17 Sep evening: Hyperdrive `genie-copy-trading-db` (d63d855a…) created against the direct IPv6 host,
+      caching disabled; Worker `genie-copy-trading-api` deployed on Workers Paid (Free rejected `[limits]`);
+      `/v2/chains` and `/v2/fields` answer from production. `/v2/health` 500 until the 14 migrations land.
+      Remote migration history was EMPTY (all 44 unrecorded): repair the 30 live ones, then push 14.
+- [ ] User: `supabase migration repair`, `db push`, 4× `wrangler secret put`, Supabase `functions deploy`,
+      then acceptance diff v1 vs v2.
+
 ## Status for the morning (17 Sep 2026)
 
 Everything that needed no input is done and pushed. Total: ~30 agents over 4 overnight waves, the workflow-gap wave and wave A.
