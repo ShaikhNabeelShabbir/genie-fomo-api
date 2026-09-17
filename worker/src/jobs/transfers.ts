@@ -1,6 +1,6 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { jobSql, type Sql } from "../sql";
+import { transferKey } from "../../../supabase/functions/_shared/md5.ts";
 import { UA } from "../../../supabase/functions/_shared/settings.ts";
 import { fetchTransactions, type ProviderKeys } from "../../../supabase/functions/_shared/transactions.ts";
 import { type Row, type Wallet, chunk, dedupe, pickWebhook, toRows, webhooksOf } from "./transfers-core";
@@ -10,19 +10,19 @@ import { type Row, type Wallet, chunk, dedupe, pickWebhook, toRows, webhooksOf }
  * `backfill_transactions.mjs --pages 5 --fanout 3`, then `register_webhook.mjs`.
  *
  * Same fetch (`_shared/transactions.ts`, twin of scripts/lib/ts), same rows, same insert with
- * `transfer_key` computed in SQL exactly as the migration and webhook.ts write it. Differs only
+ * `transfer_key` computed by `_shared/md5.ts` exactly as the migration and webhook.ts write it. Differs only
  * where the platform does: wallets are taken STALEST FIRST (by the newest row a backfill wrote
  * for either of their addresses; webhook rows do not count) so a run cut short by the budget
  * resumes where the last one stopped, and a failed wallet is counted rather than fatal.
  */
 
-type Sql = postgres.Sql;
-
 const PAGES = 5;
 const FANOUT = 3;
 const LIMIT = 200;
-/** 12 binds a row; Postgres allows 65,535 a statement. */
-const INSERT_CHUNK = 5000;
+/** 13 binds a row and D1 allows 100 a statement, so a statement carries 6 rows. */
+const INSERT_ROWS = 6;
+/** Rows per transaction: 50 statements in one `db.batch`. */
+const INSERT_CHUNK = INSERT_ROWS * 50;
 /** Kept back from phase 1 so the watch-list sync (two small Helius calls) always runs. */
 const SYNC_RESERVE_MS = 30_000;
 const HELIUS_WEBHOOKS = "https://api.helius.xyz/v0/webhooks";
@@ -55,28 +55,36 @@ const selectTargets = (sql: Sql) => sql<Wallet[]>`
    where (w.evm_address is not null or w.sol_address is not null)
    order by coalesce((select max(t.ingested_at) from transactions t
                        where t.address_key in (w.evm_address_key, w.sol_address_key)
-                         and t.source <> 'helius-webhook'), 'epoch'::timestamptz) asc,
-            s.rank nulls last`;
+                         and t.source <> 'helius-webhook'), '1970-01-01T00:00:00.000Z') asc,
+            s.rank is null, s.rank`;
 
-/** One multi-row upsert; `transfer_key` is generated in SQL so it cannot drift from the migration. */
+/** `transfer_key` is the md5 of (token, direction, counterparty, amount); SQLite has none, so `_shared/md5.ts` digests it. */
+const keyed = (r: Row): unknown[] => [
+  r[0], r[1], r[2],
+  transferKey(r[6] as string | null, r[4] as string | null, r[5] as string | null, r[8] as number | null),
+  r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11],
+];
+
+/** One transaction: statements of `INSERT_ROWS` rows, all in one D1 batch. */
 async function upsert(sql: Sql, rows: readonly Row[]): Promise<void> {
-  const values = rows.map((_, i) => {
-    const b = i * 12;
-    return `($${b+1},$${b+2},$${b+3},md5(coalesce($${b+7},'')||'|'||coalesce($${b+5},'')||'|'||coalesce($${b+6},'')||'|'||coalesce($${b+9}::text,'')),$${b+4}::timestamptz,$${b+5},$${b+6},$${b+7},$${b+8},$${b+9}::numeric,$${b+10},$${b+11},$${b+12})`;
-  }).join(",");
-  await sql.unsafe(
-    `insert into transactions
-       (network_id, tx_hash, address_key, transfer_key, block_time, direction,
-        counterparty, token_key, token_symbol, amount, source, tx_type, tx_source)
-     values ${values}
-     on conflict (network_id, tx_hash, address_key, transfer_key) do update set
-       block_time = excluded.block_time, token_symbol = excluded.token_symbol,
-       amount = excluded.amount, source = excluded.source,
-       tx_type = coalesce(excluded.tx_type, transactions.tx_type),
-       tx_source = coalesce(excluded.tx_source, transactions.tx_source),
-       ingested_at = now()`,
-    rows.flat(),
-  );
+  await sql.begin((tx) => {
+    for (const part of chunk(rows.map(keyed), INSERT_ROWS)) {
+      void tx.unsafe(
+        `insert into transactions
+           (network_id, tx_hash, address_key, transfer_key, block_time, direction,
+            counterparty, token_key, token_symbol, amount, source, tx_type, tx_source)
+         values ${part.map(() => "(?,?,?,?,?,?,?,?,?,?,?,?,?)").join(",")}
+         on conflict (network_id, tx_hash, address_key, transfer_key) do update set
+           block_time = excluded.block_time, token_symbol = excluded.token_symbol,
+           amount = excluded.amount, source = excluded.source,
+           tx_type = coalesce(excluded.tx_type, transactions.tx_type),
+           tx_source = coalesce(excluded.tx_source, transactions.tx_source),
+           ingested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+        part.flat(),
+      );
+    }
+    return Promise.resolve();
+  });
 }
 
 /** Fetch one wallet on every chain and upsert its rows. Returns rows written. */
@@ -111,7 +119,7 @@ async function syncWatchlist(sql: Sql, env: Env): Promise<number> {
   // known: Helius refuses the lowercased key linked_wallets is keyed on.
   const rows = await sql<{ sol_address: string }[]>`
     select sol_address from wallets where sol_address is not null
-    union select address from linked_wallets where watch and address is not null
+    union select address from linked_wallets where watch = 1 and address is not null
     order by 1`;
   const body = JSON.stringify({
     webhookURL: target,
@@ -142,7 +150,7 @@ export async function runTransfers(env: Env, budgetMs: number): Promise<Transfer
     helius: (env.HELIUS_SOLANA_KEY ?? "").trim(),
     bitquery: (env.BITQUERY_KEY ?? "").trim(),
   };
-  const sql = db(env);
+  const sql = jobSql(env);
   try {
     const targets = await selectTargets(sql);
     let wallets = 0, rowsUpserted = 0, errored = 0, stoppedEarly = false;

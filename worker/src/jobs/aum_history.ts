@@ -1,17 +1,15 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db, longStatement } from "../db";
+import { jobSql, type Sql } from "../sql";
+import { buildAumHistory, refreshAumLive } from "./valuation.ts";
 import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_history-core";
 
 /**
  * Hourly aum_history builder (17 Sep 2026): balance history is BUILT from stored holdings
- * and prices by the SQL function `aum_history_build` (migration 20260918010000), not sampled.
- * This job only decides which (trader, hour range) to build next and calls the function per
- * chunk of <= CHUNK_HOURS, oldest first, until the wall-clock budget is spent. Same shape as
+ * and prices by `buildAumHistory` (./valuation.ts, the port of the dropped SQL function
+ * `aum_history_build`), not sampled. This job only decides which (trader, hour range) to build
+ * next and calls it per chunk of <= CHUNK_HOURS, oldest first, until the budget is spent. Same shape as
  * prices.ts: one client, a budget check per unit of work, a summary that says how far it got.
  */
-
-type Sql = postgres.Sql;
 
 export interface AumHistorySummary {
   /** Traders with at least one hour to build this run. */
@@ -28,28 +26,31 @@ export interface AumHistorySummary {
 
 /** Rule 3 in one query: every trader with a chain capture or a sampled reading, and where their history stands. */
 async function ranges(sql: Sql): Promise<TraderRange[]> {
-  const rows = await sql<{ handle: string; last_built: Date | null; first_built: Date | null; earliest: Date }[]>`
-    select t.handle,
-           (select max(hour) from aum_history a where a.handle = t.handle) as last_built,
-           (select min(hour) from aum_history a where a.handle = t.handle) as first_built,
-           least((select min(captured_at) from holdings h where h.handle = t.handle and h.source = 'chain'),
-                 (select min(at) from aum_samples s where s.handle = t.handle and s.basis in ('sampled', 'rebuilt') and s.total_usd is not null)) as earliest
-      from traders t
-     where exists (select 1 from holdings h where h.handle = t.handle and h.source = 'chain')
-        or exists (select 1 from aum_samples s where s.handle = t.handle and s.basis = 'sampled')`;
-  return rows.map((r) => ({
+  // SQLite `min(a, b)` is null when either side is, where Postgres `least` skipped nulls.
+  const rows = await sql<{ handle: string; last_built: string | null; first_built: string | null; earliest: string | null }[]>`
+    select handle, last_built, first_built, coalesce(min(held_from, read_from), held_from, read_from) as earliest
+      from (
+        select t.handle,
+               (select max(hour) from aum_history a where a.handle = t.handle) as last_built,
+               (select min(hour) from aum_history a where a.handle = t.handle) as first_built,
+               (select min(captured_at) from holdings h where h.handle = t.handle and h.source = 'chain') as held_from,
+               (select min(at) from aum_samples s where s.handle = t.handle
+                  and s.basis in ('sampled', 'rebuilt') and s.total_usd is not null) as read_from
+          from traders t
+         where exists (select 1 from holdings h where h.handle = t.handle and h.source = 'chain')
+            or exists (select 1 from aum_samples s where s.handle = t.handle and s.basis = 'sampled')
+      )`;
+  // No earliest source hour means nothing to build; without the guard the planner would backfill from 1970.
+  return rows.filter((r) => r.earliest !== null).map((r) => ({
     handle: r.handle,
     lastBuilt: r.last_built ? new Date(r.last_built) : null,
     firstBuilt: r.first_built ? new Date(r.first_built) : null,
-    earliest: new Date(r.earliest),
+    earliest: new Date(r.earliest!),
   }));
 }
 
-async function build(sql: Sql, c: Chunk): Promise<number> {
-  const [row] = await sql<{ n: number }[]>`
-    select aum_history_build(${c.handle}, ${c.from.toISOString()}::timestamptz, ${c.to.toISOString()}::timestamptz) as n`;
-  return Number(row?.n ?? 0);
-}
+const build = (sql: Sql, c: Chunk): Promise<number> =>
+  buildAumHistory(sql, c.handle, c.from.toISOString(), c.to.toISOString());
 
 /**
  * One pass within `budgetMs`. Throws only when work was planned and none of it could be
@@ -60,7 +61,7 @@ export interface AumHistoryOptions { readonly handles?: readonly string[]; reado
 
 export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistoryOptions = {}): Promise<AumHistorySummary> {
   const started = Date.now();
-  const sql = db(env);
+  const sql = jobSql(env);
   try {
     let traders = await ranges(sql);
     if (opts.handles?.length && opts.from) {
@@ -85,16 +86,16 @@ export async function runAumHistory(env: Env, budgetMs: number, opts: AumHistory
     // Catch-up for the live value: anyone no feed has revalued in the last hour (aum_live, migration 20260918030000).
     // Stale live values in slices of 40, each its own statement, so no single call holds the
     // database for minutes (the whole-roster form did, 17 Sep 08:5x UTC).
+    const anHourAgo = new Date(started - 3_600_000).toISOString();
     const stale = (await sql<{ handle: string }[]>`
       select t.handle from traders t
       left join aum_live l on l.handle = t.handle
-      where (l.at is null or l.at < now() - interval '1 hour')
+      where (l.at is null or l.at < ${anHourAgo})
         and exists (select 1 from wallets w where w.handle = t.handle)
-      order by l.at nulls first limit 400`).map((r) => r.handle);
+      order by l.at limit 400`).map((r) => r.handle);
     let liveN = 0;
     for (let i = 0; i < stale.length && Date.now() - started < budgetMs; i += 40) {
-      const [r] = await sql<{ n: number }[]>`select aum_live_refresh(${stale.slice(i, i + 40)}::text[], 'build') as n`;
-      liveN += Number(r?.n ?? 0);
+      liveN += await refreshAumLive(sql, stale.slice(i, i + 40), "build");
     }
     const live = { n: liveN };
     return {

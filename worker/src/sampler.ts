@@ -1,6 +1,6 @@
-import type postgres from "postgres";
 import type { Env } from "./env";
-import { db } from "./db";
+import { jobSql, type Sql } from "./sql";
+import { chunk } from "./jobs/directory-core.ts";
 import { SOLANA_NETWORK_ID, solanaBalances } from "../../supabase/functions/_shared/chain_reads.ts";
 import { evmBalancesBitquery } from "../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS } from "../../supabase/functions/_shared/settings.ts";
@@ -15,10 +15,16 @@ import { concentrationSuspect, decideTotal, value } from "../../supabase/functio
  * instead of `Deno.serve`. The chain reads and the valuation rules are imported, not copied.
  */
 
-type Sql = postgres.Sql;
-
 /** Nobody gets to ask for the whole roster in one call. See the header. */
 const MAX_SLICE = 25;
+
+/* D1 binds at most 100 parameters a statement, so every list is chunked to stay under 90. */
+/** (network_id, token_key) pairs per price read: 2 binds each. */
+const PAIR_CHUNK = 45;
+/** Handles per roster read: the widest of them repeats the list three times. */
+const HANDLE_CHUNK = 25;
+/** Chains per aum_chain_samples write: 7 columns a row. */
+const CHAIN_WRITE_CHUNK = 12;
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body, null, 2), { status, headers: { "Content-Type": "application/json" } });
@@ -39,23 +45,30 @@ type Settled = {
 async function pricesFor(sql: Sql, pairs: Position[]): Promise<Map<string, { px: number; supply: number | null }>> {
   const m = new Map<string, { px: number; supply: number | null }>();
   if (!pairs.length) return m;
-  const rows = await sql`
-    select u.n as network_id, u.k as token_key,
-           coalesce(qa.pegged_usd, ti.price_usd, tp.usd)::float8 as px,
-           tk.total_supply::float8 as supply
-    from unnest(${pairs.map((p) => p.network_id)}::bigint[],
-                ${pairs.map((p) => p.token_key)}::text[]) as u(n, k)
-    left join quote_assets qa on qa.network_id = u.n and qa.token_key = u.k
-    left join token_info ti on ti.network_id = u.n and ti.token_key = u.k and ti.price_usd is not null
-    left join lateral (
-      select usd from token_prices p
-      where p.network_id = u.n and p.token_key = u.k order by day desc limit 1
-    ) tp on true
-    left join tokens tk on tk.network_id = u.n and tk.token_key = u.k`;
-  for (const r of rows) {
-    if (r.px !== null) {
-      m.set(`${r.network_id}:${r.token_key}`,
-            { px: Number(r.px), supply: r.supply === null ? null : Number(r.supply) });
+  /* One row per distinct pair: the list is spelled out as `values`, and the daily close the
+     Postgres `lateral` picked is a correlated subquery. */
+  const distinct = new Map<string, [number, string]>();
+  for (const p of pairs) distinct.set(`${p.network_id}:${p.token_key}`, [p.network_id, p.token_key]);
+  for (const part of chunk([...distinct.values()], PAIR_CHUNK)) {
+    const rows = await sql.unsafe(
+      `with u(n, k) as (values ${part.map(() => "(?,?)").join(",")})
+       select u.n as network_id, u.k as token_key,
+              coalesce(qa.pegged_usd, ti.price_usd,
+                       (select p.usd from token_prices p
+                         where p.network_id = u.n and p.token_key = u.k
+                         order by p.day desc limit 1)) as px,
+              tk.total_supply as supply
+       from u
+       left join quote_assets qa on qa.network_id = u.n and qa.token_key = u.k
+       left join token_info ti on ti.network_id = u.n and ti.token_key = u.k and ti.price_usd is not null
+       left join tokens tk on tk.network_id = u.n and tk.token_key = u.k`,
+      part.flat(),
+    );
+    for (const r of rows) {
+      if (r.px !== null) {
+        m.set(`${r.network_id}:${r.token_key}`,
+              { px: Number(r.px), supply: r.supply === null ? null : Number(r.supply) });
+      }
     }
   }
   return m;
@@ -135,14 +148,16 @@ async function write(
   const covered = [...reads].filter(([, r]) => r.nonce != null);
   if (covered.length && t.evm_address) {
     const addr = t.evm_address.toLowerCase();
-    await sql`
-      insert into chain_coverage (handle, network_id, address_key, chain_nonce, rows_held, read_at)
-      select ${handle}, u.n, ${addr}, u.c,
-             (select count(*) from transactions x where x.address_key = ${addr} and x.network_id = u.n), now()
-      from unnest(${covered.map(([n]) => n)}::bigint[], ${covered.map(([, r]) => r.nonce ?? null)}::bigint[]) as u(n, c)
-      on conflict (handle, network_id) do update set
-        address_key = excluded.address_key, chain_nonce = excluded.chain_nonce,
-        rows_held = excluded.rows_held, read_at = excluded.read_at`;
+    await sql.unsafe(
+      `insert into chain_coverage (handle, network_id, address_key, chain_nonce, rows_held, read_at)
+       values ${covered.map(() =>
+        "(?,?,?,?,(select count(*) from transactions x where x.address_key = ? and x.network_id = ?)," +
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now'))").join(",")}
+       on conflict (handle, network_id) do update set
+         address_key = excluded.address_key, chain_nonce = excluded.chain_nonce,
+         rows_held = excluded.rows_held, read_at = excluded.read_at`,
+      covered.flatMap(([n, r]) => [handle, n, addr, r.nonce ?? null, addr, n]),
+    );
   }
   /* Share of his POSITIONS we could value — what makes a thin line legible as thin. */
   const valueShare = s.total > 0 ? Number((s.priced / s.total).toFixed(4)) : null;
@@ -160,37 +175,48 @@ async function write(
       value_share = excluded.value_share, tier = excluded.tier,
       chains_answered = excluded.chains_answered,
       chains_expected = excluded.chains_expected,
-      sampled_at = now()`;
+      sampled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`;
 
   if (!reads.size) return;
   const nets = [...reads.keys()];
   const tally = (net: number) => s.perChain.get(net) ?? null;
-  await sql`
-    insert into aum_chain_samples (handle, at, basis, network_id, total_usd, priced_share, reason)
-    select ${handle}, ${at}, 'sampled', u.n, u.v, u.s, u.r
-    from unnest(${nets}::bigint[],
-                ${nets.map((n) => {
-                  const c = tally(n);
-                  /* Not asked: null. Held nothing: a true zero. Priced something: the sum. */
-                  if (!c) return null;
-                  if (c.total === 0) return 0;
-                  return c.priced > 0 && s.reason !== "price_suspect" ? c.usd : null;
-                })}::numeric[],
-                ${nets.map((n) => {
-                  const c = tally(n);
-                  return !c || c.total === 0 ? null : Number((c.priced / c.total).toFixed(4));
-                })}::numeric[],
-                ${nets.map((n) => {
-                  const c = tally(n);
-                  if (!c) return reads.get(n)!.reason;
-                  if (c.total === 0) return null;          // read, empty — not a fault
-                  if (c.priced === 0) return "no_prices";
-                  return s.reason === "price_suspect" ? "price_suspect" : null;
-                })}::text[]
-               ) as u(n, v, s, r)
-    on conflict (handle, at, basis, network_id) do update set
-      total_usd = excluded.total_usd, priced_share = excluded.priced_share,
-      reason = excluded.reason`;
+  const row = (n: number): unknown[] => {
+    const c = tally(n);
+    /* Not asked: null. Held nothing: a true zero. Priced something: the sum. */
+    const usd = !c ? null : c.total === 0 ? 0 : c.priced > 0 && s.reason !== "price_suspect" ? c.usd : null;
+    const share = !c || c.total === 0 ? null : Number((c.priced / c.total).toFixed(4));
+    const reason = !c
+      ? reads.get(n)!.reason
+      : c.total === 0
+      ? null // read, empty — not a fault
+      : c.priced === 0
+      ? "no_prices"
+      : s.reason === "price_suspect" ? "price_suspect" : null;
+    return [handle, at, "sampled", n, usd, share, reason];
+  };
+  for (const part of chunk(nets, CHAIN_WRITE_CHUNK)) {
+    await sql.unsafe(
+      `insert into aum_chain_samples (handle, at, basis, network_id, total_usd, priced_share, reason)
+       values ${part.map(() => "(?,?,?,?,?,?,?)").join(",")}
+       on conflict (handle, at, basis, network_id) do update set
+         total_usd = excluded.total_usd, priced_share = excluded.priced_share,
+         reason = excluded.reason`,
+      part.flatMap(row),
+    );
+  }
+}
+
+/** The named-handles roster, in chunks because the list is bound twice a statement. */
+async function namedTargets(sql: Sql, named: readonly string[]): Promise<Record<string, unknown>[]> {
+  const out: Record<string, unknown>[] = [];
+  for (const part of chunk(named, HANDLE_CHUNK)) {
+    out.push(...await sql`
+      select t.handle, w.sol_address, w.evm_address
+      from traders t join wallets w on w.handle = t.handle
+      where (w.sol_address is not null or w.evm_address is not null)
+        and (lower(t.handle) in (${part}) or lower(t.display_handle) in (${part}))`);
+  }
+  return out;
 }
 
 /**
@@ -219,37 +245,34 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
   const limit = Math.max(1, Math.min(MAX_SLICE, Number.isFinite(asked) ? asked : 10));
 
   const started = Date.now();
-  const sql = db(env);
+  const sql = jobSql(env);
 
   try {
     /** WHO TO SAMPLE: least-recently-sampled first. See docs/DECISIONS.md#d193 */
-    const targets = one
-      ? await sql`
+    const targets: Record<string, unknown>[] = one
+      ? [...await sql`
           select t.handle, w.sol_address, w.evm_address
           from traders t join wallets w on w.handle = t.handle
           where (w.sol_address is not null or w.evm_address is not null)
-            and (lower(t.handle) = ${one} or lower(t.display_handle) = ${one})`
+            and (lower(t.handle) = ${one} or lower(t.display_handle) = ${one})`]
       : named
-      ? await sql`
-          select t.handle, w.sol_address, w.evm_address
-          from traders t join wallets w on w.handle = t.handle
-          where (w.sol_address is not null or w.evm_address is not null)
-            and (lower(t.handle) = any(${named}) or lower(t.display_handle) = any(${named}))`
-      : await sql`
-          select t.handle, w.sol_address, w.evm_address
+      ? await namedTargets(sql, named)
+      /* The Postgres `left join lateral … on true` is a correlated subquery; SQLite `asc`
+         already sorts NULL first, which is what `nulls first` asked for. */
+      : [...await sql`
+          select t.handle, w.sol_address, w.evm_address,
+                 (select max(s.at) from aum_samples s
+                   where s.handle = t.handle and s.basis = 'sampled') as last_at
           from traders t
           join wallets w on w.handle = t.handle
-          left join lateral (
-            select max(at) as last_at from aum_samples s
-            where s.handle = t.handle and s.basis = 'sampled') s on true
           where w.sol_address is not null or w.evm_address is not null
-          order by s.last_at asc nulls first, t.handle
-          limit ${limit}`;
+          order by last_at asc, t.handle
+          limit ${limit}`];
 
     if (!targets.length) return { sampled: 0, refused: 0, traders: [], note: "no trader matched" };
 
     const chains = await sql`
-      select network_id::bigint, name from chains order by network_id`;
+      select network_id, name from chains order by network_id`;
 
     const handles = targets.map((t) => String(t.handle));
 
@@ -267,16 +290,18 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
      * Twin of the `trader_chain_history` view (migration 20260917230000); change both.
      */
     const knownByHandle = new Map<string, Set<number>>();
-    for (const r of await sql`
-      select s.handle, s.network_id::bigint
-      from (select handle, network_id from wallet_chain_presence where handle = any(${handles})
-            union select handle, network_id from holdings_current
-                  where handle = any(${handles}) and human_amount > 0
-            union select handle, network_id from aum_chain_samples
-                  where handle = any(${handles}) and total_usd is not null) s
-      join chains using (network_id)`) {
-      const h = String(r.handle);
-      knownByHandle.set(h, (knownByHandle.get(h) ?? new Set<number>()).add(Number(r.network_id)));
+    for (const part of chunk(handles, HANDLE_CHUNK)) {
+      for (const r of await sql`
+        select s.handle, s.network_id
+        from (select handle, network_id from wallet_chain_presence where handle in (${part})
+              union select handle, network_id from holdings_current
+                    where handle in (${part}) and human_amount > 0
+              union select handle, network_id from aum_chain_samples
+                    where handle in (${part}) and total_usd is not null) s
+        join chains c on c.network_id = s.network_id`) {
+        const h = String(r.handle);
+        knownByHandle.set(h, (knownByHandle.get(h) ?? new Set<number>()).add(Number(r.network_id)));
+      }
     }
     const chainById = new Map<number, Chain>(
       (chains as unknown as Chain[]).map((c) => [Number(c.network_id), c]));
@@ -344,13 +369,13 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
 
     /** How much of the roster is still waiting, so a scheduler can pace itself. */
     const [pending] = await sql`
-      select count(*)::int as n from traders t
-      join wallets w on w.handle = t.handle
-      left join lateral (
-        select max(at) as last_at from aum_samples s
-        where s.handle = t.handle and s.basis = 'sampled') s on true
-      where (w.sol_address is not null or w.evm_address is not null)
-        and (s.last_at is null or s.last_at < ${at})`;
+      select count(*) as n from (
+        select (select max(s.at) from aum_samples s
+                 where s.handle = t.handle and s.basis = 'sampled') as last_at
+        from traders t
+        join wallets w on w.handle = t.handle
+        where w.sol_address is not null or w.evm_address is not null
+      ) where last_at is null or last_at < ${at}`;
 
     return {
       at: at.toISOString(),
@@ -372,8 +397,8 @@ export async function sampleSlice(env: Env, body: Record<string, unknown>): Prom
 /** `POST /sample`: the manual door, secret-checked. The cron calls `sampleSlice` directly (§7). */
 export async function sample(req: Request, env: Env): Promise<Response> {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
-  if (!env.HYPERDRIVE) {
-    return json({ error: "not_configured", detail: "HYPERDRIVE binding is parked" }, 503);
+  if (!env.DB) {
+    return json({ error: "not_configured", detail: "D1 binding DB is parked" }, 503);
   }
   /* No secret set means misconfigured, not open. Refusing is the safe read of that. */
   const SECRET = (env.AUM_SAMPLE_SECRET ?? "").trim();

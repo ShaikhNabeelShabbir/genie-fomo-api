@@ -1,7 +1,7 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { jobSql, type Sql } from "../sql";
 import type { Load } from "./scorecards-core";
+import { chunk } from "./directory-core";
 import {
   CHAINS, EVM_CHAINS, type DiscoveredWallet, type Position, fold, group, newTraders, walletFrom,
 } from "./gmgn-core";
@@ -16,7 +16,6 @@ import {
  * script's selector reads `trades.ingested_at`, which an empty fetch never moves).
  */
 
-type Sql = postgres.Sql;
 interface Target { readonly handle: string; readonly sol_address: string | null; readonly evm_address: string | null }
 
 const API = "https://openapi.gmgn.ai";
@@ -28,6 +27,10 @@ const LIST_GAP_MS = 900;
 const ACTIVITY_GAP_MS = 320;
 const FETCH_TIMEOUT_MS = 30_000;
 const TRIES = 4;
+/** Rows per multi-row insert: the widest is `trades` at 14 columns, so 6 x 14 = 84 bound values (D1 allows 100). */
+const WRITE_CHUNK = 6;
+/** `-72 hours` as a SQLite date modifier. */
+const STALE_AGO = `-${STALE_HOURS} hours`;
 
 export interface GmgnSummary {
   /** Distinct people the two GMGN lists returned this run. */
@@ -92,26 +95,34 @@ async function discover(key: string, outOfTime: () => boolean): Promise<Discover
   return [...found.values()];
 }
 
-/** Phase 1: the script's insert into traders then wallets, one transaction. Returns rows inserted. */
+/** Phase 1: the script's insert into traders, then the wallets that reference them. Returns rows inserted. */
 async function loadTraders(sql: Sql, key: string, outOfTime: () => boolean): Promise<{ people: number; inserted: number }> {
   const people = group(await discover(key, outOfTime));
   const existing = new Set((await sql<{ handle: string }[]>`select handle from traders`).map((r) => r.handle));
   const rows = newTraders(people, existing);
   if (!rows.length) return { people: people.length, inserted: 0 };
-  const col = <T>(f: (r: (typeof rows)[number]) => T): T[] => rows.map(f);
+  // SQLite has no unnest: explicit `values` rows, chunked to stay inside D1's 100 parameters.
+  // `traders.id` has no default here, so the Worker mints it.
   const inserted = await sql.begin(async (tx) => {
-    const r = await tx`
-      insert into traders (handle, display_handle, name, avatar, bio, twitter, source)
-      select *, 'gmgn' from unnest(${col((t) => t.handle)}::text[], ${col((t) => t.display_handle)}::text[], ${col((t) => t.name)}::text[],
-                                  ${col((t) => t.avatar)}::text[], ${col((t) => t.bio)}::text[], ${col((t) => t.twitter)}::text[])
-      on conflict (handle) do nothing`;
-    await tx`
-      insert into wallets (handle, sol_address, sol_source, evm_address, evm_source)
-      select h, s, case when s is not null then 'gmgn' end,
-                e, case when e is not null then 'gmgn' end
-      from unnest(${col((t) => t.handle)}::text[], ${col((t) => t.sol)}::text[], ${col((t) => t.evm)}::text[]) as t(h, s, e)
-      on conflict (handle) do nothing`;
-    return r.count;
+    let n = 0;
+    for (const part of chunk(rows, WRITE_CHUNK)) {
+      n += (await tx.unsafe(
+        `insert into traders (handle, display_handle, name, avatar, bio, twitter, id, source)
+         values ${part.map(() => "(?,?,?,?,?,?,?,'gmgn')").join(",")}
+         on conflict (handle) do nothing`,
+        part.flatMap((t) => [t.handle, t.display_handle, t.name, t.avatar, t.bio, t.twitter, crypto.randomUUID()]),
+      )).count;
+    }
+    // Wallets after the traders they reference: each await above flushed its batch.
+    for (const part of chunk(rows, WRITE_CHUNK)) {
+      await tx.unsafe(
+        `insert into wallets (handle, sol_address, sol_source, evm_address, evm_source)
+         values ${part.map(() => "(?,?,?,?,?)").join(",")}
+         on conflict (handle) do nothing`,
+        part.flatMap((t) => [t.handle, t.sol, t.sol !== null ? "gmgn" : null, t.evm, t.evm !== null ? "gmgn" : null]),
+      );
+    }
+    return n;
   });
   return { people: people.length, inserted };
 }
@@ -123,12 +134,14 @@ async function loadTraders(sql: Sql, key: string, outOfTime: () => boolean): Pro
 const selectTargets = (sql: Sql) => sql<Target[]>`
   select handle, sol_address, evm_address from (
     select t.handle, w.sol_address, w.evm_address,
-           greatest((select max(tr.ingested_at) from trades tr where tr.handle = t.handle),
-                    (select max(l.attempted_at) from trade_loads l where l.handle = t.handle and l.outcome = 'loaded'),
-                    'epoch'::timestamptz) as fresh
+           -- SQLite's scalar max() answers NULL if any argument is, so '' stands in for the
+           -- 'epoch' sentinel: it sorts and compares below every ISO timestamp, as epoch did.
+           max(coalesce((select max(tr.ingested_at) from trades tr where tr.handle = t.handle), ''),
+               coalesce((select max(l.attempted_at) from trade_loads l
+                          where l.handle = t.handle and l.outcome = 'loaded'), '')) as fresh
       from traders t join wallets w on w.handle = t.handle
      where t.source = 'gmgn') s
-   where fresh < now() - (${STALE_HOURS} * interval '1 hour')
+   where fresh < strftime('%Y-%m-%dT%H:%M:%fZ','now',${STALE_AGO})
    order by fresh, handle`;
 
 /** One wallet's activity on one chain, up to PAGES pages. Throws when the first page fails. */
@@ -167,36 +180,45 @@ async function positions(key: string, t: Target, outOfTime: () => boolean): Prom
   return { rows, fetched, failed, lastError };
 }
 
-/** The script's tokens-then-trades write, one transaction. */
+/** The script's tokens-then-trades write; D1 batches each chunk, so a chunk lands whole or not at all. */
 async function writeTrades(sql: Sql, handle: string, rows: readonly Position[], capturedAt: Date): Promise<void> {
-  const col = <T>(f: (r: Position) => T): T[] => rows.map(f);
+  const at = capturedAt.toISOString();
   await sql.begin(async (tx) => {
     // tokens first: `holdings` has an FK to it and the scorecard reads total_supply from it.
-    await tx`
-      insert into tokens (network_id, address, symbol, total_supply, supply_source, supply_read_at)
-      select * from unnest(${col((r) => r.network_id)}::bigint[], ${col((r) => r.token_address)}::text[], ${col((r) => r.token_symbol)}::text[],
-                          ${col((r) => r.total_supply)}::numeric[], ${col((r) => (r.total_supply !== null ? "gmgn_activity" : null))}::text[],
-                          ${col((r) => (r.total_supply !== null ? capturedAt : null))}::timestamptz[])
-      on conflict (network_id, token_key) do update
-        set total_supply = coalesce(tokens.total_supply, excluded.total_supply),
-            supply_source = coalesce(tokens.supply_source, excluded.supply_source),
-            supply_read_at = coalesce(tokens.supply_read_at, excluded.supply_read_at),
-            symbol = coalesce(tokens.symbol, excluded.symbol)`;
-    await tx`
-      insert into trades (trade_id, handle, network_id, token_address, token_key, token_symbol,
-                          status, amount, avg_entry_price, avg_exit_price, realized_pnl_usd,
-                          opened_at, closed_at, captured_at)
-      select 'gmgn:'||${handle}||':'||n||':'||k, ${handle}, n, a, k, s, st, am, ep, xp, pn, op, cl, ${capturedAt}
-      from unnest(${col((r) => r.network_id)}::bigint[], ${col((r) => r.token_address)}::text[], ${col((r) => r.token_key)}::text[],
-                  ${col((r) => r.token_symbol)}::text[], ${col((r) => r.status)}::text[], ${col((r) => r.amount)}::numeric[],
-                  ${col((r) => r.avg_entry_price)}::numeric[], ${col((r) => r.avg_exit_price)}::numeric[], ${col((r) => r.realized_pnl_usd)}::numeric[],
-                  ${col((r) => r.opened_at)}::timestamptz[], ${col((r) => r.closed_at)}::timestamptz[])
-           as u(n, a, k, s, st, am, ep, xp, pn, op, cl)
-      on conflict (trade_id) do update set
-        status = excluded.status, amount = excluded.amount,
-        avg_entry_price = excluded.avg_entry_price, avg_exit_price = excluded.avg_exit_price,
-        realized_pnl_usd = excluded.realized_pnl_usd, opened_at = excluded.opened_at,
-        closed_at = excluded.closed_at, captured_at = excluded.captured_at`;
+    // token_key is a plain column in D1, so the lowered address is written explicitly.
+    for (const part of chunk(rows, WRITE_CHUNK)) {
+      await tx.unsafe(
+        `insert into tokens (network_id, address, token_key, symbol, total_supply, supply_source, supply_read_at)
+         values ${part.map(() => "(?,?,?,?,?,?,?)").join(",")}
+         on conflict (network_id, token_key) do update
+           set total_supply = coalesce(tokens.total_supply, excluded.total_supply),
+               supply_source = coalesce(tokens.supply_source, excluded.supply_source),
+               supply_read_at = coalesce(tokens.supply_read_at, excluded.supply_read_at),
+               symbol = coalesce(tokens.symbol, excluded.symbol)`,
+        part.flatMap((r) => [
+          r.network_id, r.token_address, r.token_key, r.token_symbol, r.total_supply,
+          r.total_supply !== null ? "gmgn_activity" : null, r.total_supply !== null ? at : null,
+        ]),
+      );
+    }
+    for (const part of chunk(rows, WRITE_CHUNK)) {
+      await tx.unsafe(
+        `insert into trades (trade_id, handle, network_id, token_address, token_key, token_symbol,
+                             status, amount, avg_entry_price, avg_exit_price, realized_pnl_usd,
+                             opened_at, closed_at, captured_at)
+         values ${part.map(() => "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").join(",")}
+         on conflict (trade_id) do update set
+           status = excluded.status, amount = excluded.amount,
+           avg_entry_price = excluded.avg_entry_price, avg_exit_price = excluded.avg_exit_price,
+           realized_pnl_usd = excluded.realized_pnl_usd, opened_at = excluded.opened_at,
+           closed_at = excluded.closed_at, captured_at = excluded.captured_at`,
+        part.flatMap((r) => [
+          `gmgn:${handle}:${r.network_id}:${r.token_key}`, handle, r.network_id, r.token_address,
+          r.token_key, r.token_symbol, r.status, r.amount, r.avg_entry_price, r.avg_exit_price,
+          r.realized_pnl_usd, r.opened_at, r.closed_at, at,
+        ]),
+      );
+    }
   });
 }
 
@@ -206,7 +228,7 @@ const writeStats = (sql: Sql, capturedAt: Date) => sql`
   select tr.handle, ${capturedAt},
          sum(tr.realized_pnl_usd),
          sum(coalesce(tr.amount * tr.avg_entry_price, 0)),
-         count(*)::int
+         count(*)
   from trades tr join traders t on t.handle = tr.handle
   where t.source = 'gmgn'
   group by tr.handle
@@ -226,7 +248,7 @@ export async function runGmgn(env: Env, budgetMs: number): Promise<GmgnSummary> 
   if (!key) throw new Error("GMGN_API_KEY is not set; refusing to run the GMGN load");
   const started = Date.now();
   const outOfTime = () => Date.now() - started > budgetMs;
-  const sql = db(env);
+  const sql = jobSql(env);
   try {
     const phase1 = await loadTraders(sql, key, outOfTime);
     const targets = await selectTargets(sql);

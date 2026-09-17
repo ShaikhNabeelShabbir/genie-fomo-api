@@ -1,10 +1,10 @@
-import type postgres from "postgres";
 import type { Env } from "../env";
-import { db } from "../db";
+import { jobSql, type Sql } from "../sql";
 import { SOLANA_NETWORK_ID, throttled } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
 import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaDecodeEnhanced, toRow } from "./swaps-core";
+import { chunk } from "./directory-core";
 
 /**
  * A4, the wallet's OWN two-sided swaps, written to `wallet_swaps`. Phase 1 is the EVM chains
@@ -21,9 +21,9 @@ import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaD
  * the last 30 days for rows whose money leg got a daily close after they were written.
  */
 
-type Sql = postgres.Sql;
 interface Chain { readonly network_id: number; readonly name: string }
-interface Cand { readonly tx_hash: string; readonly address_key: string; readonly block_time: Date }
+/** `block_time` is the ISO-8601 UTC text D1 stores. */
+interface Cand { readonly tx_hash: string; readonly address_key: string; readonly block_time: string }
 interface Priced { readonly cand: Cand; readonly row: SwapRow }
 interface Ctx {
   readonly sql: Sql;
@@ -61,84 +61,117 @@ const EVM_LIMIT = 2000;
 const TRADES_PER_TX = 10;
 /** Rows the re-price pass considers; older rows keep whatever they were written with. */
 const REPRICE_DAYS = 30;
+/** Raw transfer legs a candidate page reads; the walk stops once `limit` distinct pairs are held. */
+const CAND_PAGE = 2000;
+/** Rows per `wallet_swaps` insert: 10 columns x 9 rows = 90 of D1's 100 bind parameters. */
+const SWAP_WRITE_CHUNK = 9;
+/** Rows per `wallet_swaps_checked` insert: 3 columns x 30 rows = 90 parameters. */
+const CHECKED_WRITE_CHUNK = 30;
 
 /** Quote assets, keyed `network_id:token_key`, with the three prices `priceQuote` chooses from. */
 async function loadQuotes(sql: Sql): Promise<Map<string, Quote>> {
-  const rows = await sql<{ network_id: string; token_key: string; symbol: string; pegged_usd: string | null; closes: Record<string, number>; market_price: string | null }[]>`
+  const rows = await sql<{ network_id: number; token_key: string; symbol: string; pegged_usd: number | null; closes: string; market_price: number | null }[]>`
     select q.network_id, q.token_key, q.symbol, q.pegged_usd,
-           (select coalesce(jsonb_object_agg(p.day::text, p.usd), '{}'::jsonb) from token_prices p
+           (select coalesce(json_group_object(p.day, p.usd), '{}') from token_prices p
              where p.network_id = q.network_id and p.token_key = q.token_key and q.pegged_usd is null) as closes,
            (select h.price from holdings_current h
              where h.network_id = q.network_id and h.token_key = q.token_key
                and h.price is not null and h.price_source is not null
                and h.price_source <> 'fomo_reported_entry'
-             order by h.priced_at desc nulls last limit 1) as market_price
+             order by h.priced_at desc limit 1) as market_price
     from quote_assets q`;
   /* A stablecoin's peg is the honest price; a floating quote takes its daily close, else the portfolio's market price; unpriced still resolves. */
-  return new Map(rows.map((q) => [`${Number(q.network_id)}:${q.token_key}`, {
+  return new Map(rows.map((q) => [`${q.network_id}:${q.token_key}`, {
     symbol: q.symbol,
-    pegged: q.pegged_usd === null ? null : Number(q.pegged_usd),
-    closes: new Map(Object.entries(q.closes).map(([day, usd]) => [day, Number(usd)])),
-    market: q.market_price === null ? null : Number(q.market_price),
+    pegged: q.pegged_usd,
+    closes: new Map(Object.entries(JSON.parse(q.closes) as Record<string, number>)),
+    market: q.market_price,
   }]));
 }
 
 /** Each chain's wrapped native: the quote asset a native leg is recorded against. */
 async function loadNativeQuotes(sql: Sql, quotes: ReadonlyMap<string, Quote>): Promise<Map<number, NativeQuote>> {
-  const rows = await sql<{ network_id: string; native_symbol: string; token_key: string }[]>`
+  const rows = await sql<{ network_id: number; native_symbol: string; token_key: string }[]>`
     select c.network_id, c.native_symbol, q.token_key
     from chains c
     join quote_assets q on q.network_id = c.network_id
      and upper(q.symbol) = 'W' || upper(c.native_symbol)`;
   const out = new Map<number, NativeQuote>();
   for (const r of rows) {
-    const quote = quotes.get(`${Number(r.network_id)}:${r.token_key}`);
-    if (quote) out.set(Number(r.network_id), { key: r.token_key, quote });
+    const quote = quotes.get(`${r.network_id}:${r.token_key}`);
+    if (quote) out.set(r.network_id, { key: r.token_key, quote });
   }
   return out;
 }
 
 /**
  * The newest `limit` transactions on this chain not yet asked about, one per (tx, wallet). On
- * Solana only rows Helius tagged SWAP are candidates; EVM rows carry no type.
+ * Solana only rows Helius tagged SWAP are candidates; EVM rows carry no type. D1 runs one
+ * statement at a time with no room for an aggregate over the whole feed, so the group-by became
+ * newest-first pages of raw transfer legs deduped here: `block_time` is the cursor (every leg of
+ * a transaction carries its block's time, so a page that adds no new pair ends the walk) and a
+ * leg with no time is skipped, since it can neither be ordered nor resume the walk.
  */
-const candidates = (sql: Sql, net: number, limit: number) => sql<Cand[]>`
-  select t.tx_hash, t.address_key, min(t.block_time) as block_time
-  from transactions t
-  where t.network_id = ${net}
-    ${net === SOLANA_NETWORK_ID ? sql`and t.tx_type = 'SWAP'` : sql``}
-    and not exists (
-      select 1 from wallet_swaps_checked s
-      where s.network_id = ${net} and s.tx_hash = t.tx_hash and s.address_key = t.address_key)
-  group by t.tx_hash, t.address_key
-  order by min(t.block_time) desc
-  limit ${limit}`;
+async function candidates(sql: Sql, net: number, limit: number): Promise<Cand[]> {
+  const out = new Map<string, Cand>();
+  let cursor: string | null = null;
+  while (out.size < limit) {
+    const page: Cand[] = await sql<Cand[]>`
+      select t.tx_hash, t.address_key, t.block_time
+      from transactions t
+      where t.network_id = ${net} and t.block_time is not null
+        ${net === SOLANA_NETWORK_ID ? sql`and t.tx_type = 'SWAP'` : sql``}
+        ${cursor === null ? sql`` : sql`and t.block_time <= ${cursor}`}
+        and not exists (
+          select 1 from wallet_swaps_checked s
+          where s.network_id = ${net} and s.tx_hash = t.tx_hash and s.address_key = t.address_key)
+      order by t.block_time desc
+      limit ${CAND_PAGE}`;
+    const before = out.size;
+    for (const r of page) {
+      const key = `${r.tx_hash}|${r.address_key}`;
+      const held = out.get(key);
+      /* `min(t.block_time)` of the group the SQL took: the earliest leg wins. */
+      if (!held || r.block_time < held.block_time) out.set(key, r);
+      if (out.size >= limit) break;
+    }
+    if (page.length < CAND_PAGE || out.size === before) break;
+    cursor = page[page.length - 1].block_time;
+  }
+  return [...out.values()].slice(0, limit);
+}
 
 async function writeRows(sql: Sql, net: number, out: readonly Priced[]): Promise<void> {
-  const col = <T>(f: (p: Priced) => T): T[] => out.map(f);
-  await sql`
-    insert into wallet_swaps
-      (network_id, tx_hash, address_key, block_time, token_key, token_delta,
-       quote_key, quote_delta, quote_usd, quote_source, resolved_at)
-    select ${net}, u.tx, u.addr, u.at::timestamptz, u.tk, u.td::numeric,
-           u.qk, u.qd::numeric, nullif(u.qu,'')::numeric, nullif(u.qs,''), now()
-    from unnest(${col((p) => p.cand.tx_hash)}::text[], ${col((p) => p.cand.address_key)}::text[],
-                ${col((p) => new Date(p.cand.block_time).toISOString())}::text[], ${col((p) => p.row.tokenKey)}::text[],
-                ${col((p) => String(p.row.tokenDelta))}::text[], ${col((p) => p.row.quoteKey)}::text[],
-                ${col((p) => String(p.row.quoteDelta))}::text[],
-                ${col((p) => p.row.quoteUsd === null ? "" : String(p.row.quoteUsd))}::text[],
-                ${col((p) => p.row.quoteSource ?? "")}::text[])
-         as u(tx, addr, at, tk, td, qk, qd, qu, qs)
-    on conflict do nothing`;
+  if (!out.length) return;
+  await sql.begin(async (tx) => {
+    /* Issued with no await between them, so the shim flushes the whole set as ONE atomic d1 batch. */
+    await Promise.all(chunk(out, SWAP_WRITE_CHUNK).map((part) =>
+      tx.unsafe(
+        `insert into wallet_swaps
+           (network_id, tx_hash, address_key, block_time, token_key, token_delta,
+            quote_key, quote_delta, quote_usd, quote_source, resolved_at)
+         values ${part.map(() => "(?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))").join(",")}
+         on conflict do nothing`,
+        part.flatMap((p) => [
+          net, p.cand.tx_hash, p.cand.address_key, p.cand.block_time, p.row.tokenKey, p.row.tokenDelta,
+          p.row.quoteKey, p.row.quoteDelta, p.row.quoteUsd, p.row.quoteSource,
+        ]),
+      )));
+  });
 }
 
 /** Every candidate a source answered for is done, swap or not; the anti-join skips it from now on. */
 async function markChecked(sql: Sql, net: number, cands: readonly Cand[]): Promise<void> {
-  await sql`
-    insert into wallet_swaps_checked (network_id, tx_hash, address_key)
-    select ${net}, u.tx, u.addr
-    from unnest(${cands.map((c) => c.tx_hash)}::text[], ${cands.map((c) => c.address_key)}::text[]) as u(tx, addr)
-    on conflict do nothing`;
+  if (!cands.length) return;
+  await sql.begin(async (tx) => {
+    await Promise.all(chunk(cands, CHECKED_WRITE_CHUNK).map((part) =>
+      tx.unsafe(
+        `insert into wallet_swaps_checked (network_id, tx_hash, address_key)
+         values ${part.map(() => "(?,?,?)").join(",")}
+         on conflict do nothing`,
+        part.flatMap((c) => [net, c.tx_hash, c.address_key]),
+      )));
+  });
 }
 
 /**
@@ -232,17 +265,17 @@ async function resolveBatch(ctx: Ctx, slice: readonly Cand[]): Promise<[number, 
  */
 async function reprice(sql: Sql): Promise<number> {
   const res = await sql`
-    update wallet_swaps s
-       set quote_usd = s.quote_delta * coalesce(q.pegged_usd, p.usd),
+    update wallet_swaps
+       set quote_usd = wallet_swaps.quote_delta * coalesce(q.pegged_usd, p.usd),
            quote_source = case when q.pegged_usd is not null then 'money_side_pegged' else 'money_side_daily_close' end
       from quote_assets q
       left join token_prices p
         on p.network_id = q.network_id and p.token_key = q.token_key and q.pegged_usd is null
-     where q.network_id = s.network_id and q.token_key = s.quote_key
-       and (q.pegged_usd is not null or p.day = s.block_time::date)
+     where q.network_id = wallet_swaps.network_id and q.token_key = wallet_swaps.quote_key
+       and (q.pegged_usd is not null or p.day = substr(wallet_swaps.block_time, 1, 10))
        and coalesce(q.pegged_usd, p.usd) is not null
-       and s.quote_usd is null
-       and s.block_time > now() - make_interval(days => ${REPRICE_DAYS}::int)`;
+       and wallet_swaps.quote_usd is null
+       and wallet_swaps.block_time > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ${`-${REPRICE_DAYS} days`})`;
   return res.count;
 }
 
@@ -271,7 +304,7 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
   const helius = (env.HELIUS_SOLANA_KEY ?? "").trim();
   if (!helius) throw new Error("swaps: HELIUS_SOLANA_KEY is not set; Solana is read through Helius only");
   const heliusUrl = `https://api.helius.xyz/v0/transactions?api-key=${helius}`;
-  const sql = db(env);
+  const sql = jobSql(env);
   const perChain: Record<string, ChainCounts> = {};
   let remaining = 0, stoppedEarly = false, attempted = 0, failedBatches = 0, bitqueryQueries = 0;
   /** Slices of one chain's candidates through `resolve`, within the budget; bookkeeping is the same for both sources. */
@@ -296,7 +329,7 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
     return counts;
   };
   try {
-    const chains: Chain[] = (await sql<{ network_id: string; name: string }[]>`
+    const chains: Chain[] = (await sql<{ network_id: number; name: string }[]>`
       select network_id, name from chains order by (network_id = ${SOLANA_NETWORK_ID}) asc, name`)  // EVM first: 20 Bitquery calls; Solana's slower slice takes what is left
       .map((r) => ({ ...r, network_id: Number(r.network_id) }));
     const quotes = await loadQuotes(sql);
