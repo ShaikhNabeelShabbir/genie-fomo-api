@@ -8,8 +8,9 @@ import { DAY_MS, KLINES_LIMIT, PAIR, parseKlines, seriesStartMs } from "./quote_
  * Quote-asset and Robinhood-coin pricing into `token_prices`, the Worker half of refresh.yml
  * "Price quote-asset transfers" + "Price Robinhood-chain coins".
  *
- * Phase 1 (T2.1): daily Binance closes for every floating quote asset a swap references (or
- * the chain's own coin), then `transactions.value_usd` for quote-asset legs in batches.
+ * Phase 1 (T2.1): daily Binance closes for every floating quote asset with a pair in `PAIR`
+ * (SOL, wSOL, ETH, WETH, BNB, WBNB), then `transactions.value_usd` for quote-asset legs in
+ * batches. `jobs/swaps.ts` reads the same closes to value the money leg of a swap.
  * Phase 2 (R4): today's DexScreener price for every held Robinhood token neither a quote
  * asset nor priced by GMGN (docs/R4_ROBINHOOD_PRICES.md).
  *
@@ -22,7 +23,7 @@ import { DAY_MS, KLINES_LIMIT, PAIR, parseKlines, seriesStartMs } from "./quote_
  */
 
 type Sql = postgres.Sql;
-interface QuoteAsset { readonly network_id: string; readonly token_key: string; readonly symbol: string; readonly swap_rows: number; readonly first_day: Date | string | null }
+interface QuoteAsset { readonly network_id: string; readonly token_key: string; readonly symbol: string; readonly first_day: Date | string | null }
 interface RobinhoodToken { readonly token_key: string; readonly address: string }
 
 const BINANCE = "https://api.binance.com/api/v3/klines";
@@ -52,20 +53,20 @@ export interface QuotePricesSummary {
   readonly elapsedMs: number;
 }
 
-/** Which floating assets are needed, and from when: the window comes from the data, never years of history for an asset first seen last month. */
+/**
+ * Every floating quote asset with a Binance pair (X2: EVM rows carry no `tx_type`, so a swap
+ * count could never admit WBNB/WETH), and from when: the first swap day where one is known,
+ * else `seriesStartMs` looks a year back.
+ */
 const quoteAssets = (sql: Sql) => sql<QuoteAsset[]>`
   select q.network_id, q.token_key, q.symbol,
-         count(t.*)::int                       as swap_rows,
          min(t.block_time)::date               as first_day
     from quote_assets q
     left join transactions t
       on t.network_id = q.network_id and t.token_key = q.token_key and t.tx_type = 'SWAP'
-   where q.pegged_usd is null
+   where q.pegged_usd is null and q.symbol = any(${Object.keys(PAIR)})
    group by 1,2,3
-   -- The chain's own coin is always priced: a wallet holds it without ever swapping it.
-   having count(t.*) > 0 or exists (select 1 from chains c
-                  where c.network_id = q.network_id and upper(c.native_symbol) = upper(q.symbol))
-   order by swap_rows desc`;
+   order by q.network_id, q.symbol`;
 
 /** Daily closes from Binance, paged from `startMs`. */
 async function dailyCloses(pair: string, startMs: number): Promise<Map<string, number>> {

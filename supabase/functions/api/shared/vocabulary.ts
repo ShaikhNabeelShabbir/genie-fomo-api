@@ -41,7 +41,7 @@ export const VOCABULARY = {
     /* v3 fixes (R6): the sent-transaction count is Bitquery's realtime window, a lower bound on the nonce. */
     "positions.coverage.chains.*.basis": ["bitquery_realtime"],
     "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
-    "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards"],
+    "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards", "swaps"],
     /* 17 Sep 2026, v4: second wave (items 10, 11, 12, R6). */
     /* `unchanged`: fomo answered but the newest `captured_at` did not advance (v3 fixes, 18 Sep). */
     "scorecard.loadOutcome": ["loaded", "unchanged", "unavailable", "degraded", "not_found", "error"],
@@ -49,6 +49,8 @@ export const VOCABULARY = {
     "scorecard.nextLoadBasis": ["nightly_slot", "six_hourly_slot"],
     "pnl.openPositionsBasis.*": ["trade_records", "trade_records_still_held_on_chain"],
     "trades.status": ["open", "closed", "closed_by_balance"],
+    /* 17 Sep 2026, v3 fixes (X2): which arm priced the money leg (`wallet_swaps.quote_source`); null with `valueUsd`. */
+    "trades[].valueSource": ["money_side_pegged", "money_side_daily_close", "money_side_market"],
     /* 17 Sep 2026, v5: T3 bounded on-chain scorecard fallback. */
     "scorecard.staleness.fallback": ["on_chain"],
     /* Why `fallback` is null on a stale record: the swap store covers under half of the profile's swaps. */

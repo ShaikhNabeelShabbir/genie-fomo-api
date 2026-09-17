@@ -231,7 +231,7 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
       select ws.tx_hash, ws.block_time, ws.network_id, c.name as chain,
              ws.token_key, tk.address as token_address,
              coalesce(ti.symbol, tk.symbol) as token_symbol,
-             ws.token_delta, ws.quote_key, ws.quote_delta, ws.quote_usd,
+             ws.token_delta, ws.quote_key, ws.quote_delta, ws.quote_usd, ws.quote_source,
              qa.symbol as quote_symbol, ws.address_key, ws.resolved_at
       from wallet_swaps ws
       join chains c using (network_id)
@@ -367,7 +367,8 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
         money: { symbol: r.quote_symbol ?? null, tokenKey: r.quote_key ?? null,
                  amount: qd === null ? null : Math.abs(qd) },
         valueUsd: usd === null ? null : round(Math.abs(usd)),
-        valueSource: usd === null ? null : "money_side",
+        /** Which arm of the money-leg ladder priced it (`wallet_swaps.quote_source`): the peg, the day's close, or the portfolio price. */
+        valueSource: usd === null ? null : (r.quote_source ?? null),
         /** Implied by the two legs, for cross-checking — not a quoted price. */
         priceUsd: usd !== null && td !== null && td !== 0
           ? Number((Math.abs(usd) / Math.abs(td)).toPrecision(12)) : null,

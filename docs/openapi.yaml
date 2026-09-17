@@ -1624,6 +1624,7 @@ components:
             - tokenInfo
             - aum
             - scorecards
+            - swaps
           description: Sorted names of feeds that stopped; empty is healthy.
         staleTraders:
           $ref: '#/components/schemas/HealthStaleTraders'
@@ -1666,11 +1667,19 @@ components:
       - transactions
       - tokenInfo
       - aum
+      - swaps
       properties:
         traders:
           $ref: '#/components/schemas/HealthFeed'
         trades:
-          $ref: '#/components/schemas/HealthFeed'
+          allOf:
+          - $ref: '#/components/schemas/HealthFeed'
+          description: fomoapi trade records, load time (`captured_at`). Not the on-chain swaps; see `swaps`.
+        swaps:
+          allOf:
+          - $ref: '#/components/schemas/HealthFeed'
+          description: On-chain swaps resolved from the wallets' transactions (`wallet_swaps`, what `/trades`
+            and `/events?kind=swap` read), newest block time; stale after 6 h.
         wallets:
           $ref: '#/components/schemas/HealthFeed'
         positions:
@@ -1706,7 +1715,7 @@ components:
         staleAfterHours:
           type: integer
           description: 'This feed''s own allowance: traders/wallets/positions/transactions 36, trades
-            72, tokenInfo 336.'
+            72, tokenInfo 336, swaps 6.'
         state:
           type: string
           enum:
@@ -1714,6 +1723,9 @@ components:
           - stale
           - never
           description: '`never` is not `stale`: different cause, different fix.'
+        description:
+          type: string
+          description: What the clock measures, on the feeds whose name alone is ambiguous (`trades`, `swaps`).
     HealthAumFeed:
       allOf:
       - $ref: '#/components/schemas/HealthFeed'
@@ -4891,9 +4903,13 @@ components:
           type: string
           nullable: true
           enum:
-          - money_side
+          - money_side_pegged
+          - money_side_daily_close
+          - money_side_market
           - null
-          description: '`money_side` when `valueUsd` is present; `null` otherwise.'
+          description: 'Which arm priced the money leg when `valueUsd` is present: the quote asset''s
+            peg, the daily close of the block day (up to 7 days back), or the portfolio''s market price;
+            `null` when `valueUsd` is null.'
         priceUsd:
           type: number
           nullable: true
@@ -9194,6 +9210,14 @@ paths:
                     ageSeconds: 107398
                     staleAfterHours: 72
                     state: current
+                    description: fomoapi trade records, load time
+                  swaps:
+                    lastRefreshAt: '2026-09-17T11:52:31.000Z'
+                    rowCount: null
+                    ageSeconds: 449
+                    staleAfterHours: 6
+                    state: current
+                    description: on-chain swaps resolved from the wallet's transactions, newest block time
                   wallets:
                     lastRefreshAt: '2026-09-17T06:04:12.000Z'
                     rowCount: null
@@ -13713,7 +13737,8 @@ paths:
       - Transactions
       summary: The trader's own swaps, both sides, FIFO-paired
       description: 'One row per swap the wallet actually signed (`wallet_swaps`), with the coin leg and
-        the money leg. `valueUsd` comes from the money side (`valueSource: money_side`), never from a
+        the money leg. `valueUsd` comes from the money side (`valueSource` says which arm priced it:
+        `money_side_pegged`, `money_side_daily_close` or `money_side_market`), never from a
         memecoin price; `priceUsd` is only the implied cross-check. Each sell is paired to the oldest
         buy still holding quantity (FIFO over the trader''s whole record, not the page), giving `positionId`,
         `status`, `openedAt`, `closedAt`, `holdSeconds`; a sell with no matching buy carries `positionId:
@@ -13819,7 +13844,7 @@ paths:
                     tokenKey: epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwytdt1v
                     amount: 954.814033
                   valueUsd: 954.81
-                  valueSource: money_side
+                  valueSource: money_side_pegged
                   priceUsd: 7.79106969028e-05
                   tier: verified
                   positionId: 4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi9pS8mKzXbCqsjdWmXJTSGUnbgEoAr2KaMwx7gFCcdsW9M

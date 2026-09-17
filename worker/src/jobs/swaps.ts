@@ -1,12 +1,13 @@
 import type postgres from "postgres";
 import type { Env } from "../env";
 import { db } from "../db";
-import { SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
+import { rpc, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
-import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, toRow } from "./swaps-core";
+import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaDecode, toRow } from "./swaps-core";
 
 /**
+<<<<<<< HEAD
  * A4, the wallet's OWN two-sided swaps on the EVM chains: the Worker half of refresh.yml
  * "Resolve EVM swaps from receipts", now read from Bitquery's decoded `DEXTrades` rather than
  * receipts off a public node (no free JSON-RPC endpoint is called from the Worker since
@@ -14,6 +15,19 @@ import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, toRow }
  * the Worker is the only copy). Same candidate query, same decode and pricing rules
  * (`swaps-core.ts`), same insert. A wall-clock budget stops between batches and reports what
  * is left; a failed batch is counted and its transactions stay unresolved for the next run.
+=======
+ * A4, the wallet's OWN two-sided swaps, written to `wallet_swaps`. Phase 1 is Solana: every
+ * `transactions` row tagged SWAP, resolved through Helius `getTransaction` pre/post balances
+ * (ported from `scripts/resolve_wallet_swaps.mjs`, deleted 18 Sep 2026). Phase 2 is the EVM
+ * chains from Bitquery's decoded `DEXTrades` (ported from
+ * `scripts/resolve_evm_swaps_from_receipts.mjs`; no free JSON-RPC endpoint is called from the
+ * Worker). Same decode and pricing rules (`swaps-core.ts`), same insert. Candidates are read
+ * newest first with a cap per run, so every run reaches the head of the feed and the backlog
+ * drains from there; each candidate asked is marked in `wallet_swaps_checked` whether or not
+ * it was a swap (95% are not), so the next run asks the next slice. A failed batch is counted
+ * and its transactions stay unmarked for the next run. The run ends with a re-price pass over
+ * the last 30 days for rows whose money leg got a daily close after they were written.
+>>>>>>> worktree-agent-a4c36b77e7d28c5c8
  */
 
 type Sql = postgres.Sql;
@@ -31,12 +45,14 @@ interface Ctx {
   readonly wrapped: NativeQuote | null;
 }
 
-export interface ChainCounts { resolved: number; unresolved: number; failed: number; bitqueryQueries: number }
+export interface ChainCounts { resolved: number; unresolved: number; failed: number; queries: number }
 export interface SwapsSummary {
-  /** Per chain name: swaps written, transactions read but not one two-token trade, transactions in failed batches, queries sent. */
+  /** Per chain name: swaps written, transactions read but not one two-token trade, transactions in failed batches, source calls (Helius batches on solana, Bitquery queries elsewhere). */
   readonly perChain: Record<string, ChainCounts>;
-  /** Bitquery queries sent across the chains. */
+  /** Bitquery queries sent across the EVM chains. */
   readonly bitqueryQueries: number;
+  /** Rows valued by the re-price pass (a daily close arrived after the row was written). */
+  readonly repriced: number;
   /** Candidate transactions never asked because the budget ran out. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
@@ -45,23 +61,34 @@ export interface SwapsSummary {
 
 /** Hashes per Bitquery query: one `in` list, one reply. */
 const BATCH = 100;
+/** Signatures per Helius JSON-RPC batch, as `fees.ts` sends them. */
+const SOLANA_BATCH = 10;
+/** ponytail: newest candidates per chain per run; the cron is every 15 min, so a slice a run drains a backlog without hogging the budget. Raise when `remaining` stays high. */
+const SOLANA_LIMIT = 1500;
+const EVM_LIMIT = 2000;
 /** ponytail: a route is a handful of hops; a transaction with more trades than this is not one wallet's swap anyway. */
 const TRADES_PER_TX = 10;
+/** Rows the re-price pass considers; older rows keep whatever they were written with. */
+const REPRICE_DAYS = 30;
 
-/** Quote assets, keyed `network_id:token_key`, with the dollar value of one unit where we can state it. */
+/** Quote assets, keyed `network_id:token_key`, with the three prices `priceQuote` chooses from. */
 async function loadQuotes(sql: Sql): Promise<Map<string, Quote>> {
-  const rows = await sql<{ network_id: string; token_key: string; symbol: string; pegged_usd: string | null; market_price: string | null }[]>`
+  const rows = await sql<{ network_id: string; token_key: string; symbol: string; pegged_usd: string | null; closes: Record<string, number>; market_price: string | null }[]>`
     select q.network_id, q.token_key, q.symbol, q.pegged_usd,
+           (select coalesce(jsonb_object_agg(p.day::text, p.usd), '{}'::jsonb) from token_prices p
+             where p.network_id = q.network_id and p.token_key = q.token_key and q.pegged_usd is null) as closes,
            (select h.price from holdings_current h
              where h.network_id = q.network_id and h.token_key = q.token_key
                and h.price is not null and h.price_source is not null
                and h.price_source <> 'fomo_reported_entry'
              order by h.priced_at desc nulls last limit 1) as market_price
     from quote_assets q`;
-  /* A stablecoin's peg is the honest price; a wrapped native takes the portfolio's market price; unpriced still resolves. */
+  /* A stablecoin's peg is the honest price; a floating quote takes its daily close, else the portfolio's market price; unpriced still resolves. */
   return new Map(rows.map((q) => [`${Number(q.network_id)}:${q.token_key}`, {
     symbol: q.symbol,
-    usd: q.pegged_usd !== null ? Number(q.pegged_usd) : q.market_price !== null ? Number(q.market_price) : null,
+    pegged: q.pegged_usd === null ? null : Number(q.pegged_usd),
+    closes: new Map(Object.entries(q.closes).map(([day, usd]) => [day, Number(usd)])),
+    market: q.market_price === null ? null : Number(q.market_price),
   }]));
 }
 
@@ -72,36 +99,83 @@ async function loadNativeQuotes(sql: Sql, quotes: ReadonlyMap<string, Quote>): P
     from chains c
     join quote_assets q on q.network_id = c.network_id
      and upper(q.symbol) = 'W' || upper(c.native_symbol)`;
-  return new Map(rows.map((r) => [Number(r.network_id), {
-    key: r.token_key, usd: quotes.get(`${Number(r.network_id)}:${r.token_key}`)?.usd ?? null,
-  }]));
+  const out = new Map<number, NativeQuote>();
+  for (const r of rows) {
+    const quote = quotes.get(`${Number(r.network_id)}:${r.token_key}`);
+    if (quote) out.set(Number(r.network_id), { key: r.token_key, quote });
+  }
+  return out;
 }
 
-/** Every transaction on this chain with no wallet_swaps row yet, one per (tx, wallet). */
-const candidates = (sql: Sql, net: number) => sql<Cand[]>`
+/**
+ * The newest `limit` transactions on this chain not yet asked about, one per (tx, wallet). On
+ * Solana only rows Helius tagged SWAP are candidates; EVM rows carry no type.
+ */
+const candidates = (sql: Sql, net: number, limit: number) => sql<Cand[]>`
   select t.tx_hash, t.address_key, min(t.block_time) as block_time
   from transactions t
   where t.network_id = ${net}
+    ${net === SOLANA_NETWORK_ID ? sql`and t.tx_type = 'SWAP'` : sql``}
     and not exists (
-      select 1 from wallet_swaps s
+      select 1 from wallet_swaps_checked s
       where s.network_id = ${net} and s.tx_hash = t.tx_hash and s.address_key = t.address_key)
-  group by t.tx_hash, t.address_key`;
+  group by t.tx_hash, t.address_key
+  order by min(t.block_time) desc
+  limit ${limit}`;
 
 async function writeRows(sql: Sql, net: number, out: readonly Priced[]): Promise<void> {
   const col = <T>(f: (p: Priced) => T): T[] => out.map(f);
   await sql`
     insert into wallet_swaps
       (network_id, tx_hash, address_key, block_time, token_key, token_delta,
-       quote_key, quote_delta, quote_usd, resolved_at)
+       quote_key, quote_delta, quote_usd, quote_source, resolved_at)
     select ${net}, u.tx, u.addr, u.at::timestamptz, u.tk, u.td::numeric,
-           u.qk, u.qd::numeric, nullif(u.qu,'')::numeric, now()
+           u.qk, u.qd::numeric, nullif(u.qu,'')::numeric, nullif(u.qs,''), now()
     from unnest(${col((p) => p.cand.tx_hash)}::text[], ${col((p) => p.cand.address_key)}::text[],
                 ${col((p) => new Date(p.cand.block_time).toISOString())}::text[], ${col((p) => p.row.tokenKey)}::text[],
                 ${col((p) => String(p.row.tokenDelta))}::text[], ${col((p) => p.row.quoteKey)}::text[],
                 ${col((p) => String(p.row.quoteDelta))}::text[],
-                ${col((p) => p.row.quoteUsd === null ? "" : String(p.row.quoteUsd))}::text[])
-         as u(tx, addr, at, tk, td, qk, qd, qu)
+                ${col((p) => p.row.quoteUsd === null ? "" : String(p.row.quoteUsd))}::text[],
+                ${col((p) => p.row.quoteSource ?? "")}::text[])
+         as u(tx, addr, at, tk, td, qk, qd, qu, qs)
     on conflict do nothing`;
+}
+
+/** Every candidate a source answered for is done, swap or not; the anti-join skips it from now on. */
+async function markChecked(sql: Sql, net: number, cands: readonly Cand[]): Promise<void> {
+  await sql`
+    insert into wallet_swaps_checked (network_id, tx_hash, address_key)
+    select ${net}, u.tx, u.addr
+    from unnest(${cands.map((c) => c.tx_hash)}::text[], ${cands.map((c) => c.address_key)}::text[]) as u(tx, addr)
+    on conflict do nothing`;
+}
+
+/** Helius `getTransaction` for a slice of signatures, one JSON-RPC batch; ids index the slice. A reply that is not an array is a refusal. */
+async function solanaTxs(url: string, hashes: readonly string[]): Promise<Map<string, unknown>> {
+  const body = hashes.map((h, id) =>
+    ({ jsonrpc: "2.0", id, method: "getTransaction", params: [h, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed" }] }));
+  const reply: unknown = await rpc(url, body);
+  if (!Array.isArray(reply)) throw new Error(`Helius answered without a batch for ${hashes.length} signatures`);
+  const out = new Map<string, unknown>();
+  for (const r of reply) {
+    const id = typeof r === "object" && r !== null ? (r as { id?: unknown; result?: unknown }) : null;
+    if (id && typeof id.id === "number" && hashes[id.id]) out.set(hashes[id.id], id.result ?? null);
+  }
+  return out;
+}
+
+/** ONE HELIUS BATCH: the wallet's net legs per transaction, priced, written, marked. Returns [resolved, not the wallet's own two-sided swap]. */
+async function resolveSolanaBatch(sql: Sql, url: string, quotes: ReadonlyMap<string, Quote>, slice: readonly Cand[]): Promise<[number, number]> {
+  const txs = await solanaTxs(url, [...new Set(slice.map((c) => c.tx_hash))]);
+  const out: Priced[] = [];
+  for (const cand of slice) {
+    const d = solanaDecode(txs.get(cand.tx_hash), cand.address_key);
+    const row = d && toRow(d, quotes, null, new Date(cand.block_time));
+    if (row) out.push({ cand, row });
+  }
+  if (out.length) await writeRows(sql, SOLANA_NETWORK_ID, out);
+  await markChecked(sql, SOLANA_NETWORK_ID, slice);
+  return [out.length, slice.length - out.length];
 }
 
 /**
@@ -137,18 +211,39 @@ async function tradesByHash(ctx: Ctx, hashes: readonly string[]): Promise<Map<st
   return out;
 }
 
-/** ONE QUERY PER BATCH: Bitquery's decoded trades, netted per wallet, priced, written. Returns [resolved, not a two-token trade]. */
+/** ONE QUERY PER BATCH: Bitquery's decoded trades, netted per wallet, priced, written, marked. Returns [resolved, not a two-token trade]. */
 async function resolveBatch(ctx: Ctx, slice: readonly Cand[]): Promise<[number, number]> {
   const trades = await tradesByHash(ctx, [...new Set(slice.map((c) => c.tx_hash))]);
   const out: Priced[] = [];
-  let skipped = 0;
   for (const cand of slice) {
     const d = decode(trades.get(cand.tx_hash.toLowerCase()) ?? [], cand.address_key);
-    const row = d && toRow(d, ctx.quotes, ctx.wrapped);
-    if (row) out.push({ cand, row }); else skipped++;
+    const row = d && toRow(d, ctx.quotes, ctx.wrapped, new Date(cand.block_time));
+    if (row) out.push({ cand, row });
   }
   if (out.length) await writeRows(ctx.sql, ctx.net, out);
-  return [out.length, skipped];
+  await markChecked(ctx.sql, ctx.net, slice);
+  return [out.length, slice.length - out.length];
+}
+
+/**
+ * The deleted Solana script's final update, scoped: rows written unpriced in the last
+ * `REPRICE_DAYS` get the peg or the daily close of their block day once `quote_prices` has
+ * loaded it. Signed like the writer (`quote_delta` x unit price). Returns rows valued.
+ */
+async function reprice(sql: Sql): Promise<number> {
+  const res = await sql`
+    update wallet_swaps s
+       set quote_usd = s.quote_delta * coalesce(q.pegged_usd, p.usd),
+           quote_source = case when q.pegged_usd is not null then 'money_side_pegged' else 'money_side_daily_close' end
+      from quote_assets q
+      left join token_prices p
+        on p.network_id = q.network_id and p.token_key = q.token_key and q.pegged_usd is null
+     where q.network_id = s.network_id and q.token_key = s.quote_key
+       and (q.pegged_usd is not null or p.day = s.block_time::date)
+       and coalesce(q.pegged_usd, p.usd) is not null
+       and s.quote_usd is null
+       and s.block_time > now() - make_interval(days => ${REPRICE_DAYS}::int)`;
+  return res.count;
 }
 
 /** The `network_id:` prefix stripped, so the core sees one chain's quotes keyed by token address. */
@@ -165,49 +260,64 @@ function networkWord(c: Chain): string {
 }
 
 /**
- * One pass over every EVM chain's unresolved transactions, within `budgetMs`. Throws only when
- * batches were attempted and every one failed, so the cron shows as failed.
+ * One pass, Solana then every EVM chain, over the newest unresolved transactions within
+ * `budgetMs`, then the re-price pass. Throws only when batches were attempted and every one
+ * failed, so the cron shows as failed.
  */
 export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary> {
   const started = Date.now();
   const key = (env.BITQUERY_KEY ?? "").trim();
   if (!key) throw new Error("swaps: BITQUERY_KEY is not set");
+  const helius = (env.HELIUS_SOLANA_KEY ?? "").trim();
+  if (!helius) throw new Error("swaps: HELIUS_SOLANA_KEY is not set; Solana is read through Helius only");
+  const heliusUrl = `https://mainnet.helius-rpc.com/?api-key=${helius}`;
   const sql = db(env);
   const perChain: Record<string, ChainCounts> = {};
-  let remaining = 0, stoppedEarly = false, attempted = 0, failedBatches = 0;
+  let remaining = 0, stoppedEarly = false, attempted = 0, failedBatches = 0, bitqueryQueries = 0;
+  /** Slices of one chain's candidates through `resolve`, within the budget; bookkeeping is the same for both sources. */
+  const drain = async (name: string, cands: readonly Cand[], batch: number, resolve: (slice: readonly Cand[]) => Promise<[number, number]>): Promise<ChainCounts> => {
+    const counts: ChainCounts = { resolved: 0, unresolved: 0, failed: 0, queries: 0 };
+    perChain[name] = counts;
+    let i = 0;
+    for (; i < cands.length; i += batch) {
+      if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
+      const slice = cands.slice(i, i + batch);
+      attempted += 1;
+      counts.queries += 1;
+      try {
+        const [resolved, unresolved] = await resolve(slice);
+        counts.resolved += resolved; counts.unresolved += unresolved;
+      } catch (e) {
+        failedBatches += 1; counts.failed += slice.length;
+        console.error(`swaps: ${name} batch ${i / batch + 1} of ${slice.length} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    remaining += Math.max(0, cands.length - i);
+    return counts;
+  };
   try {
     const chains: Chain[] = (await sql<{ network_id: string; name: string }[]>`
-      select network_id, name from chains where network_id <> ${SOLANA_NETWORK_ID} order by name`)
+      select network_id, name from chains order by (network_id = ${SOLANA_NETWORK_ID}) desc, name`)
       .map((r) => ({ ...r, network_id: Number(r.network_id) }));
     const quotes = await loadQuotes(sql);
     const natives = await loadNativeQuotes(sql, quotes);
     for (const c of chains) {
-      const cands = await candidates(sql, c.network_id);
-      const counts: ChainCounts = { resolved: 0, unresolved: 0, failed: 0, bitqueryQueries: 0 };
-      perChain[c.name] = counts;
+      if (c.network_id === SOLANA_NETWORK_ID) {
+        const solQuotes = quotesOn(SOLANA_NETWORK_ID, quotes);
+        await drain(c.name, await candidates(sql, SOLANA_NETWORK_ID, SOLANA_LIMIT), SOLANA_BATCH,
+          (slice) => resolveSolanaBatch(sql, heliusUrl, solQuotes, slice));
+        continue;
+      }
       const ctx: Ctx = {
         sql, key, net: c.network_id, network: networkWord(c),
         quotes: quotesOn(c.network_id, quotes), wrapped: natives.get(c.network_id) ?? null,
       };
-      let i = 0;
-      for (; i < cands.length; i += BATCH) {
-        if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
-        const slice = cands.slice(i, i + BATCH);
-        attempted += 1;
-        counts.bitqueryQueries += 1;
-        try {
-          const [resolved, unresolved] = await resolveBatch(ctx, slice);
-          counts.resolved += resolved; counts.unresolved += unresolved;
-        } catch (e) {
-          failedBatches += 1; counts.failed += slice.length;
-          console.error(`swaps: ${c.name} batch ${i / BATCH + 1} of ${slice.length} failed: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      remaining += Math.max(0, cands.length - i);
+      const counts = await drain(c.name, await candidates(sql, c.network_id, EVM_LIMIT), BATCH, (slice) => resolveBatch(ctx, slice));
+      bitqueryQueries += counts.queries;
     }
     if (attempted > 0 && failedBatches === attempted) throw new Error(`swaps: all ${attempted} batches failed`);
-    const bitqueryQueries = Object.values(perChain).reduce((n, c) => n + c.bitqueryQueries, 0);
-    return { perChain, bitqueryQueries, remaining, stoppedEarly, elapsedMs: Date.now() - started };
+    const repriced = await reprice(sql);
+    return { perChain, bitqueryQueries, repriced, remaining, stoppedEarly, elapsedMs: Date.now() - started };
   } finally {
     await sql.end({ timeout: 5 });
   }

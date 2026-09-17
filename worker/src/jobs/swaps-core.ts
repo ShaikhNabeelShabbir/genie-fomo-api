@@ -1,12 +1,13 @@
 /**
- * Pure half of the EVM swap resolver (`./swaps.ts`): Bitquery's decoded `DEXTrades` rows for
- * one transaction -> the wallet's net legs -> one `wallet_swaps` row. No I/O, so
- * `tests/swaps_core_test.ts` runs it under Deno. The rules are those of the receipt decoder
- * this replaced (`scripts/resolve_evm_swaps_from_receipts.mjs`): only the wallet's own
- * two-sided trade is a swap, a native leg is recorded against the wrapped native, exactly one
- * side is the money leg. Bitquery has already scaled amounts by decimals and marked the coin.
+ * Pure half of the swap resolver (`./swaps.ts`): Bitquery's decoded `DEXTrades` rows (EVM) or
+ * a Helius `getTransaction` (Solana) for one transaction -> the wallet's net legs -> one
+ * `wallet_swaps` row. No I/O, so `tests/swaps_core_test.ts` runs it under Deno. The rules are
+ * those of the scripts this replaced (`resolve_evm_swaps_from_receipts.mjs`,
+ * `resolve_wallet_swaps.mjs`): only the wallet's own two-sided trade is a swap, a native leg
+ * is recorded against the wrapped native (EVM) or `SOL_MINT` (Solana), exactly one side is
+ * the money leg, and that leg is priced peg -> daily close -> market, never guessed.
  */
-import { ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
+import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
 
 /**
  * One `EVM.DEXTrades` row as https://docs.bitquery.io/docs/schema/evm/dextrades/ shapes it:
@@ -19,8 +20,18 @@ export interface Trade {
   readonly Transaction?: { readonly Hash?: unknown; readonly From?: unknown };
   readonly Trade?: { readonly Buy?: Side; readonly Sell?: Side };
 }
-export interface Quote { readonly symbol: string; readonly usd: number | null }
-export interface NativeQuote { readonly key: string; readonly usd: number | null }
+/** Which arm of the price ladder valued the money leg; the words are the published `trades[].valueSource`. */
+export type QuoteSource = "money_side_pegged" | "money_side_daily_close" | "money_side_market";
+export interface Quote {
+  readonly symbol: string;
+  readonly pegged: number | null;
+  /** `token_prices` daily closes, UTC day -> usd. */
+  readonly closes: ReadonlyMap<string, number>;
+  /** The portfolio's current price, the last resort. */
+  readonly market: number | null;
+}
+export interface NativeQuote { readonly key: string; readonly quote: Quote }
+export interface PricedQuote { readonly usd: number; readonly source: QuoteSource }
 
 /** `[token, amount]` in human units, signed from the wallet's side: received > 0, sent < 0. The coin is `ZERO_ADDRESS`. */
 export type Leg = readonly [string, number];
@@ -32,7 +43,23 @@ export interface SwapRow {
   readonly tokenDelta: number;
   readonly quoteKey: string;
   readonly quoteDelta: number;
+  /** `quoteDelta` x the unit price, so it carries the sign (`/scorecard` sums it as net cash). */
   readonly quoteUsd: number | null;
+  readonly quoteSource: QuoteSource | null;
+}
+
+const DAY_MS = 86_400_000;
+/** A daily close stands in up to this many days after its day; older is not that block's price. */
+export const CLOSE_LOOKBACK_DAYS = 7;
+
+/** The money leg's unit price at `at`: the peg, else the latest daily close on or before that day within the lookback, else the market price. Null: unpriced. */
+export function priceQuote(q: Quote, at: Date): PricedQuote | null {
+  if (q.pegged !== null) return { usd: q.pegged, source: "money_side_pegged" };
+  for (let back = 0; back < CLOSE_LOOKBACK_DAYS; back++) {
+    const usd = q.closes.get(new Date(at.getTime() - back * DAY_MS).toISOString().slice(0, 10));
+    if (usd !== undefined) return { usd, source: "money_side_daily_close" };
+  }
+  return q.market === null ? null : { usd: q.market, source: "money_side_market" };
 }
 
 const isRec = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -89,18 +116,18 @@ export function decode(trades: readonly Trade[], wallet: string): Decoded | null
 }
 
 /**
- * Value the trade. The coin is recorded as the chain's WRAPPED native at 1:1; exactly one side
- * must be a quote (the money leg). Null means skipped, never guessed. `quotes` is keyed by
- * token address on this chain.
+ * Value the trade at `at`. The coin is recorded as the chain's WRAPPED native at 1:1; exactly
+ * one side must be a quote (the money leg). Null means skipped, never guessed. `quotes` is
+ * keyed by token address on this chain.
  */
-export function toRow(d: Decoded, quotes: ReadonlyMap<string, Quote>, wrapped: NativeQuote | null): SwapRow | null {
+export function toRow(d: Decoded, quotes: ReadonlyMap<string, Quote>, wrapped: NativeQuote | null, at: Date): SwapRow | null {
   const [inTok, inAmt] = d.recv, [outTok, outAmtNeg] = d.sent;
   if ((inTok === ZERO_ADDRESS || outTok === ZERO_ADDRESS) && !wrapped) return null;
   /* The coin is always the money leg, under the wrapped native's key and price. */
   const quoteOf = (tok: string): NativeQuote | null => {
     if (tok === ZERO_ADDRESS) return wrapped;
     const q = quotes.get(tok);
-    return q ? { key: tok, usd: q.usd } : null;
+    return q ? { key: tok, quote: q } : null;
   };
   const inQ = quoteOf(inTok), outQ = quoteOf(outTok);
   if ((inQ && outQ) || (!inQ && !outQ)) return null;
@@ -109,9 +136,52 @@ export function toRow(d: Decoded, quotes: ReadonlyMap<string, Quote>, wrapped: N
   if (q === null) return null;
   const outAmt = -outAmtNeg;
   const tokenAmt = buying ? inAmt : outAmt, quoteAmt = buying ? outAmt : inAmt;
+  const quoteDelta = buying ? -quoteAmt : quoteAmt;
+  const px = priceQuote(q.quote, at);
   return {
     tokenKey: buying ? inTok : outTok, tokenDelta: buying ? tokenAmt : -tokenAmt,
-    quoteKey: q.key, quoteDelta: buying ? -quoteAmt : quoteAmt,
-    quoteUsd: q.usd === null ? null : quoteAmt * q.usd,
+    quoteKey: q.key, quoteDelta,
+    quoteUsd: px === null ? null : quoteDelta * px.usd,
+    quoteSource: px === null ? null : px.source,
   };
+}
+
+/**
+ * The wallet's net position change in one Solana transaction, from a Helius `getTransaction`
+ * (jsonParsed) result: every mint whose balance moved for `owner` (pre/post token balances),
+ * plus native SOL under `SOL_MINT` when the wallet is an account of the transaction. Immune to
+ * how a router shuffled funds internally. Keys are lower-cased to match `tokens.token_key`, so
+ * `owner` compares case-insensitively too. Dust below 1e-12 (1e-7 SOL: a lamport of rent is
+ * not a leg) is discarded. Null: not one two-sided trade of the wallet's own.
+ */
+export function solanaDecode(tx: unknown, owner: string): Decoded | null {
+  if (!isRec(tx) || !isRec(tx.meta)) return null;
+  const m = tx.meta, w = owner.toLowerCase();
+  const balances = (v: unknown): Map<string, number> => {
+    const out = new Map<string, number>();
+    for (const b of Array.isArray(v) ? v : []) {
+      if (!isRec(b) || lower(b.owner) !== w || typeof b.mint !== "string") continue;
+      const ui = isRec(b.uiTokenAmount) ? Number(b.uiTokenAmount.uiAmount ?? 0) : 0;
+      out.set(b.mint.toLowerCase(), Number.isFinite(ui) ? ui : 0);
+    }
+    return out;
+  };
+  const pre = balances(m.preTokenBalances), post = balances(m.postTokenBalances);
+  const net = new Map<string, number>();
+  for (const mint of new Set([...pre.keys(), ...post.keys()])) {
+    const d = (post.get(mint) ?? 0) - (pre.get(mint) ?? 0);
+    if (Math.abs(d) > 1e-12) net.set(mint, d);
+  }
+  const message = isRec(tx.transaction) && isRec(tx.transaction.message) ? tx.transaction.message : null;
+  const keys = (Array.isArray(message?.accountKeys) ? message.accountKeys : []).map((k: unknown) => lower(isRec(k) ? k.pubkey : k));
+  const i = keys.indexOf(w);
+  if (i >= 0) {
+    /* Fees are paid by whoever submitted (a relayer for these traders), so a native change is real movement, not gas. */
+    const before = Array.isArray(m.preBalances) ? Number(m.preBalances[i]) : NaN;
+    const after = Array.isArray(m.postBalances) ? Number(m.postBalances[i]) : NaN;
+    const d = Number.isFinite(before) && Number.isFinite(after) ? (after - before) / 1e9 : 0;
+    if (Math.abs(d) > 1e-7) net.set(SOL_MINT, (net.get(SOL_MINT) ?? 0) + d);
+  }
+  const received = [...net].filter(([, v]) => v > 0), sent = [...net].filter(([, v]) => v < 0);
+  return received.length === 1 && sent.length === 1 ? { recv: received[0], sent: sent[0] } : null;
 }
