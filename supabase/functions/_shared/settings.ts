@@ -1,6 +1,8 @@
+// Twin of scripts/lib/ts/settings.ts (the chain table and headers only): edit both.
 /**
- * Chain constants for the Deno/Worker side. TWIN OF `scripts/lib/ts/settings.ts` (the loaders'
- * copy, which also reads .env and holds the Node-only paths): edit both when a chain changes.
+ * Provider constants shared by the transfer fetch. No env reads here: keys are passed in by
+ * the caller (`ProviderKeys` in transactions.ts), so the same module runs under Deno and the
+ * Cloudflare Worker.
  */
 export { SOLANA_NETWORK_ID } from "./chain_reads.ts";
 
@@ -54,3 +56,8 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
     nativeSymbol: "ETH",
   },
 };
+
+/** Cloudflare fronts several providers and 403s a bare client (`error code: 1010`). */
+export const UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+export const HEADERS: Readonly<Record<string, string>> = { "User-Agent": UA, Accept: "application/json" };

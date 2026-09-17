@@ -17,6 +17,12 @@ export interface Env {
   readonly HELIUS_SOLANA_KEY?: string;
   /** Traders per chain-balance run (`jobs/balances.ts`); default 25. */
   readonly BALANCE_SLICE?: string;
+  /** Transfer backfill providers (`jobs/transfers.ts`): Etherscan V2 for Ethereum, Bitquery for BSC/Base. */
+  readonly ETHERSCAN_KEY?: string;
+  readonly BITQUERY_KEY?: string;
+  /** Where Helius delivers; the watch-list sync registers this URL. Defaults to the Supabase receiver. */
+  readonly WEBHOOK_URL?: string;
+  /** Wall-clock budget for a cron job (`jobs/*`), ms. */
   /** fomoapi bearer for the scorecard refresh (`jobs/scorecards.ts`). */
   readonly FOMOAPI_KEY?: string;
   /** GMGN key for the token fundamentals refresh (`jobs/tokens.ts`). */
