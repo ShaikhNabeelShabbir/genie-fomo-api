@@ -4,10 +4,13 @@ import { sample } from "./sampler";
 import { api } from "./api";
 import { runPrices } from "./jobs/prices";
 import { runScorecards } from "./jobs/scorecards";
+import { runAumHistory } from "./jobs/aum_history";
 
 /** Must match [triggers] crons in wrangler.toml, character for character. */
 const CRON_PRICES = "17 * * * *";
 const CRON_SCORECARDS = "0 */6 * * *";
+/** After prices (:17): every trader-hour not yet built, always redoing the last two. */
+const CRON_AUM_HISTORY = "25 * * * *";
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -29,6 +32,7 @@ export default {
     switch (event.cron) {
       case CRON_PRICES: { console.log("prices:", await runPrices(env, budgetMs)); return; }
       case CRON_SCORECARDS: { console.log("scorecards:", await runScorecards(env, budgetMs)); return; }
+      case CRON_AUM_HISTORY: { console.log("aum_history:", await runAumHistory(env, budgetMs)); return; }
       default: throw new Error(`no job for cron '${event.cron}'`);
     }
   },

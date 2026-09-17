@@ -18,7 +18,7 @@ id = "d63d855a124c463a93318e8d225f1735"
 # and prices into aum_history (18 Sep), not sampled; /sample stays for a manual read.
 # Every job stops on its own before JOB_BUDGET_MS.
 [triggers]
-crons = ["17 * * * *", "0 */6 * * *"]
+crons = ["17 * * * *", "25 * * * *", "0 */6 * * *"]
 
 [limits]
 cpu_ms = 30000
