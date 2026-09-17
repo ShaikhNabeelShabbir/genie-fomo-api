@@ -20,8 +20,11 @@ export async function runAumLiveFlush(env: Env, _budgetMs: number): Promise<AumL
   try {
     // Oldest marks first, a bounded slice a run: the cron is every 5 minutes and each trader
     // costs a `holdings_live` pass, which D1 charges CPU for.
+    // 20, not 40: a 40-trader run measured 373 s against a 5-minute cron, so it overlapped itself
+    // and competed with every read for D1's single thread (17 Sep 2026). 20 a run is 240 an hour,
+    // well above the rate wallets are marked at.
     const marked = (await sql<{ handle: string; marked_at: string }[]>`
-      select handle, marked_at from aum_live_dirty order by marked_at limit 40`);
+      select handle, marked_at from aum_live_dirty order by marked_at limit 20`);
     if (!marked.length) return { marked: 0, refreshed: 0, elapsedMs: Date.now() - started };
     const handles = marked.map((m) => m.handle);
     const refreshed = await refreshAumLive(sql, handles, "webhook");

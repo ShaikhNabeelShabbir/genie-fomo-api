@@ -10,7 +10,7 @@ compatibility_flags = ["nodejs_compat"]
 # /sample stays for a manual read. Each job stops on its own before JOB_BUDGET_MS.
 [triggers]
 crons = [
-  "17 * * * *", "25 * * * *", "40 * * * *", "45 * * * *", "*/30 * * * *",
+  "17 * * * *", "25 * * * *", "40 * * * *", "50 * * * *", "3,33 * * * *",
   "5 */2 * * *", "10 */2 * * *", "15,45 * * * *", "0 */6 * * *",
   "35 3 * * *", "50 4 * * *", "55 5 * * *", "15 2 * * *", "0 1 * * *", "*/5 * * * *",
 ]

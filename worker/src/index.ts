@@ -27,8 +27,8 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "17 * * * *":   runPrices,       // hourly token prices (DexScreener) -> token_price_hourly
   "25 * * * *":   runAumHistory,   // after prices: build every trader-hour not yet built
   "40 * * * *":   runTransfers,    // on-chain transfers, stalest wallet first; Helius watch list
-  "45 * * * *":   runQuotePrices,  // quote-asset transfer pricing; Robinhood-chain coins
-  "*/30 * * * *": runBalances,   // brake 17 Sep 08:57: a 10 min cadence overlapped its own 9 min runs     // a slice of the stalest wallets' balances -> holdings
+  "50 * * * *":   runQuotePrices,  // quote-asset transfer pricing; Robinhood-chain coins. Off :45, which it shared with swaps
+  "3,33 * * * *": runBalances,   // brake 17 Sep 08:57: a 10 min cadence overlapped its own 9 min runs. Off :00/:30, where the 5-minute flush also lands     // a slice of the stalest wallets' balances -> holdings
   "5 */2 * * *":  runTokens,       // chains, supply, fundamentals (GMGN 1 req/s)
   "10 */2 * * *": runFees,         // receipts per chain, then the per-trader rollup
   "15,45 * * * *": runSwaps,        // Solana + EVM swaps, newest first (X1); budget-bounded so overlap is safe
