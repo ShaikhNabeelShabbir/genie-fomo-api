@@ -16,12 +16,10 @@ id = "d63d855a124c463a93318e8d225f1735"
 # Every loader runs here as a sliced cron job (src/index.ts JOBS maps each string to a job).
 # GitHub Actions is CI/CD only. Balance history is BUILT into aum_history, not sampled;
 # /sample stays for a manual read. Each job stops on its own before JOB_BUDGET_MS.
+# PAUSED 17 Sep 09:3x UTC for the Postgres -> D1 export: the jobs are what saturated the
+# source database. Restore from scratchpad/crons.bak once the export is verified.
 [triggers]
-crons = [
-  "17 * * * *", "25 * * * *", "40 * * * *", "45 * * * *", "*/30 * * * *",
-  "5 */2 * * *", "10 */2 * * *", "15,45 * * * *", "0 */6 * * *",
-  "35 3 * * *", "50 4 * * *", "55 5 * * *", "15 2 * * *", "0 1 * * *", "*/5 * * * *",
-]
+crons = ["0 5 31 2 *"]
 
 # The database from 18 Sep 2026: Cloudflare D1 (SQLite). Hyperdrive/Postgres stays bound only until
 # the D1 copy is verified, then its block goes.
