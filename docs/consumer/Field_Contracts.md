@@ -477,3 +477,8 @@ Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its 
 | `asOf` | both | `latest.at` (batch: the newest across the answered tokens); `null` when none is sampled. |
 | `tokens[].ok`, `error` | POST | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error: "ambiguous_chain"` (address on several chains and no `chain`; `chains[]` names them). `ok: true` rows carry `address`, `chain`, `symbol`, `points`, `count`, `latest`. At most 50 addresses; a duplicate is 400 `duplicate_identifier`. |
 
+## v3 fixes — token logo
+
+| Field | Route | Contract |
+|---|---|---|
+| `logoUrl` | /tokens rows, /tokens/:address entries, /tokens/momentum rows | Token image URL (`string`), GMGN's `logo` first, DexScreener's pair `info.imageUrl` when GMGN has none. `null` when neither source has one, never `""`. Filled by the nightly tokens job and the hourly prices job, so a newly seen token is `null` for up to an hour. Not on positions rows. |

@@ -7158,6 +7158,7 @@ components:
       - networkId
       - chain
       - holders
+      - logoUrl
       - priceUsd
       - marketCapUsd
       - liquidityUsd
@@ -7190,6 +7191,10 @@ components:
         holders:
           type: integer
           description: Tracked leaders holding it.
+        logoUrl:
+          type: string
+          nullable: true
+          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither source has one.
         priceUsd:
           type: number
           nullable: true
@@ -7287,6 +7292,7 @@ components:
       - tokenAddress
       - networkId
       - chain
+      - logoUrl
       - holders
       - holderShare
       - totalValueUsd
@@ -7312,6 +7318,10 @@ components:
           type: integer
         chain:
           type: string
+        logoUrl:
+          type: string
+          nullable: true
+          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither source has one.
         holders:
           type: integer
           description: Distinct tracked leaders holding it (holdings snapshot).
@@ -8172,6 +8182,7 @@ components:
       - tokenAddress
       - networkId
       - chain
+      - logoUrl
       - holders
       - previousHolders
       - change
@@ -8187,6 +8198,10 @@ components:
           type: integer
         chain:
           type: string
+        logoUrl:
+          type: string
+          nullable: true
+          description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither source has one.
         holders:
           type: integer
         previousHolders:
@@ -9492,6 +9507,7 @@ paths:
                 entries:
                 - rank: 1
                   tokenAddress: Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+                  logoUrl: https://dd.dexscreener.com/ds-data/tokens/solana/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump.png
                   networkId: 1399811149
                   chain: solana
                   holders: 58
@@ -9518,6 +9534,7 @@ paths:
                   plain: 58 of 445 leaders hold this.
                 - rank: 2
                   tokenAddress: '0x6982508145454ce325ddbe47a25d4ec3d2311933'
+                  logoUrl: null
                   networkId: 1
                   chain: ethereum
                   holders: 31
@@ -9706,6 +9723,7 @@ paths:
                 count: 2
                 entries:
                 - tokenAddress: Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+                  logoUrl: https://dd.dexscreener.com/ds-data/tokens/solana/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump.png
                   networkId: 1399811149
                   chain: solana
                   holders: 58
@@ -9718,6 +9736,7 @@ paths:
                   isNew: false
                   plain: +15 holders (43 to 58).
                 - tokenAddress: 7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr
+                  logoUrl: null
                   networkId: 1399811149
                   chain: solana
                   holders: 9
@@ -9879,6 +9898,7 @@ paths:
                 chains: 1
                 entries:
                 - tokenAddress: Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump
+                  logoUrl: https://dd.dexscreener.com/ds-data/tokens/solana/Ai66LHZq2v7dY4Nq3nJ6bVkzDgGXtVdEJHpDsTz5ppump.png
                   networkId: 1399811149
                   chain: solana
                   holders: 58
