@@ -14,6 +14,7 @@ import { runBalances } from "./jobs/balances";
 import { runFees } from "./jobs/fees";
 import { runTiming } from "./jobs/timing";
 import { runSwaps } from "./jobs/swaps";
+import { runGmgn } from "./jobs/gmgn";
 
 /**
  * Every job is a sliced, resumable loader (worker/src/jobs/*). The strings must match
@@ -33,6 +34,7 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "35 3 * * *":   runLaunches,     // pump.fun launch metadata, dev ledger
   "50 4 * * *":   runWallets,      // linked wallets
   "55 5 * * *":   runTiming,       // position timing (one aggregate)
+  "15 2 * * *":   runGmgn,         // GMGN directory and its trades
 };
 
 export default {
