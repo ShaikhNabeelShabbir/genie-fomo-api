@@ -1,7 +1,8 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { DatabaseSync } from "node:sqlite";
 import { d1sql, type D1Like, type D1Statement } from "../worker/src/d1.ts";
-import { buildAumHistory, refreshAumLive, refreshAumLiveUnmoved, valueGroup } from "../worker/src/jobs/valuation.ts";
+import { buildAumHistory, latestLiquidity, refreshAumLive, refreshAumLiveUnmoved, valueGroup } from "../worker/src/jobs/valuation.ts";
+import { oldestUsableDay } from "../supabase/functions/api/shared/price-ladder.ts";
 
 /* The port of aum_history_build / aum_live_refresh (migration 20260918100000). The schema is
    the real worker/d1/migrations/*.sql, run in SQLite, so the SQL is proved, not mocked. */
@@ -9,8 +10,12 @@ import { buildAumHistory, refreshAumLive, refreshAumLiveUnmoved, valueGroup } fr
 const HOUR = 3_600_000;
 const hourIso = (ms: number): string => new Date(Math.floor(ms / HOUR) * HOUR).toISOString();
 const CURRENT_HOUR = hourIso(Date.now());
+const ago = (hours: number): string => new Date(Date.now() - hours * HOUR).toISOString();
 
-async function open(): Promise<{ sql: ReturnType<typeof d1sql>; db: DatabaseSync }> {
+/** `trips.count` is the round trips to D1: one per statement issued alone, one per `db.batch`. */
+async function open(): Promise<{ sql: ReturnType<typeof d1sql>; db: DatabaseSync; trips: { count: number } }> {
+  const trips = { count: 0 };
+  let batching = false;
   const db = new DatabaseSync(":memory:");
   db.exec("pragma foreign_keys = on");
   for (const f of ["0001_schema.sql", "0002_views.sql"]) {
@@ -22,6 +27,7 @@ async function open(): Promise<{ sql: ReturnType<typeof d1sql>; db: DatabaseSync
       const make = (params: unknown[]): D1Statement => ({
         bind: (...values: unknown[]) => make(values),
         all: () => {
+          if (!batching) trips.count += 1;
           const st = db.prepare(text);
           const p = params as (string | number | bigint | null | Uint8Array)[];
           if (write) return Promise.resolve({ results: [], meta: { changes: Number(st.run(...p).changes) } });
@@ -31,12 +37,18 @@ async function open(): Promise<{ sql: ReturnType<typeof d1sql>; db: DatabaseSync
       return make([]);
     },
     async batch(stmts: D1Statement[]) {
+      trips.count += 1;
+      batching = true;
       const out = [];
-      for (const s of stmts) out.push(await s.all());
+      try {
+        for (const s of stmts) out.push(await s.all());
+      } finally {
+        batching = false;
+      }
       return out;
     },
   };
-  return { sql: d1sql(like), db };
+  return { sql: d1sql(like), db, trips };
 }
 
 const run = (db: DatabaseSync, text: string, ...p: (string | number | null)[]): void => void db.prepare(text).run(...p);
@@ -218,13 +230,13 @@ Deno.test("buildAumHistory: nothing but suspect value reads price_suspect, and t
 
 // ------------------------------------------------------------------ refreshAumLive
 
-Deno.test("refreshAumLive: upserts aum_live and the current hour of aum_history, with the live ladder", async () => {
+Deno.test("refreshAumLive: upserts aum_live with the live ladder, and writes NO hour of aum_history", async () => {
   const { sql, db } = await open();
   trader(db, "a");
   trader(db, "b");
   token(db, 1, "0xstats");
   token(db, 1, "0xday");
-  run(db, "insert into token_price_stats (network_id, token_key, ath_usd, ath_at, last_usd, last_at, drawdown_share) values (1,'0xstats',9,'2026-09-10T00:00:00.000Z',6,'2026-09-10T00:00:00.000Z',0)");
+  run(db, "insert into token_price_stats (network_id, token_key, ath_usd, ath_at, last_usd, last_at, drawdown_share) values (1,'0xstats',9,'2026-09-10T00:00:00.000Z',6,?,0)", ago(1));
   run(db, "insert into token_prices (network_id, token_key, day, usd, source) values (1,'0xstats',?,99,'t')", CURRENT_HOUR.slice(0, 10));
   run(db, "insert into token_prices (network_id, token_key, day, usd, source) values (1,'0xday',?,4,'t')", CURRENT_HOUR.slice(0, 10));
   capture(db, "a", 1, "0xstats", "2026-09-10T02:30:00.000Z", 2);
@@ -235,7 +247,85 @@ Deno.test("refreshAumLive: upserts aum_live and the current hour of aum_history,
     { handle: "a", total_usd: 24, priced_positions: 2, reason: null, source: "webhook" },
     { handle: "b", total_usd: null, priced_positions: 0, reason: "no_holdings", source: "webhook" },
   ]);
-  assertEquals(history(db, "a").map((r) => [r.hour, r.basis, r.total_usd]), [[CURRENT_HOUR, "priced", 24]]);
+  /* cron CRON-04: the live ladder ends on GMGN's price; an hour of history is the builder's alone (V1d). */
+  assertEquals(history(db, "a"), []);
+});
+
+Deno.test("refreshAumLive: a price past its rung's age prices nothing, and the aged token_info row still flags", async () => {
+  /* claims F5: 50-hour-old stats and a 9-day-old GMGN price were summed into aum_live as 2 of 2 priced. */
+  const { sql, db } = await open();
+  trader(db, "a");
+  for (const k of ["0xoldstats", "0xoldinfo", "0xclose", "0xfresh", "0xtrap", "0xweek", "0xpastweek"]) {
+    token(db, 1, k);
+    capture(db, "a", 1, k, "2026-09-10T02:30:00.000Z", 1);
+  }
+  const stats = (k: string, usd: number, hoursAgo: number): void =>
+    run(db, "insert into token_price_stats (network_id, token_key, ath_usd, ath_at, last_usd, last_at, drawdown_share) values (1,?,9,?,?,?,0)", k, ago(hoursAgo), usd, ago(hoursAgo));
+  const info = (k: string, usd: number, hoursAgo: number, honeypot: number): void =>
+    run(db, "insert into token_info (network_id, token_key, price_usd, total_supply, is_honeypot, fetched_at) values (1,?,?,1e6,?,?)", k, usd, honeypot, ago(hoursAgo));
+  stats("0xoldstats", 500, 50);
+  info("0xoldinfo", 200, 9 * 24, 0);
+  stats("0xclose", 500, 50); // aged out, so the rung below it prices the coin
+  run(db, "insert into token_prices (network_id, token_key, day, usd, source) values (1,'0xclose',?,3,'t')", CURRENT_HOUR.slice(0, 10));
+  stats("0xfresh", 5, 23);
+  info("0xtrap", 0, 9 * 24, 1); // the ROW must survive its price: it is what says unsellable
+  stats("0xtrap", 7, 1);
+  /* The daily rung is the ladder's own day: `day > now - 7` here left out a close /positions still priced. */
+  const oldest = oldestUsableDay(new Date());
+  const close = (k: string, day: string, usd: number): void =>
+    run(db, "insert into token_prices (network_id, token_key, day, usd, source) values (1,?,?,?,'t')", k, day, usd);
+  close("0xweek", oldest, 11);
+  close("0xpastweek", new Date(Date.parse(oldest) - 24 * HOUR).toISOString().slice(0, 10), 13);
+
+  await refreshAumLive(sql, ["a"], "webhook");
+  assertEquals(db.prepare("select total_usd, unsellable_usd, priced_positions, total_positions, reason from aum_live").all(),
+    [{ total_usd: 19, unsellable_usd: 7, priced_positions: 3, total_positions: 7, reason: null }]);
+});
+
+Deno.test("round trips: a chunk's independent reads go out as one batch (load F9)", async () => {
+  /* D1 is one statement at a time and ~0.25 s a round trip: the builder was 11 a trader-hour, the flush 9. */
+  const { sql, db, trips } = await open();
+  trader(db, "a");
+  for (const k of ["0xaa", "0xbb"]) {
+    token(db, 1, k);
+    capture(db, "a", 1, k, "2026-09-10T02:30:00.000Z", 1);
+  }
+  await buildAumHistory(sql, "a", "2026-09-10T03:00:00.000Z", "2026-09-10T03:00:00.000Z");
+  assertEquals(trips.count, 5, "plan reads, holdings, facts, ladder, write");
+  trips.count = 0;
+  await refreshAumLive(sql, ["a"], "webhook");
+  assertEquals(trips.count, 5, "targets, balances, facts, daily close, write");
+});
+
+Deno.test("latestLiquidity: the rows the window it replaced kept, by seek", async () => {
+  /** loadFacts' liquidity statement until 19 Sep 2026, verbatim (its values as parameters). */
+  const OLD = `
+        select token_key, liquidity_usd from (
+          select token_key, liquidity_usd, row_number() over (partition by token_key order by hour desc) as rn
+            from token_price_hourly where network_id = ? and token_key in (?, ?, ?, ?)
+        ) where rn = 1`;
+  const { sql, db } = await open();
+  const sample = (net: number, k: string, hour: string, liq: number | null): void =>
+    run(db, "insert into token_price_hourly (network_id, token_key, hour, usd, liquidity_usd, source) values (?,?,?,1,?,'t')", net, k, hour, liq);
+  sample(1, "0xa", "2026-09-10T01:00:00.000Z", 10);
+  sample(1, "0xa", "2026-09-10T03:00:00.000Z", 30);
+  sample(1, "0xa", "2026-09-10T02:00:00.000Z", 20);
+  sample(1, "0xnull", "2026-09-10T01:00:00.000Z", 10);
+  sample(1, "0xnull", "2026-09-10T02:00:00.000Z", null); // the NEWEST sample wins even when it holds no figure
+  sample(8453, "0xa", "2026-09-10T09:00:00.000Z", 99);   // another chain's sample of the same key
+  sample(1, "0xunasked", "2026-09-10T01:00:00.000Z", 1);
+  const keys = ["0xa", "0xnull", "0xnone", "not-in-tokens"];
+  const sorted = (rows: readonly Record<string, unknown>[]): unknown[][] =>
+    rows.map((r) => [r.token_key, r.liquidity_usd]).sort();
+  /* loadFacts reads a null figure exactly as it reads no row, so the figures are what must agree. */
+  const figures = (rows: readonly Record<string, unknown>[]): unknown[][] => sorted(rows).filter(([, liq]) => liq !== null);
+  const was = db.prepare(OLD).all(1, ...keys) as Record<string, unknown>[];
+  const now = await latestLiquidity(sql, 1, keys);
+  assertEquals(sorted(was), [["0xa", 30], ["0xnull", null]]);
+  assertEquals(sorted(now), [["0xa", 30], ["0xnone", null], ["0xnull", null], ["not-in-tokens", null]]);
+  assertEquals(figures(now), figures(was));
+  const plan = (db.prepare(`explain query plan ${latestLiquidity(sql, 1, keys).text}`).all(1, "[]") as { detail: string }[]).map((r) => r.detail);
+  assertEquals(plan.filter((d) => d.includes("token_price_hourly")).every((d) => d.startsWith("SEARCH p USING")), true, plan.join("\n"));
 });
 
 Deno.test("refreshAumLive: a null handle list means every trader with a wallet; olderThanHours skips fresh rows", async () => {

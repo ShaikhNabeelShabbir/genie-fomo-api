@@ -14,9 +14,12 @@ import { n } from "../db.ts";
  *
  * Rung order, freshest and most trustworthy first:
  *   1. `quote_assets.pegged_usd` — a dollar coin is a dollar, and no market check applies.
- *   2. `token_price_stats.last_usd` — the hourly DexScreener price, the freshest we hold.
+ *   2. `token_price_stats.last_usd` — the hourly DexScreener price, at most STATS_STALE_HOURS old.
  *   3. `token_prices.usd` — the daily close, at most DAILY_CLOSE_STALE_DAYS old.
- *   4. `token_info.price_usd` — GMGN's, last because it has no staleness stamp we trust.
+ *   4. `token_info.price_usd` — GMGN's, last, and only as old as its fetch: at most INFO_STALE_DAYS.
+ *
+ * A price past its rung's age prices nothing: the row is unpriced (null), never valued at an
+ * old figure under a fresh total. `statsFresh` / `infoFresh` are the one rule every reader follows.
  */
 
 /** Vocabulary `positions[].priceSource`; `fomo_reported_entry` is the directory build's own and never comes from here. */
@@ -29,6 +32,20 @@ export const DAILY_CLOSE_STALE_DAYS = 7;
 /** The oldest `day` a daily close may carry, as the `YYYY-MM-DD` the column stores. */
 export const oldestUsableDay = (now: Date): string =>
   new Date(now.getTime() - DAILY_CLOSE_STALE_DAYS * 86_400_000).toISOString().slice(0, 10);
+
+/** The history builder's hourly rung uses the same 24 h, so `now` and the newest point agree. */
+export const STATS_STALE_HOURS = 24;
+/** No rung admits an older price than the daily close does. */
+export const INFO_STALE_DAYS = DAILY_CLOSE_STALE_DAYS;
+
+/** A price with no readable stamp cannot be shown to be young, so it is not. */
+const youngerThan = (at: unknown, now: Date, maxAgeMs: number): boolean =>
+  !!at && now.getTime() - new Date(String(at)).getTime() <= maxAgeMs;
+
+/** `token_price_stats.last_at` is young enough for `last_usd` to price a position at `now`. */
+export const statsFresh = (lastAt: unknown, now: Date): boolean => youngerThan(lastAt, now, STATS_STALE_HOURS * 3_600_000);
+/** `token_info.fetched_at` is young enough for `price_usd` to price a position at `now`. */
+export const infoFresh = (fetchedAt: unknown, now: Date): boolean => youngerThan(fetchedAt, now, INFO_STALE_DAYS * 86_400_000);
 
 /**
  * The four rungs as a query hands them over; every field optional so a caller may omit a rung.
@@ -68,18 +85,18 @@ const positive = (v: unknown): number | null => {
 const iso = (v: unknown): string | null => (v ? new Date(String(v)).toISOString() : null);
 
 /**
- * The first rung that carries a price, or null. Pure: the caller decides where the columns
- * came from, and a stale daily close is excluded by the query, not here (the `day` column is
- * indexed and the filter belongs in the seek).
+ * The first rung that carries a usable price at `now`, or null. Pure: the caller decides where
+ * the columns came from, and a stale daily close is excluded by the query, not here (the `day`
+ * column is indexed and the filter belongs in the seek).
  */
-export function ladderPrice(r: LadderColumns): LadderPrice | null {
+export function ladderPrice(r: LadderColumns, now: Date): LadderPrice | null {
   const pegged = positive(r.pegged_usd);
   if (pegged !== null) return { usd: pegged, source: "pegged", at: null };
-  const stats = positive(r.stats_usd);
+  const stats = statsFresh(r.stats_at, now) ? positive(r.stats_usd) : null;
   if (stats !== null) return { usd: stats, source: "token_price_stats", at: iso(r.stats_at) };
   const daily = unpackDaily(r.daily);
   if (daily !== null) return { usd: daily.usd, source: "token_prices", at: `${daily.day}T00:00:00.000Z` };
-  const info = positive(r.info_usd);
+  const info = infoFresh(r.info_at, now) ? positive(r.info_usd) : null;
   if (info !== null) return { usd: info, source: "token_info", at: iso(r.info_at) };
   return null;
 }

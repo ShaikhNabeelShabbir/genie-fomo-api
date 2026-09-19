@@ -1,5 +1,6 @@
 import type { Sql } from "../d1.ts";
 import { MAX_POSITION_USD, MAX_PRICE_PER_TOKEN, suspectRows, value } from "../../../supabase/functions/aum-sample/value.ts";
+import { infoFresh, oldestUsableDay, statsFresh } from "../../../supabase/functions/api/shared/price-ladder.ts";
 import { chunk } from "./directory-core.ts";
 
 /**
@@ -15,11 +16,8 @@ const IN_CHUNK = 80;
 /** Rows per multi-row upsert; 10 columns x 9 rows = 90 parameters. */
 const WRITE_CHUNK = 9;
 const HOUR_MS = 3_600_000;
-const DAY_MS = 86_400_000;
 /** A hourly sample older than this cannot price an hour (SQL: `ph.hour > b.hour - interval '24 hours'`). */
 const HOURLY_STALE_MS = 24 * HOUR_MS;
-/** The live ladder's daily rung reaches back a week (SQL: `tp.day > now()::date - 7`). */
-const DAILY_STALE_DAYS = 7;
 /** aum-rules.ts PRICED_FLOOR, as the two functions spelled it. */
 const PRICED_FLOOR = 0.25;
 /** Under this many dollars a mostly-unpriced reading says so instead of reporting the fragment. */
@@ -132,9 +130,19 @@ const positive = (v: unknown): number | null => {
   return n !== null && n > 0 ? n : null;
 };
 
+/** The newest hourly sample's liquidity per key, by seek: a window here read each key's whole hourly history to keep one row. */
+export const latestLiquidity = (sql: Sql, networkId: number, keys: readonly string[]) =>
+  sql<{ token_key: string; liquidity_usd: number | null }[]>`
+    select j.value as token_key,
+           (select p.liquidity_usd from token_price_hourly p
+             where p.network_id = ${networkId} and p.token_key = j.value
+             order by p.hour desc limit 1) as liquidity_usd
+      from json_each(${JSON.stringify(keys)}) j`;
+
 /**
  * The `left join tokens / token_info / quote_assets / token_price_hourly` half of both
- * functions, plus `token_price_stats` for the live ladder. One statement per rung per chunk.
+ * functions, plus `token_price_stats` for the live ladder. One statement per rung per chunk,
+ * issued together inside `begin` so a chunk is ONE `db.batch` round trip, not five.
  */
 async function loadFacts(sql: Sql, refs: readonly TokenRef[], withStats: boolean): Promise<Map<string, Facts>> {
   const out = new Map<string, Facts>();
@@ -144,28 +152,38 @@ async function loadFacts(sql: Sql, refs: readonly TokenRef[], withStats: boolean
     out.set(k, f);
     return f;
   };
+  const now = new Date();
   for (const [networkId, all] of byNetwork(refs)) {
     for (const keys of chunk(all, IN_CHUNK)) {
-      const info = await sql<{ token_key: string; is_honeypot: number | null; can_not_sell: number | null; total_supply: number | null; liquidity_usd: number | null; price_usd: number | null }[]>`
-        select token_key, is_honeypot, can_not_sell, total_supply, liquidity_usd, price_usd
-          from token_info where network_id = ${networkId} and token_key in (${keys})`;
+      const [info, toks, pegs, liq, stats] = await sql.begin((tx) => Promise.all([
+        tx<{ token_key: string; is_honeypot: number | null; can_not_sell: number | null; total_supply: number | null; liquidity_usd: number | null; price_usd: number | null; fetched_at: string | null }[]>`
+          select token_key, is_honeypot, can_not_sell, total_supply, liquidity_usd, price_usd, fetched_at
+            from token_info where network_id = ${networkId} and token_key in (${keys})`,
+        tx<{ token_key: string; total_supply: number | null }[]>`
+          select token_key, total_supply from tokens where network_id = ${networkId} and token_key in (${keys})`,
+        tx<{ token_key: string; pegged_usd: number | null }[]>`
+          select token_key, pegged_usd from quote_assets
+           where network_id = ${networkId} and token_key in (${keys})`,
+        latestLiquidity(tx, networkId, keys),
+        withStats
+          ? tx<{ token_key: string; last_usd: number; last_at: string }[]>`
+              select token_key, last_usd, last_at from token_price_stats
+               where network_id = ${networkId} and token_key in (${keys}) and last_usd > 0`
+          : [],
+      ]));
       for (const r of info) {
         const f = at(networkId, r.token_key);
         f.unsellable = r.is_honeypot === 1 || r.can_not_sell === 1;
         f.supply = positive(r.total_supply);
         f.liquidity = num(r.liquidity_usd);
-        f.infoPrice = positive(r.price_usd);
+        // The ROW is kept whatever its age (it carries the sell flags and supply); only its price ages out.
+        f.infoPrice = infoFresh(r.fetched_at, now) ? positive(r.price_usd) : null;
       }
-      const toks = await sql<{ token_key: string; total_supply: number | null }[]>`
-        select token_key, total_supply from tokens where network_id = ${networkId} and token_key in (${keys})`;
       // `coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0))`: the token row wins.
       for (const r of toks) {
         const f = at(networkId, r.token_key);
         f.supply = positive(r.total_supply) ?? f.supply;
       }
-      const pegs = await sql<{ token_key: string; pegged_usd: number | null }[]>`
-        select token_key, pegged_usd from quote_assets
-         where network_id = ${networkId} and token_key in (${keys})`;
       for (const r of pegs) {
         const f = at(networkId, r.token_key);
         /* Membership alone exempts the row from the market checks; only a positive peg prices it. */
@@ -173,20 +191,11 @@ async function loadFacts(sql: Sql, refs: readonly TokenRef[], withStats: boolean
         if (typeof r.pegged_usd === "number" && r.pegged_usd > 0) f.pegged = r.pegged_usd;
       }
       // V1d liquidity: the best pair's, from the latest hourly sample, else GMGN's (already set).
-      const liq = await sql<{ token_key: string; liquidity_usd: number | null }[]>`
-        select token_key, liquidity_usd from (
-          select token_key, liquidity_usd, row_number() over (partition by token_key order by hour desc) as rn
-            from token_price_hourly where network_id = ${networkId} and token_key in (${keys})
-        ) where rn = 1`;
       for (const r of liq) {
         const f = at(networkId, r.token_key);
         f.liquidity = num(r.liquidity_usd) ?? f.liquidity;
       }
-      if (!withStats) continue;
-      const stats = await sql<{ token_key: string; last_usd: number }[]>`
-        select token_key, last_usd from token_price_stats
-         where network_id = ${networkId} and token_key in (${keys}) and last_usd > 0`;
-      for (const r of stats) at(networkId, r.token_key).statsLast = r.last_usd;
+      for (const r of stats) if (statsFresh(r.last_at, now)) at(networkId, r.token_key).statsLast = r.last_usd;
     }
   }
   return out;
@@ -232,8 +241,8 @@ async function writeHistory(
 /**
  * `aum_history_build(p_handle, p_from, p_to)`: every hour from `fromIso` to `toIso` inclusive,
  * a sampled reading first, else a rebuilt one, else the latest chain capture per network before
- * the hour ends, valued on the ladder peg -> hourly (<= 24 h stale) -> that day's close ->
- * token_info (current hour only). Returns hours written.
+ * the hour ends, valued on the ladder peg -> hourly (<= 24 h stale) -> that day's close.
+ * Returns hours written.
  */
 export async function buildAumHistory(sql: Sql, handle: string, fromIso: string, toIso: string): Promise<number> {
   const first = Math.floor(new Date(fromIso).getTime() / HOUR_MS) * HOUR_MS;
@@ -243,12 +252,25 @@ export async function buildAumHistory(sql: Sql, handle: string, fromIso: string,
   for (let t = first; t <= last; t += HOUR_MS) hours.push(t);
   const windowEnd = new Date(last + HOUR_MS).toISOString();
 
+  // Rule 1's and rule 2's reads are independent: issued together inside `begin`, they are one round trip.
+  const [samples, before, inside] = await sql.begin((tx) => Promise.all([
+    tx<{ at: string; basis: string; total_usd: number; priced_positions: number | null; total_positions: number | null }[]>`
+      select at, basis, total_usd, priced_positions, total_positions
+        from aum_samples
+       where handle = ${handle} and basis in ('sampled', 'rebuilt') and total_usd is not null
+         and at >= ${new Date(first).toISOString()} and at < ${windowEnd}`,
+    tx<{ network_id: number; captured_at: string | null }[]>`
+      select network_id, max(captured_at) as captured_at from holdings
+       where handle = ${handle} and source = 'chain' and captured_at < ${new Date(first + HOUR_MS).toISOString()}
+       group by network_id`,
+    tx<{ network_id: number; captured_at: string }[]>`
+      select distinct network_id, captured_at from holdings
+       where handle = ${handle} and source = 'chain'
+         and captured_at >= ${new Date(first + HOUR_MS).toISOString()} and captured_at < ${windowEnd}
+       order by captured_at`,
+  ]));
+
   // Rule 1: a measurement inside the hour wins — sampled first, else rebuilt, newest first.
-  const samples = await sql<{ at: string; basis: string; total_usd: number; priced_positions: number | null; total_positions: number | null }[]>`
-    select at, basis, total_usd, priced_positions, total_positions
-      from aum_samples
-     where handle = ${handle} and basis in ('sampled', 'rebuilt') and total_usd is not null
-       and at >= ${new Date(first).toISOString()} and at < ${windowEnd}`;
   const readings = new Map<string, { at: string; basis: string; row: ReadingRow }>();
   for (const s of samples) {
     const h = hourIso(new Date(s.at).getTime());
@@ -260,15 +282,6 @@ export async function buildAumHistory(sql: Sql, handle: string, fromIso: string,
   }
 
   // Rule 2: per (hour, network), the latest chain capture before the hour ends.
-  const before = await sql<{ network_id: number; captured_at: string | null }[]>`
-    select network_id, max(captured_at) as captured_at from holdings
-     where handle = ${handle} and source = 'chain' and captured_at < ${new Date(first + HOUR_MS).toISOString()}
-     group by network_id`;
-  const inside = await sql<{ network_id: number; captured_at: string }[]>`
-    select distinct network_id, captured_at from holdings
-     where handle = ${handle} and source = 'chain'
-       and captured_at >= ${new Date(first + HOUR_MS).toISOString()} and captured_at < ${windowEnd}
-     order by captured_at`;
   const latest = new Map<number, string>();
   for (const r of before) if (r.captured_at !== null) latest.set(r.network_id, r.captured_at);
   const pending = [...inside];
@@ -303,19 +316,21 @@ export async function buildAumHistory(sql: Sql, handle: string, fromIso: string,
   const daily = new Map<string, number>();
   for (const [networkId, all] of byNetwork(refs)) {
     for (const keys of chunk(all, IN_CHUNK)) {
-      const ph = await sql<{ token_key: string; hour: string; usd: number }[]>`
-        select token_key, hour, usd from token_price_hourly
-         where network_id = ${networkId} and token_key in (${keys}) and usd > 0
-           and hour > ${new Date(first - HOURLY_STALE_MS).toISOString()} and hour <= ${new Date(last).toISOString()}
-         order by hour`;
+      const [ph, tp] = await sql.begin((tx) => Promise.all([
+        tx<{ token_key: string; hour: string; usd: number }[]>`
+          select token_key, hour, usd from token_price_hourly
+           where network_id = ${networkId} and token_key in (${keys}) and usd > 0
+             and hour > ${new Date(first - HOURLY_STALE_MS).toISOString()} and hour <= ${new Date(last).toISOString()}
+           order by hour`,
+        tx<{ token_key: string; day: string; usd: number }[]>`
+          select token_key, day, usd from token_prices
+           where network_id = ${networkId} and token_key in (${keys}) and usd > 0
+             and day >= ${dayOf(new Date(first).toISOString())} and day <= ${dayOf(new Date(last).toISOString())}`,
+      ]));
       for (const r of ph) {
         const k = factsKey(networkId, r.token_key);
         (hourly.get(k) ?? hourly.set(k, []).get(k)!).push(r);
       }
-      const tp = await sql<{ token_key: string; day: string; usd: number }[]>`
-        select token_key, day, usd from token_prices
-         where network_id = ${networkId} and token_key in (${keys}) and usd > 0
-           and day >= ${dayOf(new Date(first).toISOString())} and day <= ${dayOf(new Date(last).toISOString())}`;
       for (const r of tp) daily.set(`${factsKey(networkId, r.token_key)}|${r.day}`, r.usd);
     }
   }
@@ -458,8 +473,12 @@ async function capturedBalances(sql: Sql, targets: readonly string[]): Promise<M
 
 /**
  * `aum_live_refresh(p_handles, p_source, p_older_than)`: revalue the targets on the ladder
- * peg -> token_price_stats -> the latest daily close within 7 days -> token_info, upserting
- * `aum_live` and the current hour of `aum_history`. Returns rows upserted.
+ * peg -> token_price_stats (<= 24 h) -> the latest daily close within 7 days -> token_info
+ * (<= 7 days), upserting `aum_live`. Returns rows upserted.
+ *
+ * It does NOT write `aum_history`: this is the LIVE ladder (GMGN's price included), and an hour
+ * of history is only ever written by `buildAumHistory`, on the ladder whose every rung is dated
+ * (V1d). It used to upsert the current hour, so one row had two writers and two values.
  *
  * The BALANCES ARE THE CALLER'S: `refreshAumLive` rolls them forward, `refreshAumLiveUnmoved`
  * does not. A boolean here would be a flag switching the body's behaviour; two names that each
@@ -471,9 +490,9 @@ async function revalue(
   const refs: TokenRef[] = [...balances.values()].flat().map((b) => ({ networkId: b.networkId, tokenKey: b.tokenKey }));
   const facts = await loadFacts(sql, refs, true);
 
-  // Ladder rung 3: the latest daily close within 7 days.
+  // Ladder rung 3: the latest daily close the ONE ladder still admits, so `now` and /positions agree to the day.
   const today = dayOf(new Date().toISOString());
-  const since = dayOf(new Date(Date.now() - DAILY_STALE_DAYS * DAY_MS).toISOString());
+  const since = oldestUsableDay(new Date());
   const daily = new Map<string, number>();
   for (const [networkId, all] of byNetwork(refs)) {
     for (const keys of chunk(all, IN_CHUNK)) {
@@ -482,14 +501,13 @@ async function revalue(
           select token_key, usd, row_number() over (partition by token_key order by day desc) as rn
             from token_prices
            where network_id = ${networkId} and token_key in (${keys}) and usd > 0
-             and day <= ${today} and day > ${since}
+             and day <= ${today} and day >= ${since}
         ) where rn = 1`;
       for (const r of tp) daily.set(factsKey(networkId, r.token_key), r.usd);
     }
   }
 
   const at = new Date().toISOString();
-  const hour = hourIso(Date.now());
   const computed = targets.map((handle) => {
     const positions = (balances.get(handle) ?? []).map((b): Position => {
       const k = factsKey(b.networkId, b.tokenKey);
@@ -520,7 +538,6 @@ async function revalue(
       );
     }
   });
-  await writeHistory(sql, computed.map((c) => ({ handle: c.handle, hour, v: c.v, basis: "priced" as const })));
   return computed.length;
 }
 
