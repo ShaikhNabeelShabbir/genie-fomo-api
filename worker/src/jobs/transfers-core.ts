@@ -24,6 +24,8 @@ export interface Wallet {
   readonly sol_backfill_done?: number | null;
   /** W2: the oldest Solana signature we already hold, the `before` the next page starts at. */
   readonly sol_oldest_signature?: string | null;
+  /** The newest Solana signature a PULL (not the webhook) stored: where the next head pull stops. */
+  readonly sol_newest_pulled_signature?: string | null;
 }
 
 /** Chain word (as `Transfer.chain` names it) -> network_id. */
@@ -104,3 +106,10 @@ export function webhooksOf(list: unknown): Webhook[] {
 export function pickWebhook(existing: readonly Webhook[], target: string): Webhook | null {
   return existing.find((w) => w.webhookURL === target) ?? existing[0] ?? null;
 }
+
+/** A chain error that means the SOURCE is turning us away, as opposed to this wallet having a problem. */
+export const isSourceRefusal = (error: string | null): boolean => error !== null && /HTTP (?:403|429)\b|rejected the key/i.test(error);
+
+/** Wallets whose Solana history is not all in yet, in the order given; `limit` of them are walked back per run. */
+export const walkBackTargets = <W extends Wallet>(targets: readonly W[], limit: number): W[] =>
+  targets.filter((w) => w.sol_address && w.sol_backfill_done !== 1 && w.sol_oldest_signature).slice(0, limit);

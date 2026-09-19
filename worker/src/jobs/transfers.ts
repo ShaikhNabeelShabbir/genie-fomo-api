@@ -1,10 +1,10 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { transferKey } from "../../../supabase/functions/_shared/md5.ts";
-import { UA } from "../../../supabase/functions/_shared/settings.ts";
+import { REFUSALS_IN_A_ROW, UA } from "../../../supabase/functions/_shared/settings.ts";
 import { fetchTransactions, type ProviderKeys } from "../../../supabase/functions/_shared/transactions.ts";
 import { SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
-import { type Row, type Wallet, chunk, dedupe, pickWebhook, toRows, webhooksOf } from "./transfers-core";
+import { type Row, type Wallet, chunk, dedupe, isSourceRefusal, pickWebhook, toRows, walkBackTargets, webhooksOf } from "./transfers-core";
 
 /**
  * On-chain transfer refresh, the Worker half of refresh.yml steps 6 and 7:
@@ -19,6 +19,8 @@ import { type Row, type Wallet, chunk, dedupe, pickWebhook, toRows, webhooksOf }
 
 const PAGES = 5;
 const FANOUT = 3;
+/** Wallets walked back per run: 3 x PAGES Helius calls an hour, where it used to be every wallet's. */
+const WALK_BACK_PER_RUN = 3;
 const LIMIT = 200;
 /** 13 binds a row and D1 allows 100 a statement, so a statement carries 6 rows. */
 const INSERT_ROWS = 6;
@@ -46,22 +48,26 @@ export interface TransfersSummary {
 }
 
 /**
- * Every wallet with an address, stalest first: the newest `ingested_at` a backfill (not the
- * webhook) wrote for either address, never-backfilled first, then directory rank.
- * ponytail: a wallet with genuinely no activity is re-fetched every run; fine at ~1 min a pass.
+ * Every wallet with an address, longest-unpulled first (`wallets.transfers_pulled_at`, stamped by
+ * this job), never-pulled first, then directory rank. The order used to be computed from
+ * `max(transactions.ingested_at)` per wallet, which read all 1.29 M transfers every run.
+ * ponytail: a wallet with genuinely no activity is re-asked every pass; one Helius call now, not five.
  */
 const selectTargets = (sql: Sql) => sql<Wallet[]>`
   select w.handle, w.evm_address, w.sol_address, w.sol_backfill_done,
          -- W2: the oldest Solana signature we hold IS the next 'before'; no cursor column needed.
          (select t.tx_hash from transactions t
            where t.address_key = w.sol_address_key and t.network_id = ${SOLANA_NETWORK_ID}
-           order by t.block_time asc limit 1)                        as sol_oldest_signature
+           order by t.block_time asc limit 1)                        as sol_oldest_signature,
+         -- The newest one a PULL stored is where the next pull stops. Not the webhook's: it can
+         -- miss a delivery, and the pull is what closes that gap.
+         (select t.tx_hash from transactions t
+           where t.address_key = w.sol_address_key and t.network_id = ${SOLANA_NETWORK_ID}
+             and t.source <> 'helius-webhook'
+           order by t.block_time desc limit 1)                       as sol_newest_pulled_signature
     from wallets w join trader_stats_current s using (handle)
    where (w.evm_address is not null or w.sol_address is not null)
-   order by coalesce((select max(t.ingested_at) from transactions t
-                       where t.address_key in (w.evm_address_key, w.sol_address_key)
-                         and t.source <> 'helius-webhook'), '1970-01-01T00:00:00.000Z') asc,
-            s.rank is null, s.rank`;
+   order by coalesce(w.transfers_pulled_at, '') asc, s.rank is null, s.rank`;
 
 /** `transfer_key` is the md5 of (token, direction, counterparty, amount); SQLite has none, so `_shared/md5.ts` digests it. */
 const keyed = (r: Row): unknown[] => [
@@ -124,14 +130,21 @@ async function upsert(sql: Sql, rows: readonly Row[]): Promise<void> {
  * page a run, until Helius answers with nothing and `sol_backfill_done` is set. A wallet is
  * finished once and never walked again.
  */
-async function backfillWallet(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<number> {
+async function backfillWallet(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<{ rows: number; refused: boolean }> {
   // includeNative pulls the native SOL side of a swap; without it a spend cannot be attributed.
-  const out = await fetchTransactions(keys, w.evm_address, w.sol_address, null, LIMIT, { pages: PAGES, includeNative: true });
+  const out = await fetchTransactions(keys, w.evm_address, w.sol_address, null, LIMIT,
+    { pages: PAGES, includeNative: true, solanaUntil: w.sol_newest_pulled_signature ?? null });
   for (const c of out.chains) if (c.error) console.error(`transfers: ${w.handle} ${c.chain}: ${c.error}`);
   const rows = dedupe(toRows(w, out.transfers));
   for (const part of chunk(rows, INSERT_CHUNK)) await upsert(sql, part);
+  // With `solanaUntil` the Solana rows here are NEW ones, so this marks a trader who moved — it
+  // used to mark every Solana trader every hour, which kept the 5-minute flush permanently full.
   await markIfSolana(sql, w, rows);
-  return rows.length + await walkBack(sql, keys, w);
+  // Stamped only when every chain answered: a refused pull must stay first in line.
+  if (!out.chains.some((c) => c.error)) {
+    await sql`update wallets set transfers_pulled_at = ${new Date().toISOString()} where handle = ${w.handle}`;
+  }
+  return { rows: rows.length, refused: out.chains.some((c) => isSourceRefusal(c.error)) };
 }
 
 /** Mark the trader when any of the rows just written is a Solana transfer. */
@@ -139,8 +152,8 @@ async function markIfSolana(sql: Sql, w: Wallet, rows: readonly Row[]): Promise<
   if (rows.some((r) => r[0] === SOLANA_NETWORK_ID)) await markDirty(sql, w.handle);
 }
 
-/** One backward Solana page for a wallet whose history is not yet in. Returns rows written. */
-async function walkBack(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<number> {
+/** One backward Solana page for a wallet whose history is not yet in. Returns rows written, or null when Helius refused. */
+async function walkBack(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<number | null> {
   const before = w.sol_oldest_signature ?? null;
   if (!w.sol_address || w.sol_backfill_done === 1 || before === null) return 0;
   const out = await fetchTransactions(keys, null, w.sol_address, ["solana"], LIMIT,
@@ -148,7 +161,7 @@ async function walkBack(sql: Sql, keys: ProviderKeys, w: Wallet): Promise<number
   const sol = out.chains.find((c) => c.chain === "solana");
   if (sol?.error) {
     console.error(`transfers: ${w.handle} solana backfill: ${sol.error}`);
-    return 0;
+    return null;
   }
   const rows = dedupe(toRows(w, out.transfers));
   for (const part of chunk(rows, INSERT_CHUNK)) await upsert(sql, part);
@@ -216,17 +229,38 @@ export async function runTransfers(env: Env, budgetMs: number): Promise<Transfer
   const sql = jobSql(env);
   try {
     const targets = await selectTargets(sql);
-    let wallets = 0, rowsUpserted = 0, errored = 0, stoppedEarly = false;
+    let wallets = 0, rowsUpserted = 0, errored = 0, stoppedEarly = false, refusedInARow = 0;
+    /*
+     * HISTORY FIRST, A FEW WALLETS A RUN (19 Sep 2026). Walking back EVERY wallet on every hourly run
+     * doubled this job's Helius calls the day it shipped, and two days later Helius answered 429 to
+     * every balance read and swap batch. A page is five calls; the first refusal ends the walk.
+     */
+    for (const w of walkBackTargets(targets, WALK_BACK_PER_RUN)) {
+      const walked = await walkBack(sql, keys, w);
+      if (walked === null) break;
+      rowsUpserted += walked;
+    }
     for (let i = 0; i < targets.length; i += FANOUT) {
       if (Date.now() - started > budgetMs - SYNC_RESERVE_MS) { stoppedEarly = true; break; }
       const slice = targets.slice(i, i + FANOUT);
       const results = await Promise.allSettled(slice.map((w) => backfillWallet(sql, keys, w)));
       results.forEach((r, j) => {
         wallets += 1;
-        if (r.status === "fulfilled") { rowsUpserted += r.value; return; }
+        if (r.status === "fulfilled") {
+          rowsUpserted += r.value.rows;
+          refusedInARow = r.value.refused ? refusedInARow + 1 : 0;
+          // A chain the source refused is a failed wallet: it used to count as a success with 0 rows.
+          if (r.value.refused) errored += 1;
+          return;
+        }
         errored += 1;
         console.error(`transfers: ${slice[j].handle} failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
       });
+      if (refusedInARow >= REFUSALS_IN_A_ROW) {
+        console.error(`transfers: a source refused ${refusedInARow} wallets in a row; leaving the rest of this run`);
+        stoppedEarly = true;
+        break;
+      }
     }
     let watchlistSynced: number | null = null;
     try {

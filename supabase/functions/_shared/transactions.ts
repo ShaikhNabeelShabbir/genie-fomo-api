@@ -64,6 +64,12 @@ export interface FetchOptions {
    * there rather than re-reading the newest 500 for ever.
    */
   readonly solanaBefore?: string | null;
+  /**
+   * Stop the Solana walk AT this signature: the newest one a previous pull already stored. Without
+   * it every hourly pull re-read and re-wrote the newest 500 signatures of every wallet — five
+   * Helius calls and 500 upserts for a wallet that had done nothing (19 Sep 2026).
+   */
+  readonly solanaUntil?: string | null;
 }
 
 /** Provider keys, trimmed by the caller. An empty or absent key makes that chain report an error. */
@@ -162,7 +168,7 @@ async function bitqueryTx(key: string, chainId: number, wallet: string, limit: n
 
 async function solanaTx(
   key: string, wallet: string, limit: number, includeNative: boolean, pages: number,
-  startBefore: string | null = null,
+  startBefore: string | null = null, until: string | null = null,
 ): Promise<{ rows: Transfer[]; gas: GasMap; exhausted: boolean }> {
   if (!key) throw new Error("HELIUS_SOLANA_KEY is not set");
 
@@ -179,7 +185,7 @@ async function solanaTx(
   for (let p = 0; p < maxPages; p++) {
     const url =
       `https://api.helius.xyz/v0/addresses/${wallet}/transactions` +
-      `?api-key=${key}&limit=100${before ? `&before=${before}` : ""}`;
+      `?api-key=${key}&limit=100${before ? `&before=${before}` : ""}${until ? `&until=${until}` : ""}`;
     const r = await fetch(url, {
       headers: { Accept: "application/json" }, signal: AbortSignal.timeout(30_000),
     });
@@ -271,6 +277,7 @@ export async function fetchTransactions(
     includeNative: options.includeNative ?? false,
     pages: Math.max(1, options.pages ?? 5),
     solanaBefore: options.solanaBefore ?? null,
+    solanaUntil: options.solanaUntil ?? null,
   };
 
   const started = Date.now();
@@ -284,7 +291,7 @@ export async function fetchTransactions(
   }
   if (solWallet && (!chains || chains.includes("solana"))) {
     jobs.push(
-      solanaTx(keys.helius ?? "", solWallet, limit, opts.includeNative, opts.pages, opts.solanaBefore ?? null)
+      solanaTx(keys.helius ?? "", solWallet, limit, opts.includeNative, opts.pages, opts.solanaBefore ?? null, opts.solanaUntil ?? null)
         .then(({ rows, gas, exhausted }): ChainPull => ({
           rows, gas, status: { chain: "solana", count: rows.length, error: null, exhausted },
         }))
