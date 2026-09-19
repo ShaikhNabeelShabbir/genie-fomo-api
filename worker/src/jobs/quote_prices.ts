@@ -1,7 +1,7 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { ADDRESSES_PER_CALL, bestPairs, fetchPairs } from "../../../supabase/functions/_shared/dexscreener.ts";
-import { DAY_MS, KLINES_LIMIT, PAIR, bybitList, parseKlines, seriesStartMs } from "./quote_prices-core";
+import { DAY_MS, KLINES_LIMIT, KRAKEN_PAIR, PAIR, bybitList, krakenList, parseKlines, seriesStartMs } from "./quote_prices-core";
 
 /**
  * Quote-asset and Robinhood-coin pricing into `token_prices`, the Worker half of refresh.yml
@@ -97,25 +97,48 @@ async function bybitCloses(pair: string, startMs: number): Promise<Map<string, n
   return new Map(parseKlines(bybitList(await r.json())).byDay);
 }
 
+const KRAKEN = "https://api.kraken.com/0/public/OHLC";
+
+/** Daily closes from Kraken: the newest 720 days in one call. It reports a bad pair as HTTP 200 with `error`. */
+async function krakenCloses(pair: string, startMs: number): Promise<Map<string, number>> {
+  const theirs = KRAKEN_PAIR[pair];
+  if (!theirs) throw new Error(`kraken has no pair mapped for ${pair}`);
+  const r = await fetch(`${KRAKEN}?pair=${theirs}&interval=1440&since=${Math.floor(startMs / 1000)}`, { signal: AbortSignal.timeout(20_000) });
+  if (!r.ok) throw new Error(`kraken HTTP ${r.status} for ${theirs}`);
+  const body = await r.json() as { error?: unknown[] };
+  if (body.error?.length) throw new Error(`kraken refused ${theirs}: ${String(body.error[0])}`);
+  return new Map(parseKlines(krakenList(body)).byDay);
+}
+
+const SOURCES: readonly { readonly name: string; readonly closes: (pair: string, startMs: number) => Promise<Map<string, number>> }[] = [
+  { name: "binance", closes: binanceCloses }, { name: "bybit", closes: bybitCloses }, { name: "kraken", closes: krakenCloses },
+];
+
 /**
- * Binance first, Bybit when it refuses. Both are asked for the same pair and both answer daily
- * closes; a run that falls back says so once per asset, so a silent switch never hides a bad price.
+ * The first source that answers, in order, and WHICH one: Binance refuses this Worker everywhere,
+ * Bybit refuses it from US colos (403 on every run of 19 Sep), Kraken does not. Each refusal is
+ * logged once per asset, and the row's `source` names the exchange that actually priced it.
  */
-async function dailyCloses(pair: string, startMs: number): Promise<Map<string, number>> {
-  try {
-    return await binanceCloses(pair, startMs);
-  } catch (e) {
-    console.log(`quote_prices: ${e instanceof Error ? e.message : String(e)}; asking bybit instead`);
-    return await bybitCloses(pair, startMs);
+async function dailyCloses(pair: string, startMs: number): Promise<{ closes: Map<string, number>; source: string }> {
+  const refusals: string[] = [];
+  for (const s of SOURCES) {
+    try {
+      const closes = await s.closes(pair, startMs);
+      if (refusals.length) console.log(`quote_prices: ${pair} priced by ${s.name} after ${refusals.join("; ")}`);
+      return { closes, source: s.name };
+    } catch (e) {
+      refusals.push(e instanceof Error ? e.message : String(e));
+    }
   }
+  throw new Error(`no source answered for ${pair}: ${refusals.join("; ")}`);
 }
 
 /** Fetch and upsert one asset's series. Returns days written; 0 when Binance has nothing for it. */
 async function priceAsset(sql: Sql, a: QuoteAsset, pair: string, now: Date): Promise<number> {
-  const closes = await dailyCloses(pair, seriesStartMs(a.first_day ? new Date(a.first_day) : null, now));
+  const { closes, source: exchange } = await dailyCloses(pair, seriesStartMs(a.first_day ? new Date(a.first_day) : null, now));
   if (!closes.size) return 0;
   const days = [...closes.keys()], vals = [...closes.values()];
-  const source = `binance:${pair}`;
+  const source = `${exchange}:${pair}`;
   await sql.begin((tx) => {
     for (let i = 0; i < days.length; i += PRICE_ROWS) {
       const part = days.slice(i, i + PRICE_ROWS);

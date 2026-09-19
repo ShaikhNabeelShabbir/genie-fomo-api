@@ -51,3 +51,16 @@ Deno.test("bybitList: a refusal or an unexpected envelope is an empty page, neve
     assertEquals(parseKlines(bybitList(body)).count, 0);
   }
 });
+
+Deno.test("krakenList: Kraken names the pair its own way and stamps seconds; the closes come out as any kline's", async () => {
+  const { krakenList, KRAKEN_PAIR, PAIR } = await import("../worker/src/jobs/quote_prices-core.ts");
+  /* A real reply of 19 Sep 2026, trimmed: ETHUSD is answered as XETHZUSD, beside a `last` cursor. */
+  const body = { error: [], result: { XETHZUSD: [[1727568000, "2675.74", "2683.66", "2635.50", "2657.89", "2657.17", "5689.9", 6177],
+                                                 [1727654400, "2658.03", "2662.14", "2575.40", "2602.97", "2619.31", "8302.7", 9792]], last: 1727654400 } };
+  const closes = parseKlines(krakenList(body));
+  assertEquals([...closes.byDay.entries()], [["2024-09-29", 2657.89], ["2024-09-30", 2602.97]]);
+  assertEquals(krakenList({ error: ["EQuery:Unknown asset pair"] }), []);
+  assertEquals(krakenList(null), []);
+  /* Every exchange pair the job can ask for has a Kraken spelling, or the fallback is a hole. */
+  assertEquals([...new Set(Object.values(PAIR))].filter((p) => !(p in KRAKEN_PAIR)), []);
+});

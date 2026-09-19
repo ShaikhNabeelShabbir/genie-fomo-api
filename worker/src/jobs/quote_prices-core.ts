@@ -29,6 +29,21 @@ export function bybitList(body: unknown): unknown[] {
   return Array.isArray(list) ? list : [];
 }
 
+/** Kraken's USD pair for each exchange pair above. It answers from the US, where Binance and (since 19 Sep 2026) Bybit refuse this Worker's egress with 403. USD, not USDT: within a few basis points on a daily close. */
+export const KRAKEN_PAIR: Readonly<Record<string, string>> = { SOLUSDT: "SOLUSD", ETHUSDT: "ETHUSD", BNBUSDT: "BNBUSD" };
+
+/**
+ * Kraken keys `result` by ITS OWN name for the pair (ETHUSD comes back as XETHZUSD) beside a `last`
+ * cursor, and stamps candles in SECONDS. Rows are otherwise kline-shaped (close at index 4), so the
+ * open time is scaled to milliseconds and `parseKlines` reads the rest unchanged.
+ */
+export function krakenList(body: unknown): unknown[] {
+  const result = typeof body === "object" && body !== null ? (body as { result?: unknown }).result : undefined;
+  if (typeof result !== "object" || result === null) return [];
+  const rows = Object.entries(result).find(([k, v]) => k !== "last" && Array.isArray(v))?.[1];
+  return Array.isArray(rows) ? rows.map((r: unknown) => (Array.isArray(r) ? [Number(r[0]) * 1000, ...r.slice(1)] : r)) : [];
+}
+
 export interface Closes {
   /** UTC day -> close, in candle order. */
   readonly byDay: ReadonlyMap<string, number>;
