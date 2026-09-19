@@ -1,12 +1,15 @@
 import type { Env } from "../env";
 import { jobSql } from "../sql";
 import { type Sql } from "../sql";
-import { refreshAumLive, refreshAumLiveUnmoved } from "./valuation.ts";
+import { refreshAumLiveUnmoved } from "./valuation.ts";
 import { chunk } from "./directory-core";
+import { flushMarked, markedQueue } from "./aum_live_flush-core";
 
 export interface AumLiveFlushSummary {
   readonly marked: number;
   readonly refreshed: number;
+  /** Slices whose refresh threw; their traders were retried one at a time, and one who fails alone keeps his mark. */
+  readonly failed: number;
   /** A2: unmoved traders topped up this run, over and above the marked ones. */
   readonly toppedUp: number;
   readonly elapsedMs: number;
@@ -43,8 +46,6 @@ const TOP_UP_PER_RUN = 0;
  * leaves D1 to the API for the other four.
  */
 const FLUSH_BUDGET_MS = 60_000;
-/** Marked traders per `refreshAumLive` call: small, so the budget is checked often. */
-const MARKED_SLICE = 5;
 /** Handles per statement; the same slice the marked flush uses. */
 const TOP_UP_SLICE = 20;
 
@@ -95,34 +96,15 @@ export async function runAumLiveFlush(env: Env, budgetMs: number): Promise<AumLi
      * `l.at` ascending puts the longest-unvalued first, and SQLite sorts NULL first, so a
      * trader with no figure at all leads.
      */
-    const marked = (await sql<{ handle: string; marked_at: string }[]>`
-      select d.handle, d.marked_at from aum_live_dirty d
-      left join aum_live l on l.handle = d.handle
-      order by l.at limit 20`);
+    const marked = await markedQueue(sql);
     if (!marked.length) {
-      return { marked: 0, refreshed: 0, toppedUp: await topUpUnmoved(sql, TOP_UP_PER_RUN), elapsedMs: Date.now() - started };
+      return { marked: 0, refreshed: 0, failed: 0, toppedUp: await topUpUnmoved(sql, TOP_UP_PER_RUN), elapsedMs: Date.now() - started };
     }
-    /*
-     * In slices, stopping at the deadline: a trader not reached keeps its mark and leads the
-     * next run (the queue is stalest-value-first), so nothing is lost by stopping early.
-     *
-     * Each mark is cleared against ITS OWN captured value, so a trader re-marked while the
-     * refresh ran keeps the newer mark and comes back next run.
-     */
-    let refreshed = 0, reached = 0;
-    for (const part of chunk(marked, MARKED_SLICE)) {
-      if (Date.now() >= deadline) break;
-      refreshed += await refreshAumLive(sql, part.map((m) => m.handle), "webhook");
-      await sql.begin(async (tx) => {
-        for (const m of part) {
-          await tx`delete from aum_live_dirty where handle = ${m.handle} and marked_at <= ${m.marked_at}`;
-        }
-      });
-      reached += part.length;
-    }
+    const { refreshed, reached, failed } = await flushMarked(sql, marked, deadline);
     return {
       marked: reached,
       refreshed,
+      failed,
       toppedUp: await topUpUnmoved(sql, TOP_UP_PER_RUN),
       elapsedMs: Date.now() - started,
     };

@@ -1,7 +1,7 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { buildAumHistory } from "./valuation.ts";
-import { CHUNK_HOURS, planWork, type Chunk, type TraderRange } from "./aum_history-core";
+import { CHUNK_HOURS, planWork, ranges, type Chunk } from "./aum_history-core";
 
 /**
  * Hourly aum_history builder (17 Sep 2026): balance history is BUILT from stored holdings
@@ -20,31 +20,6 @@ export interface AumHistorySummary {
   readonly remaining: number;
   readonly stoppedEarly: boolean;
   readonly elapsedMs: number;
-}
-
-/** Rule 3 in one query: every trader with a chain capture or a sampled reading, and where their history stands. */
-async function ranges(sql: Sql): Promise<TraderRange[]> {
-  // SQLite `min(a, b)` is null when either side is, where Postgres `least` skipped nulls.
-  const rows = await sql<{ handle: string; last_built: string | null; first_built: string | null; earliest: string | null }[]>`
-    select handle, last_built, first_built, coalesce(min(held_from, read_from), held_from, read_from) as earliest
-      from (
-        select t.handle,
-               (select max(hour) from aum_history a where a.handle = t.handle) as last_built,
-               (select min(hour) from aum_history a where a.handle = t.handle) as first_built,
-               (select min(captured_at) from holdings h where h.handle = t.handle and h.source = 'chain') as held_from,
-               (select min(at) from aum_samples s where s.handle = t.handle
-                  and s.basis in ('sampled', 'rebuilt') and s.total_usd is not null) as read_from
-          from traders t
-         where exists (select 1 from holdings h where h.handle = t.handle and h.source = 'chain')
-            or exists (select 1 from aum_samples s where s.handle = t.handle and s.basis = 'sampled')
-      )`;
-  // No earliest source hour means nothing to build; without the guard the planner would backfill from 1970.
-  return rows.filter((r) => r.earliest !== null).map((r) => ({
-    handle: r.handle,
-    lastBuilt: r.last_built ? new Date(r.last_built) : null,
-    firstBuilt: r.first_built ? new Date(r.first_built) : null,
-    earliest: new Date(r.earliest!),
-  }));
 }
 
 const build = (sql: Sql, c: Chunk): Promise<number> =>

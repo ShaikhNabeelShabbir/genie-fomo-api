@@ -57,7 +57,7 @@ const ladderColumns = () => sql`
  * directory build's own reported entry price, so that alone survives as a fallback.
  */
 const repriced = (r: Record<string, unknown>): Record<string, unknown> => {
-  const p = ladderPrice(r);
+  const p = ladderPrice(r, new Date());
   if (p === null) {
     return r.price_source === "fomo_reported_entry"
       ? r
