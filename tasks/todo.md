@@ -321,6 +321,9 @@ two minutes of its first deploy — nothing else found them):
       `count(*)` over 1.29 M `transactions` and `count(distinct captured_at)` over `holdings`, both published fields
       (`rows.transactions`, `rows.generations`) and neither goes through `holdings_current`. Cheapest honest fix: count
       them once an hour and carry the figures between snapshots (say so in the body), not an estimate.
+- [ ] `worker/src/sampler.ts` and its `/sample` route: off the cron, `AUM_SAMPLE_URL` unset, a second price ladder.
+      Deleting it removes a route — owner's call. The folder name `supabase/functions/` is also a misnomer now;
+      renaming it means rewriting the imports of 166 files, as its own change.
 - [ ] Still whole reads of the view, left alone on purpose: the `/tokens` board and momentum (their tie order is pinned
       byte for byte by tests and would move), `trader_chain_history` inside views. Next candidates.
 - [ ] **Owner:** Helius dashboard — are the key's credits spent? Balance reads and swap parsing still answer 429.

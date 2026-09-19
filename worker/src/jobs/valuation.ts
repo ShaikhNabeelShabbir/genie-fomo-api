@@ -5,8 +5,8 @@ import { chunk } from "./directory-core.ts";
 
 /**
  * The two valuation functions, in TypeScript. D1 holds no functions, so the final Postgres
- * bodies of `aum_history_build` and `aum_live_refresh`
- * (supabase/migrations/20260918100000_valuation_v4_no_market.sql) live here: same hour rules,
+ * bodies of `aum_history_build` and `aum_live_refresh` (migration `20260918100000_valuation_v4_no_market`,
+ * removed with the Postgres history on 19 Sep 2026; git keeps it) live here: same hour rules,
  * same price ladders, same reasons, same upserts. The reads are a few bounded set-based
  * selects; the arithmetic is aum-sample/value.ts, which the SQL only ever transcribed.
  */

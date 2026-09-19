@@ -8,23 +8,23 @@ One Cloudflare Worker (`genie-copy-trading-api`) and one Cloudflare D1 database 
 binding `DB`). **v2 is the product:** `https://genie-copy-trading-api.agent-73b.workers.dev/v2`.
 Postgres, Supabase and Hyperdrive are GONE from the request path as of 17 Sep 2026: the data was
 exported and imported into D1 (31 tables, 1.29M transactions), every statement is SQLite dialect,
-and the Worker holds only the `DB` binding. v1 (`…supabase.co/functions/v1/api`) still answers from
-the old Postgres but is frozen and no longer written to; retire it once consumers have moved.
+and the Worker holds only the `DB` binding. v1 (Supabase: the edge functions, the Postgres and the GitHub nightly loaders) was SUNSET on
+19 Sep 2026: its code, its 55 Postgres migrations and the one-off export tools were removed from the tree
+(git history keeps them: last present at `6a08917`). The folder is still named `supabase/functions/` only
+because 166 imports say so; nothing in it runs on Supabase.
 Every loader is a Worker cron job (`worker/src/jobs/*`, table in `worker/src/index.ts`); GitHub Actions is CI/CD only.
 Balance history is BUILT (`aum_history`, hourly) and the current value is live (`aum_live`), not sampled.
 EVM data: Bitquery. Solana: Helius. Prices: DexScreener (+ Binance for quote assets). No free public RPC from the Worker.
 
 | Path | What |
 |---|---|
-| `supabase/functions/api/` | the read API: `app.ts` (`handle`: auth, rate limit, 11 s whole-request ceiling), `index.ts` (Deno entry: builds the client, serves), `router.ts`, `errors.ts`, `db.ts` (`sql` is a Proxy over the per-request `AsyncLocalStorage` store, falling back to `setDefaultSql`), `config.ts` (`cfg(name)`: store env, then `Deno.env` — the only place `Deno` is touched outside `index.ts`), `routes.ts` (barrel) |
+| `supabase/functions/api/` | the read API: `app.ts` (`handle`: auth, rate limit, 11 s whole-request ceiling), `router.ts`, `errors.ts`, `db.ts` (`sql` is a Proxy over the per-request `AsyncLocalStorage` store, falling back to `setDefaultSql`), `config.ts` (`cfg(name)`: store env, then `Deno.env` for the tests), `routes.ts` (barrel) |
 | `supabase/functions/api/routes/*.ts` | one module per route family (below) |
 | `supabase/functions/api/shared/*.ts` | helpers used by 2+ families; `vocabulary.ts` is the published word list; `aum-rules.ts` the pure /aum rules |
-| `supabase/functions/aum-sample/` | v1's sampler (retired: pg_cron unscheduled 17 Sep); `value.ts` still holds the price ceilings the SQL functions cite |
-| `supabase/functions/helius-webhook/` | Solana transfer push receiver |
-| `worker/` | THE deployment (`npx wrangler deploy` from `worker/`; CI deploys on push when `CLOUDFLARE_DEPLOY=true`). `src/index.ts`: `JOBS` cron table (strings must match `wrangler.toml` [triggers]) and `POST /jobs/<name>` behind `JOB_SECRET`; `src/api.ts` runs the `supabase/functions/api` modules inside `runWith({ sql, env })`; `src/webhook.ts` Helius push (+ `aum_live_refresh`); `src/jobs/*.ts` one sliced, resumable loader per source with a `-core.ts` of pure helpers. Keep postgres.js `fetch_types` on: arrays break without it |
+| `supabase/functions/aum-sample/value.ts` | the price ceilings and the suspect-price rules (`MAX_PRICE_PER_TOKEN`, `MAX_POSITION_USD`); the sampler it belonged to is gone |
+| `worker/` | THE deployment (`npx wrangler deploy` from `worker/`; CI deploys on push when `CLOUDFLARE_DEPLOY=true`). `src/index.ts`: `JOBS` cron table (strings must match `wrangler.toml` [triggers]) and `POST /jobs/<name>` behind `JOB_SECRET`; `src/api.ts` runs the `supabase/functions/api` modules inside `runWith({ sql, env })`; `src/webhook.ts` Helius push (+ `aum_live_refresh`); `src/jobs/*.ts` one sliced, resumable loader per source with a `-core.ts` of pure helpers. |
 | `supabase/functions/_shared/` | providers for the jobs: `bitquery.ts` (client + EVM balances), `transactions.ts` (transfers), `dexscreener.ts`, `pumpfun.ts`, `solana_pda.ts`, `settings.ts` (EVM_CHAINS); `chain_reads.ts` is LEGACY RPC for v1 only |
 | `worker/d1/migrations/` | THE schema: `0001_schema.sql` (30 tables), `0002_views.sql` (12 views), then fixes. Apply with `npx wrangler d1 migrations apply genie-copy-trading --remote`. `worker/d1/SCHEMA_MAP.md` maps every Postgres object to its D1 form |
-| `supabase/migrations/` | HISTORY only: the Postgres schema the D1 one was folded from. Do not add to it |
 | `worker/src/d1.ts`, `worker/src/sql.ts` | the postgres.js-shaped shim over D1 (`jobSql(env)`); `docs/D1_MIGRATION.md` holds its rules and the SQLite dialect cheatsheet |
 | `worker/src/jobs/valuation.ts` | `buildAumHistory` and `refreshAumLive` — the two Postgres SQL functions, now TypeScript |
 | `scripts/` | Deno tools: `smoke.ts`, `acceptance_capture.ts`, `typecheck_gate.ts` (`deno task smoke|capture|check`) |
@@ -69,7 +69,7 @@ to v1 so the two deployments diff).
 | `PRICED_FLOOR = 0.25` (count share, applied at read time only) | `shared/aum-rules.ts` |
 | `MAX_PRICE_PER_TOKEN`, `MAX_POSITION_USD` | `aum-sample/value.ts` (twin in `scripts/load_aum_samples.mjs`) |
 | `ROUTE_TIMEOUT_MS = 11000` (the WHOLE request, rate check included; the app gives up at 12 s), `BATCH_MAX_COST = 50` | `api/app.ts` |
-| rate limit 240/min, Postgres-backed `bump_rate_limit()` | `api/errors.ts`, migration `20260908090000_rate_limits.sql` |
+| rate limit 240/min, one atomic upsert into `rate_limits` on D1, 2 s deadline, fails open | `api/errors.ts` (`checkRateWithin`) |
 | `AUM_SAMPLE_*`, `WALLET_SUBMIT_SECRET`, live-read timing | `routes/aum.ts`, `routes/traders.ts` |
 
 ## Adding a vocabulary word (do this first, ship second)
@@ -92,7 +92,7 @@ deno task capture $BASE captures/x                 # 74-file normalised capture;
 npx @redocly/cli lint docs/openapi.yaml
 ```
 
-Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true`). Migrations: `npx supabase db push --db-url <session pooler url>` (the user runs it). A job on demand: `POST $WORKER_URL/jobs/<name>` with `x-job-secret`. Do NOT redeploy the v1 Supabase functions.
+Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true`). Migrations: `cd worker && npx wrangler d1 migrations apply genie-copy-trading --remote` BEFORE the code that needs them (CI does not apply them). A job on demand: `POST $WORKER_URL/jobs/<name>` with `x-job-secret`.
 
 ## Working rules for this repo
 

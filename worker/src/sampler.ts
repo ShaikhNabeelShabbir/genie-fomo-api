@@ -9,10 +9,10 @@ import { concentrationSuspect, decideTotal, value } from "../../supabase/functio
 /**
  * AUM sampler, the Worker half. See docs/DECISIONS.md#d188 and docs/CLOUDFLARE_MIGRATION.md §7.
  *
- * TWIN OF `supabase/functions/aum-sample/index.ts`: edit both. The Supabase function stays the
- * source of truth until cutover (§13); this file differs only where Deno does — `env` instead
- * of `Deno.env`, a per-invocation client instead of the module-level one, `sampleSlice()`
- * instead of `Deno.serve`. The chain reads and the valuation rules are imported, not copied.
+ * The only copy since 19 Sep 2026: its Supabase twin (`aum-sample/index.ts`) went with v1. It is
+ * off the cron table and `AUM_SAMPLE_URL` is unset, so nothing calls it; it still values with a
+ * ladder of its own, which is a reason to delete it rather than to revive it (tasks/todo.md).
+ * The chain reads and the valuation rules are imported, not copied.
  */
 
 /** Nobody gets to ask for the whole roster in one call. See the header. */
