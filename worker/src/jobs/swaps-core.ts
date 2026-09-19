@@ -8,6 +8,41 @@
  * the money leg, and that leg is priced peg -> daily close -> market, never guessed.
  */
 import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
+import type { Sql } from "../d1.ts";
+
+/** One transfer leg that has not been through a source yet. */
+export interface Cand { readonly tx_hash: string; readonly address_key: string; readonly block_time: string }
+
+/** A regular run reads this far back, newest first; anything older is reached by the lap. */
+export const RECENT_DAYS = 3;
+/** Each run also reads ONE older window this wide, walking down from the recent floor and wrapping past the oldest transfer. */
+export const LAP_DAYS = 14;
+
+/**
+ * One newest-first page of unchecked legs INSIDE a time window. The window is the point (19 Sep
+ * 2026): unbounded, once the newest legs were all checked the walk went on through every leg ever
+ * stored looking for one that was not - 1.7 M rows and up to 19.6 s of D1's single thread per chain,
+ * every half hour, during which every API statement queued (a 0.3 ms insert waited 7 s).
+ */
+export const candidatePage = (sql: Sql, net: number, swapsOnly: boolean, from: string, to: string, pageSize: number) => sql<Cand[]>`
+  select t.tx_hash, t.address_key, t.block_time
+  from transactions t
+  where t.block_time > ${from} and t.block_time <= ${to}
+    -- The unary + leaves the planner the time index alone: on tx_type or network_id it read every leg of the chain.
+    and +t.network_id = ${net}
+    ${swapsOnly ? sql`and +t.tx_type = 'SWAP'` : sql``}
+    and not exists (
+      select 1 from wallet_swaps_checked s
+      where s.network_id = ${net} and s.tx_hash = t.tx_hash and s.address_key = t.address_key)
+  order by t.block_time desc
+  limit ${pageSize}`;
+
+/** The older window of this run and where the next run's starts; `nextSec` null wraps the lap back to the recent floor. */
+export function lapWindow(positionSec: number | null, floorSec: number, oldestSec: number | null): { readonly fromSec: number; readonly toSec: number; readonly nextSec: number | null } {
+  const toSec = positionSec !== null && positionSec < floorSec ? positionSec : floorSec;
+  const fromSec = toSec - LAP_DAYS * 86_400;
+  return { fromSec, toSec, nextSec: oldestSec === null || fromSec <= oldestSec ? null : fromSec };
+}
 
 /**
  * One `EVM.DEXTrades` row as https://docs.bitquery.io/docs/schema/evm/dextrades/ shapes it:
