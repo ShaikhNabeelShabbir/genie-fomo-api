@@ -13,7 +13,18 @@ import type { Sql } from "../../../worker/src/d1.ts";
  * Here the question is asked per (trader, chain) PAIR — 2,240 seeks for the newest capture, then
  * that capture's rows through the same index. `cross join` states the order: D1 has picked a worse
  * one than local SQLite before. The fomo arm is the view's, unchanged: it was already a range read
- * of one build. Read ONE trader through the view, never through this.
+ * of one build.
+ *
+ * `limit -1` changes no row. It is there because a subquery with a LIMIT is never flattened into
+ * its caller: flattened, a caller with a big table to the LEFT of this one ran that table OUTSIDE
+ * the pair walk — 424 ms became 28 s on a production-sized database, past D1's 30 s limit, and no
+ * plan line looked wrong. It also means a caller's `where` is not pushed inside, so a statement
+ * naming ONE trader reads the VIEW (which seeks for a named handle), never this.
+ *
+ * Two things a caller must know. (1) Equality with the view rests on holdings' foreign keys: every
+ * chain row's handle is a trader and every network a chain (D1 enforces both). (2) The rows come in
+ * another ORDER than the view's (chains by name inside a trader): order by a total key, or do not
+ * depend on order. Do not name a CTE traders, chains, holdings or latest_capture around it.
  */
 export const currentHoldings = (sql: Sql) => sql`(
   select h.*
@@ -30,4 +41,5 @@ export const currentHoldings = (sql: Sql) => sql`(
      and h.captured_at = (select captured_at from latest_capture)
      and not exists (select 1 from holdings c2
                       where c2.source = 'chain' and c2.handle = h.handle
-                        and c2.network_id = h.network_id))`;
+                        and c2.network_id = h.network_id)
+  limit -1)`;

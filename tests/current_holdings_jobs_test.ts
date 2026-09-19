@@ -215,7 +215,8 @@ Deno.test("quote_prices robinhoodTargets: one chain's held, unpriced coins, and 
   assertEquals(rows.map((r) => r.token_key), ["r1", "x"]); // not r2 (GMGN prices it), not r3 (superseded capture)
   const plan = planOfLast(s, [RH]);
   assert(plan.includes(TOKEN_SEEK), "tokens is sought per holding");
-  assert(plan.includes("SEARCH c USING INTEGER PRIMARY KEY (rowid=?)"), `the chain filter reaches the pairs: ${plan.join(" | ")}`);
+  // The helper is not flattened (limit -1), so the chain filter stays outside it: all 2,240 pairs are walked, by seek. 26 ms at production size.
+  assert(plan.includes("SEARCH h USING INDEX holdings_source_handle_net_idx (source=? AND handle=? AND network_id=? AND captured_at=?)"), `holdings are reached per pair, by the full key: ${plan.join(" | ")}`);
   await same(s, SHIPPED_ROBINHOOD, [56], (sql) => robinhoodTargets(sql, 56)); // a chain nobody holds on: no rows, both ways
 });
 
@@ -236,5 +237,6 @@ Deno.test("launches launchTargets: held or recently moved on one chain, stalest 
   // Never read first (by address), then z on its curve. Not m (graduated), y (held on ethereum only), l1 (superseded build), l3 (moved 45 days ago).
   assertEquals(rows.map((r) => r.token_key), [SOL_MINT, "l2", "x", "z"]);
   const plan = planOfLast(s, [SOL, SOL, SOL]);
-  assert(plan.includes("SEARCH c USING INTEGER PRIMARY KEY (rowid=?)"), `the chain filter reaches the pairs: ${plan.join(" | ")}`);
+  // The helper is not flattened (limit -1), so the chain filter stays outside it: all 2,240 pairs are walked, by seek. 26 ms at production size.
+  assert(plan.includes("SEARCH h USING INDEX holdings_source_handle_net_idx (source=? AND handle=? AND network_id=? AND captured_at=?)"), `holdings are reached per pair, by the full key: ${plan.join(" | ")}`);
 });

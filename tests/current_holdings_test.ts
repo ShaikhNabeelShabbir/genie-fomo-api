@@ -38,3 +38,17 @@ Deno.test("currentHoldings: the rows of the holdings_current view, reached per (
   const viewPlan = (db.prepare("explain query plan select network_id, token_key, count(distinct handle) from holdings_current where human_amount > 0 group by 1, 2").all() as { detail: string }[]).map((r) => r.detail);
   assert(viewPlan.some((d) => /holdings_source_handle_net_idx \(source=\?\)$/.test(d)), "the view, read whole, does make that pass (if this stops being true, this helper may no longer be needed): " + viewPlan.join(" | "));
 });
+
+Deno.test("currentHoldings cannot be flattened into its caller: a big table to its LEFT still leaves the pair walk whole", async () => {
+  /* The shape a skeptic found on 19 Sep 2026: non-aggregate, tokens first. Flattened, tokens ran OUTSIDE the walk: 424 ms -> 28 s. */
+  const db = await openSchema();
+  const frag = currentHoldings(getDefaultSql()!);
+  const plan = (db.prepare(`explain query plan select tk.address, h.handle, h.human_amount from tokens tk join ${frag.text} h on h.network_id = tk.network_id and h.token_key = tk.token_key order by tk.address, h.handle`).all() as { id: number; parent: number; detail: string }[]);
+  const lines = plan.map((r) => r.detail);
+  const own = lines.findIndex((d) => /^(CO-ROUTINE|MATERIALIZE) /.test(d));
+  assert(own >= 0, "the helper runs as its own unit: " + lines.join(" | "));
+  const walk = lines.slice(own);
+  const iT = walk.findIndex((d) => /^SCAN t\b/.test(d)), iC = walk.findIndex((d) => /^(SCAN|SEARCH) c\b/.test(d)), iH = walk.findIndex((d) => /SEARCH h USING INDEX holdings_source_handle_net_idx \(source=\? AND handle=\? AND network_id=\? AND captured_at=\?\)/.test(d));
+  assert(iT >= 0 && iT < iC && iC < iH, "traders, then chains, then the full-key seek, inside the unit: " + lines.join(" | "));
+  assert(!walk.slice(0, iH).some((d) => /\btk\b/.test(d)), "the caller's table must not appear inside the walk: " + lines.join(" | "));
+});
