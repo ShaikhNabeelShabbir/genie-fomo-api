@@ -43,6 +43,8 @@ Deno.test("applyRelayResults: the Worker writes what was read elsewhere, with th
   assertEquals(info, { symbol: "AA", price_usd: 2.5, is_honeypot: 1, flagged: 1, read: 1, sec: 1 });
   assertEquals((db.prepare("select count(*) as n from token_info").get() as { n: number }).n, 1, "the coin we hold no tokens row for wrote nothing");
   assertEquals((db.prepare("select detail from token_info_misses where token_key = '0xbb'").get() as { detail: string }).detail, "token not found");
+  // storeInfo tells a first flip by its millisecond stamp; reads are 1.1 s apart in life, so give the test its own millisecond.
+  await new Promise((r) => setTimeout(r, 5));
   const again = await applyRelayResults(sql, parseRelayResults({ results: [{ network_id: 1, token_key: "0xaa", chain: "ethereum", info: { symbol: "AA2" }, security: null }] }).ok);
   assertEquals(again, { stored: 1, missed: 0, flipped: 0, unknown: 0 }, "a second read updates; the first flip is not counted twice");
   const kept = db.prepare("select symbol, is_honeypot from token_info where token_key = '0xaa'").get() as Record<string, unknown>;
