@@ -8889,8 +8889,8 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_3f9c2a1b7d4e8f01
         '503': &id011
-          description: 'Retry, keeping your last good copy. `timeout` when the route did not answer within
-            15 s (ROUTE_TIMEOUT_MS); `unavailable` when the database is unreachable (Retry-After 5) or busy
+          description: 'Retry, keeping your last good copy. `timeout` when the request did not answer within
+            11 s in all (ROUTE_TIMEOUT_MS; Retry-After 15 — the abandoned work is still running); `unavailable` when the database is unreachable (Retry-After 5) or busy
             or reset under load (Retry-After 15). A fault in our own SQL or code is never a 503: it is a
             500 `internal_error`, because retrying it cannot succeed. Every 5xx is logged with the
             `requestId` it returns.'

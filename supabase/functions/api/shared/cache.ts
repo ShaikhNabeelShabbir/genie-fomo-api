@@ -11,6 +11,9 @@
  * which says the same of its own. A miss is only ever a slower answer.
  */
 
+/** With an expired answer in hand, a rebuild gets this long before the expired answer is served instead. */
+export const STALE_AFTER_MS = 3000;
+
 /** Slots per cache. A bounded map, because the key carries caller-supplied query strings. */
 const MAX_SLOTS = 64;
 
@@ -24,24 +27,31 @@ export function ttlCache<T>(ttlMs: number): Cache<T> {
   return async (key: string, build: () => Promise<T>): Promise<T> => {
     const hit = slots.get(key);
     if (hit && Date.now() - hit.at < ttlMs) return hit.body;
-    let body: T;
-    try {
-      body = await build();
-    } catch (e) {
-      /*
-       * A database that cannot rebuild the answer must not take away the one we have: an expired
-       * body is still the newest truth this isolate knows, and its own timestamps say how old it is
-       * (consumer ask, 18 Sep 2026: "keep it serving while the database is down").
-       */
-      if (!hit) throw e;
-      console.error(`cache: ${key} could not be rebuilt (${e instanceof Error ? e.message.slice(0, 120) : String(e)}); serving the answer from ${Math.round((Date.now() - hit.at) / 1000)} s ago`);
+    const store = (body: T): T => {
+      /* Oldest out first: insertion order is Map's, and a refreshed key is deleted before it is set. */
+      slots.delete(key);
+      if (slots.size >= MAX_SLOTS) slots.delete(slots.keys().next().value as string);
+      slots.set(key, { at: Date.now(), body });
+      return body;
+    };
+    if (!hit) return store(await build());
+    /*
+     * An expired answer exists. A database that cannot rebuild it — it throws, or it stalls past
+     * STALE_AFTER_MS — must not take away the one we have: the expired body is still the newest
+     * truth this isolate knows, and its own timestamps say how old it is (consumer ask, 18 Sep
+     * 2026: "keep it serving while the database is down"). A late rebuild still lands in the slot.
+     */
+    const rebuilt = build().then(store);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stalled = new Promise<void>((resolve) => { timer = setTimeout(resolve, STALE_AFTER_MS); });
+    const served = (why: string): T => {
+      console.error(`cache: ${key} ${why}; serving the answer from ${Math.round((Date.now() - hit.at) / 1000)} s ago`);
       return hit.body;
-    }
-    /* Oldest out first: insertion order is Map's, and a refreshed key is deleted before it is set. */
-    slots.delete(key);
-    if (slots.size >= MAX_SLOTS) slots.delete(slots.keys().next().value as string);
-    slots.set(key, { at: Date.now(), body });
-    return body;
+    };
+    return Promise.race([
+      rebuilt.catch((e: unknown) => served(`could not be rebuilt (${e instanceof Error ? e.message.slice(0, 120) : String(e)})`)),
+      stalled.then(() => served(`was not rebuilt within ${STALE_AFTER_MS} ms`)),
+    ]).finally(() => clearTimeout(timer));
   };
 }
 

@@ -44,7 +44,7 @@ BALANCE_SLICE = "25"
 # Helius pushes go to this Worker; the transfers job registers it on the watch list.
 WEBHOOK_URL = "https://genie-copy-trading-api.agent-73b.workers.dev/webhook"
 RATE_LIMIT_PER_MINUTE = "240"
-ROUTE_TIMEOUT_MS = "15000"
+ROUTE_TIMEOUT_MS = "11000"
 
 [observability]
 enabled = true

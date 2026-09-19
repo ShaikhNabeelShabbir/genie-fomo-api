@@ -1,3 +1,4 @@
+import { ttlCache, urlKey } from "../shared/cache.ts";
 import { sql, n, round } from "../db.ts";
 import { cfg } from "../config.ts";
 import { get, post } from "../router.ts";
@@ -40,7 +41,20 @@ const INCLUDE_PAGE_MAX = 200;
 const INCLUDE_PAGE_DEFAULT = 100;
 type Include = typeof INCLUDES[number];
 
-get("/v1/traders", async (_p, url) => {
+/*
+ * The plain list is the same for every caller and is what the app falls back to when the includes
+ * fail (its report of 18 Sep, ask 4.2: "keep it serving while the database is down"). Through the
+ * cache an isolate that has answered it once keeps answering it — expired — when D1 throws or stalls.
+ * Pages WITH includes are not cached: 1 MB bodies, per-page keys, and wallets must not be stale.
+ */
+const plainList = ttlCache<unknown>(60_000);
+
+get("/v1/traders", (_p, url) =>
+  (url.searchParams.get("include") ?? "").trim()
+    ? listTraders(url)
+    : plainList(urlKey(url), () => listTraders(url)));
+
+async function listTraders(url: URL): Promise<unknown> {
   const q = (url.searchParams.get("q") ?? "").trim().replace(/^@/, "").toLowerCase();
   const asked = intParam(url, "limit", { min: 1, fallback: null });
   const offset = intParam(url, "offset", { min: 0, fallback: 0 }) ?? 0;
@@ -107,7 +121,8 @@ get("/v1/traders", async (_p, url) => {
     : sql`s.captured_at`;
 
   /* The build row is independent of the list, so the two share one round trip. */
-  const [rows, [{ window_label, captured }]] = await Promise.all([sql`
+  // `= {}`: a database with no build yet answers `window: null`, not a TypeError.
+  const [rows, [{ window_label, captured } = {} as Record<string, unknown>]] = await Promise.all([sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at, t.source,
            s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
            ld.load_attempted_at, ld.load_outcome,
@@ -345,7 +360,7 @@ get("/v1/traders", async (_p, url) => {
       ...(include.length ? { included: extras[i] } : {}),
     })),
   };
-});
+}
 
 // ------------------------------------------------------------ one trader
 

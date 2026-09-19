@@ -1,5 +1,5 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
-import { ttlCache, urlKey } from "../supabase/functions/api/shared/cache.ts";
+import { STALE_AFTER_MS, ttlCache, urlKey } from "../supabase/functions/api/shared/cache.ts";
 
 Deno.test("ttlCache: one build per key inside the TTL", async () => {
   let built = 0;
@@ -49,5 +49,25 @@ Deno.test("ttlCache: when the rebuild fails, the expired answer is served; with 
     assertEquals(await cache("k", () => Promise.reject(new Error("D1_ERROR: D1 DB is overloaded"))), "first");
     assertEquals(await cache("k", () => Promise.resolve("second")), "second");
     await assertRejects(() => cache("never-built", () => Promise.reject(new Error("down"))), Error, "down");
+  } finally { console.error = original; }
+});
+
+Deno.test("ttlCache: a rebuild that STALLS serves the expired answer at the deadline, and still lands when it finishes", async () => {
+  const cache = ttlCache<string>(0);
+  const original = console.error;
+  console.error = () => undefined;
+  try {
+    assertEquals(await cache("k", () => Promise.resolve("first")), "first");
+    let finish: (v: string) => void = () => undefined;
+    const slow = new Promise<string>((resolve) => { finish = resolve; });
+    const started = Date.now();
+    assertEquals(await cache("k", () => slow), "first");
+    const waited = Date.now() - started;
+    assertEquals(waited >= STALE_AFTER_MS - 50 && waited < STALE_AFTER_MS + 1500, true, `waited ${waited} ms`);
+    finish("late");
+    await slow;
+    await new Promise((r) => setTimeout(r, 0));
+    // The late answer is now the stored one: a rebuild that fails gets IT, not "first".
+    assertEquals(await cache("k", () => Promise.reject(new Error("down"))), "late");
   } finally { console.error = original; }
 });

@@ -254,3 +254,31 @@ Deno.test("/scorecard and /pnl count a wallet's SWAP transactions as the stateme
     assertEquals(seen, pnl);
   }
 });
+
+Deno.test("the plain trader list keeps answering from its last good copy when the database stops; a page with includes does not pretend to", async () => {
+  const { handle } = await import("../supabase/functions/api/app.ts");
+  const { getDefaultSql, setDefaultSql } = await import("../supabase/functions/api/db.ts");
+  const ask = (path: string): Promise<Response> => handle(new Request(`https://test.local${path}`));
+  const db = await openSchema(); // no build row on purpose: the list must answer `window: null`, not crash
+  for (const h of ["a", "b", "c"]) db.prepare("insert into traders (handle, display_handle, id) values (?,?,?)").run(h, h, `id-${h}`);
+  const good = await ask("/v2/traders?limit=3&cacheProbe=1");
+  assertEquals(good.status, 200);
+  const first = await good.json();
+  const previous = getDefaultSql();
+  // Lazy, as the real client is: a fragment that is never awaited must not reject into the void.
+  const down = () => ({ then: (r: unknown, j: unknown) => Promise.reject(new Error("D1_ERROR: D1 DB is overloaded. Requests queued for too long.")).then(r as never, j as never) });
+  const broken = Object.assign(down, { unsafe: down, begin: down, end: () => Promise.resolve() });
+  setDefaultSql(broken as never);
+  const original = console.error;
+  console.error = () => undefined;
+  try {
+    const again = await ask("/v2/traders?limit=3&cacheProbe=1");
+    assertEquals(again.status, 200, "the list the app falls back on must survive the outage it is the fallback for");
+    assertEquals((await again.json()).entries, first.entries);
+    const withIncludes = await ask("/v2/traders?include=wallets&limit=3");
+    assertEquals([withIncludes.status, (await withIncludes.json()).error.retryAfterSeconds], [503, 15]);
+  } finally {
+    console.error = original;
+    setDefaultSql(previous);
+  }
+});

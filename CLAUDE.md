@@ -16,7 +16,7 @@ EVM data: Bitquery. Solana: Helius. Prices: DexScreener (+ Binance for quote ass
 
 | Path | What |
 |---|---|
-| `supabase/functions/api/` | the read API: `app.ts` (`handle`: auth, rate limit, 15 s timeout race), `index.ts` (Deno entry: builds the client, serves), `router.ts`, `errors.ts`, `db.ts` (`sql` is a Proxy over the per-request `AsyncLocalStorage` store, falling back to `setDefaultSql`), `config.ts` (`cfg(name)`: store env, then `Deno.env` — the only place `Deno` is touched outside `index.ts`), `routes.ts` (barrel) |
+| `supabase/functions/api/` | the read API: `app.ts` (`handle`: auth, rate limit, 11 s whole-request ceiling), `index.ts` (Deno entry: builds the client, serves), `router.ts`, `errors.ts`, `db.ts` (`sql` is a Proxy over the per-request `AsyncLocalStorage` store, falling back to `setDefaultSql`), `config.ts` (`cfg(name)`: store env, then `Deno.env` — the only place `Deno` is touched outside `index.ts`), `routes.ts` (barrel) |
 | `supabase/functions/api/routes/*.ts` | one module per route family (below) |
 | `supabase/functions/api/shared/*.ts` | helpers used by 2+ families; `vocabulary.ts` is the published word list; `aum-rules.ts` the pure /aum rules |
 | `supabase/functions/aum-sample/` | v1's sampler (retired: pg_cron unscheduled 17 Sep); `value.ts` still holds the price ceilings the SQL functions cite |
@@ -68,7 +68,7 @@ to v1 so the two deployments diff).
 |---|---|
 | `PRICED_FLOOR = 0.25` (count share, applied at read time only) | `shared/aum-rules.ts` |
 | `MAX_PRICE_PER_TOKEN`, `MAX_POSITION_USD` | `aum-sample/value.ts` (twin in `scripts/load_aum_samples.mjs`) |
-| `ROUTE_TIMEOUT_MS = 15000`, `BATCH_MAX_COST = 50` | `api/app.ts` |
+| `ROUTE_TIMEOUT_MS = 11000` (the WHOLE request, rate check included; the app gives up at 12 s), `BATCH_MAX_COST = 50` | `api/app.ts` |
 | rate limit 240/min, Postgres-backed `bump_rate_limit()` | `api/errors.ts`, migration `20260908090000_rate_limits.sql` |
 | `AUM_SAMPLE_*`, `WALLET_SUBMIT_SECRET`, live-read timing | `routes/aum.ts`, `routes/traders.ts` |
 

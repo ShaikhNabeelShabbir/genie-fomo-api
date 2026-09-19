@@ -1,6 +1,6 @@
 import { match, requestVersion, rewriteVersion } from "./router.ts";
 import type { ApiVersion } from "./router.ts";
-import { ApiError, classify, unauthorized, checkRateWithin, RATE_CHECK_TIMEOUT_MS } from "./errors.ts";
+import { ApiError, classify, unauthorized, checkRateWithin, RATE_CHECK_TIMEOUT_MS, SATURATED_RETRY_SECONDS } from "./errors.ts";
 import type { RateState } from "./errors.ts";
 import { cfg } from "./config.ts";
 import "./routes.ts";
@@ -91,8 +91,13 @@ export async function handle(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
   const KEY = (cfg("GENIE_API_KEY") ?? "").trim();
   const RATE_LIMIT = Number(cfg("RATE_LIMIT_PER_MINUTE") ?? 240);
-  /** No route may hang. See docs/DECISIONS.md#d010 */
-  const ROUTE_TIMEOUT_MS = Number(cfg("ROUTE_TIMEOUT_MS") ?? 15000);
+  /*
+   * No request may hang, and the ceiling is for the WHOLE request (19 Sep 2026). See docs/DECISIONS.md#d010
+   * It was 15 s for the route alone, on top of the rate check: the app gives up at 12 s, so it never
+   * saw our coded 503, its requestId or its Retry-After — only its own timeout.
+   */
+  const ROUTE_TIMEOUT_MS = Number(cfg("ROUTE_TIMEOUT_MS") ?? 11000);
+  const t0 = Date.now();
 
   const url = new URL(req.url);
   const version = requestVersion(url.pathname);
@@ -172,9 +177,11 @@ export async function handle(req: Request): Promise<Response> {
     const answered = await Promise.race([
       Promise.resolve(hit.handler(hit.params, url, body)),
       new Promise((_, reject) => {
+        // The abandoned statements are still running on a database that serves one at a time, so a
+        // timed-out route IS a busy database: the same wait, not an invitation to pile on in 5 s.
         timer = setTimeout(() => reject(new ApiError(503, "timeout",
-          `this route did not answer within ${ROUTE_TIMEOUT_MS / 1000}s — retry`,
-          undefined, 5)), ROUTE_TIMEOUT_MS);
+          `this request did not answer within ${ROUTE_TIMEOUT_MS / 1000}s — retry after the stated delay`,
+          undefined, SATURATED_RETRY_SECONDS)), Math.max(0, ROUTE_TIMEOUT_MS - (Date.now() - t0)));
       }),
     ]);
     /** COST IS WHAT THE CALL ACTUALLY ASKED FOR, not a flat 1. See docs/DECISIONS.md#d012 */
