@@ -23,6 +23,29 @@ const BOARD_TTL_MS = 60_000;
 const boardCache = ttlCache<unknown>(BOARD_TTL_MS);
 const momentumCache = ttlCache<unknown>(BOARD_TTL_MS);
 
+/**
+ * The rule of the holdings_current view, as a predicate on holdings h for the trader t and chain c
+ * in scope: the newest chain capture, else the latest fomo build. The view tests every capture
+ * ever stored before the caller's filter applies; stated per (t, c), both columns are index seeks.
+ */
+const current = () => sql`
+  h.source = (case when exists (select 1 from holdings cap where cap.source = 'chain'
+                                   and cap.handle = t.handle and cap.network_id = c.network_id)
+                   then 'chain' else 'fomo' end)
+  and h.captured_at = coalesce(
+        (select max(cap.captured_at) from holdings cap where cap.source = 'chain'
+            and cap.handle = t.handle and cap.network_id = c.network_id),
+        (select captured_at from latest_capture))`;
+
+/**
+ * Every network_id in trades, one seek each (the last row is NULL, which trades allows): trades_token_idx
+ * leads with network_id, so a token_key alone reads the whole table. Join with IS, not =.
+ */
+const tradeNets = () => sql`nets(n) as (
+  select min(network_id) from trades
+  union all
+  select (select min(network_id) from trades where network_id > nets.n) from nets where nets.n is not null)`;
+
 // ------------------------------------------------------- K1/K3/K4/K9 board
 
 get("/v1/tokens", (_p, url) => boardCache(urlKey(url), async () => {
@@ -96,21 +119,18 @@ get("/v1/tokens", (_p, url) => boardCache(urlKey(url), async () => {
            -- Biggest position first: who has conviction, not who sorted first. Unpriced
            -- counts as 0 (matching the Node path), and ties break on rank because JS sort
            -- is stable and the directory is ordered by rank.
-           json_group_array(h.handle order by coalesce(h.value, 0) desc, st.rank nulls last) as handles
-    from holdings_current h
+           -- The rank is the trader's newest stats row, sought per trader: the trader_stats_current
+           -- view windows the whole table. No stats row (every fomo-sourced trader) sorts last and
+           -- is still a holder, which is why this was never an inner join.
+           -- A full tie keeps the order the view used to emit: chain reads by handle, then the
+           -- fomo build as stored. It was never stated, and unpriced coins tie all the time.
+           json_group_array(h.handle order by coalesce(h.value, 0) desc,
+             (select s.rank from trader_stats s where s.handle = t.handle
+               order by s.captured_at desc limit 1) nulls last,
+             h.source, (case when h.source = 'chain' then h.handle end), h.rowid) as handles
+    from traders t cross join chains c
+    cross join holdings h on h.handle = t.handle and h.network_id = c.network_id and ${current()}
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
-    join chains c on c.network_id = h.network_id
-    /*
-     * LEFT, because this was silently hiding a third of the directory.
-     *
-     * An inner join here dropped every trader with no leaderboard-stats row -- which is all
-     * 144 fomo-sourced traders, none of whom have one. The visible effect was that a token
-     * held by 105 real traders answered "no leader holds it", and 5,244 tokens held by
-     * someone were invisible on these routes entirely. Nothing in the response needs a stats
-     * row: st.rank is only a tiebreak in the ordering below, and it already sorts nulls
-     * last. A holder is a holder whether or not the leaderboard has scored them.
-     */
-    left join trader_stats_current st on st.handle = h.handle
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     where q.token_key is null ${net === null ? sql`` : sql`and h.network_id = ${net}`}
@@ -133,7 +153,8 @@ get("/v1/tokens", (_p, url) => boardCache(urlKey(url), async () => {
 
   const [{ total_tokens }] = await sql`
     select count(*) as total_tokens from (
-      select 1 from holdings_current h
+      select 1 from traders t cross join chains c
+      cross join holdings h on h.handle = t.handle and h.network_id = c.network_id and ${current()}
       left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
       where q.token_key is null ${net === null ? sql`` : sql`and h.network_id = ${net}`}
       group by h.network_id, h.token_key) x`;
@@ -141,7 +162,8 @@ get("/v1/tokens", (_p, url) => boardCache(urlKey(url), async () => {
   const [ex] = await sql`
     -- count(distinct (a, b)) has no SQLite row-value form; the pair is keyed as text.
     select count(distinct h.network_id || ':' || h.token_key) as tokens, count(*) as positions
-    from holdings_current h
+    from traders t cross join chains c
+    cross join holdings h on h.handle = t.handle and h.network_id = c.network_id and ${current()}
     join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     ${net === null ? sql`` : sql`where h.network_id = ${net}`}`;
 
@@ -291,21 +313,13 @@ get("/v1/tokens/:address", async ({ address }, url) => {
            ti.is_blacklisted, ti.can_not_sell, ti.security_fetched_at, ti.honeypot_since,
            -- Gap 1: hourly DexScreener sample with a rolling ATH (scripts/load_token_prices.mjs).
            ps.last_usd as ps_usd, ps.last_at as ps_at, ps.ath_usd, ps.ath_at, ps.drawdown_share, ps.source as ps_source
-    from holdings_current h
+    -- From the chains, because holdings_token_idx leads with network_id: a token_key alone cannot
+    -- seek it and read every capture of every token. No stats join: nothing here reads a rank, and
+    -- trader_stats_current windows its whole table (a holder needs no stats row, as before).
+    from chains c
+    cross join holdings h on h.network_id = c.network_id and h.token_key = ${key}
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
-    join chains c on c.network_id = h.network_id
     join traders t on t.handle = h.handle
-    /*
-     * LEFT, because this was silently hiding a third of the directory.
-     *
-     * An inner join here dropped every trader with no leaderboard-stats row -- which is all
-     * 144 fomo-sourced traders, none of whom have one. The visible effect was that a token
-     * held by 105 real traders answered "no leader holds it", and 5,244 tokens held by
-     * someone were invisible on these routes entirely. Nothing in the response needs a stats
-     * row: st.rank is only a tiebreak in the ordering below, and it already sorts nulls
-     * last. A holder is a holder whether or not the leaderboard has scored them.
-     */
-    left join trader_stats_current st on st.handle = h.handle
     left join token_info ti
       on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps
@@ -314,9 +328,12 @@ get("/v1/tokens/:address", async ({ address }, url) => {
       on tc.network_id = h.network_id and tc.token_key = h.token_key
     left join creators cr
       on cr.network_id = tc.network_id and cr.creator_address_key = tc.creator_address_key
-    where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}
+    where ${current()} ${net === null ? sql`` : sql`and h.network_id = ${net}`}
+    -- A tie keeps the order the view used to emit, as on the board: chain reads by handle and network,
+    -- then the fomo build as stored. The first row of a chain decides where its entry sits.
     order by (case when h.value > 0 then h.value else null end) desc nulls last,
-             t.display_handle`;
+             t.display_handle, h.source, (case when h.source = 'chain' then h.handle end),
+             (case when h.source = 'chain' then h.network_id end), h.rowid`;
 
   if (!rows.length) {
     throw notFound(`no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
@@ -328,13 +345,14 @@ get("/v1/tokens/:address", async ({ address }, url) => {
    * dependent when one of his wallets is another trader's linked address.
    */
   const cohortRows: { network_id: number; holders: number; independent: number }[] = await sql`
+    with recursive ${tradeNets()}
     select tr.network_id, count(distinct tr.handle) as holders,
            count(distinct case when not exists (
              select 1 from wallets w join linked_wallets lw
                on lw.address_key in (w.evm_address_key, w.sol_address_key)
              where w.handle = tr.handle and lw.handle <> tr.handle) then tr.handle end) as independent
-    from trades tr
-    where tr.token_key = ${key} ${net === null ? sql`` : sql`and tr.network_id = ${net}`}
+    from nets cross join trades tr on tr.network_id is nets.n and tr.token_key = ${key}
+    ${net === null ? sql`` : sql`where tr.network_id = ${net}`}
     group by 1`;
   const cohort = new Map(cohortRows.map((c) => [Number(c.network_id), { holders: c.holders, independent: c.independent }]));
 
@@ -631,8 +649,13 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
 
   const holders: Record<string, unknown>[] = await sql`
     select t.display_handle, h.network_id, h.value
-    from holdings_current h join traders t on t.handle = h.handle
-    where h.token_key = ${key} ${net === null ? sql`` : sql`and h.network_id = ${net}`}`;
+    from chains c
+    cross join holdings h on h.network_id = c.network_id and h.token_key = ${key}
+    join traders t on t.handle = h.handle
+    where ${current()} ${net === null ? sql`` : sql`and h.network_id = ${net}`}
+    -- The order the view used to emit, so totalValueUsd below adds the same floats in the same order.
+    order by h.source, (case when h.source = 'chain' then h.handle end),
+             (case when h.source = 'chain' then h.network_id end), h.rowid`;
   if (!holders.length) {
     throw notFound(`no leader holds '${address}'${chainQ ? ` on ${chainQ}` : ""}`);
   }
@@ -645,7 +668,8 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
   // this token, from one query.
   /** ISSUE-4, the K5 half. See docs/DECISIONS.md#d090 */
   const per: Record<string, unknown>[] = await sql`
-    with legs as (
+    with recursive ${tradeNets()},
+    legs as (
       select t.display_handle as handle, tr.status, tr.trade_id,
              tr.realized_pnl_usd, tr.unrealized_pnl_usd,
              tr.avg_entry_price, tr.avg_exit_price, tr.opened_at, tr.closed_at,
@@ -672,8 +696,8 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
                partition by t.display_handle
                order by (case when tr.avg_exit_price > 0 then 0 else 1 end),
                         tr.opened_at nulls last, tr.trade_id) as exit_rn
-      from trades tr join traders t on t.handle = tr.handle
-      where tr.token_key = ${key}
+      from nets cross join trades tr on tr.network_id is nets.n and tr.token_key = ${key}
+      join traders t on t.handle = tr.handle
     )
     select handle,
            count(*)                                                as trades,
@@ -709,7 +733,7 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
   const timing = new Map<string, { exitPrice: number | null; currentPrice: number | null }[]>();
   for (const r of await sql`
     with legs as (
-      select t.display_handle as handle, tr.network_id, tr.token_key,
+      select asked.display_handle as handle, tr.network_id, tr.token_key,
              tr.avg_exit_price, tr.opened_at, tr.trade_id,
              -- trade_qty() is gone with Postgres (worker/d1/SCHEMA_MAP.md): the case is
              -- inlined here, and its TS twin is legQty in shared/scorecard-core.ts.
@@ -725,11 +749,14 @@ get("/v1/tokens/:address/activity", async ({ address }, url) => {
                else null
              end as qty,
              row_number() over (
-               partition by t.display_handle, tr.network_id, tr.token_key
+               partition by asked.display_handle, tr.network_id, tr.token_key
                order by (case when tr.avg_exit_price > 0 then 0 else 1 end),
                         tr.opened_at nulls last, tr.trade_id) as exit_rn
-      from trades tr join traders t on t.handle = tr.handle
-      where t.display_handle in (${per.map((r) => String(r.handle))}) and tr.status = 'closed')
+      -- From the few traders asked for; the unary plus keeps the planner off trades_status_idx,
+      -- which reads every closed trade in the table. (Not aliased t: views name transactions t,
+      -- and the plan audit resolves a scanned alias by name.)
+      from traders asked cross join trades tr on tr.handle = asked.handle
+      where asked.display_handle in (${per.map((r) => String(r.handle))}) and +tr.status = 'closed')
     select l.handle, ti.price_usd as current,
            coalesce(
              sum(case when avg_exit_price > 0 and qty is not null
@@ -851,8 +878,15 @@ get("/v1/tokens/momentum", (_p, url) => momentumCache(urlKey(url), async () => {
   // K2 is the one parameter that is not a function of the current snapshot. It falls out
   // of `captured_at` being part of the holdings primary key — no archive files, no
   // ephemeral disk, just the two most recent generations joined against each other.
+  // Two max() seeks: distinct ... limit 2 walks every row of the newest generation to find the second.
   const gens = await sql`
-    select distinct captured_at from holdings order by captured_at desc limit 2`;
+    select captured_at from (
+      select (select max(captured_at) from holdings) as captured_at
+      union all
+      select (select max(captured_at) from holdings
+               where captured_at < (select max(captured_at) from holdings)))
+    where captured_at is not null
+    order by captured_at desc`;
   if (gens.length < 2) {
     return {
       board: "momentum", available: false, snapshots: gens.length,

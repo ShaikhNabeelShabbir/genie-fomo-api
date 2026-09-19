@@ -38,15 +38,22 @@ const pairKey = (p: Pair): string => `${p.network_id}:${p.token_key}`;
 const resolveTokens = async (keys: string[], net: number | null): Promise<TokenRow[]> => await sql<TokenRow[]>`
   select t.network_id, t.token_key, t.address, c.name as chain, t.symbol,
          ps.last_usd, ps.last_at, ps.ath_usd, ps.ath_at
-    from tokens t
-    join chains c on c.network_id = t.network_id
+    -- From the chains: the tokens key leads with network_id, so a token_key alone scans the table.
+    from chains c
+    cross join tokens t on t.network_id = c.network_id
     left join token_price_stats ps on ps.network_id = t.network_id and ps.token_key = t.token_key
    where t.token_key in (${keys}) ${net === null ? sql`` : sql`and t.network_id = ${net}`}
    order by t.token_key, t.network_id`;
 
-/** Built per request: `sql` is the per-request client, so nothing may touch it at module load. */
-const view = (step: Exclude<SeriesStep, "1h">) =>
-  step === "1d" ? sql`token_price_daily` : step === "1w" ? sql`token_price_weekly` : sql`token_price_monthly`;
+/**
+ * The bucket of token_price_daily / _weekly / _monthly (0002_views.sql). The views window the whole
+ * hourly table before any filter reaches them, so the candles are built here from the asked pairs.
+ * Built per request: `sql` is the per-request client, so nothing may touch it at module load.
+ */
+const bucket = (step: Exclude<SeriesStep, "1h">) =>
+  step === "1d" ? sql`strftime('%Y-%m-%dT00:00:00.000Z', h.hour)`
+  : step === "1w" ? sql`strftime('%Y-%m-%dT00:00:00.000Z', h.hour, '-6 days', 'weekday 1')`
+  : sql`strftime('%Y-%m-01T00:00:00.000Z', h.hour)`;
 
 /** One query for every token: the newest `limit` points per pair, ascending in the answer. */
 async function seriesFor(pairs: Pair[], q: SeriesQuery, limit: number): Promise<Map<string, Point[]>> {
@@ -60,39 +67,48 @@ async function seriesFor(pairs: Pair[], q: SeriesQuery, limit: number): Promise<
    * row_number() <= n over the same ordering. The outer order by is new: the lateral emitted
    * each pair's rows newest-first and the loop below unshifts them into ascending order, so
    * that order is now stated rather than inherited from the plan.
+   *
+   * The pairs DRIVE (cross join fixes the order) and the hourly table is sought per pair: filtered
+   * by token_key alone, or through a candle view, every request read the whole table.
    */
   const rows = q.step === "1h"
     ? await sql<PointRow[]>`
-        select w.network_id, w.token_key, p.at, p.usd, p.liquidity_usd,
+        select p.network_id, p.token_key, p.at, p.usd, p.liquidity_usd,
                null as open_usd, null as high_usd, null as low_usd, null as hours
-          from (select jn.value as network_id, jk.value as token_key
-                  from json_each(${nets}) jn
-                  join json_each(${keys}) jk on jk.key = jn.key) w
-          join (
-            select h.network_id, h.token_key, h.hour as at, h.usd, h.liquidity_usd,
+          from (
+            select jn.value as network_id, jk.value as token_key, h.hour as at, h.usd, h.liquidity_usd,
                    row_number() over (
-                     partition by h.network_id, h.token_key order by h.hour desc) as rn
-              from token_price_hourly h
-             where h.token_key in (select value from json_each(${keys}))
-               and h.hour <= ${q.to} ${q.from === null ? sql`` : sql`and h.hour >= ${q.from}`}) p
-            on p.network_id = w.network_id and p.token_key = w.token_key and p.rn <= ${limit}
-         order by w.network_id, w.token_key, p.at desc`
+                     partition by jn.value, jk.value order by h.hour desc) as rn
+              from json_each(${nets}) jn
+              cross join json_each(${keys}) jk on jk.key = jn.key
+              cross join token_price_hourly h on h.network_id = jn.value and h.token_key = jk.value
+             where h.hour <= ${q.to} ${q.from === null ? sql`` : sql`and h.hour >= ${q.from}`}) p
+         where p.rn <= ${limit}
+         order by p.network_id, p.token_key, p.at desc`
     : await sql<PointRow[]>`
-        select w.network_id, w.token_key, p.at, p.usd, null as liquidity_usd,
+        select p.network_id, p.token_key, p.at, p.usd, null as liquidity_usd,
                p.open_usd, p.high_usd, p.low_usd, p.hours
-          from (select jn.value as network_id, jk.value as token_key
-                  from json_each(${nets}) jn
-                  join json_each(${keys}) jk on jk.key = jn.key) w
-          join (
+          from (
             select v.network_id, v.token_key, v.bucket as at, v.close_usd as usd,
                    v.open_usd, v.high_usd, v.low_usd, v.hours,
                    row_number() over (
                      partition by v.network_id, v.token_key order by v.bucket desc) as rn
-              from ${view(q.step)} v
-             where v.token_key in (select value from json_each(${keys}))
-               and v.bucket <= ${q.to} ${q.from === null ? sql`` : sql`and v.bucket >= ${q.from}`}) p
-            on p.network_id = w.network_id and p.token_key = w.token_key and p.rn <= ${limit}
-         order by w.network_id, w.token_key, p.at desc`;
+              from (
+                select network_id, token_key, bucket,
+                       max(case when rn_asc  = 1 then usd end) as open_usd,
+                       max(case when rn_desc = 1 then usd end) as close_usd,
+                       max(usd) as high_usd, min(usd) as low_usd, count(*) as hours
+                  from (
+                    select jn.value as network_id, jk.value as token_key, h.usd, ${bucket(q.step)} as bucket,
+                           row_number() over (partition by jn.value, jk.value, ${bucket(q.step)} order by h.hour asc)  as rn_asc,
+                           row_number() over (partition by jn.value, jk.value, ${bucket(q.step)} order by h.hour desc) as rn_desc
+                      from json_each(${nets}) jn
+                      cross join json_each(${keys}) jk on jk.key = jn.key
+                      cross join token_price_hourly h on h.network_id = jn.value and h.token_key = jk.value)
+                 group by network_id, token_key, bucket) v
+             where v.bucket <= ${q.to} ${q.from === null ? sql`` : sql`and v.bucket >= ${q.from}`}) p
+         where p.rn <= ${limit}
+         order by p.network_id, p.token_key, p.at desc`;
   for (const r of rows) {
     const point: Point = q.step === "1h"
       ? { at: iso(r.at) ?? "", usd: n(r.usd), liquidityUsd: n(r.liquidity_usd) }
