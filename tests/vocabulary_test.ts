@@ -1,4 +1,5 @@
 import { assert, assertEquals } from "jsr:@std/assert@1";
+import { parse } from "jsr:@std/yaml@1";
 import { VOCABULARY } from "../supabase/functions/api/shared/vocabulary.ts";
 
 /**
@@ -17,7 +18,8 @@ async function sqlAllowed(table: string, column: string): Promise<string[]> {
 
 /** The create/alter statements for `table`, one string per migration file, in order; comments stripped. */
 async function tableStatements(table: string): Promise<string[]> {
-  const dir = new URL("../supabase/migrations/", import.meta.url);
+  // THE schema since 17 Sep 2026. This read the frozen Postgres history, so a word D1 can store went unchecked.
+  const dir = new URL("../worker/d1/migrations/", import.meta.url);
   const files = [];
   for await (const e of Deno.readDir(dir)) if (e.name.endsWith(".sql")) files.push(e.name);
   files.sort();
@@ -99,4 +101,31 @@ Deno.test("points[].refused and gaps[].reason publish the same words", () => {
 Deno.test("every trade_loads.outcome the database can store is published", async () => {
   const published = new Set<string>(VOCABULARY.fields["scorecard.loadOutcome"]);
   for (const w of await sqlAllowed("trade_loads", "outcome")) assert(published.has(w), `unpublished: ${w}`);
+});
+
+/*
+ * THE SPEC AND THE WORD LIST ARE HELD TOGETHER (19 Sep 2026). The consumer's build fails — or shows
+ * a blank — on a word /fields has not published, and we told them every enumerated value is there.
+ * Seventeen documented response enums were not. Any string enum in a response schema whose property
+ * is one a consumer renders or branches on must be made of published words.
+ */
+const RENDERED = /^(reason|state|basis|tier|verdict|status|kind|method|confidence|side|code|severity|presence|error|source|outcome|fallback|regime|launchpad)$|Reason$|State$|Method$|Tier$|Source$/;
+/** Echoes of the request and constants naming the endpoint: not vocabulary. */
+const NOT_VOCABULARY = new Set(["d1 · trades", "postgres", "cloudflare d1"]);
+
+Deno.test("every rendered enum in the API reference is made of published words", async () => {
+  const doc = parse(await Deno.readTextFile(new URL("../docs/openapi.yaml", import.meta.url))) as { components: { schemas: unknown } };
+  const published = new Set(Object.values(VOCABULARY.fields).flat() as string[]);
+  const missing: string[] = [];
+  const walk = (node: unknown, path: string, key: string): void => {
+    if (Array.isArray(node)) { node.forEach((v) => walk(v, path, key)); return; }
+    if (typeof node !== "object" || node === null) return;
+    const n = node as Record<string, unknown>;
+    if (Array.isArray(n.enum) && RENDERED.test(key)) {
+      for (const w of n.enum) if (typeof w === "string" && !published.has(w) && !NOT_VOCABULARY.has(w)) missing.push(`${path}: ${w}`);
+    }
+    for (const [k, v] of Object.entries(n)) walk(v, `${path}/${k}`, k === "items" || k === "properties" || k === "allOf" || k === "oneOf" || k === "anyOf" ? key : k);
+  };
+  walk(doc.components.schemas, "schemas", "");
+  assertEquals(missing, []);
 });

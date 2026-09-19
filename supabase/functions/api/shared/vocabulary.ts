@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 13,
+  version: 14,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -68,7 +68,8 @@ export const VOCABULARY = {
     "events[].traderSource": ["fomoapi.io", "gmgn"],
     "tokens[].launchpad": ["pump.fun"],
     "positions.liveBasis.solana": ["rolled_forward_from_transfers"],
-    "positions.liveBasis.evm": ["nightly_read"],
+    /* `nightly_read` was never true on v2 (the balance sweep goes round in about 9 h); it stays published one version for parsers. */
+    "positions.liveBasis.evm": ["rolling_read", "nightly_read"],
     "positions[].tier": ["verified", "reported", "rolled_forward"],
     "flow.basis": ["transactions"],
     "wallets.linked[].kind": ["funded_by", "submitted"],
@@ -78,6 +79,36 @@ export const VOCABULARY = {
     "wallets.walletState": ["on_record", "unresolved_upstream"],
     "traders.delisted.reason": ["absent_from_source"],
     "aum.comparability.reason": ["coverage_differs_by_method"],
+    /*
+     * 19 Sep 2026, v14: WORDS THE ROUTES ALREADY EMITTED AND THIS LIST NEVER CARRIED. We told the
+     * consumer "any enum-like string we return appears here"; an audit of every response enum in
+     * docs/openapi.yaml against this file found these absent. tests/vocabulary_test.ts now holds
+     * the two together, so a documented word cannot go unpublished again.
+     */
+    "health.status": ["ok"],
+    "trades.incompleteReason": ["page_capped", "chains_unresolved", "chains_truncated",
+                                "page_capped_and_chains_unresolved", "page_capped_and_chains_truncated",
+                                "chains_unresolved_and_chains_truncated",
+                                "page_capped_and_chains_unresolved_and_chains_truncated"],
+    "trades[].side": ["buy", "sell"],
+    "trades[].confidence": ["high", "medium"],
+    "trust.verdict": ["self_contradictory", "unverified", "unverifiable", "insufficient", "ok"],
+    "trust.flags[].code": ["pnl_exceeds_volume", "pnl_exceeds_holdings", "holdings_coverage_too_low",
+                           "too_few_trades", "partial_pricing"],
+    "trust.flags[].severity": ["warn", "info"],
+    "wallets.presence": ["observed", "not_yet_scanned"],
+    "positions[].costMethod": ["weighted_open_positions", "weighted_open_positions_partial"],
+    "scorecard.typicalBet.method": ["entry_price", "volume_per_trade"],
+    "scorecard.byToken[].entryPriceSource": ["reported", "chain"],
+    "scorecard.byToken[].entryMethod": ["single_position", "weighted", "weighted_partial", "first_only"],
+    "scorecard.byToken[].exitMethod": ["single_position", "weighted", "weighted_partial", "first_only"],
+    /* GMGN's figures, on every /tokens block that carries them and on /creators. */
+    "tokens.*.tier": ["third_party"],
+    "tokens.security.flags[]": ["honeypot", "sell_blocked", "blacklist_function", "high_buy_tax", "high_sell_tax",
+                                "high_rug_ratio", "mint_not_renounced", "freeze_not_renounced", "owner_not_renounced"],
+    "tokens.security.verdict": ["cannot_sell", "caution", "no_flags_raised"],
+    "tokens.activity.flow.verdict": ["accumulating", "distributing", "mixed", "unknown"],
+    "tokenPrices.tokens[].error": ["ambiguous_chain"],
     "scorecard.winRateBasis": ["closed_positions_with_realized_figure"],
     /* Why a named figure is null. `not_applicable` means the question does not arise. */
     "scorecard.fieldReasons.*": ["not_applicable", "historical_input_missing",
