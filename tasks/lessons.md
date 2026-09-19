@@ -77,3 +77,21 @@
 - **An adversarial verifier per auditor paid for itself.** 19 of 44 findings were corrected and 1 refuted —
   including the "fix" I would otherwise have prescribed without checking (bind fix alone → 503 instead of 500)
   and a "confirmed" GMGN cause that the evidence did not support.
+- **Workflow worktrees are cut from the DEFAULT branch, not from HEAD.** `isolation: 'worktree'` gave every agent a
+  tree at `main` (no `worker/`, no `tests/`); each lost time working round it. Create the worktrees yourself
+  (`git worktree add <path> -b fix-x <integration-branch>`), symlink `node_modules`, and hand agents the path.
+- **Keep the owner's checkout deployable while agents work.** Do the work on a side branch in a scratch worktree and
+  merge when the gate is green; a deploy from a half-edited tree is the next incident.
+- **A queue needs a record of the ATTEMPT, not only of the success.** GMGN (never-fetched first), fees (oldest first),
+  balances (last success first) all retried the same unanswerable items for ever while reporting green. Order by the
+  attempt, park a miss, and stop after N refusals in a row.
+- **An incremental pull is a cost fix AND a correctness fix.** Re-pulling the newest 500 transfers of every wallet
+  hourly burned Helius credits, rewrote ~224k rows an hour in D1 and marked every trader "moved", which kept the
+  5-minute flush permanently full. Ask "what does this job redo every run?" of every loader.
+- **A cache shorter than the caller's cadence is not a cache.** Every TTL was 60 s-5 min; every app read is hourly or
+  rarer, so every read was a cold build. Match the TTL to the consumer, and serve the expired answer on failure.
+- **"Every enumerated value is published" has to be a test, not a sentence.** 17 documented word sets were never in
+  `/fields`. `tests/vocabulary_test.ts` now walks the API reference.
+- **A literal NUL byte in a source file makes grep skip it silently** ("Binary file matches"); `tokens-core.ts` hid
+  from every search. Write `\u0000`.
+

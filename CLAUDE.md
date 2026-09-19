@@ -131,9 +131,12 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   runs at READ time on `pricedPositions`/`totalPositions`: >= 0.25 a figure, 0.05-0.25 `partial`,
   below 0.05 withheld with `partialUsd`. Read time is the point — the stored series is judged
   without a rebuild. 78% of stored valued hours are under 0.25.
-- Current state (19 Sep 2026): v2 on D1, in an OUTAGE for the consumer — `/traders?include=…&limit=100`
-  answers 500 (100-bind ceiling) and the For You deck is empty. Root causes and the ordered fix list are in
-  `tasks/todo.md`; two regressions were reverted in `23e1e38` (the `/portfolio` join, the flush top-up — A2's
-  hourly-for-everyone is withdrawn). Also open: GMGN `token_info` never written by the Worker, DexScreener 429
-  since 17 Sep 12:00 UTC, Helius 429 on every balance read. Owner-only: rotate secrets, make the repo private,
-  set a `JOB_SECRET`, retire Supabase once the app team is on v2.
+- Current state (19 Sep 2026, evening): the 100-bind outage is fixed in code and the deck's roster read answers, but
+  production ran a regression of mine from 10:33 UTC (always-`json_each`) until the hybrid deploy; check `npx wrangler
+  deployments list` against `git log` before believing anything is live — a push to this branch that touches `worker/**`
+  IS a production deploy, and CI does NOT apply D1 migrations (apply them first: 0007, 0011-0015 are new today).
+  What changed today is in `tasks/todo.md` (review section) and `docs/consumer/reply-to-trader-service-v1.md`.
+  A2 (every trader's live figure hourly) stays WITHDRAWN: `oldestLiveHours` rises by design. GMGN capacity is ~1,100
+  coins a day against ~31,000 held, so per-coin `fetchedAt` is the truth, not "nightly". Owner-only and still open:
+  Helius credits (dashboard), disable `main`'s v1 nightly refresh (`gh workflow disable refresh.yml` — it spends the
+  same provider keys), rotate secrets, make the repo private, set a `JOB_SECRET`, two small indexes for `/market/regime`.
