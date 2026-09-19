@@ -73,8 +73,12 @@ jobs:
         run: |
           test -n "$WORKER_URL" || { echo "::error::set the WORKER_URL repository variable"; exit 1; }
           curl -sf "$WORKER_URL/healthz"
-      - name: API smoke (fails until /v1/* is ported — migration §5)
-        continue-on-error: true
+      # The deploy job never had Deno, so this step died on `deno: command not found` behind
+      # continue-on-error from the day it was written until 19 Sep 2026: CI/CD had no smoke at all.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: API smoke against the deployed Worker (data-freshness checks are advisory)
         run: API_VERSION=v2 deno task smoke "$WORKER_URL"
 
   acceptance-diff:

@@ -29,7 +29,8 @@ const INSERT_CHUNK = INSERT_ROWS * 50;
 /** Kept back from phase 1 so the watch-list sync (two small Helius calls) always runs. */
 const SYNC_RESERVE_MS = 30_000;
 const HELIUS_WEBHOOKS = "https://api.helius.xyz/v0/webhooks";
-const DEFAULT_WEBHOOK_URL = "https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/helius-webhook";
+/** The Worker's own receiver. It was the Supabase function until that project was sunset (19 Sep 2026); `WEBHOOK_URL` in wrangler.toml says the same. */
+const DEFAULT_WEBHOOK_URL = "https://genie-copy-trading-api.agent-73b.workers.dev/webhook";
 
 export interface TransfersSummary {
   /** Wallets attempted this run. */

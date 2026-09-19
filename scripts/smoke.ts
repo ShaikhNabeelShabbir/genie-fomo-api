@@ -5,8 +5,8 @@
 //
 // Defaults to the live Supabase deployment. Exit 1 when any check fails.
 
-const V = Deno.env.get("API_VERSION") ?? "v1"; // the contract: v1 on Supabase, v2 on the Worker
-const BASE = Deno.args[0] ?? "https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api";
+const V = Deno.env.get("API_VERSION") ?? "v2"; // v2 is the product; v1 (Supabase) was sunset on 19 Sep 2026
+const BASE = Deno.args[0] ?? "https://genie-copy-trading-api.agent-73b.workers.dev";
 const HANDLE = Deno.args[1] ?? "unipcs";
 
 const at = (value: unknown, key: string): unknown =>
@@ -26,13 +26,14 @@ const get = async (path: string): Promise<unknown> => {
   return res.json();
 };
 
-const checks: ReadonlyArray<readonly [string, () => Promise<boolean>]> = [
+/** `advisory`: a verdict on the DATA, not on the deploy. It is printed and does not fail the run. */
+const checks: ReadonlyArray<readonly [string, () => Promise<boolean>, "advisory"?]> = [
   ["health responds", async () => (await status(`/${V}/health`)) < 400],
   ["directory has traders", async () => {
     const traders = at(at(await get(`/${V}/health`), "rows"), "traders");
     return typeof traders === "number" && traders > 0;
   }],
-  ["no feed is stale", async () => isEmpty(at(await get(`/${V}/health`), "staleFeeds"))],
+  ["no feed is stale", async () => isEmpty(at(await get(`/${V}/health`), "staleFeeds")), "advisory"],
   ["trader list responds", async () => {
     const entries = at(await get(`/${V}/traders?limit=1`), "entries");
     return Array.isArray(entries) && entries.length === 1;
@@ -63,10 +64,10 @@ const checks: ReadonlyArray<readonly [string, () => Promise<boolean>]> = [
 
 console.log(`genie-fomo API smoke test -> ${BASE}`);
 let fail = false;
-for (const [name, run] of checks) {
+for (const [name, run, advisory] of checks) {
   const ok = await run().catch(() => false);
-  console.log(`${name.padEnd(46)}${ok ? "ok" : "FAIL"}`);
-  if (!ok) fail = true;
+  console.log(`${name.padEnd(46)}${ok ? "ok" : advisory ? "WARN (advisory)" : "FAIL"}`);
+  if (!ok && !advisory) fail = true;
 }
 console.log();
 console.log(fail ? "some checks failed" : "all checks passed");
