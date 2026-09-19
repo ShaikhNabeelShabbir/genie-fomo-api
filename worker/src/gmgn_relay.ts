@@ -4,13 +4,14 @@ import { GMGN_MISS_RETRY_AGO, GMGN_STALE_AGO, applyRelayResults, infoTargets, pa
 
 /** Coins handed out per request, at most: a reader gets through ~700 in 25 minutes at GMGN's pace. */
 const QUEUE_MAX = 1000;
+const RELAY_BODY_MAX = 2_000_000;
 
 /**
  * GMGN IS READ SOMEWHERE ELSE AND WRITTEN HERE (19 Sep 2026). GMGN answers 429 to this Worker
  * before its key is checked: the limit is per IP and a Worker shares its outgoing IPs. So a reader
  * with an address of its own (scripts/gmgn_reader.ts) asks `GET /jobs/gmgn_queue` what is due,
  * reads it, and posts to `POST /jobs/gmgn_results`. Every D1 write stays here, in the code the
- * Worker's own job uses. Both routes are behind `JOB_SECRET`; index.ts checks it before this runs.
+ * Worker's own job uses. Both routes are behind `GMGN_RELAY_SECRET`, which opens nothing else; index.ts checks it before this runs.
  */
 export async function gmgnRelay(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
@@ -23,6 +24,8 @@ export async function gmgnRelay(req: Request, env: Env): Promise<Response> {
       return Response.json({ due: targets.length, targets: targets.slice(0, limit) });
     }
     if (url.pathname === "/jobs/gmgn_results" && req.method === "POST") {
+      // 50 GMGN documents are about 200 KB. Without a ceiling a caller could post 100 MB for the Worker to parse.
+      if (Number(req.headers.get("content-length") ?? Infinity) > RELAY_BODY_MAX) return Response.json({ error: `body over ${RELAY_BODY_MAX} bytes, or no content-length` }, { status: 413 });
       const body: unknown = await req.json().catch(() => null);
       const { ok, rejected } = parseRelayResults(body);
       if (!ok.length && rejected.length) return Response.json({ error: "nothing acceptable in the body", rejected }, { status: 400 });

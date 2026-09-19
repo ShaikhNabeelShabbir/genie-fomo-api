@@ -57,10 +57,15 @@ const MAX_BUDGET_MS = 600_000;
 const digest = async (s: string): Promise<string> =>
   [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-/** Everything under /jobs/ is the owner's: null when the caller holds `JOB_SECRET`, else the refusal. Digests are compared, so timing says nothing about the secret. */
-async function refusal(req: Request, env: Env): Promise<Response | null> {
-  if (!env.JOB_SECRET) return Response.json({ error: "JOB_SECRET is not set; refusing to run" }, { status: 503 });
-  if (await digest(req.headers.get("x-job-secret") ?? "") !== await digest(env.JOB_SECRET)) return Response.json({ error: "unauthorized" }, { status: 401 });
+/**
+ * /jobs/* is the owner's: null when the caller holds the route's secret, else the refusal. TWO
+ * secrets on purpose: `GMGN_RELAY_SECRET` opens only /jobs/gmgn_* and lives on the reader's box;
+ * `JOB_SECRET` runs jobs and never leaves the owner. Digests are compared, so timing says nothing.
+ */
+async function refusal(req: Request, env: Env, relay: boolean): Promise<Response | null> {
+  const expected = relay ? env.GMGN_RELAY_SECRET : env.JOB_SECRET;
+  if (!expected) return Response.json({ error: `${relay ? "GMGN_RELAY_SECRET" : "JOB_SECRET"} is not set; refusing` }, { status: 503 });
+  if (await digest(req.headers.get("x-job-secret") ?? "") !== await digest(expected)) return Response.json({ error: "unauthorized" }, { status: 401 });
   if (!env.DB) return Response.json({ error: "the D1 binding DB is not configured" }, { status: 503 });
   return null;
 }
@@ -89,9 +94,10 @@ export default {
     if (pathname === "/webhook") return webhook(req, env, ctx);
     if (pathname === "/sample") return sample(req, env);
     if (pathname.startsWith("/jobs/")) {
-      const refused = await refusal(req, env);
+      const relay = pathname.startsWith("/jobs/gmgn_");
+      const refused = await refusal(req, env, relay);
       if (refused) return refused;
-      return pathname.startsWith("/jobs/gmgn_") ? gmgnRelay(req, env) : runJob(req, env);
+      return relay ? gmgnRelay(req, env) : runJob(req, env);
     }
     return api(req, env, ctx);
   },

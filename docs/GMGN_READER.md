@@ -28,13 +28,15 @@ reader ── GMGN, 1 request a second ─────────▶ GMGN     i
 reader ── POST /jobs/gmgn_results ──────────▶ Worker   checked field by field; every D1 write happens here
 ```
 
-Both routes are behind `JOB_SECRET` (`x-job-secret`), like every `/jobs/*` route. The Worker refuses
-a result for a coin it holds no `tokens` row for, so the reader cannot create coins.
+Both routes are behind **`GMGN_RELAY_SECRET`** (`x-job-secret`), which opens nothing else: `JOB_SECRET`
+runs jobs and never leaves the owner, so a reader's box that is lost cannot run them. The Worker refuses a
+result for a coin it holds no `tokens` row for (or whose chain is not the one it records), takes no body
+over 2 MB, and believes "GMGN has nothing for this coin" only in a run that also stored a real document.
 
 ## Run it
 
 ```bash
-JOB_SECRET=… GMGN_API_KEY=… deno task gmgn
+GMGN_RELAY_SECRET=… GMGN_API_KEY=… deno task gmgn
 # optional: WORKER_URL, GMGN_LIMIT (default 300), GMGN_BUDGET_MS (default 25 minutes)
 ```
 
@@ -43,8 +45,8 @@ this address too). Capacity: two requests a coin at GMGN's pace is about 680 coi
 every 2 hours that is ~8,000 coins a day against ~32,000 held, so most-held coins stay under a day
 old and the one-holder tail turns over in a few days.
 
-**Before the first run the owner sets `JOB_SECRET`** (nobody holds one today, so `/jobs/*` answers
-503): `cd worker && printf '%s' '<value>' | npx wrangler secret put JOB_SECRET`.
+**Before the first run the owner sets `GMGN_RELAY_SECRET`** (until then `/jobs/gmgn_*` answers 503):
+`cd worker && printf '%s' '<value>' | npx wrangler secret put GMGN_RELAY_SECRET`. Do not reuse `JOB_SECRET`.
 
 ## Where to host it
 

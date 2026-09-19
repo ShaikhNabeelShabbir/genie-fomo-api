@@ -79,6 +79,8 @@ export function gmgnData(ok: boolean, status: number, body: unknown): Rec {
   if (!ok) throw new Error(`HTTP ${status}`);
   if (j?.code !== 0) throw new Error(String(j?.message ?? j?.error ?? "gmgn error").slice(0, 80));
   if (!isRec(j.data)) throw new Error("malformed document");
+  // `{}` would store a row of NULLs under a fresh stamp, over a good one.
+  if (!Object.keys(j.data).length) throw new Error("empty document");
   return j.data;
 }
 
@@ -431,7 +433,9 @@ const asSecurity = (v: unknown): Security | null | "bad" => {
   if (!isRec(v)) return "bad";
   for (const k of SECURITY_FLAGS) if (v[k] !== null && v[k] !== undefined && typeof v[k] !== "boolean") return "bad";
   for (const k of SECURITY_RATES) if (v[k] !== null && v[k] !== undefined && (typeof v[k] !== "number" || !Number.isFinite(v[k]))) return "bad";
-  return Object.fromEntries([...SECURITY_FLAGS, ...SECURITY_RATES].map((k) => [k, v[k] ?? null])) as unknown as Security;
+  const block = Object.fromEntries([...SECURITY_FLAGS, ...SECURITY_RATES].map((k) => [k, v[k] ?? null]));
+  // Every field null is no answer: stored, it would clear yesterday's honeypot flag under a fresh stamp.
+  return Object.values(block).every((x) => x === null) ? null : block as unknown as Security;
 };
 
 /** The body of `POST /jobs/gmgn_results`, checked field by field: it arrives from outside and becomes rows. */
@@ -445,9 +449,11 @@ export function parseRelayResults(body: unknown): { readonly ok: RelayResult[]; 
     const { network_id, token_key, chain } = r;
     if (typeof network_id !== "number" || !Number.isInteger(network_id)) return void rejected.push({ index, why: "network_id must be an integer" });
     if (typeof token_key !== "string" || !token_key || token_key.length > 100) return void rejected.push({ index, why: "token_key must be a string of 1-100 characters" });
-    if (typeof chain !== "string" || !(chain in CHAIN_CODE)) return void rejected.push({ index, why: `chain must be one of ${Object.keys(CHAIN_CODE).join(", ")}` });
+    if (typeof chain !== "string" || !Object.hasOwn(CHAIN_CODE, chain)) return void rejected.push({ index, why: `chain must be one of ${Object.keys(CHAIN_CODE).join(", ")}` });
     if (typeof r.nothing === "string") return void ok.push({ network_id, token_key, chain, nothing: r.nothing.slice(0, 120) });
     if (!isRec(r.info)) return void rejected.push({ index, why: "either nothing (a string) or info (GMGN's document) is required" });
+    const row = infoRow(r.info);
+    if (row.symbol === null && row.name === null && row.price_usd === null) return void rejected.push({ index, why: "info carries no symbol, name or price: not a GMGN document" });
     const security = asSecurity(r.security);
     if (security === "bad") return void rejected.push({ index, why: "security must be null or the normalised block (booleans and finite numbers)" });
     ok.push({ network_id, token_key, chain, info: r.info, security });
@@ -455,18 +461,54 @@ export function parseRelayResults(body: unknown): { readonly ok: RelayResult[]; 
   return { ok, rejected };
 }
 
-export interface RelayApplied { readonly stored: number; readonly missed: number; readonly flipped: number; readonly unknown: number }
+export interface RelayApplied { readonly stored: number; readonly missed: number; readonly flipped: number; readonly unknown: number; readonly failed: number }
 
-/** Write what the outside reader read. A coin we do not hold a `tokens` row for is refused: nothing here creates coins. */
+/**
+ * Write what the outside reader read. Nothing here creates a coin: one we hold no `tokens` row for,
+ * or whose chain is not the one WE record for it, is counted `unknown` and skipped. One coin that
+ * cannot be written is `failed` and the rest go on, as in the job's own loop.
+ */
 export async function applyRelayResults(sql: Sql, results: readonly RelayResult[]): Promise<RelayApplied> {
-  let stored = 0, missed = 0, flipped = 0, unknown = 0;
+  let stored = 0, missed = 0, flipped = 0, unknown = 0, failed = 0;
   for (const r of results) {
-    const [known] = await sql<{ address: string }[]>`select address from tokens where network_id = ${r.network_id} and token_key = ${r.token_key}`;
-    if (!known) { unknown += 1; continue; }
-    const t: InfoTarget = { network_id: r.network_id, token_key: r.token_key, address: known.address, chain: r.chain };
-    if ("nothing" in r) { await recordMiss(sql, t, r.nothing); missed += 1; continue; }
-    if (await storeInfo(sql, t, r.info, r.security)) flipped += 1;
-    stored += 1;
+    try {
+      const [known] = await sql<{ address: string; chain: string }[]>`
+        select tk.address, ch.name as chain from tokens tk join chains ch on ch.network_id = tk.network_id
+        where tk.network_id = ${r.network_id} and tk.token_key = ${r.token_key}`;
+      if (!known || known.chain !== r.chain) { unknown += 1; continue; }
+      const t: InfoTarget = { network_id: r.network_id, token_key: r.token_key, address: known.address, chain: known.chain };
+      if ("nothing" in r) { await recordMiss(sql, t, r.nothing); missed += 1; continue; }
+      if (await storeInfo(sql, t, r.info, r.security)) flipped += 1;
+      stored += 1;
+    } catch (e) {
+      failed += 1;
+      console.error(`gmgn relay: ${r.chain}/${r.token_key.slice(0, 12)}… not written: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
-  return { stored, missed, flipped, unknown };
+  return { stored, missed, flipped, unknown, failed };
+}
+
+/**
+ * A sink for a reader that runs elsewhere: "GMGN has nothing for this coin" is believed only once
+ * the same run has stored a real document. A reader-side fault (a changed path, a bad request)
+ * answers "nothing" for EVERY coin, and believed, it would park 300 coins for a week a run with a
+ * green exit — the failure of 19 Sep again. `held` is what was withheld, for the run to report.
+ */
+export function missesAfterFirstStore(inner: CoinSink): { readonly sink: CoinSink; readonly held: () => readonly { t: InfoTarget; detail: string }[] } {
+  let storedOne = false;
+  const held: { t: InfoTarget; detail: string }[] = [];
+  return {
+    held: () => held,
+    sink: {
+      async store(t, d, sec) {
+        const flipped = await inner.store(t, d, sec);
+        storedOne = true;
+        for (const m of held.splice(0)) await inner.miss(m.t, m.detail);
+        return flipped;
+      },
+      async miss(t, detail) {
+        if (storedOne) await inner.miss(t, detail); else held.push({ t, detail });
+      },
+    },
+  };
 }

@@ -10,6 +10,8 @@ export interface Env {
   /** Wall-clock budget for the cron jobs under `src/jobs/` (prices). */
   readonly JOB_BUDGET_MS?: string;
   readonly JOB_SECRET?: string;
+  /** Opens ONLY /jobs/gmgn_* (the outside GMGN reader). Kept apart from JOB_SECRET so a reader's box cannot run jobs. */
+  readonly GMGN_RELAY_SECRET?: string;
   readonly AUM_LIVE_AFTER_MINUTES?: string;
   readonly AUM_LIVE_WAIT_MS?: string;
   readonly WALLET_SUBMIT_SECRET?: string;
