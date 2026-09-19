@@ -53,7 +53,7 @@ const json = (body: unknown, status = 200, extra: Record<string, string> = {}, v
  */
 const requestId = () => `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 
-const fail = (e: ApiError, extra: Record<string, string> = {}, version: ApiVersion = "v1", rid = requestId()) =>
+const fail = (e: ApiError, extra: Record<string, string>, version: ApiVersion, rid: string) =>
   json(
     {
       error: {
@@ -96,6 +96,8 @@ export async function handle(req: Request): Promise<Response> {
 
   const url = new URL(req.url);
   const version = requestVersion(url.pathname);
+  /* Minted FIRST and logged with every 5xx: the id a consumer quotes has to be findable in our tail. */
+  const rid = requestId();
   let rate: RateState | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -180,10 +182,10 @@ export async function handle(req: Request): Promise<Response> {
     const cost = typeof asked === "number" && Number.isFinite(asked) && asked > 0
       ? Math.min(asked, BATCH_MAX_COST)
       : 1;
-    return json(answered, 200, { ...rateHeaders(rate), "x-cost-units": String(cost) }, version);
+    return json(answered, 200, { ...rateHeaders(rate), "x-cost-units": String(cost), "x-request-id": rid }, version);
   } catch (e) {
     const err = classify(e);
-    if (err.status >= 500) console.error(`${url.pathname}: ${err.code} ${err.message}`);
+    if (err.status >= 500) console.error(`${rid} ${req.method} ${url.pathname}${url.search}: ${err.code} ${err.message}`);
     // Errors carry the budget too — a 404 while nearly exhausted is worth knowing about
     // before the next call turns into a 429. On a 429 `rate` is null, because checkRate
     // threw instead of returning: reconstruct the state so the response that most needs
@@ -191,7 +193,7 @@ export async function handle(req: Request): Promise<Response> {
     if (!rate && err.status === 429) {
       rate = { limit: RATE_LIMIT, remaining: 0, reset: err.retryAfterSeconds ?? 60, scope: "global" };
     }
-    return fail(err, rateHeaders(rate), version);
+    return fail(err, rateHeaders(rate), version, rid);
   } finally {
     // A route that answered early must not leave its timer holding the isolate open.
     clearTimeout(timer);

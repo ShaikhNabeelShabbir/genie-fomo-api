@@ -27,8 +27,8 @@ export const rateLimited = (retryAfter: number) =>
   new ApiError(429, "rate_limited", "too many requests — retry after the stated delay",
                undefined, retryAfter);
 
-export const unavailable = (detail: string) =>
-  new ApiError(503, "unavailable", detail, undefined, 5);
+export const unavailable = (detail: string, retryAfter = 5) =>
+  new ApiError(503, "unavailable", detail, undefined, retryAfter);
 
 /** A sub-resource the caller explicitly asked for could not be produced. See docs/DECISIONS.md#d006 */
 export const includeUnavailable = (blocks: string[]) =>
@@ -41,31 +41,36 @@ export const includeUnavailable = (blocks: string[]) =>
     5,
   );
 
-/**
- * Classify a thrown error.
- *
- * A database that is unreachable, out of connections or timing out is a RETRYABLE outage,
- * not a bug in the request — returning 500 for it tells the caller to give up when they
- * should be backing off and keeping their last good copy on screen.
+/*
+ * Three answers, and the order is the rule (19 Sep 2026). See docs/DECISIONS.md#d007
+ *  1. OUR BUG — a statement SQLite rejects, a bind the shim refuses, a TypeError. The same request
+ *     fails the same way every time, so it is a loud 500. It used to match `D1_ERROR` first and
+ *     was served as 503 "retry shortly": /portfolio answered that for two days on a missing join.
+ *  2. THE DATABASE IS BUSY OR WAS RESET — 503 with a longer Retry-After. It used to be 429
+ *     `rate_limited` beside `RateLimit-Remaining: 240`, telling a caller with budget to spare that
+ *     it had spent it. 429 now means one thing: the caller's own window (`rateLimited`).
+ *  3. THE DATABASE IS NOT ANSWERING — 503, retry shortly.
  */
-/** Map anything thrown to a stable, documented code -- and never hand the caller driver text. See docs/DECISIONS.md#d007 */
+const OUR_BUG = /SQLITE_ERROR|SQLITE_CONSTRAINT|SQLITE_MISMATCH|D1_TYPE_ERROR|no such (?:column|table|function)|syntax error|too many SQL variables|^d1sql:/i;
+const SATURATED = /SQLITE_BUSY|database is locked|overloaded|queued for too long|\breset\b|too many|ECHECKOUTTIMEOUT|max client connections|remaining connection slots/i;
+const NOT_ANSWERING = /D1_ERROR|timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|connection|terminated|shutdown/i;
+export const SATURATED_RETRY_SECONDS = 15;
+
+/** Map anything thrown to a stable, documented code -- and never hand the caller driver text. */
 export function classify(e: unknown): ApiError {
   if (e instanceof ApiError) return e;
   const msg = e instanceof Error ? e.message : String(e);
-
-  // Contention is BACK OFF, not "broken". 429 with Retry-After tells a client to pace
-  // itself; a 500 tells it to give up, and a 503 tells it nothing actionable. D1 reports a
-  // busy or overloaded database inside a `D1_ERROR:` wrapper, so this test runs first.
-  if (/too many|SQLITE_BUSY|database is locked|overloaded|ECHECKOUTTIMEOUT|max client connections|remaining connection slots/i.test(msg)) {
+  const ours = e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || OUR_BUG.test(msg);
+  if (!ours && SATURATED.test(msg)) {
     console.error("database saturated:", msg.slice(0, 200));
-    return rateLimited(5);
+    return unavailable("the database is busy — retry after the stated delay", SATURATED_RETRY_SECONDS);
   }
-  if (/D1_ERROR|timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|connection|terminated|shutdown/i.test(msg)) {
+  if (!ours && NOT_ANSWERING.test(msg)) {
     console.error("database unavailable:", msg.slice(0, 200));
     return unavailable("the database is not answering — retry shortly");
   }
-  // Everything else: log the real thing, return a sentence a consumer can act on.
-  console.error("unhandled:", msg.slice(0, 400));
+  // Ours, or unknown: log the real thing, return a sentence a consumer can act on.
+  console.error(ours ? "BUG (deterministic, will not heal on retry):" : "unhandled:", msg.slice(0, 400));
   return new ApiError(500, "internal_error", "the service failed to answer this request");
 }
 

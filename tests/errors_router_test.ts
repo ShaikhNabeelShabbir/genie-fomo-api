@@ -3,9 +3,27 @@ import { get, match, post, requestVersion, rewriteVersion } from "../supabase/fu
 
 const { ApiError, classify } = await import("../supabase/functions/api/errors.ts");
 
-Deno.test("classify: pool exhaustion is 429, connection trouble 503, anything else 500", () => {
-  assertEquals(classify(new Error("too many clients already")).status, 429);
-  assertEquals(classify(new Error("connect ETIMEDOUT")).status, 503);
+Deno.test("classify: our bug is a loud 500, a busy or reset database 503 with a longer wait, an unreachable one 503, never 429", () => {
+  /* The two real messages of 17-19 Sep, which were served as 503 "retry shortly" and 500. */
+  for (const bug of [
+    "D1_ERROR: no such column: ps.last_usd at offset 424: SQLITE_ERROR",
+    "d1sql: statement binds 101 parameters, D1 allows 100",
+    "D1_ERROR: too many SQL variables at offset 12: SQLITE_ERROR",
+    "D1_TYPE_ERROR: Type 'object' not supported for value '[object Object]'",
+  ]) assertEquals([classify(new Error(bug)).status, classify(new Error(bug)).code], [500, "internal_error"], bug);
+  assertEquals(classify(new TypeError("Cannot read properties of undefined (reading 'x')")).status, 500);
+  for (const busy of [
+    "D1_ERROR: D1 DB is overloaded. Requests queued for too long.",
+    "D1_ERROR: D1 DB exceeded its CPU time limit and was reset.",
+    "D1_ERROR: D1 DB storage operation exceeded timeout which caused object to be reset.",
+    "too many clients already",
+  ]) {
+    const err = classify(new Error(busy));
+    assertEquals([err.status, err.code, err.retryAfterSeconds], [503, "unavailable", 15], busy);
+  }
+  const down = classify(new Error("connect ETIMEDOUT"));
+  assertEquals([down.status, down.retryAfterSeconds], [503, 5]);
+  assertEquals(classify(new Error("D1_ERROR: Network connection lost.")).status, 503);
   const other = classify(new Error("bind message supplies 8 parameters"));
   assertEquals([other.status, other.code], [500, "internal_error"]);
   const own = new ApiError(404, "not_found", "x");
@@ -71,6 +89,34 @@ Deno.test("checkRateWithin: a rate-limit write that stalls fails OPEN at its dea
     assert(Date.now() - started < 1000, "must return at the deadline, not wait for the database");
   } finally {
     /* The client is module-global and Deno runs every test file in one process. */
+    setDefaultSql(previous);
+  }
+});
+
+Deno.test("a 5xx is logged with the SAME request id the caller is given, and with its query string", async () => {
+  /* 19 Sep: the app team quoted five request ids and none could be found — the id was minted after the log line. */
+  const { handle } = await import("../supabase/functions/api/app.ts");
+  const { setDefaultSql, getDefaultSql } = await import("../supabase/functions/api/db.ts");
+  get("/v1/boom", () => { throw new Error("D1_ERROR: no such column: ps.last_usd at offset 424: SQLITE_ERROR"); });
+  const previous = getDefaultSql();
+  // The rate limiter's write fails, which it treats as "allow".
+  const broken = Object.assign(() => Promise.reject(new Error("no database in this test")), {
+    unsafe: () => Promise.reject(new Error("no database")), begin: () => Promise.reject(new Error("no database")), end: () => Promise.resolve(),
+  });
+  setDefaultSql(broken as never);
+  const logged: string[] = [];
+  const original = console.error;
+  console.error = (...m: unknown[]) => { logged.push(m.join(" ")); };
+  try {
+    const res = await handle(new Request("https://test.local/v2/boom?limit=100&include=wallets"));
+    const body = await res.json();
+    assertEquals([res.status, body.error.code], [500, "internal_error"]);
+    const rid = res.headers.get("x-request-id");
+    assertEquals(body.error.requestId, rid);
+    assert(logged.some((l) => l.startsWith(`${rid} GET /v2/boom?limit=100&include=wallets: internal_error`)), logged.join("\n"));
+    assert(logged.some((l) => l.startsWith("BUG (deterministic")), "a deterministic SQL fault must be named as a bug in the log");
+  } finally {
+    console.error = original;
     setDefaultSql(previous);
   }
 });
