@@ -148,7 +148,7 @@ purely additive · `capturedAt` is the daily 01:00 build stamp, NOT a cached cop
 
 ## 2. P0 — bring the deck back. ONE deploy; do not ask the app team to re-test after a bind-only deploy.
 
-- [ ] **P0.1 Bind every id list as ONE parameter with `json_each`.** Rewrite each site in the RC-1 table from
+- [x] **P0.1 Bind every id list as ONE parameter with `json_each`.** Rewrite each site in the RC-1 table from
       `in (${arr})` to `in (select value from json_each(${arr}))`. Reuse, do not invent: the idiom already ships
       at `routes/token-prices.ts:69-92` and `routes/aum.ts:823-825,834-836,895-898`; an array that does not
       directly follow `in (`/`= any(` is JSON-stringified into one bind (`d1.ts:64-70`). **Plan-checked on the
@@ -156,41 +156,41 @@ purely additive · `capturedAt` is the daily 01:00 build stamp, NOT a cached cop
       `SCAN json_each VIRTUAL TABLE` is added). It also removes the `in ()` syntax-error trap on empty lists
       (`d1.ts:81-83`; four fragment builders have no guard). Do NOT chunk: chunking adds round trips, which RC-4
       cannot afford. `tokens.ts:648` holds a twin CTE of `:732` — check it.
-- [ ] **P0.2 Cap `limit`** on `traders.ts:36`, `tokens.ts:154`, `tokens.ts:934` (suggest `max: 200`; keep the
+- [x] **P0.2 Cap `limit`** on `traders.ts:36`, `tokens.ts:154`, `tokens.ts:934` (suggest `max: 200`; keep the
       plain list's default). Decide and document; the app uses 100.
-- [ ] **P0.3 Get `include=wallets,scorecard&limit=100` under ~8 s.** Measure first (per-statement
+- [x] **P0.3 Get `include=wallets,scorecard&limit=100` under ~8 s.** Measure first (per-statement
       `meta.duration` / `rows_read` for 100 handles), then cut: (a) replace `co` with one handle-independent
       `select network_id, token_key, count(distinct handle) from trades group by 1,2` (78k rows; cacheable per
       isolate with `shared/cache.ts` `ttlCache`); (b) issue the include statements in ONE `db.batch` — the shim
       coalesces un-awaited statements inside `sql.begin` (`d1.ts:129-162`, as `jobs/prices.ts` does for writes);
       confirm it returns per-statement rows for reads; (c) fold `knownChainsFor`/`feesFor`/`monthStartCapital`
       into that batch instead of three serial awaits.
-- [ ] **P0.4 Move `checkRate` inside the timeout race**, or give it its own 2 s deadline and fail open
+- [x] **P0.4 Move `checkRate` inside the timeout race**, or give it its own 2 s deadline and fail open
       (the fail-open path exists at `errors.ts:116-123`). Today total latency is unbounded.
-- [ ] **P0.5 Verify exactly as the consumer will** (their block, §6), three runs a few minutes apart, starting
+- [x] **P0.5 Verify exactly as the consumer will** (their block, §6), three runs a few minutes apart, starting
       ON a `:00/:05` flush tick, asserting payload not just status: every entry carries wallets with a family
       and a scorecard. Then tail for 10 minutes: zero `d1sql:` lines.
 
 ## 3. P1 — stop it recurring
 
-- [ ] **P1.1 A route-SQL test harness.** `tests/valuation_test.ts:13-35` already runs the real migrations in
+- [x] **P1.1 A route-SQL test harness.** `tests/valuation_test.ts:13-35` already runs the real migrations in
       `node:sqlite` through the real shim — reuse it for `supabase/functions/api/routes/*`. Minimum: every route
       executes once against the schema (this alone would have caught RC-2), and the list/`/trades`/`activity`
       routes run at their MAXIMUM page size (catches RC-1). Note the harness loads only `0001`/`0002`; add
       `0003`–`0005`.
 - [ ] **P1.2 A lint test:** fail on any `in (${` under `supabase/functions/api/` without an allow-list comment
       stating its bound. Cheap, and it makes RC-1 unrepeatable.
-- [ ] **P1.3 `acceptance_capture.ts` / `smoke.ts`:** add `/traders?include=wallets,scorecard&limit=<max>`,
+- [x] **P1.3 `acceptance_capture.ts` / `smoke.ts`:** add `/traders?include=wallets,scorecard&limit=<max>`,
       `/trades?limit=<max>`, a batch at `BATCH_MAX`. Run the capture after ANY route SQL change (not just smoke).
-- [ ] **P1.4 Classification (RC-5):** SQLITE_ERROR / `no such column|table` / `syntax error` / `d1sql:` /
+- [x] **P1.4 Classification (RC-5):** SQLITE_ERROR / `no such column|table` / `syntax error` / `d1sql:` /
       TypeError → 500, logged with statement text; D1 overloaded/reset/`exceeded`/timeout/network → 503 +
       `retryAfterSeconds`; NEVER 429 for a server-side fault. Fix the contradictory headers at `app.ts:178-181`.
       Tell the consumer why "never 500" is the wrong rule (§5).
-- [ ] **P1.5 `/health` (RC-6):** a cheap probe (`select 1` with its own ~1 s deadline) decides `status` and a
+- [x] **P1.5 `/health` (RC-6):** a cheap probe (`select 1` with its own ~1 s deadline) decides `status` and a
       new `database` block; heavy stats served stale-while-revalidate so it answers < 1 s even when they fail;
       in-flight dedupe; drop `tokenInfo` from 14 days to ~2; add a `prices` feed (RC-8) and a `balances`
       freshness line (RC-9). Update the stale "FOUR SEQUENTIAL AWAITS" comment and `docs/DECISIONS.md#d064`.
-- [ ] **P1.6 Observability (RC-10):** mint `requestId` first and put it in every log line and an
+- [x] **P1.6 Observability (RC-10):** mint `requestId` first and put it in every log line and an
       `x-request-id` header on success too; log `url.search`; have the shim attach the first ~200 chars of SQL
       to any D1 error.
 - [ ] **P1.7 Per-cron budgets.** `index.ts:96` hands every cron 600 s, including the 5-minute one. Make the
@@ -202,37 +202,37 @@ purely additive · `capturedAt` is the daily 01:00 build stamp, NOT a cached cop
       (`transfers.ts:138`, and drop the pointless mark in `walkBack` `:155`); stop `balances.ts:348` marking
       traders whose read failed. Only then raise `TOP_UP_PER_RUN` — with a budget, and while watching API p90,
       not just `liveStale`.
-- [ ] **P1.9 Cheap latency wins (RC-4):** correlated liquidity lookup instead of the materialised window in
+- [x] **P1.9 Cheap latency wins (RC-4):** correlated liquidity lookup instead of the materialised window in
       both `/positions` queries; 60 s cache on the no-handle `asOfHoldings()` and pass the handle where one is in
       hand; bound `/trades`' pairing read; reuse `batchIds`' map in `POST /traders/aum` (`aum.ts:1041`, delete the
       two redundant directory reads at `:750`, `:1081`).
 
 ## 4. P2 — data freshness (each needs a first observation before any code)
 
-- [ ] **P2.1 GMGN (request 3).** FIRST make the failure visible: log the HTTP status/body on every non-success
+- [x] **P2.1 GMGN (request 3).** FIRST make the failure visible: log the HTTP status/body on every non-success
       in `tokens.ts:231-240`, and make the guard per-phase. Tail one tick (`5 */2 * * *`) and read it:
       `returned nothing` = provider side, `store failed` = ours. THEN: refresh held-and-recently-viewed tokens
       first instead of NULL-first; stop re-queuing tokens GMGN cannot resolve (record the miss); size the budget
       honestly — at ~1,100/day "nightly" is unreachable for 31k tokens, so either prioritise the coins traders
       hold most (a few thousand) or correct the promise in `docs/openapi.yaml:7754,8927,10082`.
-- [ ] **P2.2 DexScreener 429 (RC-8).** Find what changed at 17 Sep 12:00 UTC (`git log` around `prices.ts`,
+- [x] **P2.2 DexScreener 429 (RC-8).** Find what changed at 17 Sep 12:00 UTC (`git log` around `prices.ts`,
       the throttle in `_shared/dexscreener.ts`; are the five chains each running their own throttle?). Workers
       share egress IPs, so a per-IP limit may be unwinnable — pace far lower, honour `Retry-After`, stop after N
       consecutive 429s, and consider pricing only tokens that back a material position.
-- [ ] **P2.3 Helius 429 (RC-9).** Owner checks the plan's credits first (§7). In code: make the head pull
+- [x] **P2.3 Helius 429 (RC-9).** Owner checks the plan's credits first (§7). In code: make the head pull
       incremental (stop at the newest stored signature — Helius takes `until=`) so it costs ~1 call per wallet
       per hour instead of 5; pace `walkBack` to a credit budget or pause it; make swaps report partial failure
       instead of `ok`.
 
 ## 5. P3 — housekeeping and the reply
 
-- [ ] Delete `healClockBuiltHours` and its call (`worker/src/jobs/aum_history.ts`) — converged to 0 rows.
-- [ ] Cache ONLY the no-include branch of `/traders` with `ttlCache` (consumer ask 4.2: "keep it serving while
+- [x] Delete `healClockBuiltHours` and its call (`worker/src/jobs/aum_history.ts`) — converged to 0 rows.
+- [x] Cache ONLY the no-include branch of `/traders` with `ttlCache` (consumer ask 4.2: "keep it serving while
       the database is down") — the app's cold-start fallback currently rests on a false premise (see Cleared).
 - [ ] `loadAttemptedAt`/`loadOutcome` are NULL for ~345 of 453 traders (the table began at the cut-over and only
       fomoapi traders are targeted) — document null-means-no-attempt-since-17-Sep, or fall back to `loadedAt`.
-- [ ] Stagger `15 2 * * *` (gmgn) away from `15,45` swaps and the `*/5` tick.
-- [ ] **Reply to Roy** (`docs/consumer/reply-to-trader-service-v1.md`), same format as v5, after P0 verifies:
+- [x] Stagger `15 2 * * *` (gmgn) away from `15,45` swaps and the `*/5` tick.
+- [x] **Reply to Roy** (`docs/consumer/reply-to-trader-service-v1.md`), same format as v5, after P0 verifies:
       - Requests 1 and 2 were ONE cause and it was ours, not the database: a 100-parameter SQL ceiling their
         page size of 100 crosses by one. Their "500/503 alternating → the connection" inference was reasonable
         and wrong; say so kindly, and explain why "never 500" is the wrong rule.
@@ -266,3 +266,47 @@ and a 10-minute tail with zero `d1sql:` / `no such` lines and the `*/5` cron und
   password, set a `JOB_SECRET` you hold — there is currently no way to run any job on demand.
 - Decide the `limit` cap (P0.2) and whether to tell the app team to page at 25–50 as a stopgap until P0 ships
   (at `limit=50` today: 8 of 9 pages answer, in 6–15 s, against their 12 s deadline — not reliable).
+
+---
+
+## 8. Review — what the 19 Sep fix session did (written 19 Sep 2026, 13:30 UTC)
+
+**State:** production healthy. The app team's verification block passed three times a few minutes apart
+(15/15 roster pages 200 in 4.0–5.8 s, wallets on every trader; scorecard page 200 in ~4 s; `/health` 200 in
+0.9 s with the database probe). A 12-minute tail: 1,068 of 1,075 requests answered, 0 D1 resets (before: 18%
+failing, 132 reset lines in 5 minutes). CI/CD verified on three pushes: verify + deploy + a post-deploy smoke
+that now really runs. Reply: `docs/consumer/reply-to-trader-service-v1.md`.
+
+**How it was done:** four workflows — a pre-deploy adversarial review, five route-family fixers, a six-lens
+read-only audit (82 findings, 25 of 26 serious ones checked by a skeptic: 6 confirmed, 18 corrected, 1 refuted)
+and six audit-fix owners; every fixer's work was adversarially reviewed and repaired before merge. 348 tests
+(254 at the start of the day).
+
+**What actually broke production today, in order of cost** (all named by the shim's new `d1 slow:` log within
+two minutes of its first deploy — nothing else found them):
+1. `/positions` read ~550,000 rows / 1.8 s per call through `holdings_live`'s `sol_read` CTE -> migration 0007.
+2. `/aum` read 2.3–2.5 M rows per call: D1 chose a join order local SQLite does not -> `cross join` pins it.
+3. The swaps cron read 1.7 M rows per chain, up to 19.6 s, at :15 and :45 -> windowed candidates + a lap.
+4. My own 10:33 deploy (always-`json_each`) stopped filter push-down into aggregate views -> `compileToFit`.
+5. `/traders/:h/wallets` and the profile read three tables whole through `trader_chain_history`.
+
+**Still open, ranked:**
+- [ ] **Owner:** Helius dashboard — are the key's credits spent? Balance reads and swap parsing still answer 429.
+- [ ] **Owner:** pause the Supabase project (dashboard; reversible 90 days), delete after a quiet week.
+- [ ] **Owner:** rotate the GMGN key that is in git history; make the repo private; set a `JOB_SECRET`.
+- [ ] `holdings` grows ~107k rows a day and nothing prunes it. The safe rule (fomo generations older than the
+      newest; chain generations only under an owner decision "hours older than N days are final") is written up
+      in the balances owner's proposal — needs the decision before any delete.
+- [ ] `holdings_current`'s first branch needs `+h.source` so the not-exists probe in `holdings_live` seeks by
+      token (valuation owner's F1(b) proposal): one view migration, both views recreated.
+- [ ] Roster page: 4–6 s, ships ~30,000 trade rows per page. Safe first win: skip the `co_holders` recount when
+      `tokens: 0` (patch and proof in the routes owner's proposal). The real fix is aggregating in SQL.
+- [ ] GMGN capacity is ~1,100 coins/day against 31,522 held. A cron of its own (every 30 min) would give ~9,000.
+- [ ] Two small partial indexes clear `/market/regime`'s two whole reads (`trades.closed_at`, `tokens(network_id,
+      created_at)`) — build cost on D1 to be weighed first.
+- [ ] Hours the live flush wrote on the live ladder since 17 Sep are not rewritten (needs `JOB_SECRET` for the
+      on-demand rebuild, or a one-off heal like V1d's).
+- [ ] `positions.liveBasis.evm` still answers `nightly_read`; `rolling_read` is published (v14) — switch in v15.
+- [ ] Observe: tokens tick 14:05 UTC (GMGN `fetchedAt` must move), fees tick 14:10 (Robinhood on Bitquery
+      `realtime` is unverified), quote_prices :50 (Kraken), swaps :45 (no stall).
+
