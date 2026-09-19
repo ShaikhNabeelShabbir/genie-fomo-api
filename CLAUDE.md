@@ -112,10 +112,15 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   is not a failure, and lumping the two tripped the all-failed guard and hid a real bug (`tokens`, 17 Sep).
 - SQLite dialect only: no `::` casts, `filter (where`, `distinct on`, `lateral`, `unnest`, `array_agg`, `= any(`, `interval`, `now()`, `date_trunc`, `numeric`, `ctid`. Timestamps are ISO-8601 UTC TEXT, booleans 0/1, JSON is TEXT. 100 bound parameters and 30 s per statement; D1 runs one statement at a time, so small and many beats large and few.
 - D1 charges CPU per query and has no planner hints: a view that aggregates the whole table before the caller's filter will exceed the limit (`holdings_current`, 17 Sep). Write correlated maxima that an index can seek.
-- **Bind id lists as ONE parameter on D1:** `in (select value from json_each(${ids}))`, never `in (${ids})` —
-  the shim expands an array after `in (` to one `?` per element and D1 allows 100 (`worker/src/d1.ts:53`). This
-  took the trader list down on 19 Sep at the app's page size of 100. A SQL fragment that needs a join says so in
-  code, and every query that interpolates it is `EXPLAIN`ed on D1 before deploy.
+- **Id lists (`in (${ids})`) are bound by the shim, `compileToFit` in `worker/src/d1.ts`:** one `?` per id while the
+  statement fits D1's 100, ONE `json_each` parameter when it would not. Both halves are incidents of 19 Sep: always-N
+  took the trader list down at the app's page size of 100; always-`json_each` (live 10:33 UTC until the hybrid) stopped SQLite
+  pushing the filter into aggregate views, so every sampler chunk scanned all of `trades`. Never filter an AGGREGATE
+  VIEW by a list or a subquery — ask per key with correlated seeks (`knownChainsFor` in `shared/chains.ts`).
+- **The plan audit** (`tests/routes_sql_test.ts`, part of `deno task test`) EXPLAINs every statement every route issues
+  and fails on a whole-table read that is not in `tests/accepted_whole_reads.ts`. Shrink that list, never grow it blind.
+  D1 has no statistics, so local SQLite plans match; a unary `+col` keeps the planner off a low-cardinality index.
+- Slow (>= 1 s) and failed statements are logged with their SQL by the shim (`d1 slow:` / `d1 failed`): tail for those first.
 - A cron's wallTime must stay well under its period, and its cost is measured end to end (not one step) and
   against API p90, not only its own gauge: the 5-minute live top-up ran 231–625 s and reset D1's isolate.
 - ONE price ladder, `shared/price-ladder.ts`, read at REQUEST time: pegged -> `token_price_stats`

@@ -1,5 +1,5 @@
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
-import { d1sql, type D1Like, type D1Outcome, type D1Statement } from "../worker/src/d1.ts";
+import { d1sql, timed, type D1Like, type D1Outcome, type D1Statement } from "../worker/src/d1.ts";
 
 /* Compile-only: a fake D1 that records `prepare(text).bind(params)` and answers with canned outcomes. */
 type Recorded = { text: string; params: unknown[] };
@@ -27,27 +27,43 @@ Deno.test("d1sql: scalars bind as ?, dates as ISO, booleans as 0/1, null stays n
   assertEquals(prepared[0].params, ["2026-09-17T10:00:00.000Z", 1, null, 7]);
 });
 
-Deno.test("d1sql: an array after `in (` or `= any(` is ONE json_each parameter; elsewhere it is JSON too", async () => {
+Deno.test("d1sql: an id list that fits binds one ? per id — the plan every chunked caller was written for", async () => {
   const { db, prepared } = fake();
   const sql = d1sql(db);
   const handles = ["a", "b", "c"];
   await sql`select 1 where handle = any(${handles}) and k in (${[1, 2]}) and blob = ${["x"]}`;
-  assertEquals(prepared[0].text,
-    "select 1 where handle in (select value from json_each(?)) and k in (select value from json_each(?)) and blob = ?");
-  assertEquals(prepared[0].params, ['["a","b","c"]', "[1,2]", '["x"]']);
-  /* An empty list is valid SQL that matches nothing; `in ()` was a syntax error. */
+  assertEquals(prepared[0].text, "select 1 where handle in (?, ?, ?) and k in (?, ?) and blob = ?");
+  assertEquals(prepared[0].params, ["a", "b", "c", 1, 2, '["x"]']);
+  /* SQLite accepts an empty list as "no rows". */
   await sql`select 1 where handle in (${[]})`;
-  assertEquals(prepared[1].text, "select 1 where handle in (select value from json_each(?))");
-  assertEquals(prepared[1].params, ["[]"]);
+  assertEquals(prepared[1].text, "select 1 where handle in ()");
+  assertEquals(prepared[1].params, []);
 });
 
-Deno.test("d1sql: a page of 448 ids is one bind — the 19 Sep outage cannot recur", async () => {
-  /* /traders?include=wallets with no limit bound 448 parameters; limit=100 bound 101 and 200. */
+Deno.test("d1sql: a statement that would not fit binds EVERY list as one json_each parameter — the 19 Sep outage cannot recur", async () => {
   const { db, prepared } = fake();
   const sql = d1sql(db);
-  const ids = Array.from({ length: 448 }, (_v, i) => `h${i}`);
-  await sql`select 1 from wallets where handle in (${ids}) and x in (${ids}) and net = ${1}`;
-  assertEquals(prepared[0].params.length, 3);
+  /* The outage itself: a page of 100 handles plus one scalar bound 101; scorecardRows bound the page twice. */
+  const page = Array.from({ length: 100 }, (_v, i) => `h${i}`);
+  await sql`select 1 from wallets where net = ${1} and handle in (${page})`;
+  assertEquals(prepared[0].text, "select 1 from wallets where net = ? and handle in (select value from json_each(?))");
+  assertEquals(prepared[0].params, [1, JSON.stringify(page)]);
+  await sql`select 1 where handle in (${page}) and x = any(${page})`;
+  assertEquals(prepared[1].params.length, 2);
+  /* Exactly 100 still fits, and keeps the pushed-down plan. */
+  await sql`select 1 where handle in (${page})`;
+  assertEquals(prepared[2].params.length, 100);
+});
+
+Deno.test("d1sql: a fragment's list is re-bound as one when the ENCLOSING statement overflows", async () => {
+  const { db, prepared } = fake();
+  const sql = d1sql(db);
+  const sixty = Array.from({ length: 60 }, (_v, i) => `h${i}`);
+  const clause = sql`and handle in (${sixty})`;
+  assertEquals(clause.params.length, 60);
+  await sql`select 1 from t where other in (${sixty}) ${clause}`;
+  assertEquals(prepared[0].text, "select 1 from t where other in (select value from json_each(?)) and handle in (select value from json_each(?))");
+  assertEquals(prepared[0].params.length, 2);
 });
 
 Deno.test("d1sql: nested fragments splice text and params in order; empty fragment is nothing", async () => {
@@ -97,7 +113,7 @@ Deno.test("d1sql: begin collects statements into one batch; an await is a batch 
   assertEquals(out, Object.assign([{ k: 1 }], { count: 1 }));
   assertEquals(batches.map((b) => b.map((s) => s.text)), [
     ["insert into a values (?)", "insert into b values (?)", "insert into c values (?) returning k"],
-    ["delete from d where k in (select value from json_each(?))"],
+    ["delete from d where k in (?, ?)"],
   ]);
 });
 
@@ -105,4 +121,18 @@ Deno.test("d1sql: a failed batch rejects begin even when nothing inside was awai
   const db: D1Like = { ...fake().db, batch: () => Promise.reject(new Error("D1_ERROR: boom")) };
   const sql = d1sql(db);
   await assertRejects(() => sql.begin((tx) => { tx`insert into a values (1)`; }), Error, "boom");
+});
+
+Deno.test("d1sql: a failed statement is logged WITH its SQL and the original error still reaches the caller", async () => {
+  const logged: string[] = [];
+  const original = console.error;
+  console.error = (m: string) => { logged.push(m); };
+  try {
+    await assertRejects(
+      () => timed("select  ps.last_usd\n from holdings h", () => Promise.reject(new Error("D1_ERROR: no such column: ps.last_usd"))),
+      Error, "no such column",
+    );
+  } finally { console.error = original; }
+  assertEquals(logged.length, 1);
+  assertEquals(logged[0].endsWith("select ps.last_usd from holdings h"), true);
 });

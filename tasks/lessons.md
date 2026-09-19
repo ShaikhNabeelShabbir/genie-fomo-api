@@ -56,8 +56,19 @@
   of the thing I was fixing. None was of the thing I might be breaking.
 - **Exercise limits at their maximum.** The 100-bind ceiling shipped because every test used `limit` 1 or 10 and
   the consumer uses 100. For any paginated or batched route, the test that matters is the one at the cap.
-- **When porting `= any($array)` to SQLite, one array becomes N binds.** On D1 bind id lists as ONE parameter:
-  `in (select value from json_each(${ids}))`. Plan-checked: index seeks are preserved.
+- **When porting `= any($array)` to SQLite, one array becomes N binds.** The shim now binds per id while the statement
+  fits 100 and as one `json_each` parameter only when it would not.
+- **"Plan-checked" on ONE statement is not plan-checked.** I EXPLAINed the json_each form on a TABLE predicate, called it
+  plan-neutral, and shipped it to 79 call sites; on an AGGREGATE VIEW a subquery term is never pushed down, so the
+  sampler and the live refresh went from index seeks to whole-table scans in production (19 Sep, 10:33 UTC). A change
+  in a shared layer is checked against every KIND of caller (table, flattened view, aggregate view), and the adversarial
+  review is read BEFORE the deploy, not after — the reviewer that found this was still running when I deployed.
+- **Audit agents must not touch production D1.** Read-only is not harmless: full-table aggregates from a fan-out of
+  agents reset the database 987 times in 15 minutes. Plans are audited locally (`tests/routes_sql_test.ts`).
+- **A push to `cloudflare-migration` that touches `worker/**` IS a production deploy** (CI, `CLOUDFLARE_DEPLOY=true`).
+- **`main` still carries the v1 nightly refresh** (`.github/workflows/refresh.yml`, 06:00 UTC, ~1.5 h, cancelled by
+  timeout): it spends the same Helius, Bitquery and GMGN keys the Worker depends on. Check what the default branch
+  schedules before believing "everything moved".
 - **A handled 5xx is a successful Worker invocation** — `outcome: ok`. Count failures from `logs[]`.
 - **A classifier that maps "any database error" to "retry shortly" hides your own bugs as outages.** Deterministic
   SQL errors must be 500 and loud.

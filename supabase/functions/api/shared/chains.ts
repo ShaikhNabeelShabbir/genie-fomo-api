@@ -40,15 +40,33 @@ export async function knownChainsFor(handles: string[]): Promise<Map<string, Kno
   const out = new Map<string, KnownChain[]>();
   if (!handles.length) return out;
 
-  /* `trader_chain_history` (migration 20260917230000) is the one definition of a seen chain. */
+  /*
+   * The `trader_chain_history` rule (a chain is seen if traded on, held on, or sampled on), asked
+   * per (handle, chain) so every arm is an index seek. Reading the VIEW with a handle filter
+   * aggregated all of `trades`, `holdings_current` and `aum_chain_samples` first: SQLite does not
+   * push a filter through a grouped union, so one page of wallets cost a pass over three tables
+   * (19 Sep 2026). `limit 2` because the series rule only asks "none, one, or at least two".
+   */
   const rows = await sql`
-    select h.handle, h.chain, h.network_id, h.positions, h.history_state,
-           case when h.network_id = ${SOLANA_NET} then w.sol_address is not null
-                else w.evm_address is not null end as has_wallet
-    from trader_chain_history h
-    left join wallets w using (handle)
-    where h.handle in (${handles})
-    order by h.handle, h.chain`;
+    select * from (
+      select p.value as handle, c.name as chain, c.network_id,
+             -- The unary + keeps the planner off trades_token_idx (network_id), which reads a whole
+             -- chain's trades to find one handle; D1 has no statistics to tell it otherwise.
+             exists (select 1 from trades tr
+                     where tr.handle = p.value and +tr.network_id = c.network_id) as traded,
+             -- EXISTS, not count(*): an aggregate over the compound view materialises all of it.
+             exists (select 1 from holdings_current hc
+                     where hc.handle = p.value and hc.network_id = c.network_id and hc.human_amount > 0) as positions,
+             (select count(*) from (select 1 from aum_chain_samples s
+                                    where s.handle = p.value and s.network_id = c.network_id
+                                      and s.total_usd is not null limit 2)) as history_points,
+             case when c.network_id = ${SOLANA_NET} then w.sol_address is not null
+                  else w.evm_address is not null end as has_wallet
+      from json_each(${JSON.stringify(handles)}) p
+      cross join chains c
+      left join wallets w on w.handle = p.value)
+    where traded or positions or history_points > 0
+    order by handle, chain`;
 
   for (const r of rows) {
     const h = String(r.handle);
@@ -64,7 +82,7 @@ export async function knownChainsFor(handles: string[]): Promise<Map<string, Kno
       wallets: Number(r.has_wallet) ? 1 : 0,
       hasPositions: Number(r.positions) > 0,
       /* ready | warming | none by the series' two-point rule, decided in the view. */
-      historyState: String(r.history_state),
+      historyState: Number(r.history_points) >= 2 ? "ready" : Number(r.history_points) === 1 ? "warming" : "none",
     });
   }
   return out;

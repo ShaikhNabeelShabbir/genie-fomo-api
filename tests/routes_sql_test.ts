@@ -1,10 +1,11 @@
 import { assert, assertEquals } from "jsr:@std/assert@1";
-import { DatabaseSync } from "node:sqlite";
-import { d1sql, type D1Like, type D1Statement } from "../worker/src/d1.ts";
-import { setDefaultSql } from "../supabase/functions/api/db.ts";
+import type { DatabaseSync } from "node:sqlite";
+import { openSchema } from "./_sqlite_harness.ts";
+import { ACCEPTED_WHOLE_READS } from "./accepted_whole_reads.ts";
 import { handle } from "../supabase/functions/api/app.ts";
 import { registeredRoutes } from "../supabase/functions/api/router.ts";
 import "../supabase/functions/api/routes.ts";
+import { knownChainsFor } from "../supabase/functions/api/shared/chains.ts";
 
 /*
  * EVERY ROUTE'S SQL, EXECUTED — through the real app, the real shim and the real D1 migrations
@@ -17,41 +18,13 @@ import "../supabase/functions/api/routes.ts";
  * A route that reaches the database and gets a SQL error answers 5xx here, and this file fails.
  */
 
+/** Every statement the sweep issued, and the routes that issued it — read by the plan audit at the end. */
+const SEEN = new Map<string, Set<string>>();
+const ROUTE = { now: "seed" };
 const ROSTER = 220; // larger than INCLUDE_PAGE_MAX (200), so a cap is observable, not vacuous
 const SOL = 1399811149;
 const TOKEN = "0x00000000000000000000000000000000000000aa";
 const MINT = "mintaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-async function open(): Promise<DatabaseSync> {
-  const db = new DatabaseSync(":memory:");
-  db.exec("pragma foreign_keys = on");
-  const dir = new URL("../worker/d1/migrations/", import.meta.url);
-  const files: string[] = [];
-  for await (const e of Deno.readDir(dir)) if (e.name.endsWith(".sql")) files.push(e.name);
-  for (const f of files.sort()) db.exec(await Deno.readTextFile(new URL(f, dir)));
-  const like: D1Like = {
-    prepare(text: string): D1Statement {
-      const write = /^\s*(insert|update|delete|replace)/i.test(text) && !/returning/i.test(text);
-      const make = (params: unknown[]): D1Statement => ({
-        bind: (...values: unknown[]) => make(values),
-        all: () => {
-          const st = db.prepare(text);
-          const p = params as (string | number | bigint | null | Uint8Array)[];
-          if (write) return Promise.resolve({ results: [], meta: { changes: Number(st.run(...p).changes) } });
-          return Promise.resolve({ results: st.all(...p) as unknown[], meta: {} });
-        },
-      });
-      return make([]);
-    },
-    async batch(stmts: D1Statement[]) {
-      const out = [];
-      for (const s of stmts) out.push(await s.all());
-      return out;
-    },
-  };
-  setDefaultSql(d1sql(like));
-  return db;
-}
 
 function seed(db: DatabaseSync): void {
   const run = (text: string, ...p: (string | number | null)[]): void => void db.prepare(text).run(...p);
@@ -91,14 +64,16 @@ const fill = (pattern: string): string => {
   return path + (extra ? extra[1] : "");
 };
 
-const call = (method: string, path: string, body?: unknown): Promise<Response> =>
-  handle(new Request(`https://test.local${path}`, {
+const call = (method: string, path: string, body?: unknown): Promise<Response> => {
+  ROUTE.now = `${method} ${path.replace(/\?.*/, "").replace("/v2/", "/")}`;
+  return handle(new Request(`https://test.local${path}`, {
     method,
     headers: { "content-type": "application/json", "user-agent": "routes-sql-test/1.0" },
     body: body === undefined ? undefined : JSON.stringify(body),
   }));
+};
 
-const db = await open();
+const db = await openSchema((text) => (SEEN.get(text) ?? SEEN.set(text, new Set()).get(text)!).add(ROUTE.now));
 seed(db);
 
 Deno.test("every registered route executes its SQL against the real schema without a server error", async () => {
@@ -167,4 +142,73 @@ Deno.test("/trades at its default and maximum page sizes does not overflow on fe
     const text = await res.text();
     assertEquals(res.status, 200, `/trades${q} -> ${text.slice(0, 200)}`);
   }
+});
+
+Deno.test("knownChainsFor answers exactly what the trader_chain_history view does, without reading the view", async () => {
+  const run = (text: string, ...p: (string | number | null)[]): void => void db.prepare(text).run(...p);
+  const sample = (h: string, at: string, usd: number | null): void => {
+    run("insert into aum_samples (handle, at, total_usd, basis, tier) values (?,?,?,'sampled','verified')", h, at, usd);
+    run("insert into aum_chain_samples (handle, at, basis, network_id, total_usd) values (?,?,'sampled',?,?)", h, at, SOL, usd);
+  };
+  sample("t1", "2026-09-01T00:00:00.000Z", 10); sample("t1", "2026-09-01T01:00:00.000Z", 11); sample("t1", "2026-09-01T02:00:00.000Z", 12); // ready
+  sample("t2", "2026-09-01T00:00:00.000Z", 10); // warming
+  sample("t3", "2026-09-01T00:00:00.000Z", null); // a refused sample is no evidence of the chain
+  const asked = ["t1", "t2", "t3", "t4", "nobody"];
+  const view = db.prepare(`select h.handle, h.chain, h.network_id, h.positions, h.history_state
+    from trader_chain_history h where h.handle in ('t1','t2','t3','t4','nobody') order by h.handle, h.chain`).all() as Record<string, unknown>[];
+  const expected = view.map((r) => `${r.handle}|${r.chain}|${r.network_id}|${Number(r.positions) > 0}|${r.history_state}`);
+  const got = [...(await knownChainsFor(asked)).entries()]
+    .flatMap(([h, list]) => list.map((c) => `${h}|${c.chain}|${c.networkId}|${c.hasPositions}|${c.historyState}`));
+  assertEquals(got, expected);
+  assert(expected.includes(`t1|solana|${SOL}|false|ready`) && expected.includes(`t2|solana|${SOL}|false|warming`));
+  assert(!expected.some((e) => e.startsWith("t3|solana")));
+});
+
+/*
+ * THE PLAN AUDIT. D1 bills CPU per statement, has no statistics and no planner hints, and runs one
+ * statement at a time — so a request that reads a whole table is an outage waiting for traffic
+ * (19 Sep 2026: one page of wallets aggregated all of `trades`). Local SQLite plans the same way
+ * D1 does (neither has ANALYZE data), so every statement the sweep issued is EXPLAINed here and a
+ * whole-table read must be on the list below, with the reason it is tolerable. Shrink the list;
+ * do not grow it without measuring the table.
+ */
+const SMALL_TABLES = new Set(["chains", "builds", "quote_assets", "traders", "wallets", "linked_wallets", "creators"]);
+const LOW_CARDINALITY = /^\((?:(?:source|network_id|basis|status|tx_type|tier|direction)=\?(?: AND )?)+\)$/;
+/** `latest_capture` is max(captured_at) on (source, captured_at desc): one seek, though the plan line reads like a range. */
+const ONE_SEEK = new Set(["SEARCH holdings USING COVERING INDEX holdings_source_capture_idx (source=?)"]);
+Deno.test("no route reads a whole table unless the read is on the accepted list", () => {
+  const tables = new Set((db.prepare("select name from sqlite_master where type = 'table'").all() as { name: string }[]).map((r) => r.name));
+  const viewSql = (db.prepare("select sql from sqlite_master where type = 'view'").all() as { sql: string }[]).map((r) => r.sql).join(" ");
+  const indexTable = new Map((db.prepare("select name, tbl_name from sqlite_master where type = 'index'").all() as { name: string; tbl_name: string }[])
+    .map((r) => [r.name, r.tbl_name]));
+  const NOT_AN_ALIAS = /^(on|where|left|join|group|order|using|cross|inner|limit|union|indexed)$/i;
+  /** alias -> every relation it names, in the statement or in a view the planner may have flattened into it. */
+  const aliases = (text: string): Map<string, Set<string>> => {
+    const m = new Map<string, Set<string>>();
+    for (const x of text.matchAll(/\b(?:from|join)\s+([a-z_][a-z0-9_]*)(?:\s+(?:as\s+)?([a-z_][a-z0-9_]*))?/gi)) {
+      const alias = x[2] && !NOT_AN_ALIAS.test(x[2]) ? x[2] : x[1];
+      (m.get(alias) ?? m.set(alias, new Set()).get(alias)!).add(x[1]);
+    }
+    return m;
+  };
+  const found = new Set<string>();
+  for (const [text, routes] of SEEN) {
+    if (/^\s*(insert|update|delete|replace)/i.test(text)) continue;
+    const plan = db.prepare("explain query plan " + text).all() as { detail: string }[];
+    const names = aliases(`${text} ${viewSql}`);
+    for (const { detail } of plan) {
+      const step = /^(SCAN|SEARCH) ([a-z_0-9]+)(?: USING (?:COVERING )?INDEX (\S+)(?: (\(.*\)))?)?/i.exec(detail);
+      if (!step || ONE_SEEK.has(detail)) continue;
+      const whole = step[1] === "SCAN" || (step[4] !== undefined && LOW_CARDINALITY.test(step[4]));
+      if (!whole) continue;
+      const candidates = step[3] && indexTable.has(step[3]) ? [indexTable.get(step[3])!] : [...(names.get(step[2]) ?? [step[2]])];
+      for (const table of candidates) {
+        if (!tables.has(table) || SMALL_TABLES.has(table)) continue;
+        for (const r of routes) if (r !== "seed") found.add(`${r} | ${table}`);
+      }
+    }
+  }
+  const unexpected = [...found].filter((k) => !(k in ACCEPTED_WHOLE_READS)).sort();
+  const stale = Object.keys(ACCEPTED_WHOLE_READS).filter((k) => !found.has(k)).sort();
+  assertEquals({ unexpected, stale }, { unexpected: [], stale: [] });
 });
