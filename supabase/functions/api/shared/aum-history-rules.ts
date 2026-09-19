@@ -50,7 +50,9 @@ export const latestValued = <P extends { at: string; totalUsd: number | null }>(
  * were presented as facts, and the sawtooth that produced is what a consumer charts.
  *
  * The rule is applied HERE, at read time, on the counts every row already carries: the whole
- * stored series is judged by it the moment this deploys, with nothing rebuilt.
+ * stored series is judged by it the moment this deploys, with nothing rebuilt. The rollup steps
+ * cannot call this per hour, so `points` (routes/aum-history.ts) spells the publish floor in SQL;
+ * tests/aum_fixes_test.ts holds the two to the same hours.
  *
  * Above PRICED_FLOOR: a figure.
  * Between the two floors: a figure, `partial: true`, with `pricedShare` to label it.

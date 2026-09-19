@@ -58,7 +58,6 @@ function buildAum(
   t: { handle: string; display_handle: string },
   rows: Record<string, unknown>[],
   chainRows: Record<string, unknown>[],
-  presence: { chains: number; on_solana: boolean; on_evm: boolean } | null,
   opts: {
     windowKey: string; stepRaw: string | null;
     chainFilter: { network_id: number; name: string } | null; to: Date;
@@ -445,7 +444,7 @@ function buildAum(
    * hold no row for did not contribute zero dollars -- it contributed nothing at all.
    */
   /** TOTAL CHAINS COMES FROM THE SAME UNION `knownChains` DOES, not from what is held today. See docs/DECISIONS.md#d038 */
-  const totalChains = opts.knownChains?.length ?? Number(presence?.chains ?? 0);
+  const totalChains = opts.knownChains?.length ?? 0;
 
   const answeredNets = new Set(
     chainRows.filter((r) => r.total_usd !== null).map((r) => Number(r.network_id)));
@@ -453,7 +452,7 @@ function buildAum(
   const totalWallets = opts.knownChains?.length
     ? (opts.knownChains.some((c) => Number(c.networkId) !== SOLANA_NET) ? 1 : 0) +
       (opts.knownChains.some((c) => Number(c.networkId) === SOLANA_NET) ? 1 : 0)
-    : (presence?.on_evm ? 1 : 0) + (presence?.on_solana ? 1 : 0);
+    : 0;
   const answeredWallets =
     ([...answeredNets].some((x) => x !== SOLANA_NET) ? 1 : 0) +
     (answeredNets.has(SOLANA_NET) ? 1 : 0);
@@ -483,11 +482,6 @@ function buildAum(
     };
   })();
 
-  const warming = drawable === false && (reason === "warming" || reason === "short_coverage");
-  const nextRun = new Date();
-  nextRun.setUTCHours(6, 0, 0, 0);
-  if (nextRun.getTime() <= Date.now()) nextRun.setUTCDate(nextRun.getUTCDate() + 1);
-
   /** SAMPLER STATE, NAMED RATHER THAN IMPLIED. See docs/DECISIONS.md#d042 */
   const STALE_AFTER_H = 36;
   const lastSuccess = opts.sampler?.lastSuccess ?? null;
@@ -514,7 +508,8 @@ function buildAum(
     /** When THIS trader was last measured. The figure `state` is judged on. */
     lastSuccessAt: newest?.at ? new Date(String(newest.at)).toISOString() : null,
     ageSeconds: ownAgeH === null ? null : Math.round(ownAgeH * 3600),
-    nextExpectedAt: nextRun.toISOString(),
+    /** Null since the sampler was retired (17 Sep 2026): no run is due, and /aum/history is the built series. */
+    nextExpectedAt: null,
     staleAfterHours: STALE_AFTER_H,
     reason: samplerState === "stale"
       ? `this trader's newest reading is ${ownAgeH!.toFixed(1)}h old — it is true, but old`
@@ -636,14 +631,14 @@ function buildAum(
 
     /**
      * `ready` — this is what we have to offer.
-     * `warming` — a backfill or first sampling is still filling it.
+     * `warming` — never said since the sampler was retired (17 Sep 2026): nothing fills this table.
      * `stale` — the readings are true but the sampler has not written for a while; see
      *   `sampler`. This never used to be said, and 432 of 435 answers claimed `ready` over
      *   figures three days old.
      */
     status: newestIsEmpty
       ? "no_reading"
-      : (warming ? "warming" : (samplerState === "stale" ? "stale" : "ready")),
+      : (samplerState === "stale" ? "stale" : "ready"),
 
     /** When measurement last succeeded, and when it is next due. */
     sampler: samplerBlock,
@@ -654,9 +649,9 @@ function buildAum(
       /** Where the readings themselves begin, regardless of the window asked for. */
       historyStartsAt: trackedSince,
       boundedBy: requestedDays !== null && coveredDays >= requestedDays ? "window" : "history",
-      /** Only meaningful while filling; null once the series is as long as it will get. */
-      nextRunAt: warming ? nextRun.toISOString() : null,
-      warming,
+      /** Only meaningful while filling, and nothing fills it now: the series is as long as it will get. */
+      nextRunAt: null,
+      warming: false,
     },
 
     gaps,
@@ -809,42 +804,44 @@ async function aumFor(
    * Coverage on a chain series is `pricedShare` and nothing else. The position counts on the
    * parent row are whole-trader for a sampled point and one chain's for a rebuilt one.
    */
-  const [rows, allChainRows, knownBy, natives, samplerRow, presenceRows] = await Promise.all([
+  const [rows, allChainRows, knownBy, natives, samplerRow] = await Promise.all([
     opts.chainFilter
       ? sql`
         select a.handle, a.at, a.total_usd, a.reason as refused_reason,
                null as priced_positions, null as total_positions,
                a.priced_share as value_share, a.basis, s.tier,
                null as chains_answered, null as chains_expected
-        -- unnest(handles, floors) is two json_each runs joined on the array index. It DRIVES, by
-        -- cross join: left to itself D1 walked a time index and read 2.3 M rows to answer 50 traders.
+        -- unnest(handles, floors) is two json_each runs joined on the array index; FIRST, so the floor is a seek bound.
         from (select jh.value as handle, jl.value as lo
                 from json_each(${lh}) jh
                 join json_each(${lo}) jl on jl.key = jh.key) u
         cross join aum_chain_samples a on a.handle = u.handle and a.at >= u.lo
+        -- cross join throughout: D1 reordered a free join here and read 2.3 M rows a call (19 Sep 2026, 12:18 UTC).
         cross join aum_samples s
           on s.handle = a.handle and s.at = a.at and s.basis = a.basis
         where a.network_id = ${opts.chainFilter.network_id}
-        order by a.handle, a.at asc`
+        -- rowid: two bases can share a moment, and the floored seek walks the index the other way.
+        order by a.handle, a.at asc, a.rowid`
       : sql`
         select s.handle, s.at, s.total_usd, s.refused_reason, s.priced_positions, s.total_positions,
                s.value_share, s.basis, s.tier, s.chains_answered, s.chains_expected
-        -- The asked traders drive (cross join pins the order): 507,000 rows were read per call without it.
+        -- unnest(handles, floors) is two json_each runs joined on the array index; FIRST, so the floor is a seek bound.
         from (select jh.value as handle, jl.value as lo
                 from json_each(${lh}) jh
                 join json_each(${lo}) jl on jl.key = jh.key) u
         cross join aum_samples s on s.handle = u.handle and s.at >= u.lo
-        order by s.handle, s.at asc`,
+        -- rowid: two bases can share a moment, and the floored seek walks the index the other way.
+        order by s.handle, s.at asc, s.rowid`,
     /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
     sql`
-        select a.handle, a.at, a.basis, c.name as chain, a.total_usd
-        -- The asked traders drive, then their samples by (handle, at), then the chain's name.
+        select a.handle, a.at, a.basis, c.name as chain, a.total_usd, a.network_id, a.priced_share, a.reason
+        -- unnest(handles, floors) is two json_each runs joined on the array index; FIRST, so the floor is a seek bound.
         from (select jh.value as handle, jl.value as lo
                 from json_each(${lh}) jh
                 join json_each(${lo}) jl on jl.key = jh.key) u
         cross join aum_chain_samples a on a.handle = u.handle and a.at >= u.lo
         cross join chains c on c.network_id = a.network_id
-        order by a.handle, a.at asc`,
+        order by a.handle, a.at asc, a.rowid`,
     /** Window-independent chain list, one query for the whole batch. */
     knownChainsFor(present),
     /** Cached for the process; five rows that barely move. */
@@ -857,16 +854,6 @@ async function aumFor(
      * number rather than be reconstructed from dates by every caller.
      */
     samplerLast(),
-    /* Asked per (trader, chain): filtered by a list, the fomo half of holdings_current read the whole newest build. */
-    sql`
-    select handle, count(distinct network_id) as chains,
-           max(network_id = ${SOLANA_NET})  as on_solana,
-           max(network_id <> ${SOLANA_NET}) as on_evm
-    from (select p.value as handle, c.network_id
-            from json_each(${present}) p cross join chains c
-           where exists (select 1 from holdings_current h
-                          where h.handle = p.value and h.network_id = c.network_id and h.human_amount > 0))
-    group by handle`,
   ]);
 
   const byHandle = new Map<string, Record<string, unknown>[]>();
@@ -877,35 +864,12 @@ async function aumFor(
   }
 
   /*
-   * The chain split of each trader's NEWEST point, in one query rather than one per trader.
-   * The (handle, at, basis) triples are joined through unnest so the database matches them
-   * instead of us issuing fifty lookups.
+   * The chain split of each trader's NEWEST point lies at or above the floor, so it is already in
+   * `allChainRows`: it is picked out of the pass below, where a statement of its own read every
+   * chain row of every trader again. Largest first, nulls last; the sort is stable, so a tie keeps
+   * the stored order the statement's did.
    */
-  const nh: string[] = [], na: string[] = [], nb: string[] = [];
-  for (const h of present) {
-    const rs = byHandle.get(h);
-    if (!rs?.length) continue;
-    const newest = rs[rs.length - 1];
-    nh.push(h); na.push(String(newest.at)); nb.push(String(newest.basis));
-  }
-  const chainRows = nh.length
-    ? await sql`
-        select a.handle, c.name as chain, a.network_id, a.total_usd, a.priced_share, a.reason
-        -- unnest(handles, ats, bases) is three json_each runs joined on the array index; it drives.
-        from (select jh.value as handle, ja.value as at, jb.value as basis
-                from json_each(${nh}) jh
-                join json_each(${na}) ja on ja.key = jh.key
-                join json_each(${nb}) jb on jb.key = jh.key) u
-        cross join aum_chain_samples a on a.handle = u.handle and a.at = u.at and a.basis = u.basis
-        cross join chains c on c.network_id = a.network_id
-        order by a.handle, a.total_usd desc nulls last`
-    : [];
   const chainsBy = new Map<string, Record<string, unknown>[]>();
-  for (const r of chainRows) {
-    const h = String(r.handle);
-    let a = chainsBy.get(h); if (!a) chainsBy.set(h, a = []);
-    a.push(r);
-  }
 
   /** handle -> "<iso at>|<basis>" -> [{ chain, usd }]. One map, built once for the batch. */
   const pointChainsBy = new Map<string, Map<string, { chain: string; usd: number | null }[]>>();
@@ -915,11 +879,18 @@ async function aumFor(
     const k = `${new Date(String(r.at)).toISOString()}|${r.basis}`;
     let a = m.get(k); if (!a) m.set(k, a = []);
     a.push({ chain: String(r.chain), usd: n(r.total_usd) });
+    const newest = byHandle.get(h)?.at(-1);
+    if (newest && r.at === newest.at && r.basis === newest.basis) {
+      let c = chainsBy.get(h); if (!c) chainsBy.set(h, c = []);
+      c.push(r);
+    }
   }
-
-  const presBy = new Map<string, { chains: number; on_solana: boolean; on_evm: boolean }>(presenceRows.map((r: Record<string, unknown>) => [String(r.handle), {
-    chains: Number(r.chains), on_solana: bool(r.on_solana) === true, on_evm: bool(r.on_evm) === true,
-  }]));
+  for (const split of chainsBy.values()) {
+    split.sort((x, y) => {
+      const a = n(x.total_usd), b = n(y.total_usd);
+      return a === b ? 0 : a === null ? 1 : b === null ? -1 : b - a;
+    });
+  }
 
   for (const t of traders) {
     const h = t.handle;
@@ -928,7 +899,6 @@ async function aumFor(
       t,
       byHandle.get(h) ?? [],
       chainsBy.get(h) ?? [],
-      presBy.get(h) ?? null,
       { ...opts, to, pointChains: pointChainsBy.get(h) ?? null,
         knownChains: knownBy.get(h) ?? [], natives, tracked: {
           sinceMs: hist?.tracked_since ? Date.parse(String(hist.tracked_since)) : null,

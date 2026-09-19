@@ -154,25 +154,36 @@ const presenceOld = (handles: string[]): Row[] => old(`
     from holdings_current where handle in (${handles.map(() => "?").join(", ")}) and human_amount > 0
     group by handle`, SOL, SOL, ...handles);
 
-Deno.test("chain presence asked per (trader, chain) answers what the list filter on holdings_current did", async () => {
-  const got = await call("POST", "/v2/traders/aum", { ids: ["a", "b", "c", "e", "ghost"] });
-  assertEquals(got.status, 200);
-  const presence = theOne(got.issued, "as on_solana");
-  assert(!planOf(presence).some((d) => d.includes("holdings_source_capture_idx (source=? AND captured_at=?)")),
-    "the newest fomo build is sought per (trader, chain), never read whole");
-  assertEquals(byHandle(presence.rows), byHandle(presenceOld(["a", "b", "c", "e"])));
-  /* a: ethereum + solana + base (fomo fills base); b: ethereum from fomo; c holds nothing; e has no rows. */
-  assertEquals(byHandle(presence.rows), [
+Deno.test("chain presence is not asked: knownChains holds every chain it named, and coverage says what it did", async () => {
+  const ids = ["a", "b", "c", "d", "e"];
+  const coverageNow = async (): Promise<void> => {
+    const got = await call("POST", "/v2/traders/aum", { ids: [...ids, "ghost"] });
+    assertEquals(got.status, 200);
+    assert(!got.issued.some((s) => s.text.includes("as on_solana")), "one statement fewer per call");
+    const presence = new Map(presenceOld(ids).map((r) => [r.handle, r]));
+    for (const row of (got.json.traders as { ok: boolean; handle: string; aum: Row }[]).filter((r) => r.ok)) {
+      const h = row.handle[0].toLowerCase();
+      const known = row.aum.knownChains as { networkId: number; hasPositions: boolean }[];
+      const p = presence.get(h);
+      /* The old rule verbatim: the chain list when there is one, else presence — which never had a row then. */
+      const wallets = known.length
+        ? (known.some((c) => c.networkId !== SOL) ? 1 : 0) + (known.some((c) => c.networkId === SOL) ? 1 : 0)
+        : (p?.on_evm ? 1 : 0) + (p?.on_solana ? 1 : 0);
+      const coverage = row.aum.coverage as { totalWallets: number; totalChains: number };
+      assertEquals([coverage.totalWallets, coverage.totalChains], [wallets, known.length], h);
+      assertEquals(known.filter((c) => c.hasPositions).length, Number(p?.chains ?? 0), `${h}: every chain presence counted is a known chain`);
+    }
+  };
+  await coverageNow();
+  /* a: ethereum + solana + base (fomo fills base); b: ethereum from fomo; c holds nothing; d's build is stale; e has no rows. */
+  assertEquals(byHandle(presenceOld(ids)), [
     { handle: "a", chains: 3, on_solana: 1, on_evm: 1 },
     { handle: "b", chains: 1, on_solana: 0, on_evm: 1 },
   ]);
-  for (const list of [["c"], ["d", "e"], ["a"], []]) {
-    assertEquals(byHandle(again(presence, [SOL, SOL, JSON.stringify(list)])), byHandle(presenceOld(list)), list.join());
-  }
-  /* A chain read of (b, ethereum) lands: fomo stops filling it, and only solana-less evm remains either way. */
+  /* A chain read of (b, ethereum) lands and holds nothing: presence loses b, and so does hasPositions. */
   hold("b", ETH, TOK, C2, 0, null, "chain");
-  assertEquals(byHandle(again(presence)), byHandle(presenceOld(["a", "b", "c", "e"])));
-  assertEquals(again(presence).some((r) => r.handle === "b"), false);
+  assertEquals(presenceOld(ids).some((r) => r.handle === "b"), false);
+  await coverageNow();
   run("delete from holdings where handle = 'b' and source = 'chain'");
 });
 
@@ -315,9 +326,14 @@ const historyOld = (view: string, handles: string[]): string => `
         order by handle, at`;
 const VIEWS: [string, string][] = [["1d", "aum_history_daily"], ["1w", "aum_history_weekly"], ["1mo", "aum_history_monthly"]];
 
+/** The route also reads the close's counts, and binds the publish floor and an hour bound ahead of the view's four. */
+const asTheViewDid = (rows: Row[]): Row[] => rows.map(({ priced_positions: _p, total_positions: _t, ...rest }) => rest);
+const viewParams = (s: Issued, handles: string[]): Bind[] => [...handles, ...s.params.slice(-4)];
+
 Deno.test("a rollup step reads the asked handles' hours, and answers what the whole-table rollup view did", async () => {
+  /* Every hour here is fully priced, so the view is right; tests/aum_fixes_test.ts pins the hours where it is not. */
   const hour = (h: string, at: string, usd: number | null): void =>
-    run("insert into aum_history (handle, hour, total_usd, basis) values (?,?,?,'priced')", h, at, usd);
+    run("insert into aum_history (handle, hour, total_usd, priced_positions, total_positions, basis) values (?,?,?,1,1,'priced')", h, at, usd);
   hour("a", "2026-08-30T22:00:00.000Z", 5);    // a Sunday: the week before
   hour("a", "2026-08-31T23:00:00.000Z", 20);   // Monday, still August
   hour("a", "2026-09-01T00:00:00.000Z", 30);
@@ -336,7 +352,7 @@ Deno.test("a rollup step reads the asked handles' hours, and answers what the wh
       assert(!stmt.text.includes(view), "the view is no longer read");
       assert(planOf(stmt).some((d) => d.startsWith("SEARCH aum_history") && d.includes("(handle=?")), planOf(stmt).join("\n"));
       assert(!planOf(stmt).some((d) => d.startsWith("SCAN aum_history")), planOf(stmt).join("\n"));
-      assertEquals(stmt.rows, old(historyOld(view, ["a"]), ...stmt.params), `${step} limit=${limit}`);
+      assertEquals(asTheViewDid(stmt.rows), old(historyOld(view, ["a"]), ...viewParams(stmt, ["a"])), `${step} limit=${limit}`);
       assert(stmt.rows.length > 0);
     }
     /* The batch: two traders with hours, one with none, one unknown; and an open-ended range. */
@@ -344,7 +360,7 @@ Deno.test("a rollup step reads the asked handles' hours, and answers what the wh
       const got = await call("POST", "/v2/traders/aum/history", { ids: ["a", "b", "e", "ghost"], step, ...body });
       assertEquals(got.status, 200);
       const stmt = theOne(got.issued, "as valued_hours");
-      assertEquals(stmt.rows, old(historyOld(view, ["a", "b", "e", "ghost"]), ...stmt.params), `${step} batch`);
+      assertEquals(asTheViewDid(stmt.rows), old(historyOld(view, ["a", "b", "e", "ghost"]), ...viewParams(stmt, ["a", "b", "e", "ghost"])), `${step} batch`);
       assertEquals(new Set(stmt.rows.map((r) => r.handle)), new Set(["a", "b"]));
     }
   }
