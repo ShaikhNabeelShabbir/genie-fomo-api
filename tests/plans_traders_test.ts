@@ -123,66 +123,59 @@ Deno.test("GET /traders ranks and rates every trader as trader_stats_current did
   }
 });
 
-const OLD_MONTH_START = (n: number): string => `
-    select handle, month, total_usd, day_of_month from (
-      select handle,
-             strftime('%Y-%m', at) as month,
-             total_usd,
-             cast(strftime('%d', at) as integer) as day_of_month,
-             row_number() over (
-               partition by handle, strftime('%Y-%m', at) order by at asc) as rn
-      from aum_samples
-      where handle in (${Array(n).fill("?").join(", ")}) and total_usd is not null)
-    where rn = 1
-    order by handle, month`;
-
-Deno.test("monthStartCapital() answers what the row_number() window over aum_samples did", async () => {
+/*
+ * AF-4 (19 Sep 2026). The old statement read `aum_samples`, which nothing has written since the
+ * sampler was retired on 17 Sep, so every month from October had no start. There is no old text to
+ * equal: this pins the published meaning over `aum_history`, the series v2 does write.
+ */
+Deno.test("monthStartCapital() is the first well-covered hour of a month's first days in aum_history, and reads no sample", async () => {
   const db = await openSchema();
   const run = runner(db);
-  const handles = ["a", "b", "c", "d", "e", "f", "g"];
+  const handles = ["a", "b", "c", "d", "e", "f", "g", "p"];
   for (const h of [...handles, "offpage"]) trader(db, h);
-  const sample = (h: string, at: string, usd: number | null, basis: string): void =>
-    run("insert into aum_samples (handle, at, total_usd, basis, tier) values (?,?,?,?,'verified')", h, at, usd, basis);
-  // a: a tie on the month's first hour (rebuilt stored first), then a refused sample ahead of September's first figure
-  sample("a", "2026-08-01T00:00:00.000Z", 100, "rebuilt");
-  sample("a", "2026-08-01T00:00:00.000Z", 111, "sampled");
-  sample("a", "2026-08-20T00:00:00.000Z", 150, "sampled");
-  sample("a", "2026-09-01T00:00:00.000Z", null, "sampled");
-  sample("a", "2026-09-03T05:00:00.000Z", 200, "sampled");
-  sample("a", "2026-09-04T05:00:00.000Z", 210, "sampled");
-  // b: the same tie stored the other way round; September first valued on the 9th, outside the window
-  sample("b", "2026-08-02T00:00:00.000Z", 311, "sampled");
-  sample("b", "2026-08-02T00:00:00.000Z", 300, "rebuilt");
-  sample("b", "2026-09-09T00:00:00.000Z", 400, "sampled");
-  // c: the first hour of day 8 is outside the window, the last hour of day 7 is inside it
-  sample("c", "2026-09-08T00:00:00.000Z", 500, "sampled");
-  sample("c", "2026-10-07T23:00:00.000Z", 600, "sampled");
-  // d: only refused samples; e: none at all; f: across a year boundary, newer stored before older
-  sample("d", "2026-09-01T00:00:00.000Z", null, "sampled");
-  sample("f", "2026-01-02T00:00:00.000Z", 800, "rebuilt");
-  sample("f", "2025-12-05T00:00:00.000Z", 700, "rebuilt");
-  // g: a tie whose first-stored basis was refused
-  sample("g", "2026-08-01T00:00:00.000Z", null, "rebuilt");
-  sample("g", "2026-08-01T00:00:00.000Z", 42, "sampled");
-  // offpage is never asked for: his unparseable rows, the table's minimum and maximum, must cost the others nothing
-  for (const at of ["", "0000-bad", "2026-08-01 00:00:00+00", "zzzz"]) sample("offpage", at, 9, "sampled");
+  /* The scorecard's months run to the one we are in, so the seed is dated from the clock. */
+  const now = new Date();
+  const month = (back: number): string => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - back, 1)).toISOString().slice(0, 7);
+  const hour = (h: string, at: string, usd: number | null, priced: number, total: number, basis = "priced"): void =>
+    run("insert into aum_history (handle, hour, total_usd, priced_positions, total_positions, basis) values (?,?,?,?,?,?)", h, at, usd, priced, total, basis);
+  const M1 = month(1), M12 = month(12), M13 = month(13);
+  // a: the month opens on a 2-of-289 fragment and an unvalued hour; the first WELL-COVERED hour is the start
+  hour("a", `${M1}-01T00:00:00.000Z`, 43780.82, 2, 289);
+  hour("a", `${M1}-01T01:00:00.000Z`, null, 0, 289);
+  hour("a", `${M1}-01T02:00:00.000Z`, 351321.95, 217, 279);
+  hour("a", `${M1}-01T03:00:00.000Z`, 360000, 217, 279);
+  hour("a", `${M12}-01T00:00:00.000Z`, null, 217, 279); // price_suspect: well covered and unvalued, so the floor alone would stop here
+  hour("a", `${M12}-03T05:00:00.000Z`, 111, 1, 1); // the oldest of the scorecard's thirteen months
+  hour("a", `${M13}-03T05:00:00.000Z`, 999, 1, 1); // one month older: never asked for
+  // b: first covered on the 8th, outside the window; c: the last hour of the 7th is inside it
+  hour("b", `${M1}-08T00:00:00.000Z`, 400, 1, 1);
+  hour("c", `${M1}-07T23:00:00.000Z`, 600, 3, 4);
+  // d: only unvalued hours; e: no rows at all; p: between the floors is a partial figure, not a balance
+  hour("d", `${M1}-01T00:00:00.000Z`, null, 0, 5);
+  hour("p", `${M1}-02T00:00:00.000Z`, 1685.57, 30, 279);
+  // f: a sampled reading folded in without counts (0 of 0) is a measurement, and exactly a quarter is covered
+  hour("f", `${M1}-02T06:00:00.000Z`, 800, 0, 0, "reading");
+  hour("f", `${month(2)}-01T00:00:00.000Z`, 700, 1, 4);
+  // g: only the retired sampler has him — the October shape, inverted: nothing is read from aum_samples
+  run("insert into aum_samples (handle, at, total_usd, basis, tier) values ('g',?,42,'sampled','verified')", `${M1}-01T00:00:00.000Z`);
+  hour("offpage", `${M1}-01T00:00:00.000Z`, 9, 1, 1);
 
-  const asked = [...handles, "nobody"];
-  const expected = new Map<string, Map<string, number>>();
-  for (const r of old(db, OLD_MONTH_START(asked.length), ...asked)) {
-    if (Number(r.day_of_month) > START_CAPITAL_WINDOW_DAYS) continue; // the old read-side rule, verbatim
-    const h = String(r.handle);
-    let m = expected.get(h); if (!m) expected.set(h, m = new Map());
-    m.set(String(r.month), Number(r.total_usd));
-  }
-  assertEquals(await monthStartCapital(asked), expected);
-  assertEquals(expected.get("a"), new Map([["2026-08", 100], ["2026-09", 200]]));
-  assertEquals(expected.get("b"), new Map([["2026-08", 311]]));
-  assertEquals(expected.get("c"), new Map([["2026-10", 600]]));
-  assertEquals(expected.get("f"), new Map([["2025-12", 700], ["2026-01", 800]]));
-  assertEquals(expected.get("g"), new Map([["2026-08", 42]]));
-  assert(!expected.has("d") && !expected.has("e") && !expected.has("nobody"));
+  assertEquals(await monthStartCapital([...handles, "nobody"]), new Map([
+    ["a", new Map([[M12, 111], [M1, 351321.95]])],
+    ["c", new Map([[M1, 600]])],
+    ["f", new Map([[month(2), 700], [M1, 800]])],
+  ]));
+  assertEquals(START_CAPITAL_WINDOW_DAYS, 7);
   assertEquals(await monthStartCapital([]), new Map());
+});
+
+Deno.test("monthStartCapital() seeks each (trader, month) by the aum_history key", async () => {
+  const seen: string[] = [];
+  const db = await openSchema((text) => seen.push(text));
+  await monthStartCapital(["a"]);
+  const plan = (db.prepare("explain query plan " + seen.find((t) => t.includes("from aum_history a"))!).all() as { detail: string }[]).map((r) => r.detail);
+  assert(plan.includes("SEARCH a USING INDEX sqlite_autoindex_aum_history_1 (handle=? AND hour>? AND hour<?)"), plan.join("\n"));
+  assert(!plan.some((d) => d.startsWith("SCAN a")), plan.join("\n"));
 });
 
 Deno.test("asOfHoldings() with no handle answers max(captured_at) of holdings_current without reading the view", async () => {

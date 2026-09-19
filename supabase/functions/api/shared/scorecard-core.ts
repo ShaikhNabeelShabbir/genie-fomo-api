@@ -2,6 +2,7 @@ import { sql, n, round } from "../db.ts";
 import { get } from "../router.ts";
 import { median, cov, money } from "../shared/format.ts";
 import { NativePrice } from "../shared/prices.ts";
+import { PRICED_FLOOR } from "../shared/aum-history-rules.ts";
 
 // ------------------------------------------------ T2, T3, T5-T10, T15-T20
 
@@ -424,30 +425,27 @@ export async function monthStartCapital(handles: string[]): Promise<Map<string, 
   const out = new Map<string, Map<string, number>>();
   if (!handles.length) return out;
   /*
-   * Each trader's months are walked by seeks (his first valued sample, then the first on or after
-   * the next month's start), where a row_number() window read and sorted every sample of every
-   * trader on the page. Only the asked traders' rows are read; rowid breaks a (handle, at) tie
-   * between the two bases the way the window did; union, not union all, so a walk cannot loop.
+   * Read from `aum_history`, the series v2 writes: nothing has written `aum_samples` since the
+   * sampler was retired (17 Sep 2026), so every month from October had no start. One seek per
+   * (trader, month) of the scorecard's thirteen: the first hour of days 1-7 valued from at least
+   * PRICED_FLOOR of the wallet. A sampled reading folded in without counts (0 of 0) still passes.
    */
+  const now = new Date();
+  const months = Array.from({ length: 13 }, (_v, i) =>
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 12 + i, 1)).toISOString().slice(0, 7));
+  const windowEnd = `-${String(START_CAPITAL_WINDOW_DAYS + 1).padStart(2, "0")}`;
   const rows = await sql`
-    with recursive starts(handle, at) as (
-      select p.value, (select min(f.at) from aum_samples f
-                        where f.handle = p.value and f.total_usd is not null)
-      from json_each(${JSON.stringify(handles)}) p
-      union
-      select handle, (select min(f.at) from aum_samples f
-                       where f.handle = starts.handle and f.total_usd is not null
-                         and f.at >= date(starts.at, 'start of month', '+1 month'))
-      from starts where at is not null)
-    select handle, strftime('%Y-%m', at) as month,
-           cast(strftime('%d', at) as integer) as day_of_month,
-           (select s.total_usd from aum_samples s
-             where s.handle = starts.handle and s.at = starts.at and s.total_usd is not null
-             order by s.rowid limit 1) as total_usd
-    from starts where at is not null
-    order by handle, month`;
+    select hs.value as handle, ms.value as month,
+           (select a.total_usd from aum_history a
+             where a.handle = hs.value
+               and a.hour >= ms.value || '-01' and a.hour < ms.value || ${windowEnd}
+               and a.total_usd is not null
+               and a.priced_positions >= ${PRICED_FLOOR} * a.total_positions
+             order by a.hour limit 1) as total_usd
+    from json_each(${JSON.stringify(handles)}) hs
+    cross join json_each(${JSON.stringify(months)}) ms`;
   for (const r of rows) {
-    if (Number(r.day_of_month) > START_CAPITAL_WINDOW_DAYS) continue;
+    if (r.total_usd === null) continue;
     const h = String(r.handle);
     let m = out.get(h); if (!m) out.set(h, m = new Map());
     m.set(String(r.month), Number(r.total_usd));

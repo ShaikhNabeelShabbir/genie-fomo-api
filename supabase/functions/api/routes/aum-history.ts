@@ -5,7 +5,7 @@ import { intParam, parseIso } from "../shared/params.ts";
 import { resolveTrader } from "../shared/traders.ts";
 import { batchIds, batchEnvelope } from "../shared/batch.ts";
 import {
-  HISTORY_STEPS, HISTORY_WINDOWS, type HistoryStep, type HistoryWindow,
+  HISTORY_STEPS, HISTORY_WINDOWS, PUBLISH_FLOOR, type HistoryStep, type HistoryWindow,
   ageSeconds, confidence, defaultStep, fillHourGaps, isHistoryStep, isHistoryWindow,
   latestValued, windowRange,
 } from "../shared/aum-history-rules.ts";
@@ -61,6 +61,8 @@ type HourRow = {
 type BucketRow = {
   handle: string; at: Date | string; total_usd: string | null; high_usd: string | null;
   low_usd: string | null; valued_hours: number;
+  /** The counts of the hour the close came from; null when the bucket has no valued hour. */
+  priced_positions: number | null; total_positions: number | null;
 };
 type Point = {
   at: string; totalUsd: number | null; basis?: string; reason?: string | null;
@@ -74,7 +76,9 @@ type Point = {
 /**
  * The bucket of each rollup view (aum_history_daily / _weekly / _monthly), word for word. The
  * views window the WHOLE table before a handle filter can reach it, so `points` runs their body
- * over the asked handles instead; tests/plans_aum-misc_test.ts holds the two equal.
+ * over the asked handles instead. It differs from them in one thing: an hour `confidence()` would
+ * withhold is not a valued hour of its bucket, where the views close a day on a 2-of-289 fragment.
+ * tests/plans_aum-misc_test.ts holds the two equal over published hours; tests/aum_fixes_test.ts the rest.
  */
 const bucketOf = (step: Exclude<HistoryStep, "1h">) => ({
   "1d": sql`strftime('%Y-%m-%dT00:00:00.000Z', hour)`,
@@ -86,6 +90,8 @@ const iso = (v: Date | string): string => new Date(v).toISOString();
 
 /** The newest `limit` points per handle inside the range, returned ascending. One query. */
 async function points(handles: string[], o: Options): Promise<Map<string, Point[]>> {
+  /* A bucket the range keeps starts at or after `from`, so no hour before it is needed: a seek bound, not a filter. */
+  const since = o.from === null ? sql`` : sql`and hour >= ${o.from}`;
   const rows: (HourRow | BucketRow)[] = o.step === "1h"
     ? await sql<HourRow[]>`
         select handle, at, total_usd, suspect_usd, unsellable_usd, priced_positions, total_positions, basis, reason from (
@@ -98,19 +104,26 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
         ) x where rn <= ${o.limit}
         order by handle, at`
     : await sql<BucketRow[]>`
-        select handle, at, total_usd, high_usd, low_usd, valued_hours from (
-          select handle, bucket as at, total_usd, high_usd, low_usd, valued_hours,
+        select handle, at, total_usd, high_usd, low_usd, valued_hours, priced_positions, total_positions from (
+          select handle, bucket as at, total_usd, high_usd, low_usd, valued_hours, priced_positions, total_positions,
                  row_number() over (partition by handle order by bucket desc) as rn
           from (select handle, bucket,
                        max(case when rn = 1 then total_usd end) as total_usd,
+                       max(case when rn = 1 and total_usd is not null then priced_positions end) as priced_positions,
+                       max(case when rn = 1 and total_usd is not null then total_positions end) as total_positions,
                        max(total_usd) as high_usd, min(total_usd) as low_usd,
                        count(total_usd) as valued_hours
-                from (select handle, total_usd, ${bucketOf(o.step)} as bucket,
+                from (select handle, bucket, total_usd, priced_positions, total_positions,
                              row_number() over (
-                               partition by handle, ${bucketOf(o.step)}, total_usd is null
+                               partition by handle, bucket, total_usd is null
                                order by hour desc) as rn
-                      from aum_history
-                      where handle in (${handles}))
+                      -- pricedShare() and PUBLISH_FLOOR, in SQL: the same hours the 1h step publishes.
+                      from (select handle, hour, priced_positions, total_positions, ${bucketOf(o.step)} as bucket,
+                                   case when total_positions > 0
+                                         and round(priced_positions * 1.0 / total_positions, 4) >= ${PUBLISH_FLOOR}
+                                        then total_usd end as total_usd
+                            from aum_history
+                            where handle in (${handles}) ${since}))
                 group by handle, bucket)
           where bucket <= ${o.to}
             and (${o.from} is null or bucket >= ${o.from})
@@ -130,8 +143,14 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
             pricedPositions: Number(r.priced_positions), totalPositions: Number(r.total_positions),
             pricedShare: c.pricedShare, partial: c.partial, partialUsd: round(c.partialUsd) };
     } else {
-      p = { at: iso(r.at), totalUsd: round(n(r.total_usd)), highUsd: round(n(r.high_usd)),
-            lowUsd: round(n(r.low_usd)), valuedHours: Number(r.valued_hours) };
+      /* A4 on a bucket: its close is judged against the coverage of the hour it came from. */
+      const c = confidence({
+        totalUsd: n(r.total_usd), pricedPositions: Number(r.priced_positions ?? 0),
+        totalPositions: Number(r.total_positions ?? 0), reason: null,
+      });
+      p = { at: iso(r.at), totalUsd: round(c.totalUsd), highUsd: round(n(r.high_usd)),
+            lowUsd: round(n(r.low_usd)), valuedHours: Number(r.valued_hours),
+            pricedShare: c.pricedShare, partial: c.partial, partialUsd: round(c.partialUsd) };
     }
     if (!by.has(r.handle)) by.set(r.handle, []);
     by.get(r.handle)!.push(p);
