@@ -1,0 +1,2 @@
+# The D1 schema is SQLite. Say so, or GitHub guesses a dialect per file from its keywords.
+*.sql linguist-language=SQL

@@ -9,9 +9,10 @@
 const ROOT = new URL("..", import.meta.url);
 const BASELINE = "scripts/typecheck_baseline.txt";
 const ENTRIES = [
-  "supabase/functions/api/index.ts",
-  "supabase/functions/aum-sample/index.ts",
-  "supabase/functions/helius-webhook/index.ts",
+  // The API tree hangs off app.ts (it imports routes.ts). Until 19 Sep 2026 the entries were the three
+  // Supabase edge-function mains, which went with v1; without this line nothing here checked the routes.
+  "supabase/functions/api/app.ts",
+  "supabase/functions/aum-sample/value.ts",
   "scripts/smoke.ts",
   "scripts/acceptance_capture.ts",
   "scripts/typecheck_gate.ts",

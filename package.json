@@ -10,9 +10,6 @@
   "scripts": {
     "smoke": "deno task smoke"
   },
-  "dependencies": {
-    "postgres": "^3.4.9"
-  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260916.1",
     "@types/node": "^22.10.0",
