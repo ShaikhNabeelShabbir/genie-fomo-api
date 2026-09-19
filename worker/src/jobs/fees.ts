@@ -2,8 +2,8 @@ import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { rpc, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
-import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
-import { type BatchRead, type Fee, readBatch, readBitqueryFees } from "./fees-core";
+import { EVM_CHAINS, REFUSALS_IN_A_ROW } from "../../../supabase/functions/_shared/settings.ts";
+import { type BatchRead, type Fee, parkable, type Pending, pending, readBatch, readBitqueryFees, recordMisses } from "./fees-core";
 import { chunk } from "./directory-core";
 
 /**
@@ -12,8 +12,9 @@ import { chunk } from "./directory-core";
  *
  * TWIN OF `scripts/load_transaction_fees.mjs` + `scripts/refresh_trader_fees.mjs`: edit all
  * three. Same pending query, same insert, same rollup CTE. Differs where the platform does:
- * each chain gets a SLICE of its oldest unpriced transactions per run under a wall-clock budget
- * (the anti-join makes the next run continue), a failed batch is counted rather than fatal, and
+ * each chain gets a SLICE of its newest unpriced transactions per run under a wall-clock budget
+ * (the anti-join makes the next run continue, and a hash over a day old the source had nothing for
+ * is parked in `transaction_fee_misses`), a failed batch is counted rather than fatal, and
  * the rollup rebuilds only the traders this run touched, in place (the script's one-trader
  * path), instead of the whole table behind a swap. The script's whole-table rollup branch is
  * gone with it: D1 runs one statement at a time, so every rollup statement is scoped to a chunk.
@@ -24,8 +25,7 @@ import { chunk } from "./directory-core";
 
 interface Chain { readonly network_id: number; readonly name: string; readonly native_symbol: string }
 interface Step { readonly chain: string; readonly batch: number; readonly swapsOnly: boolean }
-interface Pending { readonly hashes: readonly string[]; readonly addresses: ReadonlySet<string>; readonly total: number }
-interface ChainCount { receipts: number; failed: number; bitqueryQueries: number }
+interface ChainCount { receipts: number; missing: number; failed: number; bitqueryQueries: number }
 
 /** Hashes per Bitquery query: one `in` list, one reply, ≤ 100 records. */
 const BITQUERY_BATCH = 100;
@@ -33,11 +33,15 @@ const BITQUERY_BATCH = 100;
 const STEPS: readonly Step[] = [
   { chain: "bsc", batch: BITQUERY_BATCH, swapsOnly: false },
   { chain: "ethereum", batch: BITQUERY_BATCH, swapsOnly: false },
+  // The workflow read Robinhood and the port dropped it: no Robinhood fee was read from 17 Sep 2026.
+  { chain: "robinhood", batch: BITQUERY_BATCH, swapsOnly: false },
   { chain: "base", batch: BITQUERY_BATCH, swapsOnly: false },
   { chain: "solana", batch: 10, swapsOnly: true },
 ];
-/** ponytail: oldest unpriced transactions per chain per run; raise when the backlog is measured to lag the cron. */
+/** ponytail: newest unpriced transactions per chain per run; raise when the backlog is measured to lag the cron. */
 const SLICE = 1000;
+/** ponytail: how long a parked hash waits, as the GMGN queue's week; a backlog over ~84k a chain (12 runs x SLICE x 7 days) comes back in weekly waves. Bitquery's realtime window is unmeasured; once it is, stop offering hashes older than it instead. */
+const MISS_RETRY_AGO = "-7 days";
 /** Traders per rollup statement, as the script: a 25-trader chunk stays inside D1's 30 s a statement. */
 const ROLLUP_CHUNK = 25;
 /** Rows per `transaction_fees` insert: 5 columns x 18 rows = 90 of D1's 100 bind parameters. */
@@ -57,12 +61,12 @@ export interface RollupSummary {
 }
 
 export interface FeesSummary {
-  /** Per chain: fees written, batches that failed or were refused, Bitquery queries sent. */
+  /** Per chain: fees written, hashes parked (over a day old and the source had nothing for them), batches that failed or were refused, Bitquery queries sent. */
   readonly perChain: Record<string, ChainCount>;
   readonly rollup: RollupSummary;
   /** Bitquery queries sent across the EVM chains. */
   readonly bitqueryQueries: number;
-  /** Unpriced transactions left across the chains. Zero means the backlog is clear. */
+  /** Unpriced transactions still to ask across the chains (parked misses apart; a fresh miss is still to ask). Zero means the backlog is clear. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
   readonly elapsedMs: number;
@@ -72,35 +76,6 @@ async function chains(sql: Sql): Promise<Map<string, Chain>> {
   const rows = await sql<{ network_id: number; name: string; native_symbol: string }[]>`
     select network_id, name, native_symbol from chains where name in (${STEPS.map((s) => s.chain)})`;
   return new Map(rows.map((r) => [r.name, r]));
-}
-
-/**
- * The transactions we still have no fee for, oldest first: the union of both places a hash can
- * appear (`wallet_swaps` for a per-trade fee, `transactions` for a per-window total) anti-joined
- * against `transaction_fees`, which is what makes a repeat run free. The addresses come along
- * so phase 2 knows which traders to roll up.
- */
-async function pending(sql: Sql, net: number, swapsOnly: boolean): Promise<Pending> {
-  /* `union all`, not `union`: the group by already collapses a transaction's repeated legs. */
-  const rows = await sql<{ tx_hash: string; addrs: string; total: number }[]>`
-    select t.tx_hash, json_group_array(distinct t.address_key) as addrs, count(*) over () as total
-      from (
-        select tx_hash, address_key, block_time from wallet_swaps
-         where network_id = ${net}
-        ${swapsOnly ? sql`` : sql`union all
-        select tx_hash, address_key, block_time from transactions
-         where network_id = ${net}`}
-      ) t
-     where not exists (
-       select 1 from transaction_fees f where f.network_id = ${net} and f.tx_hash = t.tx_hash)
-     group by t.tx_hash
-     order by min(t.block_time) is null, min(t.block_time)
-     limit ${SLICE}`;
-  return {
-    hashes: rows.map((r) => r.tx_hash),
-    addresses: new Set(rows.flatMap((r) => JSON.parse(r.addrs) as string[])),
-    total: rows[0]?.total ?? 0,
-  };
 }
 
 async function writeFees(sql: Sql, net: number, fees: readonly Fee[], symbol: string, source: string): Promise<void> {
@@ -159,12 +134,12 @@ function networkWord(c: Chain): string {
 
 interface Reader { readonly source: string; readonly read: (hashes: readonly string[]) => Promise<BatchRead | null> }
 
-/** One chain's slice, in batches, until the slice ends, the provider refuses, or `deadline` passes. Returns how many hashes got an answer. */
-async function readChain(sql: Sql, c: Chain, step: Step, hashes: readonly string[], reader: Reader, count: ChainCount, deadline: number): Promise<number> {
-  let answered = 0;
-  for (let i = 0; i < hashes.length; i += step.batch) {
+/** One chain's slice, in batches, until the slice ends, the provider refuses, or `deadline` passes. Returns how many hashes were asked and not refused. */
+async function readChain(sql: Sql, c: Chain, step: Step, p: Pending, reader: Reader, count: ChainCount, deadline: number): Promise<number> {
+  let answered = 0, failedInARow = 0;
+  for (let i = 0; i < p.hashes.length; i += step.batch) {
     if (Date.now() > deadline) break;
-    const slice = hashes.slice(i, i + step.batch);
+    const slice = p.hashes.slice(i, i + step.batch);
     try {
       if (c.network_id !== SOLANA_NETWORK_ID) count.bitqueryQueries += 1;
       const read = await reader.read(slice);
@@ -175,12 +150,18 @@ async function readChain(sql: Sql, c: Chain, step: Step, hashes: readonly string
         break;
       }
       await writeFees(sql, c.network_id, read.fees, c.native_symbol, reader.source);
+      const missed = parkable(read.absent, p.blockTime, Date.now());
+      await recordMisses(sql, c.network_id, missed);
       count.receipts += read.fees.length;
+      count.missing += missed.length;
       answered += slice.length;
+      failedInARow = 0;
     } catch (e) {
       /* Counted, never fatal: the anti-join asks for these again next run. */
       count.failed += 1;
       console.error(`fees: ${c.name} batch of ${slice.length} failed: ${e instanceof Error ? e.message : String(e)}`);
+      /* A chain that fails this many times running is down (or Bitquery has no such network): leave it for the next run. */
+      if (++failedInARow >= REFUSALS_IN_A_ROW) break;
     }
   }
   return answered;
@@ -258,16 +239,16 @@ export async function runFees(env: Env, budgetMs: number): Promise<FeesSummary> 
     for (const step of STEPS) {
       const c = byName.get(step.chain);
       if (!c) throw new Error(`fees: chain '${step.chain}' is not in \`chains\``);
-      const count: ChainCount = { receipts: 0, failed: 0, bitqueryQueries: 0 };
+      const count: ChainCount = { receipts: 0, missing: 0, failed: 0, bitqueryQueries: 0 };
       perChain[c.name] = count;
       if (c.network_id === SOLANA_NETWORK_ID && !helius) { console.log(`fees: ${c.name} skipped, HELIUS_SOLANA_KEY is not set`); continue; }
       const reader: Reader = c.network_id === SOLANA_NETWORK_ID
         ? { source: SOLANA_SOURCE, read: (h) => solanaFees(`https://mainnet.helius-rpc.com/?api-key=${helius}`, h) }
         : { source: EVM_SOURCE, read: (h) => evmFees(bitqueryKey, networkWord(c), h) };
-      const p = await pending(sql, c.network_id, step.swapsOnly);
-      const answered = p.hashes.length ? await readChain(sql, c, step, p.hashes, reader, count, readDeadline) : 0;
+      const p = await pending(sql, c.network_id, step.swapsOnly, SLICE, MISS_RETRY_AGO);
+      const answered = p.hashes.length ? await readChain(sql, c, step, p, reader, count, readDeadline) : 0;
       if (answered < p.hashes.length && Date.now() > readDeadline) stoppedEarly = true;
-      remaining += p.total - answered;
+      remaining += p.total - count.receipts - count.missing;
       if (count.receipts > 0) for (const a of p.addresses) touched.add(a);
     }
     const counts = Object.values(perChain);

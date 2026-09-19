@@ -20,7 +20,7 @@ Deno.test("parseKlines: a non-finite close is skipped but still counted; junk bo
   assertEquals(parseKlines({ code: -1 }), { byDay: new Map(), lastOpenMs: null, count: 0 });
 });
 
-Deno.test("seriesStartMs: first swap day minus one day of slack; a year back when unknown", () => {
+Deno.test("seriesStartMs: the newest stored day minus one day of slack; a year back when none is stored", () => {
   const now = new Date(D0);
   assertEquals(seriesStartMs(new Date("2026-08-10T00:00:00Z"), now), Date.UTC(2026, 7, 9));
   assertEquals(seriesStartMs(null, now), D0 - 366 * DAY_MS);

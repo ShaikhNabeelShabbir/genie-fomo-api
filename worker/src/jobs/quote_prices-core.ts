@@ -1,7 +1,9 @@
 /**
  * Pure half of the quote-price loader (`jobs/quote_prices.ts`): the Binance pair map and the
- * klines parse, twins of `scripts/load_quote_prices.mjs`. No I/O: tested in tests/quote_prices_test.ts.
+ * klines parse, twins of `scripts/load_quote_prices.mjs`, and the job's statements, which take
+ * `sql` so tests/quote_prices_test.ts and tests/quote_prices_sql_test.ts can run them.
  */
+import type { Sql } from "../d1.ts";
 
 export const DAY_MS = 86_400_000;
 /** Binance returns at most this many candles a call; ~2.7 years of days. */
@@ -70,8 +72,123 @@ export function parseKlines(body: unknown): Closes {
   return { byDay, lastOpenMs, count };
 }
 
-/** Where a series starts: the first swap day (a year back when unknown), minus one day of slack so a swap just after midnight UTC still finds a row. */
-export function seriesStartMs(firstDay: Date | null, now: Date): number {
-  const first = firstDay ?? new Date(now.getTime() - 365 * DAY_MS);
-  return first.getTime() - DAY_MS;
+/** Where a fetch starts: the newest day already stored (a year back when none is), minus one day so yesterday's close is rewritten once it is final. */
+export function seriesStartMs(lastDay: Date | null, now: Date): number {
+  const from = lastDay ?? new Date(now.getTime() - 365 * DAY_MS);
+  return from.getTime() - DAY_MS;
+}
+
+export interface Tally { readonly asked: number; readonly failed: number }
+
+/** Sources that were asked and never answered. Each is judged alone: summed, one healthy source hid a dead one and the cron stayed green. */
+export const deadSources = (tally: Readonly<Record<string, Tally>>): string[] =>
+  Object.entries(tally).filter(([, t]) => t.asked > 0 && t.failed === t.asked).map(([name]) => name);
+
+export interface QuoteAsset { readonly network_id: number; readonly token_key: string; readonly symbol: string; readonly last_day: string | null }
+
+/**
+ * Every floating quote asset with a pair (X2: EVM rows carry no `tx_type`, so a swap count could
+ * never admit WBNB/WETH), and the newest day already stored for it: one seek on token_prices' key.
+ * It used to select a null first day, so every hour re-fetched and rewrote a year of closes per asset.
+ */
+export const quoteAssets = (sql: Sql) => sql<QuoteAsset[]>`
+  select q.network_id, q.token_key, q.symbol,
+         (select max(p.day) from token_prices p
+           where p.network_id = q.network_id and p.token_key = q.token_key) as last_day
+    from quote_assets q
+   where q.pegged_usd is null and q.symbol in (${Object.keys(PAIR)})
+   order by q.network_id, q.symbol`;
+
+/** The `job_cursors` row of the value_usd pass: the last `transactions.rowid` it has been over. */
+const LEGS_CURSOR = "quote_prices.value_usd";
+
+export const legsCursor = async (sql: Sql): Promise<number> =>
+  (await sql<{ position: number }[]>`select position from job_cursors where job = ${LEGS_CURSOR}`)[0]?.position ?? 0;
+
+export const saveLegsCursor = (sql: Sql, position: number) => sql`
+  insert into job_cursors (job, position, updated_at) values (${LEGS_CURSOR}, ${position}, ${new Date().toISOString()})
+  on conflict (job) do update set position = excluded.position, updated_at = excluded.updated_at`;
+
+export const newestRowid = async (sql: Sql): Promise<number> =>
+  (await sql<{ hi: number | null }[]>`select max(rowid) as hi from transactions`)[0]?.hi ?? 0;
+
+/** The `(after, upTo]` rowid slices one run walks from `cursor` to `newest`: `size` rowids each, at most `max` of them. */
+export const legSlices = (cursor: number, newest: number, size: number, max: number): (readonly [number, number])[] =>
+  Array.from({ length: Math.min(max, Math.max(0, Math.ceil((newest - cursor) / size))) }, (_, i) =>
+    [cursor + i * size, Math.min(cursor + (i + 1) * size, newest)] as const);
+
+/**
+ * `transactions.value_usd` for the quote-asset SWAP legs with `after < rowid <= upTo`. Idempotent:
+ * only rows where `value_usd is null`. `value_usd` is a MAGNITUDE like `amount`; direction lives
+ * in the `direction` column alone. Returns rows updated.
+ *
+ * It used to pick "the first 5,000 unpriced SWAP legs", which the memecoin side of every swap
+ * fills for good: 0 rows an hour since the D1 cut-over. A rowid range is a seek on
+ * transactions_type_idx (tx_type, rowid) and passes an unpriceable leg once.
+ */
+export const priceLegs = async (sql: Sql, after: number, upTo: number): Promise<number> => {
+  // The Postgres update-from-join became one scalar subquery per rung (peg, then that day's close)
+  // with an exists guard, so a row nothing can price is left untouched and does not count as written.
+  const res = await sql`
+    update transactions
+       set value_usd = amount * coalesce(
+             (select q.pegged_usd from quote_assets q
+               where q.network_id = transactions.network_id and q.token_key = transactions.token_key),
+             (select p.usd from token_prices p
+               where p.network_id = transactions.network_id and p.token_key = transactions.token_key
+                 and p.day = substr(transactions.block_time, 1, 10)))
+     where tx_type = 'SWAP' and rowid > ${after} and rowid <= ${upTo}
+       and value_usd is null
+       and exists (select 1 from quote_assets q
+                    where q.network_id = transactions.network_id and q.token_key = transactions.token_key
+                      and (q.pegged_usd is not null
+                           or exists (select 1 from token_prices p
+                                       where p.network_id = q.network_id and p.token_key = q.token_key
+                                         and p.day = substr(transactions.block_time, 1, 10))))`;
+  return res.count;
+};
+
+/**
+ * The lowest rowid in the slice of a floating quote leg left unpriced although it moved after
+ * `since`: its day's close may still arrive, so the cursor must stop before it. Null when none
+ * waits. An older leg with no close (history behind the stored series) is passed for good.
+ */
+export const firstWaitingLeg = async (sql: Sql, after: number, upTo: number, since: string): Promise<number | null> =>
+  (await sql<{ rid: number | null }[]>`
+    select min(t.rowid) as rid
+      from transactions t
+     where t.tx_type = 'SWAP' and t.rowid > ${after} and t.rowid <= ${upTo}
+       and t.value_usd is null and t.block_time > ${since}
+       and exists (select 1 from quote_assets q
+                    where q.network_id = t.network_id and q.token_key = t.token_key and q.pegged_usd is null)`)[0]?.rid ?? null;
+
+export interface LegsPass extends Tally { readonly priced: number; readonly stoppedEarly: boolean }
+
+/**
+ * The value_usd pass: every slice from the stored place to the newest rowid is priced, and the
+ * place moves up to the first recent leg still waiting for its close (slices past it are priced,
+ * the place stays). A slice that throws ends the pass with the place before it, and counts as
+ * `failed` so `deadSources` turns a pass that cannot start red. A place PAST the newest rowid means
+ * the table was rebuilt (rowids do not survive a re-import): the walk restarts, which is idempotent,
+ * where it used to pass nothing for ever.
+ */
+export async function priceLegsFrom(
+  sql: Sql, size: number, max: number, since: string, outOfTime: () => boolean,
+  onFailure: (after: number, upTo: number, e: unknown) => void,
+): Promise<LegsPass> {
+  const newest = await newestRowid(sql), place = await legsCursor(sql);
+  let priced = 0, asked = 0, failed = 0, stoppedEarly = false, keepPlace = true;
+  for (const [after, upTo] of legSlices(place > newest ? 0 : place, newest, size, max)) {
+    if (outOfTime()) { stoppedEarly = true; break; }
+    asked += 1;
+    try {
+      priced += await priceLegs(sql, after, upTo);
+      if (!keepPlace) continue;
+      // A recent leg whose day has no close YET is offered again: the place is kept only up to the first one.
+      const waiting = await firstWaitingLeg(sql, after, upTo, since);
+      await saveLegsCursor(sql, waiting === null ? upTo : waiting - 1);
+      keepPlace = waiting === null;
+    } catch (e) { failed += 1; onFailure(after, upTo, e); break; }
+  }
+  return { priced, asked, failed, stoppedEarly };
 }

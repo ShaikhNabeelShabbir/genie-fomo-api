@@ -221,3 +221,57 @@ export function solanaDecodeEnhanced(parsed: unknown, owner: string): Decoded | 
   for (const [mint, d] of net) if (Math.abs(d) <= 1e-12) net.delete(mint);
   return twoSided(net);
 }
+
+/**
+ * The candidates that may be marked checked: those the source returned, and those it left out that
+ * moved before `giveUpBefore` (ISO text, as `block_time`). A recent one it left out was never
+ * read, so it is asked again instead of being filed as "not a swap" for good; the age bound keeps
+ * a signature Helius can never parse from being asked for ever. A reply holding NONE of the asked
+ * signatures is a refusal and throws, so nothing is filed and the batch counts as failed: every
+ * candidate was tagged SWAP by Helius itself, and a day of empty replies filed the whole queue.
+ * ponytail: a slice of only unparseable signatures fails until one that parses shares it; at ~500 new swaps a run that is the next run.
+ */
+export const settledBy = <C extends { readonly tx_hash: string; readonly block_time: string }>(
+  slice: readonly C[], txs: ReadonlyMap<string, unknown>, giveUpBefore: string,
+): C[] => {
+  if (slice.length && !slice.some((c) => txs.has(c.tx_hash))) throw new Error(`the source returned none of ${slice.length} candidates`);
+  return slice.filter((c) => txs.has(c.tx_hash) || c.block_time < giveUpBefore);
+};
+
+export interface ChainCounts { resolved: number; unresolved: number; unanswered: number; failed: number; queries: number }
+export interface Drained {
+  readonly counts: ChainCounts;
+  readonly failedBatches: number;
+  /** Candidates never asked: the budget ran out, or the source kept failing. */
+  readonly remaining: number;
+  readonly stoppedEarly: boolean;
+}
+
+/**
+ * Slices of one chain's candidates through `resolve` (which returns [resolved, unresolved,
+ * unanswered]) until they end, `outOfTime()`, or `maxFailuresInARow` batches fail back to back: a
+ * source refusing the run is left for the next one, not sent all 30 batches to prove it.
+ */
+export async function drainSlices<C>(
+  cands: readonly C[], batch: number, maxFailuresInARow: number, outOfTime: () => boolean,
+  resolve: (slice: readonly C[]) => Promise<readonly [number, number, number]>,
+  onFailure: (slice: readonly C[], e: unknown) => void,
+): Promise<Drained> {
+  const counts: ChainCounts = { resolved: 0, unresolved: 0, unanswered: 0, failed: 0, queries: 0 };
+  let i = 0, failedBatches = 0, failedInARow = 0, stoppedEarly = false;
+  for (; i < cands.length && !stoppedEarly; i += batch) {
+    if (outOfTime()) { stoppedEarly = true; break; }
+    const slice = cands.slice(i, i + batch);
+    counts.queries += 1;
+    try {
+      const [resolved, unresolved, unanswered] = await resolve(slice);
+      counts.resolved += resolved; counts.unresolved += unresolved; counts.unanswered += unanswered;
+      failedInARow = 0;
+    } catch (e) {
+      failedBatches += 1; failedInARow += 1; counts.failed += slice.length;
+      onFailure(slice, e);
+      stoppedEarly = failedInARow >= maxFailuresInARow;
+    }
+  }
+  return { counts, failedBatches, remaining: Math.max(0, cands.length - i), stoppedEarly };
+}

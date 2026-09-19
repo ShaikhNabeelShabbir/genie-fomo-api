@@ -1,6 +1,7 @@
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import { SOL_MINT, ZERO_ADDRESS } from "../supabase/functions/_shared/chain_reads.ts";
-import { decode, priceQuote, type Quote, solanaDecode, solanaDecodeEnhanced, toRow, type Trade } from "../worker/src/jobs/swaps-core.ts";
+import { deadSources } from "../worker/src/jobs/quote_prices-core.ts";
+import { decode, drainSlices, priceQuote, type Quote, settledBy, solanaDecode, solanaDecodeEnhanced, toRow, type Trade } from "../worker/src/jobs/swaps-core.ts";
 
 /* The rules of the scripts this replaced, over Bitquery `EVM.DEXTrades` rows
    (https://docs.bitquery.io/docs/schema/evm/dextrades/) and Helius `getTransaction` results:
@@ -182,4 +183,51 @@ Deno.test("solanaDecodeEnhanced: dust below 1e-12 is not a leg; two token accoun
   assertEquals(solanaDecodeEnhanced(parsed([chg(OWNER, MINT, "3000000"), chg(OWNER, USDC, "-100", 15)]), OWNER), null);
   const split = parsed([chg(OWNER, MINT, "3000000"), chg(OWNER, MINT, "-1000000"), chg(OWNER, USDC, "-4000000")]);
   assertEquals(solanaDecodeEnhanced(split, OWNER), { recv: [MINT.toLowerCase(), 2], sent: [USDC.toLowerCase(), -4] });
+});
+
+Deno.test("settledBy: a recent candidate the source left out is asked again, not filed as 'not a swap'; an old one is filed", () => {
+  const at = "2026-09-19T10:00:00.000Z", giveUpBefore = "2026-09-18T12:00:00.000Z";
+  const slice = [
+    { tx_hash: "sigA", address_key: "w", block_time: at }, { tx_hash: "sigB", address_key: "w", block_time: at },
+    { tx_hash: "sigA", address_key: "w2", block_time: at }, { tx_hash: "sigOld", address_key: "w", block_time: "2026-08-01T00:00:00.000Z" },
+  ];
+  assertEquals(settledBy(slice, new Map([["sigA", {}]]), giveUpBefore), [slice[0], slice[2], slice[3]]);
+  assertEquals(settledBy(slice, new Map([["sigOld", {}]]), giveUpBefore), [slice[3]], "a reply without the recent ones files none of them");
+  assertThrows(() => settledBy(slice, new Map(), giveUpBefore), Error, "none of 4", "an empty reply is a refusal: not even the old one is filed");
+});
+
+Deno.test("an empty reply to every batch is a red run: nothing is filed, the chain is left after N batches, and it is named dead", async () => {
+  const cands = Array.from({ length: 3000 }, (_, i) => ({ tx_hash: `sig${i}`, address_key: "w", block_time: i < 1500 ? "2026-09-19T10:00:00.000Z" : "2026-08-01T00:00:00.000Z" }));
+  const filed: string[] = [];
+  const d = await drainSlices(cands, 100, 5, () => false, (slice) => {
+    const settled = settledBy(slice, new Map(), "2026-09-18T12:00:00.000Z");   // what resolveSolanaBatch does with a 200 []
+    filed.push(...settled.map((c) => c.tx_hash));
+    return Promise.resolve([0, settled.length, slice.length - settled.length] as const);
+  }, () => undefined);
+  assertEquals(d, { counts: { resolved: 0, unresolved: 0, unanswered: 0, failed: 500, queries: 5 }, failedBatches: 5, remaining: 2500, stoppedEarly: true });
+  assertEquals(filed, []);
+  assertEquals(deadSources({ solana: { asked: d.counts.queries, failed: d.failedBatches }, bsc: { asked: 10, failed: 9 }, base: { asked: 0, failed: 0 } }), ["solana"]);
+});
+
+Deno.test("drainSlices: counts per slice, leaves a source that fails N batches in a row, and a success resets the run", async () => {
+  const cands = Array.from({ length: 95 }, (_, i) => i);
+  const asked: number[] = [];
+  const failing = (bad: (first: number) => boolean) => (slice: readonly number[]): Promise<readonly [number, number, number]> => {
+    asked.push(slice[0]);
+    return bad(slice[0]) ? Promise.reject(new Error("HTTP 429")) : Promise.resolve([1, slice.length - 2, 1]);
+  };
+  const failures: number[] = [];
+  const every = await drainSlices(cands, 10, 3, () => false, failing(() => true), (slice) => failures.push(slice.length));
+  assertEquals(asked, [0, 10, 20], "three refusals in a row end the chain's run");
+  assertEquals(every, { counts: { resolved: 0, unresolved: 0, unanswered: 0, failed: 30, queries: 3 }, failedBatches: 3, remaining: 65, stoppedEarly: true });
+  assertEquals(failures, [10, 10, 10]);
+
+  asked.length = 0;
+  const some = await drainSlices(cands, 10, 3, () => false, failing((first) => first % 30 !== 20), () => undefined);
+  assertEquals(asked.length, 10, "two failures, a success, two failures: never three in a row");
+  assertEquals(some, { counts: { resolved: 3, unresolved: 24, unanswered: 3, failed: 65, queries: 10 }, failedBatches: 7, remaining: 0, stoppedEarly: false });
+
+  let calls = 0;
+  const timed = await drainSlices(cands, 10, 3, () => ++calls > 2, failing(() => false), () => undefined);
+  assertEquals([timed.counts.queries, timed.remaining, timed.stoppedEarly], [2, 75, true]);
 });

@@ -1,7 +1,10 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { ADDRESSES_PER_CALL, bestPairs, fetchPairs } from "../../../supabase/functions/_shared/dexscreener.ts";
-import { DAY_MS, KLINES_LIMIT, KRAKEN_PAIR, PAIR, bybitList, krakenList, parseKlines, seriesStartMs } from "./quote_prices-core";
+import {
+  DAY_MS, KLINES_LIMIT, KRAKEN_PAIR, PAIR, type QuoteAsset, bybitList, deadSources, krakenList, parseKlines,
+  priceLegsFrom, quoteAssets, seriesStartMs,
+} from "./quote_prices-core";
 
 /**
  * Quote-asset and Robinhood-coin pricing into `token_prices`, the Worker half of refresh.yml
@@ -21,7 +24,6 @@ import { DAY_MS, KLINES_LIMIT, KRAKEN_PAIR, PAIR, bybitList, krakenList, parseKl
  * "still unpriced" count is not taken, and no `--all`/`--days`/`--limit`/`--token` flags.
  */
 
-interface QuoteAsset { readonly network_id: number; readonly token_key: string; readonly symbol: string; readonly first_day: Date | string | null }
 interface RobinhoodToken { readonly token_key: string; readonly address: string }
 
 const BINANCE = "https://api.binance.com/api/v3/klines";
@@ -37,9 +39,11 @@ const BYBIT = "https://api.bybit.com/v5/market/kline";
 const BYBIT_LIMIT = 1000;
 /** Pages of KLINES_LIMIT per asset; one in practice, the loop keeps a longer history from silently truncating. */
 const MAX_PAGES = 20;
-/** Rows per value_usd update: a slice D1 finishes well inside the 30 s it allows one statement. */
+/** Rowids per value_usd update: a slice D1 finishes well inside the 30 s it allows one statement. */
 const UPDATE_BATCH = 5_000;
 const MAX_UPDATE_BATCHES = 200;
+/** How long a quote leg waits for its day's close before the value_usd pass gives it up: a failed exchange read is retried for two days. */
+const CLOSE_WAIT_MS = 2 * DAY_MS;
 /** Days per token_prices insert: 5 columns x 18 rows = 90 of the 100 parameters D1 binds. */
 const PRICE_ROWS = 18;
 const ROBINHOOD_NETWORK_ID = 4663;
@@ -60,19 +64,6 @@ export interface QuotePricesSummary {
   readonly stoppedEarly: boolean;
   readonly elapsedMs: number;
 }
-
-/**
- * Every floating quote asset with a Binance pair (X2: EVM rows carry no `tx_type`, so a swap
- * count could never admit WBNB/WETH), and from when: the first swap day where one is known,
- * else `seriesStartMs` looks a year back.
- */
-const quoteAssets = (sql: Sql) => sql<QuoteAsset[]>`
-  select q.network_id, q.token_key, q.symbol, null as first_day
-    from quote_assets q
-   where q.pegged_usd is null and q.symbol in (${Object.keys(PAIR)})
-   order by q.network_id, q.symbol`;
-// No join to \`transactions\` for the first swap day: that scan is far too slow for one statement
-// (17 Sep). A null first_day makes \`seriesStartMs\` look a year back, one Binance page.
 
 /** Daily closes from Binance, paged from `startMs`. */
 async function binanceCloses(pair: string, startMs: number): Promise<Map<string, number>> {
@@ -135,7 +126,7 @@ async function dailyCloses(pair: string, startMs: number): Promise<{ closes: Map
 
 /** Fetch and upsert one asset's series. Returns days written; 0 when Binance has nothing for it. */
 async function priceAsset(sql: Sql, a: QuoteAsset, pair: string, now: Date): Promise<number> {
-  const { closes, source: exchange } = await dailyCloses(pair, seriesStartMs(a.first_day ? new Date(a.first_day) : null, now));
+  const { closes, source: exchange } = await dailyCloses(pair, seriesStartMs(a.last_day ? new Date(a.last_day) : null, now));
   if (!closes.size) return 0;
   const days = [...closes.keys()], vals = [...closes.values()];
   const source = `${exchange}:${pair}`;
@@ -155,36 +146,6 @@ async function priceAsset(sql: Sql, a: QuoteAsset, pair: string, now: Date): Pro
   });
   return days.length;
 }
-
-/**
- * One batch of `transactions.value_usd` for quote-asset legs. Idempotent and resumable: only
- * rows where `value_usd is null`. `value_usd` is a MAGNITUDE like `amount`; direction lives
- * in the `direction` column alone. Returns rows updated.
- */
-const priceTransactionsBatch = async (sql: Sql): Promise<number> => {
-  // The Postgres `update … from quote_assets left join token_prices` became one scalar subquery
-  // per rung (peg, then that day's close) with an `exists` guard, so a row nothing can price is
-  // left untouched and does not count as written. `ctid` -> `rowid`.
-  const res = await sql`
-    update transactions
-       set value_usd = amount * coalesce(
-             (select q.pegged_usd from quote_assets q
-               where q.network_id = transactions.network_id and q.token_key = transactions.token_key),
-             (select p.usd from token_prices p
-               where p.network_id = transactions.network_id and p.token_key = transactions.token_key
-                 and p.day = substr(transactions.block_time, 1, 10)))
-     where value_usd is null
-       and rowid in (select rowid from transactions
-                      where value_usd is null and tx_type = 'SWAP'
-                      limit ${UPDATE_BATCH})
-       and exists (select 1 from quote_assets q
-                    where q.network_id = transactions.network_id and q.token_key = transactions.token_key
-                      and (q.pegged_usd is not null
-                           or exists (select 1 from token_prices p
-                                       where p.network_id = q.network_id and p.token_key = q.token_key
-                                         and p.day = substr(transactions.block_time, 1, 10))))`;
-  return res.count;
-};
 
 /**
  * Held Robinhood tokens that are not a quote asset and that GMGN (`token_info`) carries no price for.
@@ -223,8 +184,8 @@ async function priceRobinhoodBatch(sql: Sql, chunk: readonly RobinhoodToken[], d
 }
 
 /**
- * One pass over both phases within `budgetMs`. Throws only when source calls were attempted
- * and every one failed, so the cron shows as failed rather than quietly pricing nothing.
+ * One pass over both phases within `budgetMs`. Throws when a SOURCE (the exchanges, DexScreener, the
+ * value_usd pass) was asked and every call to it failed, so the cron shows as failed rather than quietly pricing nothing.
  */
 export async function runQuotePrices(env: Env, budgetMs: number): Promise<QuotePricesSummary> {
   const started = Date.now();
@@ -232,7 +193,8 @@ export async function runQuotePrices(env: Env, budgetMs: number): Promise<QuoteP
   const sql = jobSql(env);
   try {
     const now = new Date(started);
-    let transfersPriced = 0, coinsPriced = 0, batches = 0, failedBatches = 0, done = 0, stoppedEarly = false;
+    let coinsPriced = 0, failedBatches = 0, done = 0, stoppedEarly = false;
+    const exchanges = { asked: 0, failed: 0 }, dexscreener = { asked: 0, failed: 0 };
     const fail = (what: string, e: unknown): void => {
       failedBatches += 1;
       console.error(`quote_prices: ${what} failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -245,22 +207,17 @@ export async function runQuotePrices(env: Env, budgetMs: number): Promise<QuoteP
       done += 1;
       const pair = PAIR[a.symbol];
       if (!pair) { console.warn(`quote_prices: ${a.symbol} skipped, no Binance pair mapped`); continue; }
-      batches += 1;
+      exchanges.asked += 1;
       try {
         const days = await priceAsset(sql, a, pair, now);
         if (days === 0) console.warn(`quote_prices: ${a.symbol} skipped, binance returned nothing`);
-      } catch (e) { fail(`${a.symbol} closes`, e); }
+      } catch (e) { exchanges.failed += 1; fail(`${a.symbol} closes`, e); }
     }
 
-    /* Phase 1b: value_usd for quote-asset legs, in batches until one updates nothing. */
-    for (let i = 0; i < MAX_UPDATE_BATCHES && !stoppedEarly; i++) {
-      if (left() <= 0) { stoppedEarly = true; break; }
-      try {
-        const n = await priceTransactionsBatch(sql);
-        if (n === 0) break;
-        transfersPriced += n;
-      } catch (e) { fail(`value_usd batch ${i + 1}`, e); break; }
-    }
+    /* Phase 1b: value_usd for quote-asset legs, a rowid slice at a time from where the last run stopped. */
+    const legs = await priceLegsFrom(sql, UPDATE_BATCH, MAX_UPDATE_BATCHES, new Date(started - CLOSE_WAIT_MS).toISOString(),
+      () => left() <= 0, (after, upTo, e) => fail(`value_usd rowids ${after}-${upTo}`, e));
+    stoppedEarly ||= legs.stoppedEarly;
 
     /* Phase 2: today's DexScreener price per unpriced held Robinhood token. */
     const tokens = await robinhoodTargets(sql);
@@ -268,16 +225,17 @@ export async function runQuotePrices(env: Env, budgetMs: number): Promise<QuoteP
     for (let i = 0; i < tokens.length; i += ADDRESSES_PER_CALL) {
       if (left() <= 0) { stoppedEarly = true; break; }
       const chunk = tokens.slice(i, i + ADDRESSES_PER_CALL);
-      batches += 1;
+      dexscreener.asked += 1;
       try {
         coinsPriced += await priceRobinhoodBatch(sql, chunk, day);
-      } catch (e) { fail(`robinhood batch of ${chunk.length}`, e); }
+      } catch (e) { dexscreener.failed += 1; fail(`robinhood batch of ${chunk.length}`, e); }
       done += chunk.length;
     }
 
-    if (batches > 0 && failedBatches === batches) throw new Error(`quote_prices: all ${batches} source calls failed`);
+    const dead = deadSources({ exchanges, dexscreener, "the value_usd pass": legs });
+    if (dead.length) throw new Error(`quote_prices: every call to ${dead.join(" and ")} failed (${legs.priced} transfers priced)`);
     return {
-      transfersPriced, coinsPriced, batches, failedBatches,
+      transfersPriced: legs.priced, coinsPriced, batches: exchanges.asked + dexscreener.asked, failedBatches,
       remaining: assets.length + tokens.length - done,
       stoppedEarly, elapsedMs: Date.now() - started,
     };

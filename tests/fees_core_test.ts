@@ -15,20 +15,31 @@ Deno.test("solanaFee: meta.fee lamports scaled to SOL, kept as a string", () => 
   assertEquals(solanaFee(null), null);
 });
 
-Deno.test("readBatch: ids index the signatures sent; null or fee-less results are missing; unknown ids are ignored", () => {
+Deno.test("readBatch: ids index the signatures sent; null or fee-less results are absent; unknown ids are ignored", () => {
   const reply = [
     { id: 0, result: { meta: { fee: 5000 } } },
     { id: 1, result: null },
     { id: 7, result: { meta: { fee: 5000 } } },
     { id: 2, result: { meta: {} } },
   ];
-  assertEquals(readBatch(reply, ["s1", "s2", "s3"]), { fees: [{ hash: "s1", fee: "0.000005" }], missing: 2 });
+  assertEquals(readBatch(reply, ["s1", "s2", "s3"]), { fees: [{ hash: "s1", fee: "0.000005" }], absent: ["s2", "s3"] });
 });
 
-Deno.test("readBatch: a non-array reply is a refusal, not an empty answer", () => {
+Deno.test("readBatch: an item the provider errored on, or left out, was not answered: it is neither a fee nor absent", () => {
+  const reply = [
+    { id: 0, result: null },
+    { id: 1, error: { code: -32429, message: "rate limited" } },
+    { id: 2, result: null, error: { code: -32429 } },
+  ];
+  assertEquals(readBatch(reply, ["s1", "s2", "s3", "s4"]), { fees: [], absent: ["s1"] });
+  // Every item rate-limited is a refusal: nothing was answered, so nothing may be parked and the batch counts as failed.
+  assertEquals(readBatch([{ id: 0, error: { code: -32429 } }], ["s1"]), null);
+});
+
+Deno.test("readBatch: a non-array reply, or a list answering none of the hashes, is a refusal, not an empty answer", () => {
   assertEquals(readBatch({ jsonrpc: "2.0", error: { message: "maximum 10 calls in 1 batch" } }, ["s1"]), null);
   assertEquals(readBatch(null, ["s1"]), null);
-  assertEquals(readBatch([], ["s1"]), { fees: [], missing: 0 });
+  assertEquals(readBatch([], ["s1"]), null);
 });
 
 const HASHES = ["0xAAA1", "0xbbb2", "0xccc3", "0xddd4", "0xeee5"];
@@ -49,7 +60,7 @@ const reply = {
 Deno.test("readBitqueryFees: SenderFee first, Cost as the fallback; hashes match case-insensitively and keep the sent spelling", () => {
   assertEquals(readBitqueryFees(reply, HASHES), {
     fees: [{ hash: "0xAAA1", fee: "0.000021" }, { hash: "0xbbb2", fee: "0.0005" }, { hash: "0xccc3", fee: "1" }],
-    missing: 2,
+    absent: ["0xddd4", "0xeee5"],
   });
 });
 
@@ -58,8 +69,8 @@ Deno.test("readBitqueryFees: a hash never asked for is never trusted; a non-deci
   assertEquals(fees.some((f) => f.hash === "0xffff" || f.hash === "0xddd4"), false);
 });
 
-Deno.test("readBitqueryFees: a reply without the Transactions list is a refusal; an empty list is all missing", () => {
+Deno.test("readBitqueryFees: a reply without the Transactions list is a refusal; an empty list is all absent", () => {
   assertEquals(readBitqueryFees({ EVM: {} }, HASHES), null);
   assertEquals(readBitqueryFees(undefined, HASHES), null);
-  assertEquals(readBitqueryFees({ EVM: { Transactions: [] } }, ["0xa"]), { fees: [], missing: 1 });
+  assertEquals(readBitqueryFees({ EVM: { Transactions: [] } }, ["0xa"]), { fees: [], absent: ["0xa"] });
 });
