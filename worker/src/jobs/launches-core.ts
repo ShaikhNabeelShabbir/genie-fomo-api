@@ -4,6 +4,7 @@
  * tests/launches_targets_test.ts can run it.
  */
 import type { Sql } from "../d1.ts";
+import { currentHoldings } from "../../../supabase/functions/_shared/current_holdings.ts";
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 
@@ -47,7 +48,7 @@ export const launchTargets = (sql: Sql, net: number) => sql<Target[]>`
     from tokens tk
    where tk.network_id = ${net}
      and (tk.launch_read_at is null or tk.graduated = 0)
-     and (tk.token_key in (select token_key from holdings_current where network_id = ${net})
+     and (tk.token_key in (select h.token_key from ${currentHoldings(sql)} h where h.network_id = ${net})
           or tk.token_key in (select token_key from transactions
                                where network_id = ${net}
                                  and block_time > strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days')))

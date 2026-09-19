@@ -2,8 +2,8 @@ import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { ADDRESSES_PER_CALL, bestPairs, fetchPairs } from "../../../supabase/functions/_shared/dexscreener.ts";
 import {
-  DAY_MS, KLINES_LIMIT, KRAKEN_PAIR, PAIR, type QuoteAsset, bybitList, deadSources, krakenList, parseKlines,
-  priceLegsFrom, quoteAssets, seriesStartMs,
+  DAY_MS, KLINES_LIMIT, KRAKEN_PAIR, PAIR, type QuoteAsset, type RobinhoodToken, bybitList, deadSources, krakenList, parseKlines,
+  priceLegsFrom, quoteAssets, robinhoodTargets, seriesStartMs,
 } from "./quote_prices-core";
 
 /**
@@ -23,8 +23,6 @@ import {
  * inside its 30 s per statement (no `statement_timeout` to raise), the informational
  * "still unpriced" count is not taken, and no `--all`/`--days`/`--limit`/`--token` flags.
  */
-
-interface RobinhoodToken { readonly token_key: string; readonly address: string }
 
 const BINANCE = "https://api.binance.com/api/v3/klines";
 /**
@@ -147,20 +145,6 @@ async function priceAsset(sql: Sql, a: QuoteAsset, pair: string, now: Date): Pro
   return days.length;
 }
 
-/**
- * Held Robinhood tokens that are not a quote asset and that GMGN (`token_info`) carries no price for.
- * `holdings_current` is a view over every capture, so this is the run's one broad read; one chain
- * keeps it small.
- */
-const robinhoodTargets = (sql: Sql) => sql<RobinhoodToken[]>`
-  select distinct h.token_key, tk.address
-    from holdings_current h
-    join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
-    left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
-    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
-   where h.network_id = ${ROBINHOOD_NETWORK_ID} and q.token_key is null and ti.price_usd is null
-   order by h.token_key`;
-
 /** Price one DexScreener batch and write today's row per token that has a pool. Returns tokens priced. */
 async function priceRobinhoodBatch(sql: Sql, chunk: readonly RobinhoodToken[], day: string): Promise<number> {
   const best = bestPairs(await fetchPairs(ROBINHOOD_CHAIN, chunk.map((t) => t.address)));
@@ -220,7 +204,7 @@ export async function runQuotePrices(env: Env, budgetMs: number): Promise<QuoteP
     stoppedEarly ||= legs.stoppedEarly;
 
     /* Phase 2: today's DexScreener price per unpriced held Robinhood token. */
-    const tokens = await robinhoodTargets(sql);
+    const tokens = await robinhoodTargets(sql, ROBINHOOD_NETWORK_ID);
     const day = now.toISOString().slice(0, 10);
     for (let i = 0; i < tokens.length; i += ADDRESSES_PER_CALL) {
       if (left() <= 0) { stoppedEarly = true; break; }

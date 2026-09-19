@@ -6,6 +6,7 @@
  * `tests/tokens_test.ts` runs it under Deno.
  */
 import type { Sql } from "../d1.ts";
+import { currentHoldings } from "../../../supabase/functions/_shared/current_holdings.ts";
 
 export type Rec = Readonly<Record<string, unknown>>;
 export const isRec = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -174,6 +175,29 @@ export function infoRow(d: Rec): InfoRow {
   };
 }
 
+export interface SupplyTarget { readonly network_id: number; readonly address: string; readonly token_key: string }
+
+/**
+ * Tokens where a supply would actually be used: an entry price exists, or somebody holds it. The
+ * most valuable held position first (gross amount x price, ceilings or not): a supply is what lets
+ * /positions run the implied-cap check on exactly those rows (V1b). Every current holding is read
+ * ONCE, grouped, and joined: the Postgres lateral re-read it per token, which D1 running one
+ * statement at a time cannot afford. "hv.token_key is not null" is the old "exists" over the same rows.
+ */
+export const supplyTargets = (sql: Sql, limit: number) => sql<SupplyTarget[]>`
+  select tk.network_id, tk.address, tk.token_key
+  from tokens tk
+  left join (select network_id, token_key, max(human_amount * price) as held
+               from ${currentHoldings(sql)} h group by network_id, token_key) hv
+    on hv.network_id = tk.network_id and hv.token_key = tk.token_key
+  where tk.total_supply is null
+    and (hv.token_key is not null
+         or exists (select 1 from trades t
+                    where t.network_id = tk.network_id and t.token_key = tk.token_key
+                      and t.avg_entry_price > 0))
+  order by hv.held desc, tk.network_id, tk.address
+  limit ${limit}`;
+
 export interface InfoTarget { readonly network_id: number; readonly token_key: string; readonly address: string; readonly chain: string }
 
 /**
@@ -189,9 +213,10 @@ export const infoTargets = (sql: Sql, staleAgo: string, missRetryAgo: string) =>
     select h.network_id, h.token_key, tk.address, ch.name as chain,
            count(distinct h.handle) as holders,
            max(coalesce(ti.fetched_at, ''), coalesce(ms.missed_at, '')) as waited
-      from holdings_current h
-      join tokens tk  on tk.network_id = h.network_id and tk.token_key = h.token_key
-      join chains ch  on ch.network_id = h.network_id
+      from ${currentHoldings(sql)} h
+      -- The cross joins state the order, h then tokens then chains: left free, the small derived table is drained into an automatic index.
+      cross join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
+      cross join chains ch on ch.network_id = h.network_id
       left join quote_assets q
         on q.network_id = h.network_id and q.token_key = h.token_key
       left join token_info ti
