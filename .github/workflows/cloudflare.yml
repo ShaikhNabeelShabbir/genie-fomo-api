@@ -14,6 +14,10 @@ on:
     paths:
       - 'worker/**'
       - 'supabase/functions/**'
+      # The gate's own inputs: a change to a test, the smoke or the task list ran no CI at all.
+      - 'tests/**'
+      - 'scripts/**'
+      - 'deno.json'
       - '.github/workflows/cloudflare.yml'
   workflow_dispatch:
     inputs:
