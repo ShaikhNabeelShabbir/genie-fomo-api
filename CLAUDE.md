@@ -133,8 +133,9 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   without a rebuild. 78% of stored valued hours are under 0.25.
 - Current state (19 Sep 2026, evening): the 100-bind outage is fixed in code and the deck's roster read answers, but
   production ran a regression of mine from 10:33 UTC (always-`json_each`) until the hybrid deploy; check `npx wrangler
-  deployments list` against `git log` before believing anything is live — a push to this branch that touches `worker/**`
-  IS a production deploy, and CI does NOT apply D1 migrations (apply them first: 0007, 0011-0015 are new today).
+  deployments list` against `git log` before believing anything is live — a push to `main` that touches `worker/**`,
+  `supabase/functions/**`, `tests/**` or `scripts/**` IS a production deploy (the migration branch was merged and
+  deleted on 19 Sep; work on a feature branch and merge), and CI does NOT apply D1 migrations (apply them first: 0007, 0011-0015 are new today).
   What changed today is in `tasks/todo.md` (review section) and `docs/consumer/reply-to-trader-service-v1.md`.
   A2 (every trader's live figure hourly) stays WITHDRAWN: `oldestLiveHours` rises by design. GMGN capacity is ~1,100
   coins a day against ~31,000 held, so per-coin `fetchedAt` is the truth, not "nightly". Owner-only and still open:

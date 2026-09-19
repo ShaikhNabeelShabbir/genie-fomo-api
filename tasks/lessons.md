@@ -65,7 +65,7 @@
   review is read BEFORE the deploy, not after — the reviewer that found this was still running when I deployed.
 - **Audit agents must not touch production D1.** Read-only is not harmless: full-table aggregates from a fan-out of
   agents reset the database 987 times in 15 minutes. Plans are audited locally (`tests/routes_sql_test.ts`).
-- **A push to `cloudflare-migration` that touches `worker/**` IS a production deploy** (CI, `CLOUDFLARE_DEPLOY=true`).
+- **A push to `main` that touches `worker/**` (or the API, tests or scripts) IS a production deploy** (CI, `CLOUDFLARE_DEPLOY=true`); CI does not apply D1 migrations — apply them first.
 - **`main` still carries the v1 nightly refresh** (`.github/workflows/refresh.yml`, 06:00 UTC, ~1.5 h, cancelled by
   timeout): it spends the same Helius, Bitquery and GMGN keys the Worker depends on. Check what the default branch
   schedules before believing "everything moved".

@@ -10,7 +10,7 @@ name: cloudflare worker
 
 on:
   push:
-    branches: [main, cloudflare-migration]
+    branches: [main]
     paths:
       - 'worker/**'
       - 'supabase/functions/**'
