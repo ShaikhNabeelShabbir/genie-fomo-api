@@ -113,3 +113,26 @@ export const isSourceRefusal = (error: string | null): boolean => error !== null
 /** Wallets whose Solana history is not all in yet, in the order given; `limit` of them are walked back per run. */
 export const walkBackTargets = <W extends Wallet>(targets: readonly W[], limit: number): W[] =>
   targets.filter((w) => w.sol_address && w.sol_backfill_done !== 1 && w.sol_oldest_signature).slice(0, limit);
+
+/**
+ * The upsert for `rows` rows of 13 binds. A conflict that would change nothing is NOT a write: Bitquery has
+ * no lower bound, so every hourly pull re-reads the newest 100 transfers per EVM chain per wallet, and each
+ * was rewritten only to move `ingested_at` (which nothing reads). Here so tests/transfers_upsert_test.ts runs it.
+ */
+export const upsertText = (rows: number): string =>
+  `insert into transactions
+     (network_id, tx_hash, address_key, transfer_key, block_time, direction,
+      counterparty, token_key, token_symbol, amount, source, tx_type, tx_source)
+   values ${Array.from({ length: rows }, () => "(?,?,?,?,?,?,?,?,?,?,?,?,?)").join(",")}
+   on conflict (network_id, tx_hash, address_key, transfer_key) do update set
+     block_time = excluded.block_time, token_symbol = excluded.token_symbol,
+     amount = excluded.amount, source = excluded.source,
+     tx_type = coalesce(excluded.tx_type, transactions.tx_type),
+     tx_source = coalesce(excluded.tx_source, transactions.tx_source),
+     ingested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   where transactions.block_time is not excluded.block_time
+      or transactions.token_symbol is not excluded.token_symbol
+      or transactions.amount is not excluded.amount
+      or transactions.source is not excluded.source
+      or (excluded.tx_type is not null and transactions.tx_type is not excluded.tx_type)
+      or (excluded.tx_source is not null and transactions.tx_source is not excluded.tx_source)`;

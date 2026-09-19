@@ -2,9 +2,9 @@ import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { SOLANA_NETWORK_ID, solanaBalances } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { evmBalancesBitquery, evmTxCount } from "../../../supabase/functions/_shared/bitquery.ts";
-import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
+import { EVM_CHAINS, REFUSALS_IN_A_ROW } from "../../../supabase/functions/_shared/settings.ts";
 import { value } from "../../../supabase/functions/aum-sample/value.ts";
-import { askable, positionRows, sliceSize, type Chain, type Row, type Trader } from "./balances-core";
+import { askable, balanceTargets, failedInARow, notAttemptedSince, positionRows, sliceSize, sourceOf, stampAttempt, type Chain, type Row, type Source, type Trader } from "./balances-core";
 import { chunk } from "./directory-core";
 
 /**
@@ -31,7 +31,7 @@ const BATCH_STATEMENTS = 50;
 const STALE_TRADE_MS = 36 * 3_600_000;
 
 export interface BalancesSummary {
-  /** Traders whose chains were asked this run. */
+  /** Traders reached this run, each stamped as attempted; a source left out after REFUSALS_IN_A_ROW was not asked for the later ones. */
   readonly traders: number;
   /** (trader, chain) reads that answered. */
   readonly chainsRead: number;
@@ -47,7 +47,7 @@ export interface BalancesSummary {
   readonly unknownTokens: number;
   /** Traders whose aum_live row was marked dirty after their capture; the flush cron revalues them. */
   readonly liveRefreshed: number;
-  /** Traders with a wallet whose newest chain capture is older than this run. Zero means the roster is current. */
+  /** Traders with a wallet this run did not attempt (`wallets.balances_read_at`). Zero means the slice covered the roster. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
   readonly elapsedMs: number;
@@ -65,20 +65,6 @@ interface TokenRef { readonly network_id: number; readonly token_key: string }
 interface Priced { readonly px: number | null; readonly src: string | null; readonly supply: number | null }
 
 const refKey = (networkId: number, tokenKey: string): string => `${networkId}|${tokenKey}`;
-
-/** Stalest first: max(holdings.captured_at) where source = 'chain', never read first (ASC sorts NULL first). */
-async function targets(sql: Sql, limit: number): Promise<Trader[]> {
-  const rows = await sql<{ handle: string; sol_address: string | null; evm_address: string | null }[]>`
-    select t.handle, w.sol_address, w.evm_address,
-           (select max(captured_at) from holdings h
-             where h.handle = t.handle and h.source = 'chain') as last_at
-    from traders t
-    join wallets w on w.handle = t.handle
-    where w.sol_address is not null or w.evm_address is not null
-    order by last_at, t.handle
-    limit ${limit}`;
-  return rows.map((r) => ({ handle: r.handle, sol_address: r.sol_address, evm_address: r.evm_address }));
-}
 
 /** One chain for one trader. Throws on a read fault; the caller counts it. */
 async function readChain(keys: { helius: string; bitquery: string }, t: Trader, c: Chain): Promise<ChainAnswer> {
@@ -312,18 +298,20 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
   if (!keys.bitquery) throw new Error("balances: BITQUERY_KEY is not set; EVM chains are read through Bitquery");
   const sql = jobSql(env);
   try {
-    const slice = await targets(sql, sliceSize(env.BALANCE_SLICE));
+    const slice = await balanceTargets(sql, sliceSize(env.BALANCE_SLICE));
     const chains = (await sql<{ network_id: number; name: string; rpc: string }[]>`
       select network_id, name, rpc from chains order by network_id`)
       .map((c): Chain => ({ network_id: Number(c.network_id), name: c.name, rpc: c.rpc }));
     const capturedAt = new Date();
     const read: string[] = [];
     let chainsRead = 0, chainsFailed = 0, rowsWritten = 0, unknownTokens = 0, liveRefreshed = 0, stoppedEarly = false;
-    // ponytail: an emptied wallet writes no row, so its capture never advances and it keeps a slot at the head of the queue; record empty reads if that ever costs slots.
+    let failed: Record<Source, number> = { helius: 0, bitquery: 0 };
     for (const t of slice) {
       if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
       read.push(t.handle);
-      const ask = askable(t, chains);
+      // A source that answered none of REFUSALS_IN_A_ROW traders running is refusing the RUN: its chains are
+      // left out (5 tries and ~15 s of backoff each), the other source is still asked, the trader still stamped.
+      const ask = askable(t, chains).filter((c) => failed[sourceOf(c)] < REFUSALS_IN_A_ROW);
       /* Chains in parallel: the per-host throttle in chain_reads serialises same-host calls, so this is safe. */
       const answers = await Promise.allSettled(ask.map((c) => readChain(keys, t, c)));
       const rows: Row[] = [], learned = new Map<string, number>(), counted: { network_id: number; nonce: number }[] = [];
@@ -338,7 +326,16 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
           console.error(`balances: ${t.handle} ${ask[i].name}: ${a.reason instanceof Error ? a.reason.message : String(a.reason)}`);
         }
       });
+      const next = failedInARow(failed, ask, answers.map((a) => a.status === "fulfilled"));
+      for (const s of ["helius", "bitquery"] as const) {
+        if (next[s] >= REFUSALS_IN_A_ROW && failed[s] < REFUSALS_IN_A_ROW) {
+          console.error(`balances: ${s} answered none of ${next[s]} traders in a row; its chains are left out of the rest of this run`);
+        }
+      }
+      failed = next;
       try {
+        // First, and whatever was answered: a refused or emptied wallet writes no row, and unstamped it led every run.
+        await stampAttempt(sql, t.handle, capturedAt.toISOString());
         const w = await writeRows(sql, capturedAt, rows, learned);
         rowsWritten += w.written; unknownTokens += w.unknown;
         await writeCoverage(sql, t, counted);
@@ -361,14 +358,7 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
 
     const repriced = rowsWritten ? await reprice(sql, capturedAt) : 0;
     const tradesClosed = read.length ? await closeStaleTrades(sql, read) : 0;
-    const [pending] = await sql<{ n: number }[]>`
-      select count(*) as n from (
-        select (select max(captured_at) from holdings h
-                 where h.handle = t.handle and h.source = 'chain') as last_at
-        from traders t
-        join wallets w on w.handle = t.handle
-        where w.sol_address is not null or w.evm_address is not null
-      ) where last_at is null or last_at < ${capturedAt.toISOString()}`;
+    const [pending] = await notAttemptedSince(sql, capturedAt.toISOString());
     return {
       traders: read.length, chainsRead, chainsFailed, rowsWritten, unknownTokens, repriced, tradesClosed, liveRefreshed,
       remaining: Number(pending?.n ?? 0), stoppedEarly, elapsedMs: Date.now() - started,
