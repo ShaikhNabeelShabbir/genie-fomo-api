@@ -195,7 +195,10 @@ Deno.test("no route reads a whole table unless the read is on the accepted list"
   for (const [text, routes] of SEEN) {
     if (/^\s*(insert|update|delete|replace)/i.test(text)) continue;
     const plan = db.prepare("explain query plan " + text).all() as { detail: string }[];
-    const names = aliases(`${text} ${viewSql}`);
+    /* The statement's OWN binding of an alias wins; view SQL is consulted only for aliases it does not define
+       (a view flattened into it). Mixing the two blamed `transactions t` in a view for a scan of `traders t`. */
+    const own = aliases(text), fromViews = aliases(viewSql);
+    const names = new Map([...fromViews, ...own]);
     for (const { detail } of plan) {
       const step = /^(SCAN|SEARCH) ([a-z_0-9]+)(?: USING (?:COVERING )?INDEX (\S+)(?: (\(.*\)))?)?/i.exec(detail);
       if (!step || ONE_SEEK.has(detail)) continue;
