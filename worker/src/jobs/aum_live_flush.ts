@@ -25,7 +25,26 @@ export interface AumLiveFlushSummary {
  * up within minutes of crossing the line rather than at the top of the next hour. One job now
  * owns live freshness and the history job is back to building history.
  */
-const TOP_UP_PER_RUN = 60;
+/**
+ * 0 SINCE 19 Sep 2026 — THE TOP-UP IS SWITCHED OFF, NOT REMOVED.
+ *
+ * At 60 it made this job run 231 s / 382 s / 625 s against a 300 s cadence (measured from the
+ * Worker tail, 19 Sep 07:05-07:20 UTC), so the job overlapped itself, and twice in 40 minutes a
+ * run ended in "D1 DB's isolate exceeded its memory limit and was reset" — after which D1
+ * refuses every statement for about a minute and the API serves those refusals as errors. The
+ * "about 0.1 s a trader" this was sized on measured only the balance read; `revalue` then runs
+ * `loadFacts`, five serial statements per 80 token keys, which is where the time and the crash
+ * are. Re-enable only with a per-run budget AND a batched `loadFacts` (tasks/todo.md, P1).
+ */
+const TOP_UP_PER_RUN = 0;
+/**
+ * This job's own ceiling. The scheduler hands every cron JOB_BUDGET_MS (600 s), twice this
+ * job's period, so honouring that would still let it overlap itself; a fifth of the period
+ * leaves D1 to the API for the other four.
+ */
+const FLUSH_BUDGET_MS = 60_000;
+/** Marked traders per `refreshAumLive` call: small, so the budget is checked often. */
+const MARKED_SLICE = 5;
 /** Handles per statement; the same slice the marked flush uses. */
 const TOP_UP_SLICE = 20;
 
@@ -35,6 +54,7 @@ const TOP_UP_SLICE = 20;
  * valued from the balances as read, which is ~20x less database work a trader.
  */
 async function topUpUnmoved(sql: Sql, limit: number): Promise<number> {
+  if (limit <= 0) return 0;
   const anHourAgo = new Date(Date.now() - 3_600_000).toISOString();
   const stale = (await sql<{ handle: string }[]>`
     select t.handle from traders t
@@ -53,8 +73,9 @@ async function topUpUnmoved(sql: Sql, limit: number): Promise<number> {
  * the last run, in ONE `refreshAumLive` call, then clear exactly the handles refreshed. A
  * trader marked again while the refresh ran keeps the newer mark for the next minute.
  */
-export async function runAumLiveFlush(env: Env, _budgetMs: number): Promise<AumLiveFlushSummary> {
+export async function runAumLiveFlush(env: Env, budgetMs: number): Promise<AumLiveFlushSummary> {
   const started = Date.now();
+  const deadline = started + Math.min(budgetMs, FLUSH_BUDGET_MS);
   const sql = jobSql(env);
   try {
     // Oldest marks first, a bounded slice a run: the cron is every 5 minutes and each trader
@@ -81,21 +102,26 @@ export async function runAumLiveFlush(env: Env, _budgetMs: number): Promise<AumL
     if (!marked.length) {
       return { marked: 0, refreshed: 0, toppedUp: await topUpUnmoved(sql, TOP_UP_PER_RUN), elapsedMs: Date.now() - started };
     }
-    const handles = marked.map((m) => m.handle);
-    const refreshed = await refreshAumLive(sql, handles, "webhook");
     /*
+     * In slices, stopping at the deadline: a trader not reached keeps its mark and leads the
+     * next run (the queue is stalest-value-first), so nothing is lost by stopping early.
+     *
      * Each mark is cleared against ITS OWN captured value, so a trader re-marked while the
-     * refresh ran keeps the newer mark and comes back next run. The single `newest` bound this
-     * replaced was only sound while the rows came back in `marked_at` order, which they no
-     * longer do.
+     * refresh ran keeps the newer mark and comes back next run.
      */
-    await sql.begin(async (tx) => {
-      for (const m of marked) {
-        await tx`delete from aum_live_dirty where handle = ${m.handle} and marked_at <= ${m.marked_at}`;
-      }
-    });
+    let refreshed = 0, reached = 0;
+    for (const part of chunk(marked, MARKED_SLICE)) {
+      if (Date.now() >= deadline) break;
+      refreshed += await refreshAumLive(sql, part.map((m) => m.handle), "webhook");
+      await sql.begin(async (tx) => {
+        for (const m of part) {
+          await tx`delete from aum_live_dirty where handle = ${m.handle} and marked_at <= ${m.marked_at}`;
+        }
+      });
+      reached += part.length;
+    }
     return {
-      marked: handles.length,
+      marked: reached,
       refreshed,
       toppedUp: await topUpUnmoved(sql, TOP_UP_PER_RUN),
       elapsedMs: Date.now() - started,

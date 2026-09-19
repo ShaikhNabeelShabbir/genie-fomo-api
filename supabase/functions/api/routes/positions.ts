@@ -109,6 +109,9 @@ get("/v1/traders/:handle/portfolio", async ({ handle }, url) => {
     join chains c on c.network_id = h.network_id
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
+    -- ladderColumns() selects ps.last_usd: without this join EVERY /portfolio call failed with
+    -- "no such column: ps.last_usd" from 17 Sep 15:05 to 19 Sep (b9baeca). See tasks/todo.md.
+    left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
     where h.handle = ${t.handle}`;
   /**
    * The same ladder and the same suspect rule as /positions (v5 fixes, A1): this route used to
