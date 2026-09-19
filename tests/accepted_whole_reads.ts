@@ -11,7 +11,6 @@ export const ACCEPTED_WHOLE_READS: Record<string, string> = {
   "GET /health | aum_samples": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row",
   "GET /health | holdings": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row",
   "GET /health | tokens": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row",
-  "GET /health | trade_loads": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row",
   "GET /health | trades": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row",
   "GET /health | transactions": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row",
   "GET /market/regime | tokens": "a 7-day window on a column no index carries (trades.closed_at / tokens.created_at); global, behind a 60 s cache that serves stale. Two small partial indexes would clear it: owner decision, see tasks/todo.md",

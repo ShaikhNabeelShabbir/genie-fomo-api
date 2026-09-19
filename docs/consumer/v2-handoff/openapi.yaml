@@ -5897,7 +5897,9 @@ components:
         wallet transacting, and when the balance sweep reads the trader (about 9 h a lap). It is NOT
         refreshed when prices land, and the hourly refresh of every trader (A2, 17 Sep 2026) was
         withdrawn on 19 Sep 2026 - so an unmoved trader's figure is hours old by design, and `at` /
-        `ageSeconds` say how old. The hourly series' last point is refreshed with it. `totalUsd` is
+        `ageSeconds` say how old. The hourly series is written by the
+        hourly builder alone (19 Sep 2026) - until its run at 25 past, the newest stored point is the
+        previous hour and `now` carries the live figure. `totalUsd` is
         `null` when not valued (`reason` says why), never 0.
       required:
       - at
@@ -9240,7 +9242,7 @@ paths:
         in: query
         required: false
         description: 'Opaque keyset cursor from this route''s `nextCursor`, unmodified. A cursor that
-          does not decode, or whose shape is not `(at, kind, id)` (for example one issued by `/transactions`
+          does not decode, or whose shape is not `(at, kind, id, sub)` — or the 3-part `(at, kind, id)` issued before 19 Sep 2026, which still decodes and re-delivers rather than loses — (for example one issued by `/transactions`
           or `/trades`), answers 400 `bad_request` with `parameter: "cursor"`.'
         schema:
           type: string
@@ -12688,8 +12690,8 @@ paths:
       description: The `now` block of `GET /v1/traders/{handle}/aum/history` on its own, for callers that
         only want the current figure. Read from `aum_live`, which is refreshed within about five minutes of
         a watched Solana wallet transacting and when the balance sweep reads the trader (about 9 h a lap) -
-        not when prices land, and not hourly for everyone (withdrawn 19 Sep 2026); the hourly series'
-        last point is refreshed with it. `now` is `null` when the trader has no live figure yet; `now.totalUsd`
+        not when prices land, and not hourly for everyone (withdrawn 19 Sep 2026). The hourly series
+        is written by the hourly builder alone (19 Sep 2026) and `now` carries the live figure. `now` is `null` when the trader has no live figure yet; `now.totalUsd`
         is `null` when not valued (`reason` says why), never 0. `ageSeconds` is how old the figure was
         when answered.
       parameters:

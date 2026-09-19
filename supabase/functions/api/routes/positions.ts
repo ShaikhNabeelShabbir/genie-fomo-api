@@ -367,8 +367,8 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
       /** Why there is no value, rather than an unexplained null. */
       whyNoPrice: v !== null ? null
         : n(r.price) !== null ? "price refused by the valuation ceilings; see priceSuspectReason"
-        : "no price for this token on any rung of the ladder: no peg, no hourly sample, no " +
-          "daily close inside seven days, and nothing from token_info",
+        : "no price for this token on any rung of the ladder: no peg, no hourly sample inside 24 h, no " +
+          "daily close inside seven days, and nothing from token_info fetched inside seven days",
       /** V1: the price fails a check a consumer cannot run alone (price x supply, concentration). The row keeps its figures; the totals do not. */
       priceSuspect: suspect !== null,
       priceSuspectReason: suspect,
