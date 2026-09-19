@@ -95,14 +95,15 @@ its outgoing IPs with other customers — so the limit is spent before we ask. T
 is why nothing has been read since the move to Cloudflare; the last successful reads (9 Sep, and
 16 Sep for a few coins) were made by the old loader, which ran from its own machine.
 
-**What we are doing.** We will run the GMGN reader from an address of our own, or get an allowance
-from GMGN that is tied to our key rather than to an IP. We will tell you when the first run lands;
-until then `fetchedAt` will not move, and `/health` says so (`feeds.tokenInfo: stale`, 12,524 of
-31,522 held coins stale, 18,998 never read).
+**What we are doing.** The reader is built (19 Sep): it runs from an address of our own, asks our
+service which coins are due, reads GMGN at its pace and hands the results back; every write still
+happens in our service. It has not run yet — it needs one secret set on our side. We will tell you
+when the first run lands; until then `fetchedAt` will not move, and `/health` says so
+(`feeds.tokenInfo: stale`, about 12,500 of 32,000 held coins stale, about 19,600 never read).
 
-**What it will deliver when it runs.** One request a second, two requests per coin: roughly 1,100
-coins a day against 31,522 held. So coins held by several traders stay under about a day old and a
-coin held by one trader is refreshed every few weeks. Your done-criterion — every coin under a day
+**What it will deliver when it runs.** One request a second, two requests per coin: up to about
+8,000 coins a day against about 32,000 held. So coins held by several traders stay under about a day old and a
+coin held by one trader is refreshed every few days. Your done-criterion — every coin under a day
 old — is not reachable at GMGN's rate, and we should have told you so instead of writing "nightly"
 in the API reference. That sentence is gone. Each coin's own `fetchedAt` is the truth; please keep
 printing it. If a specific set of coins must stay fresh, tell us the rule and we will rank by it.

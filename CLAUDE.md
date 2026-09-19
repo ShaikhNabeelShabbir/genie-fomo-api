@@ -106,6 +106,11 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   guard must accept a null `data` or every message is lost; its cubes differ, so `Currency { Native }`
   exists on Balances and NOT on DEXTrades; and its plan limits requests per minute, so
   `bitquery()` paces at ~50/min and waits out a rate-limit reply.
+  **GMGN and DexScreener limit PER IP, and a Worker shares its outgoing IPs** (19 Sep 2026): GMGN answers 429 to the
+  Worker before its key is checked (401 to a keyless request from a clean address), so GMGN is read by
+  `scripts/gmgn_reader.ts` from an address of our own and written through `GET /jobs/gmgn_queue` +
+  `POST /jobs/gmgn_results` (`GMGN_RELAY_SECRET`, which opens nothing else; runbook `docs/GMGN_READER.md`). DexScreener
+  answers Cloudflare 1015 with `retry-after: 24-46`; the prices job waits as long as it is told and gets part-way.
   **Binance answers 403 to this Worker** (it refuses Cloudflare egress), so `quote_prices` falls back
   to Bybit, whose candle rows carry the open at index 0 and the close at index 4 exactly as a kline does.
 - A job that counts "errored" must count "unresolved" apart from it: a source answering "nothing here"

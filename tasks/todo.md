@@ -306,7 +306,18 @@ two minutes of its first deploy — nothing else found them):
   1.46 M, health 2.6 s / 1.98 M), fees `pending` 3.6-3.8 s, the `/tokens` board 4.4 s cold.
 
 **Still open, ranked:**
-- [ ] **Move the GMGN and DexScreener readers off shared Worker egress** (see above) — the only thing that closes
+- [x] GMGN reader BUILT 19 Sep 17:40 UTC (not yet run): `scripts/gmgn_reader.ts` + `/jobs/gmgn_queue` + `/jobs/gmgn_results`,
+      one read loop shared with the Worker's job, reviewed adversarially (a HIGH found and shipped first: `POST
+      /jobs/constructor` returned every secret to a JOB_SECRET holder — own names only now). **Owner, to close request 3:**
+      set `GMGN_RELAY_SECRET` on the Worker (`printf '%s' '<value>' | npx wrangler secret put GMGN_RELAY_SECRET`), then run
+      `GMGN_RELAY_SECRET=… GMGN_API_KEY=… deno task gmgn` from any address that is not a Worker's; then pick its host
+      (docs/GMGN_READER.md — a Cloudflare Container is UNPROVEN: probe first, 401 = clean, 429 = same limiter).
+- [ ] After the first supervised run: read GMGN's actual "no such coin" answer in the log and tighten `gmgnFailure` to an
+      allow-list of it (today everything that is not 401/403/429/5xx counts as "nothing"; the reader's canary covers it).
+- [ ] MEASURED 17:17 UTC: prices targets 5.9 s / 1.46 M rows -> 1.66 s / 636,464 rows; the run priced 1,880 coins in 235
+      batches with three waits of ~61 s as DexScreener asked (45 batches refused). aum_history 17:25: every trader built,
+      `remaining: 0`, 184 s (it was 319 s with 677 left at 12:25).
+- [ ] **Move the DexScreener reader off shared Worker egress too, or find a second price source** (see above) — the only thing that closes
       request 3 and keeps prices alive. Setting a `JOB_SECRET` first would let `POST /jobs/prices` be run on demand
       to measure what DexScreener's limit really allows.
 - [x] The three whole-`holdings_current` group-bys (tokens, prices, health) — done 19 Sep 16:22 UTC WITHOUT a new table:
