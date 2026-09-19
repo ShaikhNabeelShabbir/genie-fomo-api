@@ -95,3 +95,14 @@
 - **A literal NUL byte in a source file makes grep skip it silently** ("Binary file matches"); `tokens-core.ts` hid
   from every search. Write `\u0000`.
 
+
+- **Bound a scan by the rows it may EXAMINE, never by a property of the data.** "Newest unchecked first", then "inside
+  a 14-day window", both read ~1.25 M rows: the qualifying rows were few and the data was nothing like I assumed
+  (every transfer a few weeks old). A rowid range costs its width whatever it holds. And a fix is not done until the
+  NEXT scheduled run is read in the tail — the first swaps fix passed its tests, its plan check and CI, and failed.
+- **Local SQLite and D1 do NOT always pick the same plan.** `/aum` seeks by handle locally and read 2.3 M rows on D1.
+  Where a join order or an index choice matters, state it (`cross join`, unary `+`); the plan audit cannot see this.
+- **Free provider limits are per IP, and a Worker's egress IPs are shared.** GMGN (429) and DexScreener (Cloudflare
+  1015) refuse the Worker before it has asked anything. Log the refusal's own words (status, retry-after, body) the
+  first day, not the third.
+

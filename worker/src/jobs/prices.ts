@@ -3,7 +3,7 @@ import { jobSql, type Sql } from "../sql";
 import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { REFUSALS_IN_A_ROW } from "../../../supabase/functions/_shared/settings.ts";
 import {
-  ADDRESSES_PER_CALL, REFUSAL_PAUSE_MS, afterRefusal, athUpdate, bestPairs, fetchPairs, isRefusal, rankedBatches, type Ath, type BestPair,
+  ADDRESSES_PER_CALL, afterRefusal, athUpdate, bestPairs, fetchPairs, isRefusal, rankedBatches, refusalWaitMs, type Ath, type BestPair,
 } from "../../../supabase/functions/_shared/dexscreener.ts";
 
 /**
@@ -151,7 +151,8 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
          * day of lost hours would blank every position. At most 20 refused calls an hour this way.
          */
         const next = afterRefusal(refusedInARow, pauses, REFUSALS_IN_A_ROW);
-        if (next === "stop" || (next === "pause" && Date.now() - started + REFUSAL_PAUSE_MS > budgetMs)) {
+        const waitMs = refusalWaitMs(message);
+        if (next === "stop" || (next === "pause" && Date.now() - started + waitMs > budgetMs)) {
           console.error(`prices: DexScreener refused ${refusedInARow} batches in a row after ${pauses} wait(s); leaving the rest of this hour`);
           stoppedEarly = true;
           done += chunk.length;
@@ -160,8 +161,8 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
         if (next === "pause") {
           pauses += 1;
           refusedInARow = 0;
-          console.warn(`prices: DexScreener refused ${REFUSALS_IN_A_ROW} batches in a row; waiting ${REFUSAL_PAUSE_MS / 1000} s (wait ${pauses})`);
-          await new Promise((r) => setTimeout(r, REFUSAL_PAUSE_MS));
+          console.warn(`prices: DexScreener refused ${REFUSALS_IN_A_ROW} batches in a row; waiting ${waitMs / 1000} s as it asked (wait ${pauses})`);
+          await new Promise((r) => setTimeout(r, waitMs));
         }
       }
       done += chunk.length;

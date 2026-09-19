@@ -290,7 +290,27 @@ two minutes of its first deploy — nothing else found them):
 4. My own 10:33 deploy (always-`json_each`) stopped filter push-down into aggregate views -> `compileToFit`.
 5. `/traders/:h/wallets` and the profile read three tables whole through `trader_chain_history`.
 
+**Found at 14:05-14:17 UTC, the first runs with refusals logged in the source's own words:**
+- **GMGN answers HTTP 429 to the Worker** on the first read of a run. Its limit is 1 req/s PER IP and a Worker
+  shares egress IPs with other tenants. This — not only our queue — is why `token_info` has not moved since the
+  old loader (own runner IP) last ran. Request 3 is NOT done. Fix: read GMGN from an address of our own (a small
+  VM or a scheduled runner writing to D1 through the Cloudflare API), or a key-bound allowance from GMGN.
+- **DexScreener answers Cloudflare 1015 "you are being rate limited", `retry-after: 24-46`**, for the same
+  reason. Last hour priced: 11:00 UTC. With the 24 h price age limit a day of refusals nulls every position value:
+  `staleFeeds: prices` is the alarm. The job now waits as long as it is told, up to 8 times a run.
+- Swaps: the time-windowed scan (a86c9bd) did NOT work (24.6 s at 13:45: nearly every transfer is a few weeks old,
+  so a 14-day window is the table). Rowid ranges + a lap (2ff8ae5) did: 14:15 ran in 2 s, worst statement
+  50,001 rows / 1.2 s.
+- Tail 14:03-14:22: 1,846 of 1,852 requests ok, 0 resets. API statements still queue 1.5-4 s behind job
+  statements: THREE jobs each group all of `holdings_current` per run (tokens 6.6 s / 1.6 M rows, prices 5.9 s /
+  1.46 M, health 2.6 s / 1.98 M), fees `pending` 3.6-3.8 s, the `/tokens` board 4.4 s cold.
+
 **Still open, ranked:**
+- [ ] **Move the GMGN and DexScreener readers off shared Worker egress** (see above) — the only thing that closes
+      request 3 and keeps prices alive. Setting a `JOB_SECRET` first would let `POST /jobs/prices` be run on demand
+      to measure what DexScreener's limit really allows.
+- [ ] One `held_tokens` table (network, token, holders), maintained by the balances job, read by tokens, prices and
+      the health snapshot instead of three whole-`holdings_current` group-bys a run.
 - [ ] **Owner:** Helius dashboard — are the key's credits spent? Balance reads and swap parsing still answer 429.
 - [ ] **Owner:** pause the Supabase project (dashboard; reversible 90 days), delete after a quiet week.
 - [ ] **Owner:** rotate the GMGN key that is in git history; make the repo private; set a `JOB_SECRET`.
@@ -307,6 +327,6 @@ two minutes of its first deploy — nothing else found them):
 - [ ] Hours the live flush wrote on the live ladder since 17 Sep are not rewritten (needs `JOB_SECRET` for the
       on-demand rebuild, or a one-off heal like V1d's).
 - [ ] `positions.liveBasis.evm` still answers `nightly_read`; `rolling_read` is published (v14) — switch in v15.
-- [ ] Observe: tokens tick 14:05 UTC (GMGN `fetchedAt` must move), fees tick 14:10 (Robinhood on Bitquery
-      `realtime` is unverified), quote_prices :50 (Kraken), swaps :45 (no stall).
+- [x] Observed 14:05-14:17: swaps no stall; fees ok (Robinhood answers on Bitquery `realtime`: 1,000 receipts);
+      GMGN and DexScreener refused by IP (above). Still to observe: quote_prices :50 (Kraken).
 

@@ -91,3 +91,10 @@ Deno.test("afterRefusal: a run of refusals earns a wait, three waits an hour, th
   assertEquals(afterRefusal(5, REFUSAL_PAUSES_PER_RUN - 1, 5), "pause");
   assertEquals(afterRefusal(5, REFUSAL_PAUSES_PER_RUN, 5), "stop");
 });
+
+Deno.test("refusalWaitMs: the wait is what DexScreener asked for plus a little, bounded; a minute when it names none", async () => {
+  const { refusalWaitMs } = await import("../supabase/functions/_shared/dexscreener.ts");
+  assertEquals(refusalWaitMs("dexscreener HTTP 429 (retry-after: 40; error code: 1015 )"), 43_000);
+  assertEquals(refusalWaitMs("dexscreener HTTP 429 (retry-after: 600; error code: 1015 )"), 90_000);
+  assertEquals(refusalWaitMs("dexscreener HTTP 429 (retry-after: none; no body)"), 60_000);
+});

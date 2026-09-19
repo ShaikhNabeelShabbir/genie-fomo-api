@@ -94,9 +94,20 @@ export function rankedBatches<T extends { readonly chain: string }>(ranked: read
     .sort((a, b) => (rank.get(a[0]) ?? 0) - (rank.get(b[0]) ?? 0));
 }
 
-/** After a run of refusals the prices job waits this long and tries again, at most this many times an hour. */
+/** After a run of refusals the prices job waits and tries again, at most this many times an hour. */
 export const REFUSAL_PAUSE_MS = 60_000;
-export const REFUSAL_PAUSES_PER_RUN = 3;
+export const REFUSAL_PAUSES_PER_RUN = 8;
+
+/**
+ * How long to wait after a refusal: what DexScreener ASKED for, plus a little, within bounds. Its
+ * refusals are Cloudflare 1015 ("you are being rate limited") with `retry-after: 24..46` — measured
+ * 19 Sep 2026, 14:17 UTC, the first time the refusal's own words were logged. A fixed 60 s wait was
+ * refused again every time; the limit is per IP and a Worker shares its egress IPs with strangers.
+ */
+export function refusalWaitMs(message: string): number {
+  const asked = Number(/retry-after: (\d+)/.exec(message)?.[1]);
+  return Number.isFinite(asked) && asked > 0 ? Math.min(90_000, (asked + 3) * 1000) : REFUSAL_PAUSE_MS;
+}
 
 /** What to do after a batch was refused: go on, wait and go on, or leave the hour. Pure, so the rule is testable. */
 export function afterRefusal(refusedInARow: number, pausesTaken: number, limit: number): "continue" | "pause" | "stop" {

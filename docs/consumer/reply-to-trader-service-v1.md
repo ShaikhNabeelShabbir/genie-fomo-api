@@ -18,9 +18,8 @@ applied first. Every figure quoted below as current was read from production aft
 | `/tokens/Lyi47…` (UBI) | 503 | 200 in 1.5 s |
 | Requests over a 12-minute production tail | 18% failing | 1,068 of 1,075 answered; no database resets |
 
-**Request 3 (GMGN) is fixed in code and cannot show yet**: the job that reads GMGN runs at five past
-every even hour UTC. Section 3 says what it can and cannot deliver, which is less than "every coin
-under a day old".
+**Request 3 (GMGN) is NOT fixed, and we can now say why**: GMGN answers HTTP 429 to our Worker.
+Section 3 has the detail and what we are doing about it.
 
 **What we need from you:** re-run your block, then read sections 5 and 6 — five behaviours change
 numbers on your side. Word list goes to **14** (you are on 11; 12, 13 and 14 are all additive).
@@ -64,7 +63,7 @@ our logs we could name the statements within two minutes of deploying:
 | `/aum` and `POST /traders/aum` (your warm-up burst) | 2.3–2.5 million rows | the asked traders drive every statement |
 | `/traders/:handle/wallets` and the profile | three whole tables | one index seek per chain |
 | `/tokens/:address` | whole `trades`, `holdings` and `trader_stats` | reaches its rows through the coin |
-| our own half-hourly swaps job | 1.7 million rows per chain, up to 19.6 s | a 3-day window plus one older window per run |
+| our own half-hourly swaps job | 1.7 million rows per chain, up to 19.6 s | 50,001 rows in 1.2 s (measured 14:15 UTC) |
 
 The last row matters to you: for about 30 seconds at :15 and :45 every request queued behind that
 job. If you saw failures cluster at those minutes, that was it.
@@ -80,31 +79,36 @@ a time, so a burst queues behind itself.
 
 ## 3. GMGN coin details are 9 days old
 
-**Why it stopped.** Not the key and not a rate limit. The job's queue put never-read coins first,
-and a read that found nothing left no trace — so the head of the queue was permanently coins GMGN
-has no document for, asked again on every run, while the coins it does know waited behind them.
-The reason for each failed read was also dropped before it was logged, so the log said only
-"returned nothing".
+**Not done. Two faults, and we have fixed only the one that was ours.**
 
-**What we changed.** A coin GMGN has nothing for is parked for 7 days. The queue now splits each
-run between the most-held coins that are due and the coins that have waited longest. Every refusal
-is logged with its reason, and five refusals in a row end the run instead of burning it.
+**The one that was ours.** The job's queue put never-read coins first, and a read that found
+nothing left no trace — so the head of the queue was permanently coins GMGN has no document for,
+asked again on every run. The reason for each failed read was also dropped before it was logged, so
+the log said only "returned nothing" and we could not see the second fault at all. Both are fixed:
+a coin GMGN has nothing for is parked for 7 days, each run is split between the most-held coins that
+are due and the coins that have waited longest, and every refusal is logged with its reason.
 
-**What this can and cannot deliver.** GMGN allows one request a second and each coin takes two
-requests. That is roughly **1,100 coins a day against 31,522 coins your traders hold**
-(`/health` → `feeds.tokenInfo`: 12,524 of them stale, 18,998 never read). So:
+**The one we found by fixing that.** On the first run with the reason logged (14:05 UTC today)
+**GMGN answered HTTP 429 to the first five reads** and the job stopped, as it now does after five
+refusals in a row. GMGN's limit is one request a second **per IP**, and a Cloudflare Worker shares
+its outgoing IPs with other customers — so the limit is spent before we ask. That, not our queue,
+is why nothing has been read since the move to Cloudflare; the last successful reads (9 Sep, and
+16 Sep for a few coins) were made by the old loader, which ran from its own machine.
 
-- coins held by several traders stay under about a day old;
-- a coin held by one trader is refreshed every few weeks;
-- your done-criterion — every coin under a day old — is not reachable at GMGN's rate, and we
-  should have told you so instead of writing "nightly" in the API reference. That sentence is gone.
+**What we are doing.** We will run the GMGN reader from an address of our own, or get an allowance
+from GMGN that is tied to our key rather than to an IP. We will tell you when the first run lands;
+until then `fetchedAt` will not move, and `/health` says so (`feeds.tokenInfo: stale`, 12,524 of
+31,522 held coins stale, 18,998 never read).
 
-Each coin's own `fetchedAt` is the truth; please keep printing it. If a specific set of coins must
-stay fresh (the ones on a trader's card, say), tell us the rule and we will rank by it.
+**What it will deliver when it runs.** One request a second, two requests per coin: roughly 1,100
+coins a day against 31,522 held. So coins held by several traders stay under about a day old and a
+coin held by one trader is refreshed every few weeks. Your done-criterion — every coin under a day
+old — is not reachable at GMGN's rate, and we should have told you so instead of writing "nightly"
+in the API reference. That sentence is gone. Each coin's own `fetchedAt` is the truth; please keep
+printing it. If a specific set of coins must stay fresh, tell us the rule and we will rank by it.
 
 **Your request 3.3 — Robinhood Chain.** GMGN does cover it: JUGGERNAUT carries details. PAIDCAT has
-none because it had not been reached; it is in the queue like any other coin. We will confirm once
-the job has run (first run after this deploy: 14:05 UTC).
+none because it had not been reached.
 
 ## 4. Smaller items
 
@@ -182,9 +186,14 @@ its remaining transfers; old cursors still work and re-deliver rather than lose)
 - **Helius answers 429** to balance reads and swap parsing. We believe the key's credits were spent
   by our own over-pulling, which is fixed; the owner is checking the dashboard. Until it recovers,
   Solana balances and new swaps lag. `/health` shows it (`feeds.positions`, `feeds.swaps`).
-- **DexScreener** refused 1,027 of 1,052 price batches an hour from 17 Sep 12:00 UTC. It is answering
-  again today. The job now stops after five refusals in a row instead of asking a thousand more
-  times, and prices the most-held coins of every chain first.
+- **DexScreener refuses most of our price reads**, for the same reason GMGN does: its limit is per
+  IP and our Worker's addresses are shared. The refusal is Cloudflare's "you are being rate limited"
+  with a wait of 24–46 s. Prices were last written for the 11:00 UTC hour today; the 12:17, 13:17 and
+  14:17 runs were refused. The job now waits exactly as long as it is told and tries again (it used
+  to ask a thousand more times), and prices the most-held coins of every chain first. **This matters
+  with change 1 in section 5**: a price older than 24 h prices nothing, so if the refusals last a
+  day, position values will read `null` rather than a stale figure. `/health` shows it as
+  `staleFeeds: prices`. Moving the price reader off shared addresses fixes this one too.
 - **ETH, WETH and BNB prices**: Binance refuses our Worker and Bybit refused it today; Kraken is now
   the third source, and each price row names the exchange that produced it.
 - The roster page takes 4–6 s. It is inside your deadline; we know where the rest of the time goes
@@ -202,7 +211,7 @@ curl -s "$B/tokens/Lyi47medADEVDd5hxJo1mbxhnBct841sFpcGRyHTuwp" | grep -o '"fetc
 curl -s -w "\n%{time_total}s\n" "$B/health"
 ```
 
-Expected: five 200s, each under 8 s; 200; a `fetchedAt` that moves once UBI's turn comes (section 3);
+Expected: five 200s, each under 8 s; 200; a `fetchedAt` that has NOT moved yet (section 3);
 `/health` under a second with `"database":{"answering":true,…}` and `dataState: "degraded"` naming
 `scorecards` and `tokenInfo`.
 
