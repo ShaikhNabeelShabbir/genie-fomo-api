@@ -309,8 +309,14 @@ two minutes of its first deploy — nothing else found them):
 - [ ] **Move the GMGN and DexScreener readers off shared Worker egress** (see above) — the only thing that closes
       request 3 and keeps prices alive. Setting a `JOB_SECRET` first would let `POST /jobs/prices` be run on demand
       to measure what DexScreener's limit really allows.
-- [ ] One `held_tokens` table (network, token, holders), maintained by the balances job, read by tokens, prices and
-      the health snapshot instead of three whole-`holdings_current` group-bys a run.
+- [x] The three whole-`holdings_current` group-bys (tokens, prices, health) — done 19 Sep 16:22 UTC WITHOUT a new table:
+      `currentHoldings(sql)` reaches the same rows per (trader, chain) pair (a table would have needed two writers kept
+      in step). Adopted in 10 statements (tokens queue + supply, prices, Robinhood quote prices, launches, three in the
+      health snapshot, /chains); each proven row-for-row and order-for-order against its old text; two skeptics attacked
+      the helper (5,000 random states equal; a caller shape that flattened it went 424 ms -> 28 s, closed with `limit -1`).
+      Production-sized local database: held-coins group-by 445 -> 26 ms, count(*) 359 -> 4 ms.
+- [ ] Still whole reads of the view, left alone on purpose: the `/tokens` board and momentum (their tie order is pinned
+      byte for byte by tests and would move), `trader_chain_history` inside views. Next candidates.
 - [ ] **Owner:** Helius dashboard — are the key's credits spent? Balance reads and swap parsing still answer 429.
 - [ ] **Owner:** pause the Supabase project (dashboard; reversible 90 days), delete after a quiet week.
 - [ ] **Owner:** rotate the GMGN key that is in git history; make the repo private; set a `JOB_SECRET`.

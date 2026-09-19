@@ -121,6 +121,15 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   and fails on a whole-table read that is not in `tests/accepted_whole_reads.ts`. Shrink that list, never grow it blind.
   D1 has no statistics, so local SQLite plans match; a unary `+col` keeps the planner off a low-cardinality index.
 - Slow (>= 1 s) and failed statements are logged with their SQL by the shim (`d1 slow:` / `d1 failed`): tail for those first.
+- **A statement that needs EVERY current holding reads `currentHoldings(sql)`** (`supabase/functions/_shared/current_holdings.ts`),
+  never the `holdings_current` view: the view is written for ONE trader, and read whole it tests every chain row ever
+  captured (~950,000) to keep ~40,000 — 6 s a statement in three jobs, behind which every API statement queued. The
+  helper asks per (trader, chain) pair and cannot be flattened into its caller (`limit -1`). A statement naming one
+  trader keeps the view. Its rows come in another order than the view's: order by a total key.
+- **A scan is bounded by the rows it may EXAMINE** (a rowid range, a fixed page), never by a property of the data: the
+  swaps job's "newest unchecked" and then "last 14 days" both read ~1.25 M rows because nearly every transfer is recent.
+- **Local SQLite and D1 do not always pick the same plan**, and the plan audit cannot see it. Where a join order matters,
+  state it: `cross join`, a unary `+`, the driving table first. D1's `sqlite_version()` is not recorded anywhere yet.
 - A cron's wallTime must stay well under its period, and its cost is measured end to end (not one step) and
   against API p90, not only its own gauge: the 5-minute live top-up ran 231–625 s and reset D1's isolate.
 - ONE price ladder, `shared/price-ladder.ts`, read at REQUEST time: pegged -> `token_price_stats`
