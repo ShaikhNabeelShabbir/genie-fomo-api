@@ -1,6 +1,6 @@
 import { match, requestVersion, rewriteVersion } from "./router.ts";
 import type { ApiVersion } from "./router.ts";
-import { ApiError, classify, unauthorized, checkRate } from "./errors.ts";
+import { ApiError, classify, unauthorized, checkRateWithin, RATE_CHECK_TIMEOUT_MS } from "./errors.ts";
 import type { RateState } from "./errors.ts";
 import { cfg } from "./config.ts";
 import "./routes.ts";
@@ -21,6 +21,8 @@ const headers = (extra: Record<string, string> = {}) => ({
   "Content-Type": "application/json",
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-api-key, content-type",
+  // Without this a browser re-asks every 5 s; `x-api-key` makes every call a preflighted one.
+  "Access-Control-Max-Age": "86400",
   // A browser client cannot read these unless they are exposed.
   "Access-Control-Expose-Headers":
     "Retry-After, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, RateLimit-Scope, x-request-id",
@@ -75,8 +77,13 @@ const fail = (e: ApiError, extra: Record<string, string> = {}, version: ApiVersi
 const callerKey = (req: Request): string => {
   const apiKey = req.headers.get("x-api-key");
   if (apiKey) return `key:${apiKey}`;
+  /*
+   * `cf-connecting-ip` is set by Cloudflare and cannot be forged. The LEFT-most x-forwarded-for
+   * element, which this used to read, is whatever the caller sent — Cloudflare appends, it does
+   * not overwrite — so a fresh value per request landed in a fresh bucket and was never limited.
+   */
   const fwd = req.headers.get("x-forwarded-for") ?? "";
-  const client = fwd.split(",")[0].trim();
+  const client = (req.headers.get("cf-connecting-ip") ?? fwd.split(",").at(-1) ?? "").trim();
   return client ? `ip:${client}` : "anon";
 };
 
@@ -93,7 +100,13 @@ export async function handle(req: Request): Promise<Response> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // Rate limit before auth so a flood of bad keys cannot be used to hammer the database.
-    rate = await checkRate(callerKey(req));
+    /*
+     * With its own deadline (19 Sep 2026). checkRate is a D1 WRITE on every request and it ran
+     * BEFORE the route race was armed, so a stalled database added its wait on top of the 15 s
+     * ceiling — 23-26 s responses were measured, from a service that promises no route hangs.
+     * On expiry it fails OPEN, exactly as it already does when the write errors.
+     */
+    rate = await checkRateWithin(callerKey(req), RATE_CHECK_TIMEOUT_MS);
 
     if (KEY && req.headers.get("x-api-key") !== KEY) throw unauthorized();
 

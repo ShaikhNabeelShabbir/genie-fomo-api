@@ -271,7 +271,12 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
            cast(coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0)) as real) as total_supply,
            -- V1d: the best pair's liquidity, latest hourly sample first, else GMGN's; null = no pair known.
-           cast(coalesce(ph.liquidity_usd, ti.liquidity_usd) as real) as liquidity_usd,
+           -- A correlated seek (19 Sep): the windowed join it replaces materialised ALL of
+           -- token_price_hourly on every call, twice (once per branch of holdings_current) —
+           -- 170k rows read against 26k without it, on the most-called route in the API.
+           cast(coalesce((select tph.liquidity_usd from token_price_hourly tph
+                          where tph.network_id = h.network_id and tph.token_key = h.token_key
+                          order by tph.hour desc limit 1), ti.liquidity_usd) as real) as liquidity_usd,
            -- Workflow gap 4: Solana rolled forward from the webhook feed since the read.
            h.human_amount_live, h.delta, h.last_transfer_at,
            ${ladderColumns()}
@@ -281,12 +286,6 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
-    -- The lateral's order by hour desc limit 1 is the rn = 1 row of the same ordering.
-    left join (
-      select network_id, token_key, liquidity_usd,
-             row_number() over (partition by network_id, token_key order by hour desc) as rn
-      from token_price_hourly
-    ) ph on ph.network_id = h.network_id and ph.token_key = h.token_key and ph.rn = 1
     where h.handle = ${t.handle}`;
 
   /**
@@ -484,7 +483,9 @@ post("/v1/traders/positions", async (_p, _url, body) => {
            h.price_source, h.priced_at, ti.is_honeypot, ti.can_not_sell, ps.drawdown_share,
            (q.token_key is not null) as is_quote,
            cast(coalesce(nullif(tk.total_supply, 0), nullif(ti.total_supply, 0)) as real) as total_supply,
-           cast(coalesce(ph.liquidity_usd, ti.liquidity_usd) as real) as liquidity_usd,
+           cast(coalesce((select tph.liquidity_usd from token_price_hourly tph
+                          where tph.network_id = h.network_id and tph.token_key = h.token_key
+                          order by tph.hour desc limit 1), ti.liquidity_usd) as real) as liquidity_usd,
            ${ladderColumns()}
     from holdings_current h
     join chains ch using (network_id)
@@ -492,12 +493,6 @@ post("/v1/traders/positions", async (_p, _url, body) => {
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
     left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
-    -- The lateral's order by hour desc limit 1 is the rn = 1 row of the same ordering.
-    left join (
-      select network_id, token_key, liquidity_usd,
-             row_number() over (partition by network_id, token_key order by hour desc) as rn
-      from token_price_hourly
-    ) ph on ph.network_id = h.network_id and ph.token_key = h.token_key and ph.rn = 1
     where h.handle in (${handles})`;
 
   /**

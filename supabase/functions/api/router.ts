@@ -25,6 +25,10 @@ export function post(pattern: string, handler: Handler): void {
   routes.push({ method: "POST", parts: pattern.split("/").filter(Boolean), handler });
 }
 
+/** Every registered route. tests/routes_sql_test.ts executes each one against the real schema. */
+export const registeredRoutes = (): readonly { method: string; pattern: string }[] =>
+  routes.map((r) => ({ method: r.method, pattern: "/" + r.parts.join("/") }));
+
 /** Match a path, preferring literal segments over parameters. See docs/DECISIONS.md#d013 */
 /**
  * The API versions a path may carry. `v1` is the Supabase deployment's contract; `v2` is the

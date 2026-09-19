@@ -29,11 +29,20 @@ get("/v1/traders/:handle/trust", async ({ handle }) => {
 
 
 const INCLUDES = ["pnl", "scorecard", "wallets", "trust"] as const;
+/**
+ * A page that asks for includes is bounded; the plain list is NOT (the consumer's hourly
+ * directory sync is `?limit=500`, one call — docs/consumer/Field_Contracts.md §0). The bound is
+ * about cost, not binds: each include is one statement over the whole page, and the scorecard
+ * one returns every trade of every trader on it.
+ */
+const INCLUDE_PAGE_MAX = 200;
+/** The page a request with `include` gets when it names no `limit`. */
+const INCLUDE_PAGE_DEFAULT = 100;
 type Include = typeof INCLUDES[number];
 
 get("/v1/traders", async (_p, url) => {
   const q = (url.searchParams.get("q") ?? "").trim().replace(/^@/, "").toLowerCase();
-  const limit = intParam(url, "limit", { min: 1, fallback: null });
+  const asked = intParam(url, "limit", { min: 1, fallback: null });
   const offset = intParam(url, "offset", { min: 0, fallback: 0 }) ?? 0;
 
   // Unknown values are rejected rather than ignored, for the same reason BUG-3 made
@@ -49,6 +58,13 @@ get("/v1/traders", async (_p, url) => {
       if (!include.includes(part as Include)) include.push(part as Include);
     }
   }
+  /*
+   * With includes: INCLUDE_PAGE_DEFAULT when no limit is named, never more than INCLUDE_PAGE_MAX.
+   * `?include=…` with no limit meant every include over all 448 traders — and answered 500 for as
+   * long as the D1 port existed, so no consumer can be depending on it. `total` and `nextCursor`
+   * say there is more.
+   */
+  const limit = include.length ? Math.min(asked ?? INCLUDE_PAGE_DEFAULT, INCLUDE_PAGE_MAX) : asked;
 
   /**
    * Incremental sync. Without it a consumer re-pulls the whole directory every hour forever;

@@ -27,15 +27,27 @@ Deno.test("d1sql: scalars bind as ?, dates as ISO, booleans as 0/1, null stays n
   assertEquals(prepared[0].params, ["2026-09-17T10:00:00.000Z", 1, null, 7]);
 });
 
-Deno.test("d1sql: arrays expand inside `in (…)` and `= any(…)`; elsewhere they become JSON", async () => {
+Deno.test("d1sql: an array after `in (` or `= any(` is ONE json_each parameter; elsewhere it is JSON too", async () => {
   const { db, prepared } = fake();
   const sql = d1sql(db);
   const handles = ["a", "b", "c"];
   await sql`select 1 where handle = any(${handles}) and k in (${[1, 2]}) and blob = ${["x"]}`;
-  assertEquals(prepared[0].text, "select 1 where handle in (?, ?, ?) and k in (?, ?) and blob = ?");
-  assertEquals(prepared[0].params, ["a", "b", "c", 1, 2, '["x"]']);
+  assertEquals(prepared[0].text,
+    "select 1 where handle in (select value from json_each(?)) and k in (select value from json_each(?)) and blob = ?");
+  assertEquals(prepared[0].params, ['["a","b","c"]', "[1,2]", '["x"]']);
+  /* An empty list is valid SQL that matches nothing; `in ()` was a syntax error. */
   await sql`select 1 where handle in (${[]})`;
-  assertEquals(prepared[1].text, "select 1 where handle in ()");
+  assertEquals(prepared[1].text, "select 1 where handle in (select value from json_each(?))");
+  assertEquals(prepared[1].params, ["[]"]);
+});
+
+Deno.test("d1sql: a page of 448 ids is one bind — the 19 Sep outage cannot recur", async () => {
+  /* /traders?include=wallets with no limit bound 448 parameters; limit=100 bound 101 and 200. */
+  const { db, prepared } = fake();
+  const sql = d1sql(db);
+  const ids = Array.from({ length: 448 }, (_v, i) => `h${i}`);
+  await sql`select 1 from wallets where handle in (${ids}) and x in (${ids}) and net = ${1}`;
+  assertEquals(prepared[0].params.length, 3);
 });
 
 Deno.test("d1sql: nested fragments splice text and params in order; empty fragment is nothing", async () => {
@@ -65,10 +77,11 @@ Deno.test("d1sql: unsafe binds the given params; end resolves; count comes from 
   assertEquals(await sql.end({ timeout: 5 }), undefined);
 });
 
-Deno.test("d1sql: the 100-parameter limit throws naming the statement", () => {
+Deno.test("d1sql: the 100-parameter limit still guards multi-row writes, naming the statement", () => {
   const sql = d1sql(fake().db);
-  const ids = Array.from({ length: 101 }, (_v, i) => i);
-  assertThrows(() => sql`delete from t where id in (${ids})`, Error, "binds 101 parameters, D1 allows 100");
+  const cells = Array.from({ length: 101 }, (_v, i) => i);
+  const text = `insert into t (a) values ${cells.map(() => "(?)").join(",")}`;
+  assertThrows(() => sql.unsafe(text, cells), Error, "binds 101 parameters, D1 allows 100");
 });
 
 Deno.test("d1sql: begin collects statements into one batch; an await is a batch boundary", async () => {
@@ -84,7 +97,7 @@ Deno.test("d1sql: begin collects statements into one batch; an await is a batch 
   assertEquals(out, Object.assign([{ k: 1 }], { count: 1 }));
   assertEquals(batches.map((b) => b.map((s) => s.text)), [
     ["insert into a values (?)", "insert into b values (?)", "insert into c values (?) returning k"],
-    ["delete from d where k in (?, ?)"],
+    ["delete from d where k in (select value from json_each(?))"],
   ]);
 });
 

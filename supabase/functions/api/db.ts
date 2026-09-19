@@ -14,7 +14,9 @@ const als = new AsyncLocalStorage<Store>();
 let defaultSql: Sql | undefined;
 
 export const store = (): Store | undefined => als.getStore();
-export const setDefaultSql = (client: Sql): void => { defaultSql = client; };
+export const setDefaultSql = (client: Sql | undefined): void => { defaultSql = client; };
+/** The process-wide client, so a test that swaps it can put it back. */
+export const getDefaultSql = (): Sql | undefined => defaultSql;
 export const runWith = <T>(s: Store, fn: () => T): T => als.run(s, fn);
 
 const current = (): Sql => {

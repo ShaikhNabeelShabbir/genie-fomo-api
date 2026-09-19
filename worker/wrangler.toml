@@ -8,6 +8,15 @@ compatibility_flags = ["nodejs_compat"]
 # Every loader runs here as a sliced cron job (src/index.ts JOBS maps each string to a job).
 # GitHub Actions is CI/CD only. Balance history is BUILT into aum_history, not sampled;
 # /sample stays for a manual read. Each job stops on its own before JOB_BUDGET_MS.
+# SMART PLACEMENT (19 Sep 2026). The D1 primary is in APAC (SIN); the consumer's traffic entered at
+# SJC, and with no placement the Worker runs beside the CALLER, so every SQL statement crossed the
+# Pacific (~175 ms a round trip). A route issues ~10 statements in sequence plus a rate-limit write,
+# i.e. ~2 s of pure network before any queueing — measured median 6.2 s, p90 14.6 s from SJC against
+# a 12 s client deadline. "smart" runs the Worker beside the backend it talks to, so the ocean is
+# crossed once per request, not once per statement. It learns from traffic: allow ~15 min to settle.
+[placement]
+mode = "smart"
+
 [triggers]
 crons = [
   "17 * * * *", "25 * * * *", "40 * * * *", "50 * * * *", "3,33 * * * *",

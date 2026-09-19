@@ -10440,7 +10440,7 @@ paths:
 
         `include_unavailable`, never an empty block. `cursor` wins over `offset` when both are
 
-        sent. `null` means absent, never zero. Without `limit` the whole visible set is returned.
+        sent. `null` means absent, never zero. Without `limit` the plain list returns the whole visible set; with `include` it returns a page of 100 (at most 200) - see `limit`.
 
         '
       parameters:
@@ -10451,7 +10451,7 @@ paths:
           type: string
       - name: limit
         in: query
-        description: Page size. Whole number ≥ 1; no upper bound is enforced. Absent = every visible row.
+        description: "Page size. On the plain list: a whole number >= 1 with no upper bound; absent = every visible row. WITH `include`: a page of at most 200, and 100 when no `limit` is given - each include is one statement over the whole page, so read `total` and follow `nextCursor` (or `offset`) for the rest. Until 19 Sep 2026 a page of 100 or more with `include` answered 500."
         schema:
           type: integer
           minimum: 1

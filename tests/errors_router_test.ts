@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@1";
+import { assert, assertEquals } from "jsr:@std/assert@1";
 import { get, match, post, requestVersion, rewriteVersion } from "../supabase/functions/api/router.ts";
 
 const { ApiError, classify } = await import("../supabase/functions/api/errors.ts");
@@ -51,4 +51,26 @@ Deno.test("rewriteVersion: v1 links are spelled for v2, nothing else changes", (
   const body = '{"links":{"aum":"/v1/traders/x/aum"},"note":"use GET /v1/traders/:handle/aum","addr":"0xv1/nope"}';
   assertEquals(rewriteVersion(body, "v1"), body);
   assertEquals(rewriteVersion(body, "v2"), '{"links":{"aum":"/v2/traders/x/aum"},"note":"use GET /v2/traders/:handle/aum","addr":"0xv1/nope"}');
+});
+
+Deno.test("checkRateWithin: a rate-limit write that stalls fails OPEN at its deadline (19 Sep)", async () => {
+  /* The write ran before the 15 s race was armed, so a slow database pushed responses to 23-26 s. */
+  const { checkRateWithin } = await import("../supabase/functions/api/errors.ts");
+  const { setDefaultSql, getDefaultSql } = await import("../supabase/functions/api/db.ts");
+  const previous = getDefaultSql();
+  const never = new Promise(() => {});
+  // A client whose every statement hangs: the tagged call returns a thenable that never settles.
+  const hung = Object.assign(() => ({ then: (r: unknown, j: unknown) => never.then(r as never, j as never) }), {
+    unsafe: () => never, begin: () => never, end: () => Promise.resolve(),
+  });
+  setDefaultSql(hung as never);
+  try {
+    const started = Date.now();
+    const state = await checkRateWithin("test-key", 50);
+    assertEquals(state.scope, "unlimited");
+    assert(Date.now() - started < 1000, "must return at the deadline, not wait for the database");
+  } finally {
+    /* The client is module-global and Deno runs every test file in one process. */
+    setDefaultSql(previous);
+  }
 });

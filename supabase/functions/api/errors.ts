@@ -89,6 +89,21 @@ const unlimited = (): RateState => ({
   scope: "unlimited",
 });
 
+/** The rate-limit write may take this long; past it the request is allowed through unmetered. */
+export const RATE_CHECK_TIMEOUT_MS = 2000;
+
+/** `checkRate`, bounded: a database too slow to count a request must not also delay it. */
+export function checkRateWithin(key: string, ms: number): Promise<RateState> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<RateState>((resolve) => {
+    timer = setTimeout(() => {
+      console.error(`rate limiter did not answer within ${ms} ms, allowing request`);
+      resolve(unlimited());
+    }, ms);
+  });
+  return Promise.race([checkRate(key), expired]).finally(() => clearTimeout(timer));
+}
+
 /** Counts the request against the shared window and returns the state, or throws 429. */
 export async function checkRate(key: string): Promise<RateState> {
   // bump_rate_limit() is gone with Postgres (worker/d1/SCHEMA_MAP.md): one atomic upsert keeps

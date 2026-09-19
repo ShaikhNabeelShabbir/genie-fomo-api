@@ -67,7 +67,19 @@ export const bindable = (v: unknown): unknown => {
 
 const isFragment = (v: unknown): v is Query<unknown> => v instanceof Query;
 
-/** Merge template text and params; nested fragments splice in; arrays expand inside `in (…)` / `= any(…)`. */
+/**
+ * Merge template text and params; nested fragments splice in.
+ *
+ * AN ARRAY AFTER `in (` OR `= any(` IS ONE PARAMETER, read back with `json_each` (19 Sep 2026).
+ * It used to expand to one `?` per element. Postgres bound `= any($1)` as a single array, so the
+ * D1 port (e12d303) quietly turned every id list into N binds against D1's ceiling of 100 — and
+ * the trader list went down the first time a consumer asked for a page of exactly 100 (101 binds
+ * in knownChainsFor, 200 in scorecardRows, 119-501 on /trades, 169 on /tokens/:address/activity).
+ * 45 call sites in the API tree alone had the shape; fixing it here fixes them all and makes the
+ * class unrepeatable. Plan-checked on the real scorecard statement against D1: every index seek
+ * survives, SQLite only adds a scan of the json_each virtual table. An empty list is now valid
+ * SQL that matches nothing, where `in ()` was a syntax error.
+ */
 export const compile = (strings: readonly string[], values: readonly unknown[]): { text: string; params: unknown[] } => {
   let text = "";
   const params: unknown[] = [];
@@ -79,8 +91,8 @@ export const compile = (strings: readonly string[], values: readonly unknown[]):
       text += v.text;
       params.push(...v.params);
     } else if (Array.isArray(v) && (IN_LIST.test(text) || EQ_ANY.test(text))) {
-      text = text.replace(EQ_ANY, " in (") + v.map(() => "?").join(", ");
-      params.push(...v.map(bindable));
+      text = text.replace(EQ_ANY, " in (") + "select value from json_each(?)";
+      params.push(JSON.stringify(v.map(bindable)));
     } else {
       text += "?";
       params.push(bindable(v));
@@ -92,7 +104,7 @@ export const compile = (strings: readonly string[], values: readonly unknown[]):
 const guard = (text: string, params: readonly unknown[]): void => {
   if (params.length > D1_MAX_PARAMS) {
     throw new Error(
-      `d1sql: statement binds ${params.length} parameters, D1 allows ${D1_MAX_PARAMS} (chunk the ids): ${text.trim().slice(0, 80)}`,
+      `d1sql: statement binds ${params.length} parameters, D1 allows ${D1_MAX_PARAMS} (id lists bind as one; this is a multi-row write — chunk the rows): ${text.trim().slice(0, 80)}`,
     );
   }
 };
