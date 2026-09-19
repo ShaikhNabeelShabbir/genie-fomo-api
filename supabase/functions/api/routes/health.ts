@@ -108,20 +108,42 @@ export function tokenInfoFeed<F extends { readonly state: string }>(
   };
 }
 
+/**
+ * The rows of holdings_current, read WHOLE. The view seeks a maximum per row it scans, which is every
+ * capture ever written (1 M rows, three times a run); this seeks once per (trader, chain) and reads
+ * only the newest capture. The cross joins pin that order. tests/health_statements_test.ts holds the two equal.
+ */
+const currentHoldings = () => sql`
+  select h.handle, h.network_id, h.token_key, h.human_amount
+  from traders t cross join chains n cross join holdings h
+  where h.source = 'chain' and h.handle = t.handle and h.network_id = n.network_id
+    and h.captured_at = (select max(h2.captured_at) from holdings h2
+                          where h2.source = 'chain' and h2.handle = t.handle and h2.network_id = n.network_id)
+  union all
+  select h.handle, h.network_id, h.token_key, h.human_amount from holdings h
+  where h.source = 'fomo' and h.captured_at = (select captured_at from latest_capture)
+    and not exists (select 1 from holdings c
+                     where c.source = 'chain' and c.handle = h.handle and c.network_id = h.network_id)`;
+
 async function healthBody(): Promise<Record<string, unknown>> {
   /** Exact counts throughout: SQLite has no planner estimate to substitute. See docs/DECISIONS.md#d063 */
   /** FOUR SEQUENTIAL AWAITS, DELIBERATELY. See docs/DECISIONS.md#d064 */
   const [c] = await sql`
     select (select count(*) from traders where listed = 1)       as traders,
            (select count(*) from traders where listed = 0)       as delisted,
-           (select count(*) from holdings_current)               as holdings,
+           (select count(*) from (${currentHoldings()}))         as holdings,
            (select count(*) from tokens)                         as tokens,
            (select count(*) from trades)                         as trades,
            -- SQLite has no planner row estimate, so transactions is now COUNTED like the
            -- rest; estimatedRows is empty because nothing on this route is an estimate.
            (select count(*) from transactions)                   as transactions,
            (select count(distinct handle) from wallets)          as wallets,
-           (select count(distinct captured_at) from holdings)    as generations`;
+           -- count(distinct captured_at), one index seek per capture time, not a walk of every row.
+           (with recursive g(at) as (
+              select max(captured_at) from holdings
+              union all
+              select (select max(captured_at) from holdings where captured_at < g.at) from g where g.at is not null)
+            select count(at) from g)                             as generations`;
   const [b] = await sql`
     select captured_at, window_label from builds order by captured_at desc limit 1`;
 
@@ -147,22 +169,25 @@ async function healthBody(): Promise<Record<string, unknown>> {
            (select max(at)          from aum_live)                        as aum_live_at,
            (select max(last_seen_at) from wallets)                       as wallets_at,
            (select count(*) from aum_history)                             as aum_rows,
-           (select count(distinct handle) from aum_history)               as aum_traders`;
+           -- count(distinct handle): aum_history.handle references traders, so one seek per trader.
+           (select count(*) from traders t
+             where exists (select 1 from aum_history a where a.handle = t.handle)) as aum_traders`;
   /** HOW MANY TRADERS ARE THEMSELVES STALE. See docs/DECISIONS.md#d066 */
   const [st] = await sql`
     with newest as (
       select handle, max(case when total_usd is not null then at end) as reading_at
       from aum_samples group by handle
     ), loads as (
-      select handle, max(captured_at) as scorecard_at from trades group by handle
+      -- One index-ordered maximum per trader; grouping walked every trade.
+      select t.handle, (select max(tr.captured_at) from trades tr where tr.handle = t.handle) as scorecard_at
+      from traders t
     ), live as (
       select handle, at from aum_live
     ), attempts as (
-      -- distinct on (handle) ... order by handle, attempted_at desc.
-      select handle, outcome from (
-        select handle, outcome,
-               row_number() over (partition by handle order by attempted_at desc) as rn
-        from trade_loads) where rn = 1
+      -- The newest attempt per trader, by seek; outcome is NOT NULL, so null means never attempted.
+      select t.handle, (select tl.outcome from trade_loads tl where tl.handle = t.handle
+                         order by tl.attempted_at desc limit 1) as outcome
+      from traders t
     )
     select
       -- A2 (v5 fixes): a trader nobody watched kept a six-hour-old live figure while
@@ -187,7 +212,7 @@ async function healthBody(): Promise<Record<string, unknown>> {
                   and t.source = 'fomoapi.io'
                   and a.outcome is not 'loaded' then 1 end)               as scorecard_load_failed,
       count(case when l.scorecard_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-72 hours')
-                  and t.source = 'fomoapi.io' and a.handle is null then 1 end)
+                  and t.source = 'fomoapi.io' and a.outcome is null then 1 end)
                                                                           as scorecard_never_attempted,
       -- extract(epoch from (now() - t)) / 3600.0 is a julianday difference in hours;
       -- the ::int rounded, so round() keeps the figure rather than truncating it.
@@ -204,13 +229,15 @@ async function healthBody(): Promise<Record<string, unknown>> {
     select count(*) as held,
            count(case when i.fetched_at is null then 1 end) as never_fetched,
            count(case when i.fetched_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-48 hours') then 1 end) as stale
-    from (select distinct network_id, token_key from holdings_current where human_amount > 0) h
+    from (select distinct network_id, token_key from (${currentHoldings()}) where human_amount > 0) h
     left join token_info i on i.network_id = h.network_id and i.token_key = h.token_key`;
 
   /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
   const [m] = await sql`
     select count(*) as traders,
-           (select count(distinct handle) from trades where status = 'closed')
+           -- count(distinct handle): one seek per trader; the unary + keeps the planner off trades_status_idx.
+           (select count(*) from traders t
+             where exists (select 1 from trades tr where tr.handle = t.handle and +tr.status = 'closed'))
              as measurable
     from traders`;
 
@@ -218,14 +245,17 @@ async function healthBody(): Promise<Record<string, unknown>> {
   const chainRows = await sql`
     /*
      * One grouped pass per block so each chain is one range on aum_chain_samples_net_at_idx
-     * (network_id, at desc) where basis = 'sampled'; the history counts come from
-     * trader_chain_history, the one definition knownChainsFor also reads, aggregated once
-     * for all chains. The two Postgres laterals became these joins.
+     * (network_id, at desc) where basis = 'sampled'. The history counts are trader_chain_history's
+     * rule (>= 2 valued chain samples ready, 1 warming, 0 none) over its three sources of evidence,
+     * written out because the view embeds holdings_current; the test named above holds them equal.
      */
     select c.name,
            coalesce(r.accepted_36h, 0) as accepted_36h,
            coalesce(r.failed_24h, 0)   as failed_24h,
-           a.newest_accepted_at,
+           -- The newest valued sample: an index-ordered maximum per chain, not a window over every sample.
+           (select max(s.at) from aum_chain_samples s
+             where s.network_id = c.network_id and s.basis = 'sampled' and s.total_usd is not null)
+                                       as newest_accepted_at,
            coalesce(h.ready, 0)        as hist_ready,
            coalesce(h.warming, 0)      as hist_warming,
            coalesce(h.none, 0)         as hist_none
@@ -241,17 +271,18 @@ async function healthBody(): Promise<Record<string, unknown>> {
         and s.at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-36 hours')
       group by s.network_id) r on r.network_id = c.network_id
     left join (
-      select s.network_id, s.at as newest_accepted_at,
-             row_number() over (partition by s.network_id order by s.at desc) as rn
-      from aum_chain_samples s
-      where s.basis = 'sampled' and s.total_usd is not null) a
-      on a.network_id = c.network_id and a.rn = 1
-    left join (
       select network_id,
-             count(case when history_state = 'ready'   then 1 end) as ready,
-             count(case when history_state = 'warming' then 1 end) as warming,
-             count(case when history_state = 'none'    then 1 end) as none
-      from trader_chain_history group by network_id) h on h.network_id = c.network_id
+             count(case when points >= 2 then 1 end) as ready,
+             count(case when points = 1  then 1 end) as warming,
+             count(case when points = 0  then 1 end) as none
+      from (select e.handle, e.network_id, sum(e.points) as points
+            from (select distinct handle, network_id, 0 as points from trades not indexed
+                  union all
+                  select handle, network_id, 0 from (${currentHoldings()}) where human_amount > 0
+                  union all
+                  select handle, network_id, 1 from aum_chain_samples where total_usd is not null) e
+            group by e.handle, e.network_id)
+      group by network_id) h on h.network_id = c.network_id
     order by c.name`;
   const histOf = (r: Record<string, unknown>) => ({
     ready: Number(r.hist_ready), warming: Number(r.hist_warming), none: Number(r.hist_none),
