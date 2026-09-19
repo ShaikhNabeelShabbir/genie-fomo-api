@@ -24,7 +24,19 @@ export function ttlCache<T>(ttlMs: number): Cache<T> {
   return async (key: string, build: () => Promise<T>): Promise<T> => {
     const hit = slots.get(key);
     if (hit && Date.now() - hit.at < ttlMs) return hit.body;
-    const body = await build();
+    let body: T;
+    try {
+      body = await build();
+    } catch (e) {
+      /*
+       * A database that cannot rebuild the answer must not take away the one we have: an expired
+       * body is still the newest truth this isolate knows, and its own timestamps say how old it is
+       * (consumer ask, 18 Sep 2026: "keep it serving while the database is down").
+       */
+      if (!hit) throw e;
+      console.error(`cache: ${key} could not be rebuilt (${e instanceof Error ? e.message.slice(0, 120) : String(e)}); serving the answer from ${Math.round((Date.now() - hit.at) / 1000)} s ago`);
+      return hit.body;
+    }
     /* Oldest out first: insertion order is Map's, and a refreshed key is deleted before it is set. */
     slots.delete(key);
     if (slots.size >= MAX_SLOTS) slots.delete(slots.keys().next().value as string);

@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import { ttlCache, urlKey } from "../supabase/functions/api/shared/cache.ts";
 
 Deno.test("ttlCache: one build per key inside the TTL", async () => {
@@ -38,4 +38,16 @@ Deno.test("urlKey: parameter order cannot miss a hit", () => {
   assertEquals(urlKey(new URL("https://x/v2/tokens")), "/v2/tokens?");
   /* A different path is a different answer, whatever the query. */
   assertEquals(urlKey(new URL("https://x/v2/tokens/momentum?a=1")), "/v2/tokens/momentum?a=1");
+});
+
+Deno.test("ttlCache: when the rebuild fails, the expired answer is served; with nothing to serve, the failure is the answer", async () => {
+  const cache = ttlCache<string>(0); // every call is a miss
+  const original = console.error;
+  console.error = () => undefined;
+  try {
+    assertEquals(await cache("k", () => Promise.resolve("first")), "first");
+    assertEquals(await cache("k", () => Promise.reject(new Error("D1_ERROR: D1 DB is overloaded"))), "first");
+    assertEquals(await cache("k", () => Promise.resolve("second")), "second");
+    await assertRejects(() => cache("never-built", () => Promise.reject(new Error("down"))), Error, "down");
+  } finally { console.error = original; }
 });
