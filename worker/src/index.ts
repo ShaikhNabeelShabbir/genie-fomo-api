@@ -60,7 +60,8 @@ async function runJob(req: Request, env: Env): Promise<Response> {
   if (!env.DB) return Response.json({ error: "the D1 binding DB is not configured" }, { status: 503 });
   const url = new URL(req.url);
   const name = url.pathname.slice("/jobs/".length);
-  const job = JOB_BY_NAME[name];
+  // Own names only: `constructor` resolved through the prototype to Object, which returned `env` — every secret, as the summary.
+  const job = Object.hasOwn(JOB_BY_NAME, name) ? JOB_BY_NAME[name] : undefined;
   if (!job) return Response.json({ error: `no job '${name}'`, jobs: Object.keys(JOB_BY_NAME) }, { status: 404 });
   const asked = Number(url.searchParams.get("budgetMs") ?? env.JOB_BUDGET_MS ?? MAX_BUDGET_MS);
   const budgetMs = Math.min(MAX_BUDGET_MS, Number.isFinite(asked) && asked > 0 ? asked : MAX_BUDGET_MS);
@@ -93,7 +94,7 @@ export default {
    */
   async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     if (!env.DB) { console.log("cron: the D1 binding DB is not configured, nothing to do"); return; }
-    const job = JOBS[event.cron];
+    const job = Object.hasOwn(JOBS, event.cron) ? JOBS[event.cron] : undefined;
     if (!job) throw new Error(`no job for cron '${event.cron}'`);
     const budgetMs = Number(env.JOB_BUDGET_MS ?? 600_000);
     console.log(`${job.name}:`, await job(env, budgetMs));
