@@ -2,6 +2,7 @@ import { sql, n, round } from "../db.ts";
 import { get } from "../router.ts";
 import { ttlCache } from "../shared/cache.ts";
 import { money } from "../shared/format.ts";
+import { currentHoldings } from "../../_shared/current_holdings.ts";
 
 /** The same answer for every caller, and it moves with the balance sweep: one caller a minute pays (4.6 s measured, 19 Sep). */
 const chainsCache = ttlCache<unknown>(60_000);
@@ -11,27 +12,10 @@ const chainsCache = ttlCache<unknown>(60_000);
 get("/v1/chains", () => chainsCache("chains", async () => {
   /*
    * holdings_current, read ONCE (it was three passes: the rows, their count, their newest capture)
-   * and with its chain half driven per (trader, chain), so the newest capture is a seek rather
-   * than a read of every capture kept. Every holding names a trader and, through its token, a
-   * chain (foreign keys), so no row is lost; tests/plans_aum-misc_test.ts holds it to the view.
+   * and through currentHoldings, which drives the chain half per (trader, chain): the newest capture
+   * is a seek rather than a read of every capture kept. tests/plans_aum-misc_test.ts holds it to the view.
    */
   const rows = await sql`
-    with cur as (
-      select h.handle, h.network_id, h.token_key, h.value, h.captured_at
-        from traders t cross join chains n cross join holdings h
-       where h.source = 'chain' and h.handle = t.handle and h.network_id = n.network_id
-         and h.captured_at = (select max(h2.captured_at) from holdings h2
-                               where h2.source = 'chain' and h2.handle = t.handle
-                                 and h2.network_id = n.network_id)
-      union all
-      select h.handle, h.network_id, h.token_key, h.value, h.captured_at
-        from holdings h
-       where h.source = 'fomo'
-         and h.captured_at = (select captured_at from latest_capture)
-         and not exists (select 1 from holdings c
-                          where c.source = 'chain' and c.handle = h.handle
-                            and c.network_id = h.network_id)
-    )
     select c.network_id, c.name, c.history_provider,
            count(*)                                       as positions,
            count(distinct cur.handle)                     as traders,
@@ -40,7 +24,7 @@ get("/v1/chains", () => chainsCache("chains", async () => {
            count(case when cur.value > 0 then cur.value end) as priced,
            sum(case when cur.value > 0 then cur.value end)   as total_value,
            max(cur.captured_at)                           as newest
-    from cur
+    from ${currentHoldings(sql)} cur
     cross join chains c on c.network_id = cur.network_id
     left join quote_assets q on q.network_id = cur.network_id and q.token_key = cur.token_key
     group by c.network_id, c.name, c.history_provider
