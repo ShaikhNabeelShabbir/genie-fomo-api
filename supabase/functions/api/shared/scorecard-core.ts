@@ -8,13 +8,15 @@ import { NativePrice } from "../shared/prices.ts";
 /**
  * T1. The newest `trade_loads` row per trader, as the two columns `scorecardBody` reads
  * (`load_attempted_at`, `load_outcome`). Join after `from traders t`; select those two by
- * name — the derived table also carries `handle` and `rn`, so `ld.*` would clobber `handle`.
+ * name — the derived table also carries `handle`, so `ld.*` would clobber `handle`.
+ * A correlated maximum on (handle, attempted_at): two seeks per trader, where the row_number()
+ * window it replaces read all of trade_loads on every call.
  */
 export const latestLoad = () => sql`
   left join (
-    select handle, attempted_at as load_attempted_at, outcome as load_outcome,
-           row_number() over (partition by handle order by attempted_at desc) as rn
-    from trade_loads) ld on ld.handle = t.handle and ld.rn = 1`;
+    select handle, attempted_at as load_attempted_at, outcome as load_outcome
+    from trade_loads) ld on ld.handle = t.handle
+   and ld.load_attempted_at = (select max(attempted_at) from trade_loads where handle = t.handle)`;
 
 /**
  * The trade rows a scorecard is computed from. One statement, so the bulk route can ask for
@@ -421,17 +423,28 @@ export const START_CAPITAL_WINDOW_DAYS = 7;
 export async function monthStartCapital(handles: string[]): Promise<Map<string, Map<string, number>>> {
   const out = new Map<string, Map<string, number>>();
   if (!handles.length) return out;
+  /*
+   * Each trader's months are walked by seeks (his first valued sample, then the first on or after
+   * the next month's start), where a row_number() window read and sorted every sample of every
+   * trader on the page. Only the asked traders' rows are read; rowid breaks a (handle, at) tie
+   * between the two bases the way the window did; union, not union all, so a walk cannot loop.
+   */
   const rows = await sql`
-    select handle, month, total_usd, day_of_month from (
-      select handle,
-             strftime('%Y-%m', at) as month,
-             total_usd,
-             cast(strftime('%d', at) as integer) as day_of_month,
-             row_number() over (
-               partition by handle, strftime('%Y-%m', at) order by at asc) as rn
-      from aum_samples
-      where handle in (${handles}) and total_usd is not null)
-    where rn = 1
+    with recursive starts(handle, at) as (
+      select p.value, (select min(f.at) from aum_samples f
+                        where f.handle = p.value and f.total_usd is not null)
+      from json_each(${JSON.stringify(handles)}) p
+      union
+      select handle, (select min(f.at) from aum_samples f
+                       where f.handle = starts.handle and f.total_usd is not null
+                         and f.at >= date(starts.at, 'start of month', '+1 month'))
+      from starts where at is not null)
+    select handle, strftime('%Y-%m', at) as month,
+           cast(strftime('%d', at) as integer) as day_of_month,
+           (select s.total_usd from aum_samples s
+             where s.handle = starts.handle and s.at = starts.at and s.total_usd is not null
+             order by s.rowid limit 1) as total_usd
+    from starts where at is not null
     order by handle, month`;
   for (const r of rows) {
     if (Number(r.day_of_month) > START_CAPITAL_WINDOW_DAYS) continue;

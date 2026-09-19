@@ -34,9 +34,10 @@ get("/v1/traders/:handle/scorecard", async ({ handle }, url) => {
     nativePrices().then((nat) => feesFor([h], nat)),
     /** T3. Swap-shaped groups in `transactions` — the denominator of `onChain.coverage`. */
     addrs.length
+      // The unary + keeps the planner off transactions_type_idx, which reads every wallet's swaps to count one's.
       ? sql`select count(*) as n from (
               select network_id, tx_hash from transactions
-              where address_key in (${addrs}) and tx_type = 'SWAP'
+              where address_key in (${addrs}) and +tx_type = 'SWAP'
               group by network_id, tx_hash) g`
       : Promise.resolve([{ n: 0 }]),
     monthStartCapital([h]),
@@ -90,9 +91,10 @@ get("/v1/traders/:handle/pnl", async ({ handle }) => {
     addrs.length ? chainPnl(addrs) : Promise.resolve([undefined]),
     addrs.length ? chainRoundTrips(addrs) : Promise.resolve([undefined]),
     addrs.length
+      // The unary + on both leaves only address_key to seek on: the primary key led with network_id and read the whole chain.
       ? sql`select count(*) as n from (
               select tx_hash from transactions
-               where network_id = 1399811149 and tx_type = 'SWAP'
+               where +network_id = 1399811149 and +tx_type = 'SWAP'
                  and address_key in (${addrs}) group by tx_hash) x`
       : Promise.resolve([{ n: 0 }]),
   ]);

@@ -106,7 +106,8 @@ get("/v1/traders", async (_p, url) => {
     ? sql`s.followers`
     : sql`s.captured_at`;
 
-  const rows = await sql`
+  /* The build row is independent of the list, so the two share one round trip. */
+  const [rows, [{ window_label, captured }]] = await Promise.all([sql`
     select t.handle, t.id, t.display_handle, t.name, t.avatar, t.last_seen_at, t.source,
            s.rank, s.pnl_usd, s.volume_usd, s.followers, s.trade_count, s.captured_at,
            ld.load_attempted_at, ld.load_outcome,
@@ -117,7 +118,13 @@ get("/v1/traders", async (_p, url) => {
              else 2
            end as score
     from traders t
-    left join trader_stats_current s using (handle) ${latestLoad()}
+    -- The newest stats row by two seeks on (handle, captured_at): joined to every trader, the
+    -- trader_stats_current view windows all of trader_stats before the join can narrow it.
+    -- The unary + keeps traders the outer loop: a range filter on s makes this an inner join,
+    -- which the planner would otherwise drive from a scan of trader_stats.
+    left join trader_stats s on s.handle = +t.handle
+     and s.captured_at = (select max(captured_at) from trader_stats where handle = t.handle)
+    ${latestLoad()}
     where (${includeDelisted} or t.listed)
       and (${q} = '' or lower(t.display_handle) like ${"%" + q + "%"}
                      or lower(coalesce(t.name,'')) like ${"%" + q + "%"})
@@ -136,11 +143,9 @@ get("/v1/traders", async (_p, url) => {
     -- order within that block was whatever the planner produced, which meant an offset
     -- could already skip or repeat rows across two calls. A cursor over a non-total order
     -- would do the same thing silently, so it stays on the end of EVERY sort, unreversed.
-    order by score, ${sortCol} ${dir} nulls last, t.handle`;
-
-  const [{ window_label, captured }] = await sql`
+    order by score, ${sortCol} ${dir} nulls last, t.handle`, sql`
     select window_label, cast(strftime('%s', captured_at) as integer) as captured
-    from builds order by captured_at desc limit 1`;
+    from builds order by captured_at desc limit 1`]);
 
   /** A range filter over a nullable column drops rows where the value is UNKNOWN, not just rows… See docs/DECISIONS.md#d095 */
   const anyFilter = [minPnl, maxPnl, minVolume, maxVolume, minTrades, minFollowers]
@@ -149,7 +154,7 @@ get("/v1/traders", async (_p, url) => {
     ? Number(
       (await sql`
         select count(*) as n from traders t
-        left join trader_stats_current s using (handle) where s.handle is null`)[0].n,
+        where not exists (select 1 from trader_stats s where s.handle = t.handle)`)[0].n,
     )
     : 0;
 
@@ -180,7 +185,8 @@ get("/v1/traders", async (_p, url) => {
    */
   const handles = page.map((r: Record<string, unknown>) => r.handle as string);
   const wantsScorecard = include.includes("scorecard");
-  const [pnlRows, scRows, wRows, trRows, swapBy] = handles.length
+  /* Every read below is independent of the others, so they overlap: each awaited alone cost a round trip to D1. */
+  const [pnlRows, scRows, wRows, trRows, swapBy, holdingsAsOf, knownChainsBy, feesBy, startCapBy] = handles.length
     ? await Promise.all([
       include.includes("pnl") ? pnlAgg(handles) : Promise.resolve([]),
       wantsScorecard ? scorecardRows(handles) : Promise.resolve([]),
@@ -189,11 +195,17 @@ get("/v1/traders", async (_p, url) => {
       // Axes 5 and 2. One query for every swap on the page, from which the entry price, the
       // exit P&L and the individual buys are all derived -- see `swapsFor`.
       wantsScorecard ? swapsFor(handles) : Promise.resolve(new Map<string, Swap[]>()),
+      // One global value shared by every trader's trust block, fetched once.
+      include.includes("trust") ? asOfHoldings() : Promise.resolve(null),
+      /** One query for the page, not one per trader — same rule as every other include. */
+      include.includes("wallets") ? knownChainsFor(handles) : Promise.resolve(new Map<string, KnownChain[]>()),
+      /** Same rule for fees: one read of the daily buckets for the whole page. */
+      wantsScorecard ? nativePrices().then((nat) => feesFor(handles, nat)) : Promise.resolve(new Map<string, FeeWindows>()),
+      /** Month-start balances for the whole page in ONE query, not one per trader. */
+      wantsScorecard ? monthStartCapital(handles) : Promise.resolve(new Map<string, Map<string, number>>()),
     ])
-    : [[], [], [], [], new Map<string, Swap[]>()];
-
-  // One global value shared by every trader's trust block, fetched once.
-  const holdingsAsOf = include.includes("trust") ? await asOfHoldings() : null;
+    : [[], [], [], [], new Map<string, Swap[]>(), null, new Map<string, KnownChain[]>(),
+      new Map<string, FeeWindows>(), new Map<string, Map<string, number>>()];
 
   // deno-lint-ignore no-explicit-any
   const byHandle = <T extends { handle: unknown }>(list: T[]) => {
@@ -211,14 +223,6 @@ get("/v1/traders", async (_p, url) => {
   const scBy = byHandle(scRows as any[]);
   // deno-lint-ignore no-explicit-any
   const wBy = byHandle(wRows as any[]);
-  /** One query for the page, not one per trader — same rule as every other include. */
-  const knownChainsBy = include.includes("wallets")
-    ? await knownChainsFor(page.map((r: Record<string, unknown>) => String(r.handle)))
-    : new Map<string, KnownChain[]>();
-  /** Same rule for fees: one read of the daily buckets for the whole page. */
-  const feesBy = include.includes("scorecard")
-    ? await nativePrices().then((nat) => feesFor(page.map((r: Record<string, unknown>) => String(r.handle)), nat))
-    : new Map<string, FeeWindows>();
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
   /** A requested include that produced NOTHING is a failure, not an empty truth. See docs/DECISIONS.md#d097 */
@@ -260,14 +264,6 @@ get("/v1/traders", async (_p, url) => {
     }
     return out;
   };
-
-  /*
-   * Month-start balances for the whole page in ONE query, not one per trader — the same rule
-   * every other include here follows.
-   */
-  const startCapBy = include.includes("scorecard")
-    ? await monthStartCapital(page.map((r: Record<string, unknown>) => String(r.handle)))
-    : new Map<string, Map<string, number>>();
 
   const extras = include.length ? await Promise.all(page.map(attach)) : [];
 
