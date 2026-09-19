@@ -3,7 +3,7 @@ import { jobSql, type Sql } from "../sql";
 import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { REFUSALS_IN_A_ROW } from "../../../supabase/functions/_shared/settings.ts";
 import {
-  ADDRESSES_PER_CALL, athUpdate, bestPairs, fetchPairs, isRefusal, rankedBatches, type Ath, type BestPair,
+  ADDRESSES_PER_CALL, REFUSAL_PAUSE_MS, afterRefusal, athUpdate, bestPairs, fetchPairs, isRefusal, rankedBatches, type Ath, type BestPair,
 } from "../../../supabase/functions/_shared/dexscreener.ts";
 
 /**
@@ -131,7 +131,7 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
   try {
     const list = await targets(sql);
     const hour = new Date(Math.floor(started / 3_600_000) * 3_600_000).toISOString();
-    let priced = 0, done = 0, attempted = 0, failedBatches = 0, stoppedEarly = false, refusedInARow = 0;
+    let priced = 0, done = 0, attempted = 0, failedBatches = 0, stoppedEarly = false, refusedInARow = 0, pauses = 0;
     for (const chunk of rankedBatches(list, ADDRESSES_PER_CALL)) {
       if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
       attempted += 1;
@@ -145,11 +145,23 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
         // 1,027 of 1,052 batches were refused with 429 every hour from 17 Sep 12:00 UTC, each one
         // asked anyway: a thousand error lines an hour, and a ban that never had a quiet hour to lapse in.
         refusedInARow = isRefusal(message) ? refusedInARow + 1 : 0;
-        if (refusedInARow >= REFUSALS_IN_A_ROW) {
-          console.error(`prices: DexScreener refused ${refusedInARow} batches in a row; leaving the rest of this hour`);
+        /*
+         * Wait and try again before giving the hour up (19 Sep 2026): stopping at the first run of
+         * refusals lost 12:17 and 13:17 whole, and a price older than 24 h now prices nothing, so a
+         * day of lost hours would blank every position. At most 20 refused calls an hour this way.
+         */
+        const next = afterRefusal(refusedInARow, pauses, REFUSALS_IN_A_ROW);
+        if (next === "stop" || (next === "pause" && Date.now() - started + REFUSAL_PAUSE_MS > budgetMs)) {
+          console.error(`prices: DexScreener refused ${refusedInARow} batches in a row after ${pauses} wait(s); leaving the rest of this hour`);
           stoppedEarly = true;
           done += chunk.length;
           break;
+        }
+        if (next === "pause") {
+          pauses += 1;
+          refusedInARow = 0;
+          console.warn(`prices: DexScreener refused ${REFUSALS_IN_A_ROW} batches in a row; waiting ${REFUSAL_PAUSE_MS / 1000} s (wait ${pauses})`);
+          await new Promise((r) => setTimeout(r, REFUSAL_PAUSE_MS));
         }
       }
       done += chunk.length;

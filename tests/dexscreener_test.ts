@@ -83,3 +83,11 @@ Deno.test("rankedBatches: never mixes chains, and the most-held coin of EVERY ch
   assertEquals(rankedBatches([], 30), []);
   assertEquals([isRefusal("dexscreener HTTP 429"), isRefusal("dexscreener HTTP 403"), isRefusal("dexscreener HTTP 500"), isRefusal("dexscreener answered a non-array")], [true, true, false, false]);
 });
+
+Deno.test("afterRefusal: a run of refusals earns a wait, three waits an hour, then the hour is left", async () => {
+  const { afterRefusal, REFUSAL_PAUSES_PER_RUN } = await import("../supabase/functions/_shared/dexscreener.ts");
+  assertEquals(afterRefusal(4, 0, 5), "continue");
+  assertEquals(afterRefusal(5, 0, 5), "pause");
+  assertEquals(afterRefusal(5, REFUSAL_PAUSES_PER_RUN - 1, 5), "pause");
+  assertEquals(afterRefusal(5, REFUSAL_PAUSES_PER_RUN, 5), "stop");
+});

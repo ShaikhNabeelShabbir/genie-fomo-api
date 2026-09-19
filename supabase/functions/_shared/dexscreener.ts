@@ -67,7 +67,11 @@ export async function fetchPairs(chain: string, addresses: readonly string[]): P
   const url = `${DEXSCREENER}/${chain}/${addresses.join(",")}`;
   return throttled(url, async () => {
     const r = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(30_000) });
-    if (!r.ok) throw new Error(`dexscreener HTTP ${r.status}`);
+    // What they SAY when they refuse: for two days we knew only "429", not whether it named a wait.
+    if (!r.ok) {
+      const said = (await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 80);
+      throw new Error(`dexscreener HTTP ${r.status} (retry-after: ${r.headers.get("retry-after") ?? "none"}; ${said || "no body"})`);
+    }
     const j: unknown = await r.json();
     if (!Array.isArray(j)) throw new Error("dexscreener answered a non-array");
     return j as DexPair[];
@@ -88,4 +92,14 @@ export function rankedBatches<T extends { readonly chain: string }>(ranked: read
   return [...byChain.values()]
     .flatMap((tokens) => Array.from({ length: Math.ceil(tokens.length / size) }, (_, i) => tokens.slice(i * size, (i + 1) * size)))
     .sort((a, b) => (rank.get(a[0]) ?? 0) - (rank.get(b[0]) ?? 0));
+}
+
+/** After a run of refusals the prices job waits this long and tries again, at most this many times an hour. */
+export const REFUSAL_PAUSE_MS = 60_000;
+export const REFUSAL_PAUSES_PER_RUN = 3;
+
+/** What to do after a batch was refused: go on, wait and go on, or leave the hour. Pure, so the rule is testable. */
+export function afterRefusal(refusedInARow: number, pausesTaken: number, limit: number): "continue" | "pause" | "stop" {
+  if (refusedInARow < limit) return "continue";
+  return pausesTaken < REFUSAL_PAUSES_PER_RUN ? "pause" : "stop";
 }
