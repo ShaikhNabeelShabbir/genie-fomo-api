@@ -2,7 +2,8 @@ import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { rpc, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bondingCurveAddress, decodeCurve, type Curve } from "../../../supabase/functions/_shared/pumpfun.ts";
-import { accountData, fromBase64, rpcError, signatures } from "./launches-core";
+import { type Target, accountData, fromBase64, launchTargets, rpcError, signatures } from "./launches-core";
+import { deadSources } from "./quote_prices-core";
 
 /**
  * Nightly launch metadata and dev ledger, the Worker half of refresh.yml steps 6d
@@ -15,7 +16,6 @@ import { accountData, fromBase64, rpcError, signatures } from "./launches-core";
  * fails is counted rather than fatal, and no `--dry-run`/`--limit`/`--token` flags.
  */
 
-interface Target { readonly address: string; readonly token_key: string; readonly created_at: string | null }
 interface Launch extends Curve { readonly curve: string }
 
 // ponytail: 20 pages = 20,000 signatures, the deepest curve history measured (31 s).
@@ -75,26 +75,6 @@ const CREATORS = `
   from per_token p
   join best b on b.network_id = p.network_id and b.creator_address_key = p.creator_address_key
   group by p.network_id, p.creator_address_key, b.ath_mc, b.ath_token_key`;
-
-/**
- * Held or recently traded Solana tokens, unread or ungraduated; stalest first (ascending
- * already puts a never-read token first in SQLite). The two `exists` became joins over one
- * distinct pass each: D1 runs a statement at a time, and holdings_current is a view no
- * correlated per-token scan can afford.
- */
-const targets = (sql: Sql) => sql<Target[]>`
-  select tk.address, tk.token_key, tk.created_at
-    from tokens tk
-    left join (select distinct network_id, token_key from holdings_current) h
-      on h.network_id = tk.network_id and h.token_key = tk.token_key
-    left join (select distinct network_id, token_key from transactions
-                where network_id = ${SOLANA_NETWORK_ID}
-                  and block_time > strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days')) t
-      on t.network_id = tk.network_id and t.token_key = tk.token_key
-   where tk.network_id = ${SOLANA_NETWORK_ID}
-     and (tk.launch_read_at is null or tk.graduated = 0)
-     and (h.token_key is not null or t.token_key is not null)
-   order by tk.launch_read_at, tk.address`;
 
 async function readCurve(url: string, mint: string): Promise<Launch | null> {
   const curve = await bondingCurveAddress(mint);
@@ -165,7 +145,8 @@ async function refreshCreators(sql: Sql): Promise<number> {
 
 /**
  * Phase 1 reads curves until `budgetMs - CREATORS_RESERVE_MS`; phase 2 rebuilds the dev ledger
- * in what is left. Throws only when nothing at all could be written, so the cron shows as failed.
+ * in what is left. Throws when either was tried and wrote nothing, so the cron shows as failed:
+ * judged together, a creators rebuild that always works kept every refused curve read green.
  */
 export async function runLaunches(env: Env, budgetMs: number): Promise<LaunchesSummary> {
   const started = Date.now();
@@ -174,7 +155,7 @@ export async function runLaunches(env: Env, budgetMs: number): Promise<LaunchesS
   const url = `https://mainnet.helius-rpc.com/?api-key=${helius}`;
   const sql = jobSql(env);
   try {
-    const list = await targets(sql);
+    const list = await launchTargets(sql, SOLANA_NETWORK_ID);
     let launchesRefreshed = 0, curvesRead = 0, errored = 0, attempted = 0, stoppedEarly = false;
     for (const t of list) {
       if (Date.now() - started > budgetMs - CREATORS_RESERVE_MS) { stoppedEarly = true; break; }
@@ -187,21 +168,22 @@ export async function runLaunches(env: Env, budgetMs: number): Promise<LaunchesS
         console.error(`launches: ${t.address} read failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    let creatorsRefreshed = 0, creatorsOk = false;
+    const curves = { asked: attempted, failed: errored }, creators = { asked: 0, failed: 0 };
+    let creatorsRefreshed = 0;
     if (Date.now() - started > budgetMs) {
       stoppedEarly = true;
     } else {
+      creators.asked = 1;
       try {
         creatorsRefreshed = await refreshCreators(sql);
-        creatorsOk = true;
       } catch (e) {
+        creators.failed = 1;
         errored += 1;
         console.error(`launches: creators rebuild failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    if (launchesRefreshed === 0 && !creatorsOk && (attempted > 0 || !stoppedEarly)) {
-      throw new Error(`launches: nothing written (${errored} failure(s) over ${attempted} token(s) and the creators rebuild)`);
-    }
+    const dead = deadSources({ "the Helius curve reads": curves, "the creators rebuild": creators });
+    if (dead.length) throw new Error(`launches: ${dead.join(" and ")} wrote nothing (${errored} failure(s) over ${attempted} token(s))`);
     return { launchesRefreshed, curvesRead, creatorsRefreshed, errored, remaining: list.length - attempted, stoppedEarly, elapsedMs: Date.now() - started };
   } finally {
     await sql.end({ timeout: 5 });

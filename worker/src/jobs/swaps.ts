@@ -2,9 +2,10 @@ import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { SOLANA_NETWORK_ID, throttled } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
-import { EVM_CHAINS } from "../../../supabase/functions/_shared/settings.ts";
-import { type NativeQuote, type Quote, type SwapRow, type Trade, decode, solanaDecodeEnhanced, toRow } from "./swaps-core";
+import { EVM_CHAINS, REFUSALS_IN_A_ROW } from "../../../supabase/functions/_shared/settings.ts";
+import { type ChainCounts, type NativeQuote, type Quote, type SwapRow, type Trade, decode, drainSlices, settledBy, solanaDecodeEnhanced, toRow } from "./swaps-core";
 import { chunk } from "./directory-core";
+import { deadSources, type Tally } from "./quote_prices-core";
 
 /**
  * A4, the wallet's OWN two-sided swaps, written to `wallet_swaps`. Phase 1 is the EVM chains
@@ -15,9 +16,10 @@ import { chunk } from "./directory-core";
  * behind the ~2,000 SWAP rows an hour the webhook writes). Same decode and pricing rules
  * (`swaps-core.ts`), same insert. Candidates are read
  * newest first with a cap per run, so every run reaches the head of the feed and the backlog
- * drains from there; each candidate asked is marked in `wallet_swaps_checked` whether or not
- * it was a swap (95% are not), so the next run asks the next slice. A failed batch is counted
- * and its transactions stay unmarked for the next run. The run ends with a re-price pass over
+ * drains from there; each candidate the source answered for is marked in `wallet_swaps_checked`
+ * whether or not it was a swap (95% are not), so the next run asks the next slice. A failed batch
+ * is counted and its transactions stay unmarked for the next run, as does a recent signature
+ * Helius left out of its reply. The run ends with a re-price pass over
  * the last 30 days for rows whose money leg got a daily close after they were written.
  */
 
@@ -36,15 +38,14 @@ interface Ctx {
   readonly wrapped: NativeQuote | null;
 }
 
-export interface ChainCounts { resolved: number; unresolved: number; failed: number; queries: number }
 export interface SwapsSummary {
-  /** Per chain name: swaps written, transactions read but not one two-token trade, transactions in failed batches, source calls (Helius batches on solana, Bitquery queries elsewhere). */
+  /** Per chain name: swaps written, transactions read but not one two-token trade, transactions the source left out of its reply, transactions in failed batches, source calls (Helius batches on solana, Bitquery queries elsewhere). */
   readonly perChain: Record<string, ChainCounts>;
   /** Bitquery queries sent across the EVM chains. */
   readonly bitqueryQueries: number;
   /** Rows valued by the re-price pass (a daily close arrived after the row was written). */
   readonly repriced: number;
-  /** Candidate transactions never asked because the budget ran out. */
+  /** Candidate transactions never asked because the budget ran out or the source kept failing. */
   readonly remaining: number;
   readonly stoppedEarly: boolean;
   readonly elapsedMs: number;
@@ -67,6 +68,8 @@ const CAND_PAGE = 2000;
 const SWAP_WRITE_CHUNK = 9;
 /** Rows per `wallet_swaps_checked` insert: 3 columns x 30 rows = 90 parameters. */
 const CHECKED_WRITE_CHUNK = 30;
+/** How long a Solana transaction Helius left out of a reply is asked again before it is filed as not a swap. */
+const UNANSWERED_RETRY_MS = 86_400_000;
 
 /** Quote assets, keyed `network_id:token_key`, with the three prices `priceQuote` chooses from. */
 async function loadQuotes(sql: Sql): Promise<Map<string, Quote>> {
@@ -197,9 +200,11 @@ async function solanaTxs(url: string, hashes: readonly string[]): Promise<Map<st
   return out;
 }
 
-/** ONE HELIUS PARSE REQUEST: the wallet's net legs per transaction, priced, written, marked. Returns [resolved, not the wallet's own two-sided swap]. */
-async function resolveSolanaBatch(sql: Sql, url: string, quotes: ReadonlyMap<string, Quote>, slice: readonly Cand[]): Promise<[number, number]> {
+/** ONE HELIUS PARSE REQUEST: the wallet's net legs per transaction, priced, written, marked. Returns [resolved, not the wallet's own two-sided swap, left out of the reply]. */
+async function resolveSolanaBatch(sql: Sql, url: string, quotes: ReadonlyMap<string, Quote>, slice: readonly Cand[]): Promise<[number, number, number]> {
   const txs = await solanaTxs(url, [...new Set(slice.map((c) => c.tx_hash))]);
+  /* First: it throws on a reply holding none of the signatures, which is a refusal, not 100 answers. */
+  const settled = settledBy(slice, txs, new Date(Date.now() - UNANSWERED_RETRY_MS).toISOString());
   const out: Priced[] = [];
   for (const cand of slice) {
     const d = solanaDecodeEnhanced(txs.get(cand.tx_hash), cand.address_key);
@@ -207,8 +212,8 @@ async function resolveSolanaBatch(sql: Sql, url: string, quotes: ReadonlyMap<str
     if (row) out.push({ cand, row });
   }
   if (out.length) await writeRows(sql, SOLANA_NETWORK_ID, out);
-  await markChecked(sql, SOLANA_NETWORK_ID, slice);
-  return [out.length, slice.length - out.length];
+  await markChecked(sql, SOLANA_NETWORK_ID, settled);
+  return [out.length, settled.length - out.length, slice.length - settled.length];
 }
 
 /**
@@ -247,8 +252,8 @@ async function tradesByHash(ctx: Ctx, hashes: readonly string[]): Promise<Map<st
   return out;
 }
 
-/** ONE QUERY PER BATCH: Bitquery's decoded trades, netted per wallet, priced, written, marked. Returns [resolved, not a two-token trade]. */
-async function resolveBatch(ctx: Ctx, slice: readonly Cand[]): Promise<[number, number]> {
+/** ONE QUERY PER BATCH: Bitquery's decoded trades, netted per wallet, priced, written, marked. Returns [resolved, not a two-token trade, 0: a hash with no trade IS the answer here]. */
+async function resolveBatch(ctx: Ctx, slice: readonly Cand[]): Promise<[number, number, number]> {
   const trades = await tradesByHash(ctx, [...new Set(slice.map((c) => c.tx_hash))]);
   const out: Priced[] = [];
   for (const cand of slice) {
@@ -258,7 +263,7 @@ async function resolveBatch(ctx: Ctx, slice: readonly Cand[]): Promise<[number, 
   }
   if (out.length) await writeRows(ctx.sql, ctx.net, out);
   await markChecked(ctx.sql, ctx.net, slice);
-  return [out.length, slice.length - out.length];
+  return [out.length, slice.length - out.length, 0];
 }
 
 /**
@@ -297,8 +302,9 @@ function networkWord(c: Chain): string {
 
 /**
  * One pass, Solana then every EVM chain, over the newest unresolved transactions within
- * `budgetMs`, then the re-price pass. Throws only when batches were attempted and every one
- * failed, so the cron shows as failed.
+ * `budgetMs`, then the re-price pass. Throws when a CHAIN was sent batches and every one failed,
+ * so the cron shows as failed: counted together, one Bitquery answer kept 30 refused Helius
+ * batches green, and one EVM chain's answers would hide a chain Bitquery refuses.
  */
 export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary> {
   const started = Date.now();
@@ -309,27 +315,17 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
   const heliusUrl = `https://api.helius.xyz/v0/transactions?api-key=${helius}`;
   const sql = jobSql(env);
   const perChain: Record<string, ChainCounts> = {};
-  let remaining = 0, stoppedEarly = false, attempted = 0, failedBatches = 0, bitqueryQueries = 0;
-  /** Slices of one chain's candidates through `resolve`, within the budget; bookkeeping is the same for both sources. */
-  const drain = async (name: string, cands: readonly Cand[], batch: number, resolve: (slice: readonly Cand[]) => Promise<[number, number]>): Promise<ChainCounts> => {
-    const counts: ChainCounts = { resolved: 0, unresolved: 0, failed: 0, queries: 0 };
-    perChain[name] = counts;
-    let i = 0;
-    for (; i < cands.length; i += batch) {
-      if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
-      const slice = cands.slice(i, i + batch);
-      attempted += 1;
-      counts.queries += 1;
-      try {
-        const [resolved, unresolved] = await resolve(slice);
-        counts.resolved += resolved; counts.unresolved += unresolved;
-      } catch (e) {
-        failedBatches += 1; counts.failed += slice.length;
-        console.error(`swaps: ${name} batch ${i / batch + 1} of ${slice.length} failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
-    remaining += Math.max(0, cands.length - i);
-    return counts;
+  let remaining = 0, stoppedEarly = false, bitqueryQueries = 0;
+  const calls: Record<string, Tally> = {};
+  /** One chain's candidates through `drainSlices`, within the budget; bookkeeping is the same for both sources. */
+  const drain = async (name: string, cands: readonly Cand[], batch: number, resolve: (slice: readonly Cand[]) => Promise<[number, number, number]>): Promise<ChainCounts> => {
+    const d = await drainSlices(cands, batch, REFUSALS_IN_A_ROW, () => Date.now() - started > budgetMs, resolve,
+      (slice, e) => console.error(`swaps: ${name} batch of ${slice.length} failed: ${e instanceof Error ? e.message : String(e)}`));
+    perChain[name] = d.counts;
+    calls[name] = { asked: d.counts.queries, failed: d.failedBatches };
+    remaining += d.remaining;
+    stoppedEarly ||= d.stoppedEarly;
+    return d.counts;
   };
   try {
     const chains: Chain[] = (await sql<{ network_id: number; name: string }[]>`
@@ -351,8 +347,9 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
       const counts = await drain(c.name, await candidates(sql, c.network_id, EVM_LIMIT), BATCH, (slice) => resolveBatch(ctx, slice));
       bitqueryQueries += counts.queries;
     }
-    if (attempted > 0 && failedBatches === attempted) throw new Error(`swaps: all ${attempted} batches failed`);
     const repriced = await reprice(sql);
+    const dead = deadSources(calls);
+    if (dead.length) throw new Error(`swaps: every batch sent for ${dead.join(" and ")} failed (${repriced} repriced)`);
     return { perChain, bitqueryQueries, repriced, remaining, stoppedEarly, elapsedMs: Date.now() - started };
   } finally {
     await sql.end({ timeout: 5 });
