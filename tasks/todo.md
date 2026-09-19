@@ -315,6 +315,12 @@ two minutes of its first deploy — nothing else found them):
       health snapshot, /chains); each proven row-for-row and order-for-order against its old text; two skeptics attacked
       the helper (5,000 random states equal; a caller shape that flattened it went 424 ms -> 28 s, closed with `limit -1`).
       Production-sized local database: held-coins group-by 445 -> 26 ms, count(*) 359 -> 4 ms.
+      MEASURED IN PRODUCTION 16:32 UTC (health snapshot): the held-coins/token_info statement 965,760 rows / 2.1-2.6 s
+      -> 159,428 rows / 1.07 s. Tail 16:31-16:35: 112 of 112 requests ok, 0 resets, 1 queued statement.
+- [ ] The health snapshot's COUNTS statement is unchanged at 1.98 M rows / 2.6 s every 10 minutes: it is the exact
+      `count(*)` over 1.29 M `transactions` and `count(distinct captured_at)` over `holdings`, both published fields
+      (`rows.transactions`, `rows.generations`) and neither goes through `holdings_current`. Cheapest honest fix: count
+      them once an hour and carry the figures between snapshots (say so in the body), not an estimate.
 - [ ] Still whole reads of the view, left alone on purpose: the `/tokens` board and momentum (their tie order is pinned
       byte for byte by tests and would move), `trader_chain_history` inside views. Next candidates.
 - [ ] **Owner:** Helius dashboard — are the key's credits spent? Balance reads and swap parsing still answer 429.
