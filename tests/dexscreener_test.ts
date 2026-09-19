@@ -73,3 +73,13 @@ Deno.test("bestPairs: the winning pair's info.imageUrl is the logo; absent or em
   assertEquals(best.get("0xb")?.logo, null);
   assertEquals(bestPairs([{ baseToken: { address: "c" }, priceUsd: 2, info: { imageUrl: "https://cdn/c.png" } }]).get("c")?.logo, "https://cdn/c.png");
 });
+
+Deno.test("rankedBatches: never mixes chains, and the most-held coin of EVERY chain is priced before any chain's tail", async () => {
+  const { rankedBatches, isRefusal } = await import("../supabase/functions/_shared/dexscreener.ts");
+  // Ranked most-held first: solana's two leaders, then base's leader, then solana's tail.
+  const ranked = [{ chain: "solana", k: "s1" }, { chain: "solana", k: "s2" }, { chain: "base", k: "b1" }, { chain: "solana", k: "s3" }, { chain: "solana", k: "s4" }, { chain: "base", k: "b2" }];
+  const out = rankedBatches(ranked, 2).map((b) => b.map((t) => t.k).join(","));
+  assertEquals(out, ["s1,s2", "b1,b2", "s3,s4"]); // chain by chain it was s1,s2 | s3,s4 | b1,b2
+  assertEquals(rankedBatches([], 30), []);
+  assertEquals([isRefusal("dexscreener HTTP 429"), isRefusal("dexscreener HTTP 403"), isRefusal("dexscreener HTTP 500"), isRefusal("dexscreener answered a non-array")], [true, true, false, false]);
+});

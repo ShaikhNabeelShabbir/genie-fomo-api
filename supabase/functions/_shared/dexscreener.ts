@@ -73,3 +73,19 @@ export async function fetchPairs(chain: string, addresses: readonly string[]): P
     return j as DexPair[];
   });
 }
+
+export const isRefusal = (message: string): boolean => /HTTP (?:403|429)\b/.test(message);
+
+/**
+ * Batches of `size` that never mix chains (the endpoint is per chain), worked in the order of the
+ * FIRST token each holds in `ranked`. Chain by chain, one chain's one-holder dust was priced before
+ * another chain's most-held coin — and a run cut short never reached the second chain at all.
+ */
+export function rankedBatches<T extends { readonly chain: string }>(ranked: readonly T[], size: number): T[][] {
+  const byChain = new Map<string, T[]>();
+  for (const t of ranked) byChain.set(t.chain, [...(byChain.get(t.chain) ?? []), t]);
+  const rank = new Map(ranked.map((t, i) => [t, i]));
+  return [...byChain.values()]
+    .flatMap((tokens) => Array.from({ length: Math.ceil(tokens.length / size) }, (_, i) => tokens.slice(i * size, (i + 1) * size)))
+    .sort((a, b) => (rank.get(a[0]) ?? 0) - (rank.get(b[0]) ?? 0));
+}

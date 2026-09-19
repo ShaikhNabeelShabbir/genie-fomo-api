@@ -1,8 +1,9 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
+import { REFUSALS_IN_A_ROW } from "../../../supabase/functions/_shared/settings.ts";
 import {
-  ADDRESSES_PER_CALL, athUpdate, bestPairs, fetchPairs, type Ath, type BestPair,
+  ADDRESSES_PER_CALL, athUpdate, bestPairs, fetchPairs, isRefusal, rankedBatches, type Ath, type BestPair,
 } from "../../../supabase/functions/_shared/dexscreener.ts";
 
 /**
@@ -108,14 +109,6 @@ async function writeChunk(sql: Sql, hour: string, priced: readonly Hit[], prev: 
   });
 }
 
-/** DexScreener's endpoint is per chain, so a batch never mixes chains. */
-function batches(list: readonly Target[]): Target[][] {
-  const byChain = new Map<string, Target[]>();
-  for (const t of list) byChain.set(t.chain, [...(byChain.get(t.chain) ?? []), t]);
-  return [...byChain.values()].flatMap((tokens) =>
-    Array.from({ length: Math.ceil(tokens.length / ADDRESSES_PER_CALL) }, (_, i) => tokens.slice(i * ADDRESSES_PER_CALL, (i + 1) * ADDRESSES_PER_CALL)));
-}
-
 /** Price one batch and write it. Returns how many tokens had a pool. */
 async function priceBatch(sql: Sql, hour: string, chunk: readonly Target[]): Promise<number> {
   const best = bestPairs(await fetchPairs(chunk[0].chain, chunk.map((t) => t.address)));
@@ -138,15 +131,26 @@ export async function runPrices(env: Env, budgetMs: number): Promise<PricesSumma
   try {
     const list = await targets(sql);
     const hour = new Date(Math.floor(started / 3_600_000) * 3_600_000).toISOString();
-    let priced = 0, done = 0, attempted = 0, failedBatches = 0, stoppedEarly = false;
-    for (const chunk of batches(list)) {
+    let priced = 0, done = 0, attempted = 0, failedBatches = 0, stoppedEarly = false, refusedInARow = 0;
+    for (const chunk of rankedBatches(list, ADDRESSES_PER_CALL)) {
       if (Date.now() - started > budgetMs) { stoppedEarly = true; break; }
       attempted += 1;
       try {
         priced += await priceBatch(sql, hour, chunk);
+        refusedInARow = 0;
       } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
         failedBatches += 1;
-        console.error(`prices: ${chunk[0].chain} batch of ${chunk.length} failed: ${e instanceof Error ? e.message : String(e)}`);
+        console.error(`prices: ${chunk[0].chain} batch of ${chunk.length} failed: ${message}`);
+        // 1,027 of 1,052 batches were refused with 429 every hour from 17 Sep 12:00 UTC, each one
+        // asked anyway: a thousand error lines an hour, and a ban that never had a quiet hour to lapse in.
+        refusedInARow = isRefusal(message) ? refusedInARow + 1 : 0;
+        if (refusedInARow >= REFUSALS_IN_A_ROW) {
+          console.error(`prices: DexScreener refused ${refusedInARow} batches in a row; leaving the rest of this hour`);
+          stoppedEarly = true;
+          done += chunk.length;
+          break;
+        }
       }
       done += chunk.length;
     }
