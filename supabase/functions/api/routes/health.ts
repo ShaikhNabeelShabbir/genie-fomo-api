@@ -2,6 +2,7 @@ import { sql, n, round } from "../db.ts";
 import { cfg } from "../config.ts";
 import { get, requestVersion } from "../router.ts";
 import { ApiError, classify } from "../errors.ts";
+import { currentHoldings } from "../../_shared/current_holdings.ts";
 
 // ------------------------------------------------------------------ health
 
@@ -108,30 +109,14 @@ export function tokenInfoFeed<F extends { readonly state: string }>(
   };
 }
 
-/**
- * The rows of holdings_current, read WHOLE. The view seeks a maximum per row it scans, which is every
- * capture ever written (1 M rows, three times a run); this seeks once per (trader, chain) and reads
- * only the newest capture. The cross joins pin that order. tests/health_statements_test.ts holds the two equal.
- */
-const currentHoldings = () => sql`
-  select h.handle, h.network_id, h.token_key, h.human_amount
-  from traders t cross join chains n cross join holdings h
-  where h.source = 'chain' and h.handle = t.handle and h.network_id = n.network_id
-    and h.captured_at = (select max(h2.captured_at) from holdings h2
-                          where h2.source = 'chain' and h2.handle = t.handle and h2.network_id = n.network_id)
-  union all
-  select h.handle, h.network_id, h.token_key, h.human_amount from holdings h
-  where h.source = 'fomo' and h.captured_at = (select captured_at from latest_capture)
-    and not exists (select 1 from holdings c
-                     where c.source = 'chain' and c.handle = h.handle and c.network_id = h.network_id)`;
-
 async function healthBody(): Promise<Record<string, unknown>> {
   /** Exact counts throughout: SQLite has no planner estimate to substitute. See docs/DECISIONS.md#d063 */
   /** FOUR SEQUENTIAL AWAITS, DELIBERATELY. See docs/DECISIONS.md#d064 */
   const [c] = await sql`
     select (select count(*) from traders where listed = 1)       as traders,
            (select count(*) from traders where listed = 0)       as delisted,
-           (select count(*) from (${currentHoldings()}))         as holdings,
+           -- currentHoldings, not the view: read whole, the view walks every capture ever written.
+           (select count(*) from ${currentHoldings(sql)})        as holdings,
            (select count(*) from tokens)                         as tokens,
            (select count(*) from trades)                         as trades,
            -- SQLite has no planner row estimate, so transactions is now COUNTED like the
@@ -229,7 +214,7 @@ async function healthBody(): Promise<Record<string, unknown>> {
     select count(*) as held,
            count(case when i.fetched_at is null then 1 end) as never_fetched,
            count(case when i.fetched_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-48 hours') then 1 end) as stale
-    from (select distinct network_id, token_key from (${currentHoldings()}) where human_amount > 0) h
+    from (select distinct network_id, token_key from ${currentHoldings(sql)} where human_amount > 0) h
     left join token_info i on i.network_id = h.network_id and i.token_key = h.token_key`;
 
   /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
@@ -247,7 +232,8 @@ async function healthBody(): Promise<Record<string, unknown>> {
      * One grouped pass per block so each chain is one range on aum_chain_samples_net_at_idx
      * (network_id, at desc) where basis = 'sampled'. The history counts are trader_chain_history's
      * rule (>= 2 valued chain samples ready, 1 warming, 0 none) over its three sources of evidence,
-     * written out because the view embeds holdings_current; the test named above holds them equal.
+     * written out because the view embeds holdings_current, read here per (trader, chain) pair;
+     * tests/health_statements_test.ts holds them equal.
      */
     select c.name,
            coalesce(r.accepted_36h, 0) as accepted_36h,
@@ -278,7 +264,7 @@ async function healthBody(): Promise<Record<string, unknown>> {
       from (select e.handle, e.network_id, sum(e.points) as points
             from (select distinct handle, network_id, 0 as points from trades not indexed
                   union all
-                  select handle, network_id, 0 from (${currentHoldings()}) where human_amount > 0
+                  select handle, network_id, 0 from ${currentHoldings(sql)} where human_amount > 0
                   union all
                   select handle, network_id, 1 from aum_chain_samples where total_usd is not null) e
             group by e.handle, e.network_id)
