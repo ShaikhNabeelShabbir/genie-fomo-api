@@ -112,6 +112,12 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   is not a failure, and lumping the two tripped the all-failed guard and hid a real bug (`tokens`, 17 Sep).
 - SQLite dialect only: no `::` casts, `filter (where`, `distinct on`, `lateral`, `unnest`, `array_agg`, `= any(`, `interval`, `now()`, `date_trunc`, `numeric`, `ctid`. Timestamps are ISO-8601 UTC TEXT, booleans 0/1, JSON is TEXT. 100 bound parameters and 30 s per statement; D1 runs one statement at a time, so small and many beats large and few.
 - D1 charges CPU per query and has no planner hints: a view that aggregates the whole table before the caller's filter will exceed the limit (`holdings_current`, 17 Sep). Write correlated maxima that an index can seek.
+- **Bind id lists as ONE parameter on D1:** `in (select value from json_each(${ids}))`, never `in (${ids})` —
+  the shim expands an array after `in (` to one `?` per element and D1 allows 100 (`worker/src/d1.ts:53`). This
+  took the trader list down on 19 Sep at the app's page size of 100. A SQL fragment that needs a join says so in
+  code, and every query that interpolates it is `EXPLAIN`ed on D1 before deploy.
+- A cron's wallTime must stay well under its period, and its cost is measured end to end (not one step) and
+  against API p90, not only its own gauge: the 5-minute live top-up ran 231–625 s and reset D1's isolate.
 - ONE price ladder, `shared/price-ladder.ts`, read at REQUEST time: pegged -> `token_price_stats`
   -> `token_prices` (<= 7 days) -> `token_info`. `/positions` used to serve the price frozen into
   `holdings` at the last balance read (a ~9 h sweep), which is why one coin showed three prices on
@@ -120,7 +126,9 @@ Deploy: `cd worker && npx wrangler deploy` (or push with `CLOUDFLARE_DEPLOY=true
   runs at READ time on `pricedPositions`/`totalPositions`: >= 0.25 a figure, 0.05-0.25 `partial`,
   below 0.05 withheld with `partialUsd`. Read time is the point — the stored series is judged
   without a rebuild. 78% of stored valued hours are under 0.25.
-- Current state: v2 on D1, handed to the app team 17 Sep 2026 (`docs/consumer/v2-handoff/`); fix
-  request v5 answered in `docs/consumer/reply-to-genie-v5.md`, vocabulary 12, NOT yet deployed —
-  migration `0005` must be applied first. Open: rotate secrets, the `/tokens` query rewrite
-  (24 Sep), retire the Supabase project once the app team is on v2.
+- Current state (19 Sep 2026): v2 on D1, in an OUTAGE for the consumer — `/traders?include=…&limit=100`
+  answers 500 (100-bind ceiling) and the For You deck is empty. Root causes and the ordered fix list are in
+  `tasks/todo.md`; two regressions were reverted in `23e1e38` (the `/portfolio` join, the flush top-up — A2's
+  hourly-for-everyone is withdrawn). Also open: GMGN `token_info` never written by the Worker, DexScreener 429
+  since 17 Sep 12:00 UTC, Helius 429 on every balance read. Owner-only: rotate secrets, make the repo private,
+  set a `JOB_SECRET`, retire Supabase once the app team is on v2.
