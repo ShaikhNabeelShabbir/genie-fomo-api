@@ -311,11 +311,13 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
    * position it can carry one. Looked up for the page only -- at most 500 hashes.
    */
   const pageHashes = rows.map((r: Record<string, unknown>) => String(r.tx_hash));
+  /** The fee key is (network_id, tx_hash): naming the page's chains makes this a seek, not a read of every fee. */
+  const pageNets = [...new Set(rows.map((r: Record<string, unknown>) => Number(r.network_id)))];
   const [feeRows, feeNatives] = pageHashes.length
     ? await Promise.all([
       sql`select network_id, tx_hash, fee_native, fee_native_symbol
           from transaction_fees
-          where tx_hash in (${pageHashes})`,
+          where network_id in (${pageNets}) and tx_hash in (${pageHashes})`,
       nativePrices(),
     ])
     : [[], new Map<number, NativePrice>()];

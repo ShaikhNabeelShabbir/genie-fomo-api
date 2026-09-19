@@ -17,15 +17,16 @@ import { batchIds, batchEnvelope } from "../shared/batch.ts";
  */
 const SOLANA = 1399811149;
 
-const flowRows = (handles: string[], since: string) => sql`
+/** CROSS JOIN pins wallets first: given a LIST of handles the planner otherwise starts from every Solana transfer. */
+export const flowRows = (handles: string[], since: string) => sql`
   select w.handle, c.name as chain, tk.address as token_address, t.token_key,
          sum(case when t.direction = 'in' then t.amount end) as in_amount,
          sum(case when t.direction = 'out' then t.amount end) as out_amount,
          sum(case t.direction when 'in' then t.amount when 'out' then -t.amount end) as net,
          count(*) as transfers,
          min(t.block_time) as first_at, max(t.block_time) as last_at
-  from transactions t
-  join wallets w on w.sol_address_key = t.address_key
+  from wallets w
+  cross join transactions t on t.address_key = w.sol_address_key
   join chains c on c.network_id = t.network_id
   left join tokens tk on tk.network_id = t.network_id and tk.token_key = t.token_key
   where w.handle in (${handles})

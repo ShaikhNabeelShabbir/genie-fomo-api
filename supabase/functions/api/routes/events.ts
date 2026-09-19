@@ -118,13 +118,14 @@ get("/v1/events", async (_p, url) => {
       from aum_samples s
       where s.basis = 'sampled'
     )
-    select ev.*, c.name as chain, t.display_handle, t.source as trader_source,
+    select ev.*, c.name as chain, traders.display_handle, traders.source as trader_source,
            (ti.token_key is not null) as has_info, ti.is_honeypot, ti.can_not_sell
     from ev
-    join traders t using (handle)
+    join traders using (handle)
     left join chains c using (network_id)
     left join token_info ti on ti.network_id = ev.network_id and ti.token_key = ev.token_address
-    where ev.at >= ${since}
+    -- The keyset below already implies at >= the cursor at, and saying so lets each arm SEEK from the cursor, not from since.
+    where ev.at >= max(${since}, ${cur === null ? since : cur.at})
       ${kind === null ? sql`` : sql`and ev.kind = ${kind}`}
       ${net === null ? sql`` : sql`and ev.network_id = ${net}`}
       ${handle === null ? sql`` : sql`and ev.handle = ${handle}`}
