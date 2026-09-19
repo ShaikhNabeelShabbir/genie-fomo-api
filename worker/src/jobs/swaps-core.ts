@@ -10,38 +10,56 @@
 import { SOL_MINT, ZERO_ADDRESS } from "../../../supabase/functions/_shared/chain_reads.ts";
 import type { Sql } from "../d1.ts";
 
-/** One transfer leg that has not been through a source yet. */
-export interface Cand { readonly tx_hash: string; readonly address_key: string; readonly block_time: string }
+/** One (transaction, wallet) that has not been through a source yet. `rid` is the rowid of the leg it was found on. */
+export interface Cand { readonly rid: number; readonly network_id: number; readonly tx_hash: string; readonly address_key: string; readonly block_time: string }
 
-/** A regular run reads this far back, newest first; anything older is reached by the lap. */
-export const RECENT_DAYS = 3;
-/** Each run also reads ONE older window this wide, walking down from the recent floor and wrapping past the oldest transfer. */
-export const LAP_DAYS = 14;
+/** Rows of `transactions` a run may examine past its place: a bound on COST, not on candidates. New rows since the last run are far fewer. */
+export const NEW_RANGE = 50_000;
+/** Rows of the older range each run re-examines. The lap is what retries a leg a source refused and what reaches the history. */
+export const LAP_RANGE = 25_000;
 
 /**
- * One newest-first page of unchecked legs INSIDE a time window. The window is the point (19 Sep
- * 2026): unbounded, once the newest legs were all checked the walk went on through every leg ever
- * stored looking for one that was not - 1.7 M rows and up to 19.6 s of D1's single thread per chain,
- * every half hour, during which every API statement queued (a 0.3 ms insert waited 7 s).
+ * Unchecked legs in ONE RANGE OF ROWIDS, newest first. The range is the point (19 Sep 2026).
+ * Asked "newest unchecked first" with no bound, the statement read every leg ever stored to find the
+ * few left - 1.7 M rows, up to 19.6 s of D1's single thread per chain, every half hour. Bounded by
+ * block time it was no better (1.25 M rows, 24.6 s): nearly every leg we hold is a few weeks old. A
+ * rowid range costs its width whatever it holds, and rowid order is insertion order, so "rows past
+ * my place" is exactly "rows nobody has looked at".
  */
-export const candidatePage = (sql: Sql, net: number, swapsOnly: boolean, from: string, to: string, pageSize: number) => sql<Cand[]>`
-  select t.tx_hash, t.address_key, t.block_time
+export const candidateRange = (sql: Sql, solanaNet: number, afterRid: number, uptoRid: number) => sql<Cand[]>`
+  select t.rowid as rid, t.network_id, t.tx_hash, t.address_key, t.block_time
   from transactions t
-  where t.block_time > ${from} and t.block_time <= ${to}
-    -- The unary + leaves the planner the time index alone: on tx_type or network_id it read every leg of the chain.
-    and +t.network_id = ${net}
-    ${swapsOnly ? sql`and +t.tx_type = 'SWAP'` : sql``}
+  where t.rowid > ${afterRid} and t.rowid <= ${uptoRid}
+    -- The unary + leaves the planner the rowid range and nothing else: D1 has chosen a time index over the intended one before.
+    and +t.block_time is not null
+    -- On Solana only what Helius tagged SWAP is a candidate; EVM rows carry no type.
+    and (t.network_id <> ${solanaNet} or t.tx_type = 'SWAP')
     and not exists (
       select 1 from wallet_swaps_checked s
-      where s.network_id = ${net} and s.tx_hash = t.tx_hash and s.address_key = t.address_key)
-  order by t.block_time desc
-  limit ${pageSize}`;
+      where s.network_id = t.network_id and s.tx_hash = t.tx_hash and s.address_key = t.address_key)
+  order by t.rowid desc`;
 
-/** The older window of this run and where the next run's starts; `nextSec` null wraps the lap back to the recent floor. */
-export function lapWindow(positionSec: number | null, floorSec: number, oldestSec: number | null): { readonly fromSec: number; readonly toSec: number; readonly nextSec: number | null } {
-  const toSec = positionSec !== null && positionSec < floorSec ? positionSec : floorSec;
-  const fromSec = toSec - LAP_DAYS * 86_400;
-  return { fromSec, toSec, nextSec: oldestSec === null || fromSec <= oldestSec ? null : fromSec };
+/** The older range of this run and the lap's next place; `next` null wraps the lap back under the run's own place. */
+export function lapRange(position: number | null, below: number, width: number): { readonly after: number; readonly upto: number; readonly next: number | null } {
+  const upto = position !== null && position > 0 && position <= below ? position : below;
+  const after = Math.max(0, upto - width);
+  return { after, upto, next: after > 0 ? after : null };
+}
+
+/** One candidate per (transaction, wallet) per chain, the earliest leg's time kept, newest first, at most `limit` a chain. */
+export function byChain(legs: readonly Cand[], limit: (net: number) => number): Map<number, Cand[]> {
+  const seen = new Map<string, Cand>();
+  for (const r of legs) {
+    const key = `${r.network_id}|${r.tx_hash}|${r.address_key}`;
+    const held = seen.get(key);
+    if (!held || r.block_time < held.block_time) seen.set(key, held ? { ...held, block_time: r.block_time } : r);
+  }
+  const out = new Map<number, Cand[]>();
+  for (const c of [...seen.values()].sort((a, b) => (a.block_time < b.block_time ? 1 : a.block_time > b.block_time ? -1 : 0))) {
+    const list = out.get(c.network_id) ?? [];
+    if (list.length < limit(c.network_id)) out.set(c.network_id, [...list, c]);
+  }
+  return out;
 }
 
 /**

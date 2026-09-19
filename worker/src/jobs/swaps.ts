@@ -3,7 +3,7 @@ import { jobSql, type Sql } from "../sql";
 import { SOLANA_NETWORK_ID, throttled } from "../../../supabase/functions/_shared/chain_reads.ts";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS, REFUSALS_IN_A_ROW } from "../../../supabase/functions/_shared/settings.ts";
-import { type Cand, type ChainCounts, type NativeQuote, type Quote, type SwapRow, type Trade, RECENT_DAYS, candidatePage, decode, drainSlices, lapWindow, settledBy, solanaDecodeEnhanced, toRow } from "./swaps-core";
+import { type Cand, type ChainCounts, type NativeQuote, type Quote, type SwapRow, type Trade, LAP_RANGE, NEW_RANGE, byChain, candidateRange, decode, drainSlices, lapRange, settledBy, solanaDecodeEnhanced, toRow } from "./swaps-core";
 import { chunk } from "./directory-core";
 import { deadSources, type Tally } from "./quote_prices-core";
 
@@ -61,8 +61,6 @@ const EVM_LIMIT = 2000;
 const TRADES_PER_TX = 10;
 /** Rows the re-price pass considers; older rows keep whatever they were written with. */
 const REPRICE_DAYS = 30;
-/** Raw transfer legs a candidate page reads; the walk stops once `limit` distinct pairs are held. */
-const CAND_PAGE = 2000;
 /** Rows per `wallet_swaps` insert: 10 columns x 9 rows = 90 of D1's 100 bind parameters. */
 const SWAP_WRITE_CHUNK = 9;
 /** Rows per `wallet_swaps_checked` insert: 3 columns x 30 rows = 90 parameters. */
@@ -76,11 +74,13 @@ async function loadQuotes(sql: Sql): Promise<Map<string, Quote>> {
     select q.network_id, q.token_key, q.symbol, q.pegged_usd,
            (select coalesce(json_group_object(p.day, p.usd), '{}') from token_prices p
              where p.network_id = q.network_id and p.token_key = q.token_key and q.pegged_usd is null) as closes,
-           (select h.price from holdings_current h
+           -- The newest priced holding of the asset, walked on holdings_token_idx. Through holdings_current this
+           -- read every current holding of SOL and USDC - 605,000 rows a run - to keep one price.
+           (select h.price from holdings h
              where h.network_id = q.network_id and h.token_key = q.token_key
                and h.price is not null and h.price_source is not null
                and h.price_source <> 'fomo_reported_entry'
-             order by h.priced_at desc limit 1) as market_price
+             order by h.captured_at desc limit 1) as market_price
     from quote_assets q`;
   /* A stablecoin's peg is the honest price; a floating quote takes its daily close, else the portfolio's market price; unpriced still resolves. */
   return new Map(rows.map((q) => [`${q.network_id}:${q.token_key}`, {
@@ -106,54 +106,36 @@ async function loadNativeQuotes(sql: Sql, quotes: ReadonlyMap<string, Quote>): P
   return out;
 }
 
-/**
- * The newest `limit` transactions on this chain not yet asked about, one per (tx, wallet). On
- * Solana only rows Helius tagged SWAP are candidates; EVM rows carry no type. D1 runs one
- * statement at a time with no room for an aggregate over the whole feed, so the group-by became
- * newest-first pages of raw transfer legs deduped here: `block_time` is the cursor (every leg of
- * a transaction carries its block's time, so a page that adds no new pair ends the walk) and a
- * leg with no time is skipped, since it can neither be ordered nor resume the walk.
- */
-async function candidates(sql: Sql, net: number, limit: number, from: string, to: string): Promise<Cand[]> {
-  const out = new Map<string, Cand>();
-  let cursor = to;
-  while (out.size < limit) {
-    const page: Cand[] = await candidatePage(sql, net, net === SOLANA_NETWORK_ID, from, cursor, CAND_PAGE);
-    const before = out.size;
-    for (const r of page) {
-      const key = `${r.tx_hash}|${r.address_key}`;
-      const held = out.get(key);
-      /* `min(t.block_time)` of the group the SQL took: the earliest leg wins. */
-      if (!held || r.block_time < held.block_time) out.set(key, r);
-      if (out.size >= limit) break;
-    }
-    if (page.length < CAND_PAGE || out.size === before) break;
-    cursor = page[page.length - 1].block_time;
-  }
-  return [...out.values()].slice(0, limit);
-}
+const SEEN_JOB = "swaps_seen";
+const LAP_JOB = "swaps_lap";
 
-const iso = (sec: number): string => new Date(sec * 1000).toISOString();
-const lapJob = (net: number): string => `swaps_lap:${net}`;
+const place = async (sql: Sql, job: string): Promise<number | null> => {
+  const [row] = await sql<{ position: number }[]>`select position from job_cursors where job = ${job}`;
+  return row ? Number(row.position) : null;
+};
+const keep = (sql: Sql, job: string, position: number) => sql`
+  insert into job_cursors (job, position, updated_at) values (${job}, ${position}, ${new Date().toISOString()})
+  on conflict (job) do update set position = excluded.position, updated_at = excluded.updated_at`;
 
 /**
- * This run's candidates on one chain: the recent window newest first, then ONE older window of the
- * lap, whose place is kept in `job_cursors` (0014). A leg a source refused stays unchecked and is
- * offered again when the lap next comes round (about 13 h for a year of history).
+ * This run's candidates for every chain, from two bounded ranges of `transactions`: the rows
+ * inserted since the last run, and one older range of the lap. The run's place ALWAYS moves on -
+ * a leg a source refuses stays unchecked and is met again by the lap, so a refusing source (Helius
+ * has answered 429 for days) cannot hold the queue. Places live in `job_cursors` (0014). The first
+ * run starts at the newest row: everything older is the lap's.
  */
-async function windowedCandidates(sql: Sql, net: number, limit: number, nowSec: number, oldestSec: number | null): Promise<Cand[]> {
-  const floorSec = nowSec - RECENT_DAYS * 86_400;
-  const recent = await candidates(sql, net, limit, iso(floorSec), iso(nowSec));
-  const [held] = await sql<{ position: number }[]>`select position from job_cursors where job = ${lapJob(net)}`;
-  const lap = lapWindow(held ? Number(held.position) : null, floorSec, oldestSec);
-  const older = recent.length < limit ? await candidates(sql, net, limit - recent.length, iso(lap.fromSec), iso(lap.toSec)) : [];
-  if (lap.nextSec === null) await sql`delete from job_cursors where job = ${lapJob(net)}`;
-  else {
-    await sql`
-      insert into job_cursors (job, position, updated_at) values (${lapJob(net)}, ${lap.nextSec}, ${new Date().toISOString()})
-      on conflict (job) do update set position = excluded.position, updated_at = excluded.updated_at`;
-  }
-  return [...recent, ...older];
+async function rangedCandidates(sql: Sql): Promise<Map<number, Cand[]>> {
+  const [{ top }] = await sql<{ top: number | null }[]>`select max(rowid) as top from transactions`;
+  if (top === null) return new Map();
+  const seen = (await place(sql, SEEN_JOB)) ?? Number(top);
+  const upto = Math.min(Number(top), seen + NEW_RANGE);
+  const lap = lapRange(await place(sql, LAP_JOB), seen, LAP_RANGE);
+  const fresh = upto > seen ? await candidateRange(sql, SOLANA_NETWORK_ID, seen, upto) : [];
+  const older = lap.upto > lap.after ? await candidateRange(sql, SOLANA_NETWORK_ID, lap.after, lap.upto) : [];
+  await keep(sql, SEEN_JOB, upto);
+  if (lap.next === null) await sql`delete from job_cursors where job = ${LAP_JOB}`;
+  else await keep(sql, LAP_JOB, lap.next);
+  return byChain([...fresh, ...older], (net) => (net === SOLANA_NETWORK_ID ? SOLANA_LIMIT : EVM_LIMIT));
 }
 
 async function writeRows(sql: Sql, net: number, out: readonly Priced[]): Promise<void> {
@@ -345,14 +327,11 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
       .map((r) => ({ ...r, network_id: Number(r.network_id) }));
     const quotes = await loadQuotes(sql);
     const natives = await loadNativeQuotes(sql, quotes);
-    const nowSec = Math.floor(started / 1000);
-    /* One seek on the time index: where the lap wraps. */
-    const [{ oldest }] = await sql<{ oldest: string | null }[]>`select min(block_time) as oldest from transactions`;
-    const oldestSec = oldest ? Math.floor(Date.parse(oldest) / 1000) : null;
+    const cands = await rangedCandidates(sql);
     for (const c of chains) {
       if (c.network_id === SOLANA_NETWORK_ID) {
         const solQuotes = quotesOn(SOLANA_NETWORK_ID, quotes);
-        await drain(c.name, await windowedCandidates(sql, SOLANA_NETWORK_ID, SOLANA_LIMIT, nowSec, oldestSec), SOLANA_BATCH,
+        await drain(c.name, cands.get(SOLANA_NETWORK_ID) ?? [], SOLANA_BATCH,
           (slice) => resolveSolanaBatch(sql, heliusUrl, solQuotes, slice));
         continue;
       }
@@ -360,7 +339,7 @@ export async function runSwaps(env: Env, budgetMs: number): Promise<SwapsSummary
         sql, key, net: c.network_id, network: networkWord(c),
         quotes: quotesOn(c.network_id, quotes), wrapped: natives.get(c.network_id) ?? null,
       };
-      const counts = await drain(c.name, await windowedCandidates(sql, c.network_id, EVM_LIMIT, nowSec, oldestSec), BATCH, (slice) => resolveBatch(ctx, slice));
+      const counts = await drain(c.name, cands.get(c.network_id) ?? [], BATCH, (slice) => resolveBatch(ctx, slice));
       bitqueryQueries += counts.queries;
     }
     const repriced = await reprice(sql);
