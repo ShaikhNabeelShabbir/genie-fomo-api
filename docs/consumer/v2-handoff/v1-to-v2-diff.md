@@ -1,14 +1,14 @@
-# v1 → v2: route map, differences and additions (17 Sep 2026)
+# v1 → v2: route map, differences and additions (17 Sep 2026, corrected 19 Sep 2026)
 
-Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is the Supabase deployment frozen at the 16 Sep 2026 deploy; v2 is the Cloudflare Worker. Same database, same route names; v2 adds. Vocabulary: v1 answers `version: 2`, v2 answers `version: 11`.
+Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is the Supabase deployment frozen at the 16 Sep 2026 deploy; v2 is the Cloudflare Worker over Cloudflare D1, which was filled from v1's Postgres on 17 Sep 2026 and is the only one still written to. Same route names; v2 adds. Vocabulary: v1 answers `version: 2`, v2 answers `version: 14`.
 
 ## 1. Route map
 
 | v1 (Supabase) | v2 (Cloudflare) | Status |
 |---|---|---|
 | `GET /v1/chains` | `GET /v2/chains` | unchanged |
-| `GET /v1/fields` | `GET /v2/fields` | extended: version 10, constants block |
-| `GET /v1/health` | `GET /v2/health` | extended: staleTraders per chain, historyState, dataState, apiVersion |
+| `GET /v1/fields` | `GET /v2/fields` | extended: version 14, constants block |
+| `GET /v1/health` | `GET /v2/health` | extended: staleTraders per chain, historyState, dataState, apiVersion; since 19 Sep a one-row database probe (`database`, or a 503), a body the scheduler computes every 10 min and a request never does (`computedAt`, `computeMs`; before the first snapshot a 503 with `Retry-After` 60 and `error.database.answering: true`), a `prices` feed, `tokenInfo` judged per held coin |
 | `GET /v1/traders` | `GET /v2/traders` | extended: orderBy/direction/range filters, include=trust, source |
 | `GET /v1/traders/:handle` | `GET /v2/traders/:handle` | extended: source, onChain per chain |
 | `GET /v1/traders/:handle/trust` | `GET /v2/traders/:handle/trust` | unchanged |
@@ -21,7 +21,7 @@ Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is t
 | `GET /v1/traders/:handle/pnl` | `GET /v2/traders/:handle/pnl` | extended: `openPositionsHeld` (basis `trade_records_still_held_on_chain`) is the figure that matches `/positions`; `openPositions` still counts trade records (basis `trade_records`) |
 | `GET /v1/traders/:handle/trades` | `GET /v2/traders/:handle/trades` | extended: since/until/status filters |
 | `GET /v1/traders/:handle/transactions` | `GET /v2/traders/:handle/transactions` | unchanged |
-| `GET /v1/traders/:handle/aum` | `GET /v2/traders/:handle/aum` | LEGACY on v2: partial/chains_missing, null-not-zero, step from tracked span; readings stop at 17 Sep; live read never runs (`liveRead.state: skipped`) |
+| `GET /v1/traders/:handle/aum` | `GET /v2/traders/:handle/aum` | LEGACY on v2: partial/chains_missing, null-not-zero, step from tracked span; readings stop at 17 Sep; no live read (`liveRead.state` is `unavailable` with no sampler configured, `skipped` with `?live=false` and on the batch) |
 | `POST /v1/traders/aum` | `POST /v2/traders/aum` | legacy, as above |
 | `GET /v1/tokens` | `GET /v2/tokens` | extended: range filters, excludeHoneypots |
 | `GET /v1/tokens/:address` | `GET /v2/tokens/:address` | extended: price block, launch, security.honeypotSince, cohort, creator ledger, perHolder exitTimingScore |
@@ -37,12 +37,16 @@ Companion to `README.md` (the guide) and `openapi.yaml` (the reference). v1 is t
 
 ## 2. Behaviour that changed on the same path
 
-- `/aum` no longer performs a live chain read; `?live=true` is accepted and ignored, `liveRead.state` is always `skipped`. Its readings stop growing on 17 Sep 2026. Use `/aum/history` and `/aum/now`.
+- `/aum` no longer performs a live chain read: the batch always answers `liveRead.state: skipped`, and the single route answers `unavailable` while the deployment has no sampler configured (`/health.externalCallsPerRequest.liveAum.enabled: false`) or `skipped` with `?live=false`. Its readings stop growing on 17 Sep 2026, and `sampler.nextExpectedAt` still names a next run that is not scheduled. Use `/aum/history` and `/aum/now`.
 - `/aum` readings that priced nothing are `totalUsd: null` with a reason, never `0` (Z1); a reading that answered fewer chains than known is `partial: true, partialReason: chains_missing` naming them (Z2, R5).
 - `/pnl` adds `openPositionsHeld`, the count of trade records still held on chain, which is the figure that matches `/positions`; `openPositions` is unchanged and still counts trade records (`openPositionsBasis` says so) (P1).
 - `/positions` rows carry `amount` as null when unknown on the single route as on the batch route (the single route used to coerce to 0).
 - `/health.dataState` is `degraded` while any scorecard is stale (T2); `/fields.version` gates your build.
 - `error.code` publishes `unavailable`, `include_unavailable`, `internal_error` (v1 published the never-emitted `internal`).
+- Errors, since 19 Sep 2026: 500 `internal_error` is a fault of ours that no retry heals; 503 `unavailable` carries `Retry-After` 5 (database unreachable), 15 (busy) or 60 (`/health` before its first snapshot); 503 `timeout` means the WHOLE request passed 11 s and carries 15; 429 is the caller's own window only. Every answer the API serves under `/v2` carries `x-request-id`; the Worker's own 404 for `/v1/*` and the CORS preflight do not.
+- `GET /traders` with `include` returns a page of 100 by default and at most 200; the plain list is cached 60 s and served expired when the database fails (per isolate).
+- GMGN details (`fundamentals`, `security`, `walletTags`, `creator`) are NOT refreshed nightly for every coin: at most roughly 1,100 coins a day against ~31,000 held, most-held first. Each block's `fetchedAt` is the truth.
+- `/health.staleTraders.liveStale` and `oldestLiveHours` are not fault signals since 19 Sep 2026: the hourly refresh of every trader's live figure was withdrawn, so they rise by design.
 
 ## 3. Fields added since the 16 Sep contract, by route
 
@@ -106,7 +110,7 @@ Every line below is also in `Field_Contracts.md` with its full contract; the wav
 | `health.feeds.aum.chains.{chain}` | Added 17 Sep 2026 (vocabulary v3, pre-migration fixes) | `{ accepted36h, failed24h, newestAcceptedAt }` per chain |
 | `health.staleTraders.scorecardLoadFailed` | Added 17 Sep 2026, second wave (vocabulary v4) | traders past 72 h whose latest load attempt was not `loaded` |
 | `health.feeds.aum.historyState`, `health.feeds.aum.chains.{chain}.historyState` | Added 17 Sep 2026, second wave (vocabulary v4) | `{ ready, warming, none }` counts of trader-chains, same definition as `wallets.knownChains[].historyState` |
-| `health.feeds.aum.state`, `samplerLastRunAt` | Added 17 Sep 2026, second wave (vocabulary v4) | the feed clock is the newest ACCEPTED reading; the sampler's own clock moved to `samplerLastRunAt` |
+| `health.feeds.aum.state`, `samplerLastRunAt` | Added 17 Sep 2026, second wave (vocabulary v4) | SUPERSEDED the same day (X3): v2 does not emit `samplerLastRunAt`; the retired sampler's clock is `feeds.aum.sampler.lastRunAt` |
 | `health.staleTraders.noReading` | Added 17 Sep 2026, second wave (vocabulary v4) | now counts every listed trader with no accepted reading (refused readings do not count) |
 
 ### `/pnl, /traders?include=pnl`
@@ -187,7 +191,7 @@ Every line below is also in `Field_Contracts.md` with its full contract; the wav
 | Field | Wave | Contract (first line) |
 |---|---|---|
 | `entries[].creator.ledger` | Added 17 Sep 2026, creators and linked wallets | `{ launches, bestPeakMcapUsd, bestToken, stillHoldingCount, soldCount, honeypotCount, lastLaunchAt }` for this |
-| `entries[].security.honeypotSince` | Added 17 Sep 2026, honeypot-since and cohort | ISO time of the first nightly security read where `isHoneypot` or sell-blocked became true (`token_info.honeyp |
+| `entries[].security.honeypotSince` | Added 17 Sep 2026, honeypot-since and cohort | ISO time of our first GMGN security read (not nightly) where `isHoneypot` or sell-blocked became true (`token_info.honeyp |
 | `entries[].cohort` | Added 17 Sep 2026, honeypot-since and cohort | `{ holders, independent, linkedGroups }`, per chain. `holders`: distinct tracked traders with any `trades` row |
 
 ### `new route`
@@ -320,9 +324,9 @@ Every line below is also in `Field_Contracts.md` with its full contract; the wav
 |---|---|---|
 | `tokens[].ok`, `error` | Added 17 Sep 2026 — token prices | `ok: false` with `error: "not_found"` (address not in `tokens`, on that chain when `chain` was sent) or `error |
 
-## 4. Words added to the vocabulary (v2 → v10)
+## 4. Words added to the vocabulary (v2 → v14)
 
-`GET /v2/fields` is the source; `fields-v10.json` in this folder is the snapshot at handover. Add every word your allow-list lacks before pointing at v2; the guide's §3 lists the ones that matter most.
+`GET /v2/fields` is the source; `fields-v14.json` in this folder is its `vocabulary` block, generated from the service's vocabulary module (not a live capture: it carries no counts). Add every word your allow-list lacks before pointing at v2; the guide's §3 lists the ones that matter most.
 
 ## 5. Removed
 

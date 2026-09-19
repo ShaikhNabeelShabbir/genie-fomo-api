@@ -338,7 +338,7 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `scorecard.loadAttemptedAt`, `loadOutcome`, `nextLoadBasis` | /scorecard | last fomoapi fetch attempt and its outcome (`loaded` \| `unavailable` \| `degraded` \| `not_found` \| `error`, null = never attempted); `nextLoadBasis: nightly_slot` |
 | `health.staleTraders.scorecardLoadFailed` | /health | traders past 72 h whose latest load attempt was not `loaded` |
 | `health.feeds.aum.historyState`, `health.feeds.aum.chains.{chain}.historyState` | /health | `{ ready, warming, none }` counts of trader-chains, same definition as `wallets.knownChains[].historyState` |
-| `health.feeds.aum.state`, `samplerLastRunAt` | /health | the feed clock is the newest ACCEPTED reading; the sampler's own clock moved to `samplerLastRunAt` |
+| `health.feeds.aum.state`, `samplerLastRunAt` | /health | SUPERSEDED by X3 (v5 fixes, below): v2 has not emitted `samplerLastRunAt` since 17 Sep 2026; the retired sampler's clock is `feeds.aum.sampler.lastRunAt`, and the feed clock is the newest hour `aum_history` carries a figure for |
 | `health.staleTraders.noReading` | /health | now counts every listed trader with no accepted reading (refused readings do not count) |
 | `aum.sampler.state = never_read` | /aum | the sampler has never covered this trader (no reading row at all) |
 | `positions.coverage.chains.{chain}` | /positions, POST /traders/positions v2 | `{ chainTxCount, rowsHeld, share, readAt }` from one `eth_getTransactionCount` per sampled EVM chain; `partialReason: indexer_coverage_low` when any share < 0.5, composed with `unsellable_positions` as `unsellable_positions_and_indexer_coverage_low` |
@@ -373,9 +373,9 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 
 | Field | Route | Contract |
 |---|---|---|
-| `entries[].creator.ledger` | /tokens/:address | `{ launches, bestPeakMcapUsd, bestToken, stillHoldingCount, soldCount, honeypotCount, lastLaunchAt }` for this token's creator across every token we hold GMGN info for; rebuilt nightly (`creators`). `null` until the ledger has a row — the rest of `creator` is unaffected. `launches` is a real count; `bestPeakMcapUsd`, `bestToken` (an address key) and `lastLaunchAt` are `null` when unknown. `lastLaunchAt` is when we first saw the token, not its mint time |
+| `entries[].creator.ledger` | /tokens/:address | `{ launches, bestPeakMcapUsd, bestToken, stillHoldingCount, soldCount, honeypotCount, lastLaunchAt }` for this token's creator across every token we hold GMGN info for; rebuilt daily at 03:35 UTC (`creators`) from those stored details, which are only as fresh as each coin's own GMGN read (see "Corrected 19 Sep 2026"). `null` until the ledger has a row — the rest of `creator` is unaffected. `launches` is a real count; `bestPeakMcapUsd`, `bestToken` (an address key) and `lastLaunchAt` are `null` when unknown. `lastLaunchAt` is when we first saw the token, not its mint time |
 | `GET /creators/:address` | new route | `{ creator, asOf, ledger, tokens: [{ chain, tokenAddress, symbol, status, isHoneypot, marketCapUsd }], tier: third_party, source: gmgn }`. `?chain=` optional; without it an EVM address sums across chains. `tokens[].status` is GMGN's own word, `creator_hold` or `creator_close`, `null` when GMGN was silent. 404 `not_found` for an address the ledger has never seen; 503 `unavailable` when the database is down |
-| `linked[]` | /wallets | `[{ chain, address, linkedFrom, kind, firstSeenAt, evidenceTx, watch }]`, wallets the trader funded from his known Solana wallet (`linked_wallets`, nightly). `kind` is `funded_by`; `submitted` is reserved and not yet written. `address` is the case-preserved spelling when resolved, otherwise the lowercased key. `watch: true` means the Helius webhook is registered for it, so its transfers appear under this trader's `/transactions`. `[]` when none, never absent |
+| `linked[]` | /wallets | `[{ chain, address, linkedFrom, kind, firstSeenAt, evidenceTx, watch }]`, wallets the trader funded from his known Solana wallet (`linked_wallets`, nightly). `kind` is `funded_by`; `submitted` is reserved and not yet written. `address` is the case-preserved spelling when resolved, otherwise the lowercased key. `watch: true` means the address is on the Helius watch list, and nothing more (corrected 19 Sep 2026): its transfers are NOT stored and do NOT appear under `/transactions`, because the receiver keeps only legs that touch the trader's own wallet and the route reads only his two own addresses. `[]` when none, never absent |
 
 ## Added 17 Sep 2026, market regime
 
@@ -392,7 +392,7 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 
 | Field | Route | Contract |
 |---|---|---|
-| `entries[].security.honeypotSince` | /tokens/:address | ISO time of the first nightly security read where `isHoneypot` or sell-blocked became true (`token_info.honeypot_since`); never cleared, even if a later read says otherwise. `null` when never flagged, or flagged before the column existed (backfills from the first refresh after 17 Sep 2026) |
+| `entries[].security.honeypotSince` | /tokens/:address | ISO time of our first GMGN security read (not nightly, see "Corrected 19 Sep 2026") where `isHoneypot` or sell-blocked became true (`token_info.honeypot_since`); never cleared, even if a later read says otherwise. `null` when never flagged, or flagged before the column existed (backfills from the first refresh after 17 Sep 2026) |
 | `entries[].cohort` | /tokens/:address | `{ holders, independent, linkedGroups }`, per chain. `holders`: distinct tracked traders with any `trades` row in the coin — by trades, so it can differ from the holdings-snapshot `holders` beside it. `independent`: `holders` minus traders whose wallet is another trader's `linked_wallets` address. `linkedGroups = holders − independent`. Real zeros, never null |
 | `byToken[].isHoneypotNow` | /scorecard, `?include=scorecard` | latest GMGN read: `true` when honeypot or sell-blocked, `false` when checked and neither, `null` when the chain is not assessed (Solana) or the token was never checked |
 | `byToken[].honeypotSince` | same | as `security.honeypotSince` above, on the coin the trader traded |
@@ -423,7 +423,7 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 
 | Field | Route | Contract |
 |---|---|---|
-| `error.code` | every route | One of `not_found`, `bad_request`, `duplicate_identifier`, `rate_limited`, `timeout`, `unavailable`, `include_unavailable`, `internal_error`, `not_configured`, `unauthorized`, `invalid_address`, `address_in_use`, `already_on_record`. v8 corrects the list: `internal` was published but the service emits `internal_error`; `unavailable` (503, Postgres not answering) and `include_unavailable` (503, `blocks[]` names the `?include=` blocks not produced) were emitted but unpublished. |
+| `error.code` | every route | One of `not_found`, `bad_request`, `duplicate_identifier`, `rate_limited`, `timeout`, `unavailable`, `include_unavailable`, `internal_error`, `not_configured`, `unauthorized`, `invalid_address`, `address_in_use`, `already_on_record`. v8 corrects the list: `internal` was published but the service emits `internal_error`; `unavailable` (503, the database not answering, or busy since 19 Sep 2026) and `include_unavailable` (503, `blocks[]` names the `?include=` blocks not produced) were emitted but unpublished. |
 
 ## Added 17 Sep 2026 — aum history
 ## v3 fixes — positions
@@ -464,7 +464,7 @@ Vocabulary v9. `GET /traders/:handle/aum/history` and `POST /traders/aum/history
 
 ## Added 17 Sep 2026 — live value
 
-Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its own at `GET /traders/:handle/aum/now` and `POST /traders/aum/now { ids }`: the trader's current value from `aum_live`, refreshed when a watched wallet transacts (Solana push), when a balance slice reads the wallet, and when prices land. The hourly series' last point is refreshed with it.
+Vocabulary v10. A `now` block on `/aum/history` (GET and POST rows), and on its own at `GET /traders/:handle/aum/now` and `POST /traders/aum/now { ids }`: the trader's current value from `aum_live`, refreshed within about five minutes of a watched Solana wallet transacting and when the balance sweep reads the trader (about 9 h a lap). Corrected 19 Sep 2026: it is NOT refreshed when prices land, and nothing revalues an unmoved trader hourly (A2 withdrawn, see "Corrected 19 Sep 2026"), so `now.at` / `now.ageSeconds` are the truth about one figure. The hourly series' last point is refreshed with it.
 
 | Field | Route | Contract |
 |---|---|---|
@@ -513,13 +513,13 @@ Migration `20260918060000_valuation_v3.sql` (17 Sep 2026, fix request v3 V1 / N1
 
 | Field | Route | Contract |
 |---|---|---|
-| `logoUrl` | /tokens rows, /tokens/:address entries, /tokens/momentum rows | Token image URL (`string`), GMGN's `logo` first, DexScreener's pair `info.imageUrl` when GMGN has none. `null` when neither source has one, never `""`. Filled by the nightly tokens job and the hourly prices job, so a newly seen token is `null` for up to an hour. Not on positions rows. |
+| `logoUrl` | /tokens rows, /tokens/:address entries, /tokens/momentum rows | Token image URL (`string`), GMGN's `logo` first, DexScreener's pair `info.imageUrl` when GMGN has none. `null` when neither source has one, never `""`. Filled by the GMGN queue (most-held coins first, see "Corrected 19 Sep 2026") and by the hourly prices job when DexScreener has a pair image, so a newly seen token is `null` until one of them reads it. Not on positions rows. |
 ## v3 fixes — scorecards
 
 | Field | Route | Contract |
 |---|---|---|
 | `scorecard.loadOutcome` | /scorecard, /traders?include=scorecard | Adds `unchanged`: fomo answered but the newest snapshot (`loadedAt` = `trades.captured_at`) did not advance (re-served or empty document). The loader targets `loadedAt` older than 72 h and retries a trader at most once per 6 h, whatever the last outcome; every attempt writes a row, so `loadAttemptedAt`/`loadOutcome` stop being null after the first six-hourly run. |
-| `scorecard.nextLoadAt`, `nextLoadBasis` | same | `nextLoadAt` is the next 00/06/12/18 UTC tick of the Worker cron; `nextLoadBasis: six_hourly_slot`. `nightly_slot` stays published for one version and is no longer emitted. |
+| `scorecard.nextLoadAt`, `nextLoadBasis` | same | `nextLoadAt` is the next 00/06/12/18 UTC tick of the Worker cron - when the loader next RUNS, not when it next loads this trader (a record is reloaded only past 72 h; gmgn-sourced traders load daily at 02:20 UTC); `nextLoadBasis: six_hourly_slot`. `nightly_slot` stays published for one version and is no longer emitted. |
 | `scorecard.staleness.fallback` | /scorecard | `on_chain` only when the record is `stale` or `never` AND `onChain.coverage.share >= 0.5` (the swap store holds at least half the profile's swap-shaped transactions). Otherwise `null`. |
 | `scorecard.staleness.fallbackReason` | /scorecard | `swap_store_incomplete` when the record is `stale` or `never` and `fallback` is null because coverage is under 0.5 (or `onChain.swaps` is 0). `null` when current, when `fallback` is set, and always on the embedded scorecard. |
 | `health.staleTraders.scorecardStale` | /health | Now counts `source = fomoapi.io` traders only (the set the loader owns); `scorecardStaleGmgn` counts the rest, refreshed by the nightly gmgn job. |
@@ -571,7 +571,7 @@ stored series is judged by it immediately with nothing rebuilt. Measured on 17 S
 | Field | Route | Contract |
 |---|---|---|
 | `points[].reason` = `not_built` | /aum/history, `step=1h` | **New word** (vocabulary 12). An hour inside the window the builder never wrote. Such hours used to be ABSENT from `points[]`; they are now null points with this reason, so a gap is distinguishable from the end of the data. Only hours BETWEEN the first and last point we hold are filled — nothing is invented before a trader was tracked. |
-| `health.staleTraders.liveStale`, `liveStaleAfterHours`, `liveNever`, `oldestLiveHours` | /health | How many traders' `/aum/now` is older than an hour. The catch-up that refreshes them now runs FIRST in its hourly job with a quarter of the budget reserved, instead of on whatever the history backfill left over. |
+| `health.staleTraders.liveStale`, `liveStaleAfterHours`, `liveNever`, `oldestLiveHours` | /health | How many traders' `/aum/now` is older than an hour, and the oldest. WITHDRAWN 19 Sep 2026: there is no catch-up any more. The hourly refresh of every trader ran 231-625 s every five minutes and reset the database, so it was switched off; `liveStale` reads in the hundreds and `oldestLiveHours` rises to about one lap of the balance sweep (9 h, more while a provider refuses us) BY DESIGN. Neither is a fault signal; we told you on 17 Sep that `oldestLiveHours` above 2 meant our job had stopped, and that no longer holds. |
 | `health.feeds.aum` | /health | Now watches `aum_history` (`newestReadingAt`, `lastBuiltAt`) and `aum_live` (`newestLiveAt`), which are what write the hours. The retired hourly sampler's own clocks move to `feeds.aum.sampler` with `retired: true` and `retiredAt`. This is why the feed said 06:00 while the data went on past it. |
 
 ### Completeness and the trade counts (W2)
@@ -596,4 +596,27 @@ reached past them, which on an airdrop-spammed wallet is a few weeks.
 | `coverage.chains.{chain}.transferRowsHeld` | /positions | **RENAMED from `rowsHeld`.** Transfer LEGS we store for the address on that chain. |
 | `coverage.chains.{chain}.rowsPerSentTx` | /positions | **REPLACES `share`**, which was never a share: its numerator counts transfer legs and its denominator counts sent transactions, so it legitimately read 2.2989 and 8.5. Same arithmetic, honest name. Still an upper bound (`chainTxCount` is a lower bound), and still makes the list partial below 0.5. |
 | `positions[].canSell` | /positions, /events | **False whenever `isHoneypot` is true.** It used to negate `can_not_sell` alone, so every honeypot row read `isHoneypot: true, canSell: true` — two fields contradicting each other on the same coin. Still null when no security source has judged the coin. |
-| `logoUrl` | openapi only | Marked NOT YET PUBLISHED in all three schemas and removed from their `required` lists, so a generated client no longer depends on a key no route serves. |
+| `logoUrl` | openapi only | CORRECTED 19 Sep 2026: this was wrong. `GET /tokens`, `GET /tokens/:address` and `GET /tokens/momentum` have served `logoUrl` since 17 Sep; the spec describes it and lists it as `required` (nullable) again. It is `null` until GMGN or DexScreener has given us an image for the coin. |
+
+## Corrected 19 Sep 2026 — errors, /health, /traders, GMGN cadence, the live figure (vocabulary 14)
+
+Vocabulary 13 adds two words, both on `health.staleFeeds[]`: `prices` and `scheduler`. Vocabulary 14 changes no response: it publishes 18 word sets the routes ALREADY emitted and `/fields` never listed (`health.status`, `trades.incompleteReason`, `trades[].side`, `trades[].confidence`, `trust.verdict`, `trust.flags[].code`, `trust.flags[].severity`, `wallets.presence`, `positions[].costMethod`, `scorecard.typicalBet.method`, `scorecard.byToken[].entryPriceSource`, `scorecard.byToken[].entryMethod`, `scorecard.byToken[].exitMethod`, `tokens.*.tier`, `tokens.security.flags[]`, `tokens.security.verdict`, `tokens.activity.flow.verdict`, `tokenPrices.tokens[].error`), and adds `rolling_read` to `positions.liveBasis.evm` ahead of the code, which still answers `nightly_read`. Everything else here is a change of behaviour or a correction of something we told you.
+
+| Field | Route | Contract |
+|---|---|---|
+| `x-request-id` header | every route | On every answer the API serves under `/v2`, 200s included; the Worker's own 404 for `/v1/*` and the CORS preflight do not carry it. Every 5xx is logged under the id it returns. |
+| 500 `internal_error` | every route | OUR fault: a statement the database rejects, or a bug. The same request fails the same way, so do not retry - report `requestId`. Until 19 Sep a fault of ours could be served as 503 "retry shortly" (`/portfolio` did, for two days). |
+| 503 `unavailable` | every route | The database is unreachable (`Retry-After: 5`) or busy / reset under load (`Retry-After: 15`). Retry, keeping your last good copy. |
+| 503 `unavailable`, `Retry-After: 60` | /health | The one 503 that is NOT an outage: the scheduler has not written the first snapshot yet (the first ten minutes after the snapshot table is created). `error.database` is `{ answering: true, latencyMs }`; an outage is `{ answering: false, waitedMs }`. A request never computes the body, so `cached` is always `true` on a 200. |
+| 503 `timeout` | every route | The WHOLE request (rate check included) passed 11 s; `Retry-After: 15`, because the abandoned work is still running. The ceiling was 15 s for the route alone, above your 12 s deadline, so you never saw this answer. |
+| 429 `rate_limited` | every route | Your own 240/min window, and nothing else. Until 19 Sep a busy database was also answered 429 beside `RateLimit-Remaining: 240`. |
+| `x-cost-units` header | every route | The size of the work asked for (ids in a batch, capped at 50). NOT what the limiter charges: the 240/min window counts every request as 1, a batch of 50 included. |
+| `limit` with `include` | GET /traders | A page of 100 when no `limit` is named, never more than 200. The plain list is unbounded as before. |
+| plain list | GET /traders (no `include`) | Cached 60 s per query; when the database throws or stalls for 3 s the last answer is served, expired, instead of a 503. Per Worker isolate: a fresh isolate has nothing to serve, so keep your own copy too. `capturedAt` is the daily directory build's stamp (01:00 UTC), not the cache's. Pages with `include` are never cached. |
+| `health.feeds.positions` | /health | `staleAfterHours: 12` (was 36): the balance sweep takes about 9 h to go round. |
+| `health.feeds.prices` | /health | New feed: the newest hourly token price written; `staleAfterHours: 3`. |
+| `health.feeds.tokenInfo` | /health | Reads `stale` BY DESIGN today: see the GMGN row below. `heldCoinsStaleShare` is the number to watch move, not the word. |
+| `health.estimatedRows` | /health | Always `[]` on v2: every row count is exact. |
+| `fundamentals.fetchedAt`, `security.fetchedAt` | /tokens/:address | THERE IS NO NIGHTLY GMGN REFRESH OF EVERY COIN; the API reference said so and was wrong. GMGN allows one request a second, which buys at most roughly 1,100 coins a day against ~31,000 held. The queue is most-held first, so at best a widely held coin stays about a day old and a coin one or two traders hold can be weeks old. A coin GMGN has nothing for is parked for 7 days, and the payload cannot yet tell "not asked" from "GMGN has nothing". Robinhood Chain coins are in the same queue. Print `fetchedAt`. |
+| `sampler.nextExpectedAt`, `progress.nextRunAt` | /aum, POST /traders/aum | Still name the next 06:00 UTC, but the sampler was retired on 17 Sep 2026 and no run is scheduled. Do not schedule on them; charts read `/aum/history`, the current value `/aum/now`. |
+| `since`, `until` | /trades | Compared as TEXT and not validated: send ISO-8601 UTC ending in `Z`. Anything else answers 200 with wrong or no rows (the reference used to promise a 500). |

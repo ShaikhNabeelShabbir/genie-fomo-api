@@ -1,5 +1,10 @@
 # Genie API v2 — status for the app team
 
+> **Dated note, kept as sent (17 Sep 2026).** Superseded where it disagrees with `README.md` and
+> `openapi.yaml` in this folder (19 Sep 2026): the vocabulary is version 14 (`fields-v14.json`
+> replaces `fields-v11.json`); `logoUrl` IS served on the three `/tokens` routes; a 503 carries
+> `Retry-After` 5 or 15 (60 on `/health` before its first snapshot), a fault of ours is a 500, and 429 means your own window only.
+
 **As of 17 September 2026, 12:20 UTC.** Written to be read by a person or handed to a coding agent.
 
 Base URL: `https://genie-copy-trading-api.agent-73b.workers.dev/v2`
