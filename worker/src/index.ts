@@ -37,7 +37,7 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "35 3 * * *":   runLaunches,     // pump.fun launch metadata, dev ledger
   "50 4 * * *":   runWallets,      // linked wallets
   "55 5 * * *":   runTiming,       // position timing (one aggregate)
-  "15 2 * * *":   runGmgn,         // GMGN directory and its trades
+  "20 2 * * *":   runGmgn,         // GMGN directory and its trades; off :15, which swaps holds
   "0 1 * * *":    runDirectory,    // fomo leaderboard, wallets, fomo-reported holdings
   "*/5 * * * *":  runAumLiveFlush, // live value for traders whose wallet moved in the last minute
   "2,12,22,32,42,52 * * * *": runHealthSnapshot, // the body /health serves; off the 5-minute marks the flush lands on
