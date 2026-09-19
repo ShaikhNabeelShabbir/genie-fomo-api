@@ -4,11 +4,8 @@
  * list; never grow it without measuring the table on D1.
  */
 export const ACCEPTED_WHOLE_READS: Record<string, string> = {
-  "GET /chains | holdings": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /chains | trades": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /events | transactions": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /fields | aum_samples": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /fields | trades": "baseline 19 Sep 2026 — not yet fixed",
+  "GET /chains | trades": "a global aggregate over every trade (per-chain realised PnL / fill rates): whole by nature, behind a 60 s cache that serves stale on error",
+  "GET /fields | trades": "a global aggregate over every trade (per-chain realised PnL / fill rates): whole by nature, behind a 60 s cache that serves stale on error",
   "GET /health | aum_chain_samples": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
   "GET /health | aum_history": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
   "GET /health | aum_samples": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
@@ -29,19 +26,6 @@ export const ACCEPTED_WHOLE_READS: Record<string, string> = {
   "GET /tokens/0x00000000000000000000000000000000000000aa/prices | token_price_hourly": "baseline 19 Sep 2026 — not yet fixed",
   "GET /tokens/0x00000000000000000000000000000000000000aa/prices | tokens": "baseline 19 Sep 2026 — not yet fixed",
   "GET /tokens/momentum | holdings": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders | holdings": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders | trade_loads": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders | trader_stats": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/aum | aum_samples": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/pnl | transactions": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/portfolio | holdings": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/portfolio | token_prices": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/positions | holdings": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/scorecard | trade_loads": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/scorecard | transactions": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/trades | transaction_fees": "baseline 19 Sep 2026 — not yet fixed",
-  "GET /traders/t1/trust | holdings": "baseline 19 Sep 2026 — not yet fixed",
   "POST /tokens/prices | token_price_hourly": "baseline 19 Sep 2026 — not yet fixed",
   "POST /tokens/prices | tokens": "baseline 19 Sep 2026 — not yet fixed",
-  "POST /traders/flow | transactions": "baseline 19 Sep 2026 — not yet fixed",
 };

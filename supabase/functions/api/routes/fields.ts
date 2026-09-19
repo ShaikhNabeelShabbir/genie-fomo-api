@@ -6,7 +6,7 @@ import { MIN_DRAWABLE_POINTS, PARTIAL_SERVE_FLOOR_USD, PRICED_FLOOR } from "../s
 // ------------------------------------------------------------------ fields
 
 /**
- * Memoised per isolate: the fill rates scan every trade and reading, which timed out once at
+ * Memoised per isolate: the fill rates scan every trade, which timed out once at
  * the 15 s route limit, and they move at most hourly (the loaders' cadence). Same pattern as
  * `routes/market.ts`.
  */
@@ -31,9 +31,7 @@ async function fieldsBody(): Promise<unknown> {
         count(distinct case when t.status = 'closed' then strftime('%Y-%m', t.closed_at) end) as months,
         count(case when t.status not in ('closed', 'closed_by_balance') and t.unrealized_pnl_usd is not null then 1 end) as unreal
       from trades t group by t.handle),
-    w as (select handle from wallets where evm_address is not null or sol_address is not null),
-    a as (select handle, count(case when total_usd is not null then 1 end) as pts
-          from aum_samples group by handle)
+    w as (select handle from wallets where evm_address is not null or sol_address is not null)
     select
       (select count(*) from traders)                                as traders,
       (select count(*) from w)                                      as with_wallet,
@@ -44,7 +42,10 @@ async function fieldsBody(): Promise<unknown> {
       (select count(*) from sc where entry_px >= 20)                as entry_px_20,
       (select count(*) from sc where months >= 3)                   as months_3,
       (select count(*) from sc where unreal > 0)                    as with_unrealized,
-      (select count(*) from a where pts > 0)                        as with_reading`;
+      -- One seek per trader that stops at his first figured reading, where a group-by read every sample.
+      (select count(*) from traders d
+        where exists (select 1 from aum_samples s
+                       where s.handle = d.handle and s.total_usd is not null)) as with_reading`;
 
   const N = Number(f.traders);
   const rate = (of: unknown, why: string | null = null) => ({

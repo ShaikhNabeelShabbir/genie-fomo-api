@@ -71,9 +71,16 @@ type Point = {
   highUsd?: number | null; lowUsd?: number | null; valuedHours?: number;
 };
 
-const VIEW: Record<Exclude<HistoryStep, "1h">, string> = {
-  "1d": "aum_history_daily", "1w": "aum_history_weekly", "1mo": "aum_history_monthly",
-};
+/**
+ * The bucket of each rollup view (aum_history_daily / _weekly / _monthly), word for word. The
+ * views window the WHOLE table before a handle filter can reach it, so `points` runs their body
+ * over the asked handles instead; tests/plans_aum-misc_test.ts holds the two equal.
+ */
+const bucketOf = (step: Exclude<HistoryStep, "1h">) => ({
+  "1d": sql`strftime('%Y-%m-%dT00:00:00.000Z', hour)`,
+  "1w": sql`strftime('%Y-%m-%dT00:00:00.000Z', hour, '-6 days', 'weekday 1')`,
+  "1mo": sql`strftime('%Y-%m-01T00:00:00.000Z', hour)`,
+})[step];
 
 const iso = (v: Date | string): string => new Date(v).toISOString();
 
@@ -94,9 +101,18 @@ async function points(handles: string[], o: Options): Promise<Map<string, Point[
         select handle, at, total_usd, high_usd, low_usd, valued_hours from (
           select handle, bucket as at, total_usd, high_usd, low_usd, valued_hours,
                  row_number() over (partition by handle order by bucket desc) as rn
-          from ${sql(VIEW[o.step])}
-          where handle in (${handles})
-            and bucket <= ${o.to}
+          from (select handle, bucket,
+                       max(case when rn = 1 then total_usd end) as total_usd,
+                       max(total_usd) as high_usd, min(total_usd) as low_usd,
+                       count(total_usd) as valued_hours
+                from (select handle, total_usd, ${bucketOf(o.step)} as bucket,
+                             row_number() over (
+                               partition by handle, ${bucketOf(o.step)}, total_usd is null
+                               order by hour desc) as rn
+                      from aum_history
+                      where handle in (${handles}))
+                group by handle, bucket)
+          where bucket <= ${o.to}
             and (${o.from} is null or bucket >= ${o.from})
         ) x where rn <= ${o.limit}
         order by handle, at`;

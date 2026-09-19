@@ -729,28 +729,28 @@ function buildAum(
 let samplerCache: { at: number; row: Record<string, unknown> | undefined } | null = null;
 async function samplerLast(): Promise<Record<string, unknown> | undefined> {
   if (samplerCache && Date.now() - samplerCache.at < 60_000) return samplerCache.row;
+  /* One max() per select: SQLite answers a lone max() from an index and scans the table for two. */
   const [row] = await sql`
-    select max(at) as last_at, max(sampled_at) as last_success
-    from aum_samples where basis = 'sampled'`;
+    select (select max(at) from aum_samples where basis = 'sampled') as last_at,
+           (select max(sampled_at) from aum_samples where basis = 'sampled') as last_success`;
   samplerCache = { at: Date.now(), row };
   return row;
 }
 
-/** AUM envelopes for MANY traders in a fixed number of queries. See docs/DECISIONS.md#d051 */
+/**
+ * AUM envelopes for MANY traders in a fixed number of queries. See docs/DECISIONS.md#d051
+ * `traders` are directory rows the caller already holds, so the batch does not look them up twice.
+ */
 async function aumFor(
-  handles: string[],
+  traders: { handle: string; display_handle: string }[],
   opts: { windowKey: string; stepRaw: string | null; chainFilter: { network_id: number; name: string } | null },
 ): Promise<Map<string, ReturnType<typeof buildAum>>> {
   const out = new Map<string, ReturnType<typeof buildAum>>();
-  if (!handles.length) return out;
+  if (!traders.length) return out;
 
   const to = new Date();
   const span = AUM_WINDOWS[opts.windowKey];
-
-  const traders = await sql`
-    select handle, display_handle from traders where handle in (${handles})`;
-  if (!traders.length) return out;
-  const present = traders.map((r: Record<string, unknown>) => String(r.handle));
+  const present = traders.map((t) => t.handle);
 
   /*
    * THE READ IS BOUNDED TO THE WINDOW, per trader. This is the one cost curve that grows with
@@ -859,11 +859,15 @@ async function aumFor(
      * number rather than be reconstructed from dates by every caller.
      */
     samplerLast(),
+    /* Asked per (trader, chain): filtered by a list, the fomo half of holdings_current read the whole newest build. */
     sql`
     select handle, count(distinct network_id) as chains,
            max(network_id = ${SOLANA_NET})  as on_solana,
            max(network_id <> ${SOLANA_NET}) as on_evm
-    from holdings_current where handle in (${present}) and human_amount > 0
+    from (select p.value as handle, c.network_id
+            from json_each(${present}) p cross join chains c
+           where exists (select 1 from holdings_current h
+                          where h.handle = p.value and h.network_id = c.network_id and h.human_amount > 0))
     group by handle`,
   ]);
 
@@ -921,10 +925,10 @@ async function aumFor(
   }]));
 
   for (const t of traders) {
-    const h = String(t.handle);
+    const h = t.handle;
     const hist = histBy.get(h);
     out.set(h, buildAum(
-      { handle: h, display_handle: String(t.display_handle) },
+      t,
       byHandle.get(h) ?? [],
       chainsBy.get(h) ?? [],
       presBy.get(h) ?? null,
@@ -1015,7 +1019,9 @@ get("/v1/traders/:handle/aum", async ({ handle }, url) => {
     refreshed = "unavailable";
   }
 
-  const got = await aumFor([h], { windowKey, stepRaw, chainFilter });
+  const directory = await sql<{ handle: string; display_handle: string }[]>`
+    select handle, display_handle from traders where handle = ${h}`;
+  const got = await aumFor(directory, { windowKey, stepRaw, chainFilter });
   const envelope = got.get(h);
   if (!envelope) throw notFound(`no trader '${handle}' in the directory`);
   return {
@@ -1038,7 +1044,7 @@ const BATCH_LIVE_READ = {
 
 /** AUM for many traders in one call. See docs/DECISIONS.md#d057 */
 post("/v1/traders/aum", async (_p, _url, body) => {
-  const { requested, handles, asked, capped } = await batchIds(body);
+  const { requested, handles, asked, capped, traders } = await batchIds(body);
   /** `live` is accepted and ignored: the batch never reads live (L1); every row says so. */
   const b = body as { window?: string; step?: string; contractVersion?: number; chain?: string; live?: unknown };
   /* Same aliases as the individual route, from the same table, so the two cannot disagree. */
@@ -1064,7 +1070,12 @@ post("/v1/traders/aum", async (_p, _url, body) => {
    * so the two cannot disagree about what a chain series means.
    */
   const chainFilter = await resolveChain((b?.chain ?? "").trim().toLowerCase());
-  const envelopes = await aumFor(handles, { windowKey, stepRaw, chainFilter });
+  /* The directory rows batchIds already read; an id it could not resolve has none and gets no envelope. */
+  const directory = handles.flatMap((h) => {
+    const t = traders.get(h);
+    return t ? [{ handle: h, display_handle: t.display_handle }] : [];
+  });
+  const envelopes = await aumFor(directory, { windowKey, stepRaw, chainFilter });
 
   /*
    * The newest reading anywhere in this batch. Each trader carries his own `now.at`; this is
@@ -1078,10 +1089,6 @@ post("/v1/traders/aum", async (_p, _url, body) => {
 
   /** THE FULL ENVELOPE IS THE DEFAULT here too, for the reason above and one measurement: witho… See docs/DECISIONS.md#d058 */
   if (Number(b?.contractVersion) !== 1) {
-    const idRows = await sql`
-      select handle, id from traders where handle in (${handles})`;
-    const idBy = new Map<string, string | null>(idRows.map((r: Record<string, unknown>) => [String(r.handle), r.id ? String(r.id) : null]));
-
     const rowsOut = requested.map((req, i) => {
       const h = handles[i];
       const aum = envelopes.get(h);
@@ -1097,7 +1104,7 @@ post("/v1/traders/aum", async (_p, _url, body) => {
       return {
         ok: true as const,
         requested: req,
-        id: idBy.get(h) ?? null,
+        id: traders.get(h)?.id ?? null,
         handle: aum.handle,
         aum: { ...aum, liveRead: BATCH_LIVE_READ },
       };

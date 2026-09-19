@@ -1,27 +1,55 @@
 import { sql, n, round } from "../db.ts";
 import { get } from "../router.ts";
-import { asOfHoldings } from "../shared/asof.ts";
+import { ttlCache } from "../shared/cache.ts";
 import { money } from "../shared/format.ts";
+
+/** The same answer for every caller, and it moves with the balance sweep: one caller a minute pays (4.6 s measured, 19 Sep). */
+const chainsCache = ttlCache<unknown>(60_000);
 
 // ------------------------------------------------------------- C1/C2/C4/C5
 
-get("/v1/chains", async () => {
+get("/v1/chains", () => chainsCache("chains", async () => {
+  /*
+   * holdings_current, read ONCE (it was three passes: the rows, their count, their newest capture)
+   * and with its chain half driven per (trader, chain), so the newest capture is a seek rather
+   * than a read of every capture kept. Every holding names a trader and, through its token, a
+   * chain (foreign keys), so no row is lost; tests/plans_aum-misc_test.ts holds it to the view.
+   */
   const rows = await sql`
+    with cur as (
+      select h.handle, h.network_id, h.token_key, h.value, h.captured_at
+        from traders t cross join chains n cross join holdings h
+       where h.source = 'chain' and h.handle = t.handle and h.network_id = n.network_id
+         and h.captured_at = (select max(h2.captured_at) from holdings h2
+                               where h2.source = 'chain' and h2.handle = t.handle
+                                 and h2.network_id = n.network_id)
+      union all
+      select h.handle, h.network_id, h.token_key, h.value, h.captured_at
+        from holdings h
+       where h.source = 'fomo'
+         and h.captured_at = (select captured_at from latest_capture)
+         and not exists (select 1 from holdings c
+                          where c.source = 'chain' and c.handle = h.handle
+                            and c.network_id = h.network_id)
+    )
     select c.network_id, c.name, c.history_provider,
-           count(*)                                     as positions,
-           count(distinct h.handle)                     as traders,
+           count(*)                                       as positions,
+           count(distinct cur.handle)                     as traders,
            count(distinct case when q.token_key is null
-                               then h.token_key end)    as tokens,
-           count(case when h.value > 0 then h.value end) as priced,
-           sum(case when h.value > 0 then h.value end)   as total_value
-    from chains c
-    join holdings_current h on h.network_id = c.network_id
-    left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
+                               then cur.token_key end)    as tokens,
+           count(case when cur.value > 0 then cur.value end) as priced,
+           sum(case when cur.value > 0 then cur.value end)   as total_value,
+           max(cur.captured_at)                           as newest
+    from cur
+    cross join chains c on c.network_id = cur.network_id
+    left join quote_assets q on q.network_id = cur.network_id and q.token_key = cur.token_key
     group by c.network_id, c.name, c.history_provider
     order by positions desc`;
 
   const [{ traders: traderCount }] = await sql`select count(*) as traders from traders`;
-  const [{ total }] = await sql`select count(*) as total from holdings_current`;
+  const total = rows.reduce((sum: number, r: Record<string, unknown>) => sum + Number(r.positions), 0);
+  const newest = rows.reduce((best: string | null, r: Record<string, unknown>) =>
+    best === null || String(r.newest) > best ? String(r.newest) : best, null);
 
   /** C3 — realized profit per chain. See docs/DECISIONS.md#d060 */
   const profit = await sql<ProfitRow[]>`
@@ -37,7 +65,7 @@ get("/v1/chains", async () => {
   const top = rows[0];
   return {
     board: "chains",
-    asOf: await asOfHoldings(),
+    asOf: newest ? new Date(newest).toISOString() : null,
     /** THE CHAIN VOCABULARY IS CLOSED, AND SAYS SO. See docs/DECISIONS.md#d061 */
     vocabulary: {
       closed: true,
@@ -110,4 +138,4 @@ get("/v1/chains", async () => {
       };
     }),
   };
-});
+}));
