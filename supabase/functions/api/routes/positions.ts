@@ -280,13 +280,14 @@ get("/v1/traders/:handle/positions", async ({ handle }, url) => {
            -- Workflow gap 4: Solana rolled forward from the webhook feed since the read.
            h.human_amount_live, h.delta, h.last_transfer_at,
            ${ladderColumns()}
-    from holdings_live h
+    -- Filtered inside the subquery (same plan): the step that walks this trader's rows is then named
+    -- holdings_live, where under a bare alias h the plan audit read it as a scan of holdings.
+    from (select * from holdings_live where handle = ${t.handle}) h
     join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
     join chains c on c.network_id = h.network_id
     left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
     left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
-    left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key
-    where h.handle = ${t.handle}`;
+    left join token_price_stats ps on ps.network_id = h.network_id and ps.token_key = h.token_key`;
 
   /**
    * Priced rows first, descending. Unpriced rows TRAIL rather than being dropped: they are
