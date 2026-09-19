@@ -1,9 +1,9 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
-import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/settings.ts";
+import { EVM_CHAINS, REFUSALS_IN_A_ROW, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/settings.ts";
 import {
-  CHAIN_CODE, type Rec, type Security, type Supply, chainHits, evmSupply, gmgnData, infoRow,
+  CHAIN_CODE, type InfoTarget, type Rec, type Security, type Supply, chainHits, evmSupply, gmgnData, gmgnFailure, infoRow, infoTargets,
   isEvmAddress, isSolAddress, normaliseSecurity, singleChain, solanaSupply,
 } from "./tokens-core";
 
@@ -35,6 +35,8 @@ const STALE_AGO = `-${STALE_HOURS} hours`;
 /** GMGN: 1 request per second per IP. Deliberate, not a knob worth turning up. */
 const GMGN_GAP_MS = 1100;
 const GMGN_RATE_LIMIT_WAIT_MS = 3000;
+/** How long a coin GMGN had nothing for waits before it is asked again (a SQLite date modifier). */
+const MISS_RETRY_AGO = "-7 days";
 
 export interface TokensSummary {
   readonly chainsResolved: number;
@@ -216,7 +218,6 @@ async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): P
 }
 
 // --------------------------------------------------------------- 3. token_info
-interface InfoTarget { readonly network_id: number; readonly token_key: string; readonly address: string; readonly chain: string }
 
 async function fetchGmgn(key: string, path: string, code: string, address: string): Promise<Rec> {
   const qs = new URLSearchParams({ chain: code, address, timestamp: String(Math.floor(Date.now() / 1000)), client_id: crypto.randomUUID() });
@@ -227,16 +228,23 @@ async function fetchGmgn(key: string, path: string, code: string, address: strin
 
 const isRateLimit = (e: unknown): boolean => e instanceof Error && e.message === "RATE_LIMIT";
 
-/** Their limiter is per IP and we are the only caller: a 429 means we drifted too fast, so back off and retry; anything else is this token's problem. */
-async function fetchInfo(key: string, code: string, address: string): Promise<Rec | null> {
+type InfoRead = { readonly data: Rec } | { readonly refused: string } | { readonly nothing: string };
+
+/**
+ * Their limiter is per IP and we are the only caller: a 429 means we drifted too fast, so back off
+ * and retry. Anything else comes back WITH ITS REASON — it used to be dropped here, and the log said
+ * only "returned nothing" for every coin of every run (17-19 Sep 2026).
+ */
+async function fetchInfo(key: string, code: string, address: string): Promise<InfoRead> {
+  let last = "RATE_LIMIT";
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { return await fetchGmgn(key, "/v1/token/info", code, address); } catch (e) {
-      if (isRateLimit(e)) { await sleep(GMGN_RATE_LIMIT_WAIT_MS); continue; }
-      if (attempt === 2) console.error(`tokens: ${code}/${address.slice(0, 10)}… ${e instanceof Error ? e.message : String(e)}`);
-      return null;
+    try { return { data: await fetchGmgn(key, "/v1/token/info", code, address) }; } catch (e) {
+      last = e instanceof Error ? e.message : String(e);
+      if (!isRateLimit(e)) break;
+      await sleep(GMGN_RATE_LIMIT_WAIT_MS);
     }
   }
-  return null;
+  return gmgnFailure(last) === "refused" ? { refused: last } : { nothing: last };
 }
 
 /** Allowed to fail on its own: fundamentals are still stored, and `security_fetched_at` stays put so the next pass retries this half. */
@@ -299,38 +307,40 @@ async function storeInfo(sql: Sql, t: InfoTarget, d: Rec, sec: Security | null):
   return row?.flipped === 1;
 }
 
+/** GMGN had no document for this coin: remember when, so it leaves the head of the queue. */
+const recordMiss = (sql: Sql, t: InfoTarget, detail: string) => sql`
+  insert into token_info_misses (network_id, token_key, missed_at, detail)
+  values (${t.network_id}, ${t.token_key}, ${new Date().toISOString()}, ${detail.slice(0, 120)})
+  on conflict (network_id, token_key) do update set missed_at = excluded.missed_at, detail = excluded.detail`;
+
 async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promise<Phase & { flipped: number }> {
-  const targets = await sql<InfoTarget[]>`
-    select h.network_id, h.token_key, tk.address, ch.name as chain
-      from holdings_current h
-      join tokens tk  on tk.network_id = h.network_id and tk.token_key = h.token_key
-      join chains ch  on ch.network_id = h.network_id
-      left join quote_assets q
-        on q.network_id = h.network_id and q.token_key = h.token_key
-      left join token_info ti
-        on ti.network_id = h.network_id and ti.token_key = h.token_key
-     where q.token_key is null
-       -- Either half being stale is reason to refetch: security has its own timestamp.
-       and (ti.fetched_at is null or ti.security_fetched_at is null
-            or ti.fetched_at < strftime('%Y-%m-%dT%H:%M:%fZ','now',${STALE_AGO})
-            or ti.security_fetched_at < strftime('%Y-%m-%dT%H:%M:%fZ','now',${STALE_AGO}))
-     group by h.network_id, h.token_key, tk.address, ch.name, ti.fetched_at, ti.security_fetched_at
-     -- Never-fetched first, then stalest (ascending already puts NULL first in SQLite): a run cut
-     -- short leaves the set more complete than it found it.
-     order by ti.security_fetched_at, ti.fetched_at, h.token_key`;
+  const targets = await infoTargets(sql, STALE_AGO, MISS_RETRY_AGO);
   const key = (env.GMGN_API_KEY ?? "").trim();
   if (targets.length && !key) throw new Error("GMGN_API_KEY is not set");
-  let attempted = 0, ok = 0, errored = 0, unresolved = 0, flipped = 0, secFailed = 0;
+  let attempted = 0, ok = 0, errored = 0, unresolved = 0, flipped = 0, secFailed = 0, refusedInARow = 0;
   for (const t of targets) {
     if (outOfTime()) break;
     attempted += 1;
     const code = CHAIN_CODE[t.chain];
     // A chain GMGN does not cover is unresolved, not failed: no request was made and none will help.
     if (!code) { unresolved += 1; continue; }
-    const d = await fetchInfo(key, code, t.address);
-    if (!d) {
+    const read = await fetchInfo(key, code, t.address);
+    if ("refused" in read) {
       errored += 1;
-      console.error(`tokens: GMGN info for ${t.chain}/${t.address.slice(0, 12)}… returned nothing`);
+      refusedInARow += 1;
+      console.error(`tokens: GMGN refused ${t.chain}/${t.address.slice(0, 12)}…: ${read.refused}`);
+      if (refusedInARow >= REFUSALS_IN_A_ROW) {
+        console.error(`tokens: GMGN refused ${refusedInARow} reads in a row (${read.refused}); leaving the rest of this run`);
+        break;
+      }
+      await sleep(GMGN_GAP_MS);
+      continue;
+    }
+    refusedInARow = 0;
+    if ("nothing" in read) {
+      unresolved += 1;
+      console.warn(`tokens: GMGN has nothing for ${t.chain}/${t.address.slice(0, 12)}…: ${read.nothing}`);
+      await recordMiss(sql, t, read.nothing);
       await sleep(GMGN_GAP_MS);
       continue;
     }
@@ -339,7 +349,7 @@ async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promis
     const sec = await fetchSecurity(key, t.chain, code, t.address);
     if (!sec) secFailed += 1;
     try {
-      if (await storeInfo(sql, t, d, sec)) flipped += 1;
+      if (await storeInfo(sql, t, read.data, sec)) flipped += 1;
       ok += 1;
     } catch (e) {
       // One unstorable token must not end the run; `fetched_at` stays null so the next pass retries it.
@@ -366,9 +376,11 @@ export async function runTokens(env: Env, budgetMs: number): Promise<TokensSumma
   if (!bitqueryKey) throw new Error("tokens: BITQUERY_KEY is not set; chains and supply are read through Bitquery");
   const sql = jobSql(env);
   try {
-    const supply = await resolveSupply(sql, bitqueryKey, outOfTime(0.5));
-    const chains = await resolveChains(sql, bitqueryKey, outOfTime(0.6));
-    const info = await refreshInfo(sql, env, outOfTime(1));
+    // GMGN FIRST, with half the run (19 Sep 2026): it is the one phase a consumer reads the date of,
+    // and last in line it got 40% of whatever the two Bitquery phases left.
+    const info = await refreshInfo(sql, env, outOfTime(0.5));
+    const supply = await resolveSupply(sql, bitqueryKey, outOfTime(0.9));
+    const chains = await resolveChains(sql, bitqueryKey, outOfTime(1));
     const phases = [supply, chains, info];
     const attempted = phases.reduce((n, p) => n + p.attempted, 0);
     const errored = phases.reduce((n, p) => n + p.errored, 0);

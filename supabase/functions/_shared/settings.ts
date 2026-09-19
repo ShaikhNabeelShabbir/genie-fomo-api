@@ -51,3 +51,6 @@ export const EVM_CHAINS: Readonly<Record<number, EvmChain>> = {
 export const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 export const HEADERS: Readonly<Record<string, string>> = { "User-Agent": UA, Accept: "application/json" };
+
+/** A source that refuses this many calls in a row is refusing the RUN: a job stops, it does not spend its budget proving it. */
+export const REFUSALS_IN_A_ROW = 5;
