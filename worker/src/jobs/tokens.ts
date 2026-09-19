@@ -3,8 +3,8 @@ import { jobSql, type Sql } from "../sql";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
 import { EVM_CHAINS, REFUSALS_IN_A_ROW, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/settings.ts";
 import {
-  CHAIN_CODE, type InfoTarget, type Rec, type Security, type Supply, chainHits, evmSupply, gmgnData, gmgnFailure, infoRow, infoTargets,
-  isEvmAddress, isSolAddress, normaliseSecurity, singleChain, solanaSupply,
+  CHAIN_CODE, type InfoTarget, type Rec, type Security, type Supply, type SupplyTarget, chainHits, evmSupply, gmgnData, gmgnFailure, infoRow, infoTargets,
+  isEvmAddress, isSolAddress, normaliseSecurity, singleChain, solanaSupply, supplyTargets,
 } from "./tokens-core";
 
 /**
@@ -13,7 +13,7 @@ import {
  *   2. `scripts/load_token_supply.mjs`     total supply so an entry price can be a market cap
  *   3. `scripts/load_token_info.mjs --stale-hours 20`  GMGN fundamentals + security
  *
- * TWINS of those scripts: edit both. Same SQL, same target order, same bookkeeping (a
+ * TWINS of those scripts: edit both. Same rows, same target order, same bookkeeping (a
  * resolved chain, a stored supply, `token_info.fetched_at` are what take a token off the
  * list), so a run cut short by the budget resumes where it stopped. Differs where the
  * platform does: writes land per chunk rather than at the end, a failed unit is counted
@@ -127,8 +127,6 @@ async function resolveChains(sql: Sql, key: string, outOfTime: () => boolean): P
 }
 
 // ------------------------------------------------------------------ 2. supply
-interface SupplyTarget { readonly network_id: number; readonly address: string; readonly token_key: string }
-
 /**
  * Latest total supply after the token's most recent transaction, per
  * https://docs.bitquery.io/docs/blockchain/Ethereum/token-supply/evm-token-supply/ and
@@ -164,25 +162,7 @@ async function readSupply(key: string, t: SupplyTarget): Promise<Supply | null> 
 }
 
 async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): Promise<Phase> {
-  // Only tokens where a supply would actually be used: an entry price exists, or somebody holds it.
-  // The most valuable held position first (gross amount x price, ceilings or not): a supply is what
-  // lets /positions run the implied-cap check on exactly those rows (V1b).
-  // holdings_current is a view over every capture, so it is read ONCE, grouped, and joined:
-  // the Postgres lateral re-read it per token, which D1 runs one statement at a time cannot
-  // afford. `hv.token_key is not null` is the old `exists` over the same view.
-  const targets = await sql<SupplyTarget[]>`
-    select tk.network_id, tk.address, tk.token_key
-    from tokens tk
-    left join (select network_id, token_key, max(human_amount * price) as held
-                 from holdings_current group by network_id, token_key) hv
-      on hv.network_id = tk.network_id and hv.token_key = tk.token_key
-    where tk.total_supply is null
-      and (hv.token_key is not null
-           or exists (select 1 from trades t
-                      where t.network_id = tk.network_id and t.token_key = tk.token_key
-                        and t.avg_entry_price > 0))
-    order by hv.held desc, tk.network_id, tk.address
-    limit ${SUPPLY_SLICE}`;
+  const targets = await supplyTargets(sql, SUPPLY_SLICE);
   let attempted = 0, ok = 0, errored = 0, unresolved = 0;
   for (let i = 0; i < targets.length && !outOfTime(); i += SUPPLY_FANOUT) {
     const chunk = targets.slice(i, i + SUPPLY_FANOUT);

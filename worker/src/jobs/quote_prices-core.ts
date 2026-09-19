@@ -4,6 +4,7 @@
  * `sql` so tests/quote_prices_test.ts and tests/quote_prices_sql_test.ts can run them.
  */
 import type { Sql } from "../d1.ts";
+import { currentHoldings } from "../../../supabase/functions/_shared/current_holdings.ts";
 
 export const DAY_MS = 86_400_000;
 /** Binance returns at most this many candles a call; ~2.7 years of days. */
@@ -192,3 +193,19 @@ export async function priceLegsFrom(
   }
   return { priced, asked, failed, stoppedEarly };
 }
+
+export interface RobinhoodToken { readonly token_key: string; readonly address: string }
+
+/**
+ * Held tokens of one chain (Robinhood) that are not a quote asset and that GMGN (`token_info`)
+ * carries no price for. The chain filter reaches inside the source, so only that chain's pairs are asked.
+ */
+export const robinhoodTargets = (sql: Sql, net: number) => sql<RobinhoodToken[]>`
+  select distinct h.token_key, tk.address
+    from ${currentHoldings(sql)} h
+    -- cross join states the order: the small derived table tempts the planner to read the chain's tokens whole instead.
+    cross join tokens tk on tk.network_id = h.network_id and tk.token_key = h.token_key
+    left join quote_assets q on q.network_id = h.network_id and q.token_key = h.token_key
+    left join token_info ti on ti.network_id = h.network_id and ti.token_key = h.token_key
+   where h.network_id = ${net} and q.token_key is null and ti.price_usd is null
+   order by h.token_key`;
