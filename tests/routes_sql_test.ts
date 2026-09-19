@@ -6,6 +6,7 @@ import { handle } from "../supabase/functions/api/app.ts";
 import { registeredRoutes } from "../supabase/functions/api/router.ts";
 import "../supabase/functions/api/routes.ts";
 import { knownChainsFor } from "../supabase/functions/api/shared/chains.ts";
+import { refreshHealthSnapshot } from "../supabase/functions/api/routes/health.ts";
 
 /*
  * EVERY ROUTE'S SQL, EXECUTED — through the real app, the real shim and the real D1 migrations
@@ -75,6 +76,10 @@ const call = (method: string, path: string, body?: unknown): Promise<Response> =
 
 const db = await openSchema((text) => (SEEN.get(text) ?? SEEN.set(text, new Set()).get(text)!).add(ROUTE.now));
 seed(db);
+/* /health serves the scheduler's snapshot and computes nothing itself, so the scheduler's half runs here:
+   its SQL is still executed against the schema, and the plan audit still sees it under the route's name. */
+ROUTE.now = "GET /health";
+await refreshHealthSnapshot();
 
 Deno.test("every registered route executes its SQL against the real schema without a server error", async () => {
   const failures: string[] = [];

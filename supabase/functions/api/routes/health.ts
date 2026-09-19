@@ -41,7 +41,7 @@ async function readSnapshot(): Promise<Snapshot | undefined> {
   }
 }
 
-/** Compute the body and store it. Called by the Worker's scheduler; by a request only while the table is empty. */
+/** Compute the body and store it. Called by the Worker's scheduler only, never by a request. */
 export async function refreshHealthSnapshot(): Promise<Snapshot> {
   const started = Date.now();
   const body = JSON.stringify(await healthBody());
@@ -64,7 +64,15 @@ get("/v1/health", async (_p, url) => {
   const started = Date.now();
   const stored = await readSnapshot();
   const latencyMs = Date.now() - started;
-  const snap = stored ?? await refreshHealthSnapshot();
+  /*
+   * No snapshot yet (the first minutes after migration 0011): say so at once. Computing the body
+   * here ran 2.8 M rows inline on every call and met the request ceiling (19 Sep 2026, 12:23 UTC).
+   */
+  if (!stored) {
+    throw new ApiError(503, "unavailable", "the health snapshot has not been computed yet — the scheduler writes it every 10 minutes",
+      { database: { answering: true, latencyMs } }, 60);
+  }
+  const snap = stored;
   const ageSeconds = Math.max(0, Math.round((Date.now() - Date.parse(snap.computed_at)) / 1000));
   return {
     status: "ok",
@@ -73,7 +81,7 @@ get("/v1/health", async (_p, url) => {
     /** The probe: one indexed row read, under a deadline. A database that does not answer is a 503, not this body. */
     database: { answering: true, latencyMs },
     /** The body below is computed by the scheduler every 10 minutes; these say when, and how long it took. */
-    cached: stored !== undefined,
+    cached: true,
     cacheAgeSeconds: ageSeconds,
     computedAt: snap.computed_at,
     computeMs: snap.took_ms,

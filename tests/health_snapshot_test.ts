@@ -13,6 +13,14 @@ db.exec("insert into builds (captured_at, window_label, trader_count, holding_co
 
 const health = (): Promise<Response> => handle(new Request("https://test.local/v2/health"));
 
+Deno.test("health: before the first snapshot a request answers at once that there is none, and computes nothing", async () => {
+  issued.length = 0;
+  const res = await health();
+  const body = await res.json();
+  assertEquals([res.status, body.error.code, body.error.database.answering, res.headers.get("retry-after")], [503, "unavailable", true, "60"]);
+  assertEquals(issued.filter((t) => /^\s*select/i.test(t)).length, 1, "the probe alone");
+});
+
 Deno.test("health: the scheduler's snapshot runs every heavy statement against the real schema and stores one row", async () => {
   const snap = await refreshHealthSnapshot();
   const body = JSON.parse(snap.body);
