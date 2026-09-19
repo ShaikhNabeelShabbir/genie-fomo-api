@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { askable, positionRows, sliceSize } from "../worker/src/jobs/balances-core.ts";
+import { askable, failedInARow, positionRows, sliceSize } from "../worker/src/jobs/balances-core.ts";
 import { SOLANA_NETWORK_ID } from "../supabase/functions/_shared/chain_reads.ts";
 
 const chains = [
@@ -27,4 +27,16 @@ Deno.test("positionRows: key lowercased, address kept as the chain spells it", (
   assertEquals(positionRows("a", 56, [{ address: "0xAbC", amount: "1.5" }]), [
     { handle: "a", network_id: 56, token_key: "0xabc", address: "0xAbC", amount: "1.5" },
   ]);
+});
+
+Deno.test("failedInARow: a source counts the traders it answered nothing for; any answer resets it, not being asked leaves it", () => {
+  const [solana, bsc, base] = chains;
+  const none = { helius: 0, bitquery: 0 };
+  // Helius refuses, Bitquery answers one of its two chains: only Helius counts.
+  assertEquals(failedInARow(none, [solana, bsc, base], [false, false, true]), { helius: 1, bitquery: 0 });
+  // An EVM-only trader says nothing about Helius; every EVM chain failing is one more for Bitquery.
+  assertEquals(failedInARow({ helius: 4, bitquery: 2 }, [bsc, base], [false, false]), { helius: 4, bitquery: 3 });
+  assertEquals(failedInARow({ helius: 4, bitquery: 2 }, [solana], [true]), { helius: 0, bitquery: 2 });
+  // A Solana-only trader reached after Solana was left out is asked nothing: the count stays where it stopped.
+  assertEquals(failedInARow({ helius: 5, bitquery: 0 }, [], []), { helius: 5, bitquery: 0 });
 });

@@ -4,7 +4,7 @@ import { transferKey } from "../../../supabase/functions/_shared/md5.ts";
 import { REFUSALS_IN_A_ROW, UA } from "../../../supabase/functions/_shared/settings.ts";
 import { fetchTransactions, type ProviderKeys } from "../../../supabase/functions/_shared/transactions.ts";
 import { SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/chain_reads.ts";
-import { type Row, type Wallet, chunk, dedupe, isSourceRefusal, pickWebhook, toRows, walkBackTargets, webhooksOf } from "./transfers-core";
+import { type Row, type Wallet, chunk, dedupe, isSourceRefusal, pickWebhook, toRows, upsertText, walkBackTargets, webhooksOf } from "./transfers-core";
 
 /**
  * On-chain transfer refresh, the Worker half of refresh.yml steps 6 and 7:
@@ -98,19 +98,7 @@ async function markDirty(sql: Sql, handle: string): Promise<void> {
 async function upsert(sql: Sql, rows: readonly Row[]): Promise<void> {
   await sql.begin((tx) => {
     for (const part of chunk(rows.map(keyed), INSERT_ROWS)) {
-      void tx.unsafe(
-        `insert into transactions
-           (network_id, tx_hash, address_key, transfer_key, block_time, direction,
-            counterparty, token_key, token_symbol, amount, source, tx_type, tx_source)
-         values ${part.map(() => "(?,?,?,?,?,?,?,?,?,?,?,?,?)").join(",")}
-         on conflict (network_id, tx_hash, address_key, transfer_key) do update set
-           block_time = excluded.block_time, token_symbol = excluded.token_symbol,
-           amount = excluded.amount, source = excluded.source,
-           tx_type = coalesce(excluded.tx_type, transactions.tx_type),
-           tx_source = coalesce(excluded.tx_source, transactions.tx_source),
-           ingested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-        part.flat(),
-      );
+      void tx.unsafe(upsertText(part.length), part.flat());
     }
     return Promise.resolve();
   });

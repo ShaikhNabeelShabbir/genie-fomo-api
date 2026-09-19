@@ -181,7 +181,14 @@ export interface InfoTarget { readonly network_id: number; readonly token_key: s
  * can run it against the schema. `staleAgo` and `missRetryAgo` are SQLite date modifiers.
  */
 export const infoTargets = (sql: Sql, staleAgo: string, missRetryAgo: string) => sql<InfoTarget[]>`
-    select h.network_id, h.token_key, tk.address, ch.name as chain
+  select network_id, token_key, address, chain from (
+    select due.*,
+           row_number() over (order by holders desc, waited, token_key) as by_held,
+           row_number() over (order by waited, holders desc, token_key) as by_wait
+      from (
+    select h.network_id, h.token_key, tk.address, ch.name as chain,
+           count(distinct h.handle) as holders,
+           max(coalesce(ti.fetched_at, ''), coalesce(ms.missed_at, '')) as waited
       from holdings_current h
       join tokens tk  on tk.network_id = h.network_id and tk.token_key = h.token_key
       join chains ch  on ch.network_id = h.network_id
@@ -200,8 +207,9 @@ export const infoTargets = (sql: Sql, staleAgo: string, missRetryAgo: string) =>
        -- every run (never-fetched sorted first and a miss left no trace), so the head of the queue
        -- was permanently coins GMGN does not know and the coins it does know sat 9 days old.
        and (ms.missed_at is null or ms.missed_at < strftime('%Y-%m-%dT%H:%M:%fZ','now',${missRetryAgo}))
-     group by h.network_id, h.token_key, tk.address, ch.name, ti.fetched_at
-     -- MOST-HELD FIRST, then longest-waiting (never-fetched sorts before any date). One request a
-     -- second buys about 1,500 coins a day against ~31,000 held, so the order decides which coins
-     -- stay under a day old: the ones most traders hold. The one-holder tail rotates behind them.
-     order by count(distinct h.handle) desc, coalesce(ti.fetched_at, ''), h.token_key`;
+     group by h.network_id, h.token_key, tk.address, ch.name, ti.fetched_at, ms.missed_at
+      ) due)
+   -- TWO ORDERS, INTERLEAVED: odd places to the most-held due coin, even places to the one longest since
+   -- it was last ASKED (the LATER of answered and missed; never asked sorts before any date). A run reads ~94
+   -- coins and the top ~1,030 by holders fall due again every 22 h, so most-held-first alone never reached the tail.
+   order by min(2 * by_held - 1, 2 * by_wait)`;
