@@ -18,6 +18,7 @@ import { runGmgn } from "./jobs/gmgn";
 import { runDirectory } from "./jobs/directory";
 import { runAumLiveFlush } from "./jobs/aum_live_flush";
 import { runHealthSnapshot } from "./jobs/health_snapshot";
+import { gmgnRelay } from "./gmgn_relay";
 
 /**
  * Every job is a sliced, resumable loader (worker/src/jobs/*). The strings must match
@@ -53,11 +54,19 @@ const JOB_BY_NAME: Readonly<Record<string, (env: Env, budgetMs: number, opts: Jo
 };
 const MAX_BUDGET_MS = 600_000;
 
+const digest = async (s: string): Promise<string> =>
+  [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** Everything under /jobs/ is the owner's: null when the caller holds `JOB_SECRET`, else the refusal. Digests are compared, so timing says nothing about the secret. */
+async function refusal(req: Request, env: Env): Promise<Response | null> {
+  if (!env.JOB_SECRET) return Response.json({ error: "JOB_SECRET is not set; refusing to run" }, { status: 503 });
+  if (await digest(req.headers.get("x-job-secret") ?? "") !== await digest(env.JOB_SECRET)) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!env.DB) return Response.json({ error: "the D1 binding DB is not configured" }, { status: 503 });
+  return null;
+}
+
 async function runJob(req: Request, env: Env): Promise<Response> {
   if (req.method !== "POST") return Response.json({ error: "POST only" }, { status: 405 });
-  if (!env.JOB_SECRET) return Response.json({ error: "JOB_SECRET is not set; refusing to run" }, { status: 503 });
-  if (req.headers.get("x-job-secret") !== env.JOB_SECRET) return Response.json({ error: "unauthorized" }, { status: 401 });
-  if (!env.DB) return Response.json({ error: "the D1 binding DB is not configured" }, { status: 503 });
   const url = new URL(req.url);
   const name = url.pathname.slice("/jobs/".length);
   // Own names only: `constructor` resolved through the prototype to Object, which returned `env` — every secret, as the summary.
@@ -79,7 +88,11 @@ export default {
     if (pathname === "/healthz" && req.method === "GET") return Response.json({ ok: true, worker: "genie-copy-trading-api" });
     if (pathname === "/webhook") return webhook(req, env, ctx);
     if (pathname === "/sample") return sample(req, env);
-    if (pathname.startsWith("/jobs/")) return runJob(req, env);
+    if (pathname.startsWith("/jobs/")) {
+      const refused = await refusal(req, env);
+      if (refused) return refused;
+      return pathname.startsWith("/jobs/gmgn_") ? gmgnRelay(req, env) : runJob(req, env);
+    }
     return api(req, env, ctx);
   },
 

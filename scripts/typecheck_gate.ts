@@ -14,6 +14,7 @@ const ENTRIES = [
   "supabase/functions/api/app.ts",
   "supabase/functions/aum-sample/value.ts",
   "scripts/smoke.ts",
+  "scripts/gmgn_reader.ts",
   "scripts/acceptance_capture.ts",
   "scripts/typecheck_gate.ts",
 ];

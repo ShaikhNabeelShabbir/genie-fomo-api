@@ -1,10 +1,11 @@
 import type { Env } from "../env";
 import { jobSql, type Sql } from "../sql";
 import { bitquery } from "../../../supabase/functions/_shared/bitquery.ts";
-import { EVM_CHAINS, REFUSALS_IN_A_ROW, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/settings.ts";
+import { EVM_CHAINS, SOLANA_NETWORK_ID } from "../../../supabase/functions/_shared/settings.ts";
 import {
-  CHAIN_CODE, type InfoTarget, type Rec, type Security, type Supply, type SupplyTarget, chainHits, evmSupply, gmgnData, gmgnFailure, infoRow, infoTargets,
-  isEvmAddress, isSolAddress, normaliseSecurity, singleChain, solanaSupply, supplyTargets,
+  chainHits, d1Sink, evmSupply, GMGN_MISS_RETRY_AGO, GMGN_STALE_AGO, infoTargets, isEvmAddress,
+  isSolAddress, readCoins, singleChain, solanaSupply, type Supply, type SupplyTarget,
+  supplyTargets,
 } from "./tokens-core";
 
 /**
@@ -29,14 +30,6 @@ const SUPPLY_FANOUT = 5;
 /** Targets built per run. Bitquery paces about 50 reads a minute, so a larger list only costs the
  *  group-by that builds it — which, unbounded, used the whole phase budget (17 Sep 2026). */
 const SUPPLY_SLICE = 400;
-const STALE_HOURS = 20;
-/** The same staleness as a SQLite date modifier (`strftime(…, 'now', '-20 hours')`). */
-const STALE_AGO = `-${STALE_HOURS} hours`;
-/** GMGN: 1 request per second per IP. Deliberate, not a knob worth turning up. */
-const GMGN_GAP_MS = 1100;
-const GMGN_RATE_LIMIT_WAIT_MS = 3000;
-/** How long a coin GMGN had nothing for waits before it is asked again (a SQLite date modifier). */
-const MISS_RETRY_AGO = "-7 days";
 
 export interface TokensSummary {
   readonly chainsResolved: number;
@@ -199,147 +192,11 @@ async function resolveSupply(sql: Sql, key: string, outOfTime: () => boolean): P
 
 // --------------------------------------------------------------- 3. token_info
 
-async function fetchGmgn(key: string, path: string, code: string, address: string): Promise<Rec> {
-  const qs = new URLSearchParams({ chain: code, address, timestamp: String(Math.floor(Date.now() / 1000)), client_id: crypto.randomUUID() });
-  const r = await fetch(`https://openapi.gmgn.ai${path}?${qs}`, { headers: { "X-APIKEY": key, Accept: "application/json" }, signal: AbortSignal.timeout(30_000) });
-  const body: unknown = await r.json().catch(() => null);
-  return gmgnData(r.ok, r.status, body);
-}
-
-const isRateLimit = (e: unknown): boolean => e instanceof Error && e.message === "RATE_LIMIT";
-
-type InfoRead = { readonly data: Rec } | { readonly refused: string } | { readonly nothing: string };
-
-/**
- * Their limiter is per IP and we are the only caller: a 429 means we drifted too fast, so back off
- * and retry. Anything else comes back WITH ITS REASON — it used to be dropped here, and the log said
- * only "returned nothing" for every coin of every run (17-19 Sep 2026).
- */
-async function fetchInfo(key: string, code: string, address: string): Promise<InfoRead> {
-  let last = "RATE_LIMIT";
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try { return { data: await fetchGmgn(key, "/v1/token/info", code, address) }; } catch (e) {
-      last = e instanceof Error ? e.message : String(e);
-      if (!isRateLimit(e)) break;
-      await sleep(GMGN_RATE_LIMIT_WAIT_MS);
-    }
-  }
-  return gmgnFailure(last) === "refused" ? { refused: last } : { nothing: last };
-}
-
-/** Allowed to fail on its own: fundamentals are still stored, and `security_fetched_at` stays put so the next pass retries this half. */
-async function fetchSecurity(key: string, chain: string, code: string, address: string): Promise<Security | null> {
-  try { return normaliseSecurity(chain, await fetchGmgn(key, "/v1/token/security", code, address)); } catch (e) {
-    if (!isRateLimit(e)) return null;
-    await sleep(GMGN_RATE_LIMIT_WAIT_MS);
-    try { return normaliseSecurity(chain, await fetchGmgn(key, "/v1/token/security", code, address)); } catch { return null; }
-  }
-}
-
-/** Upsert one token; true when honeypot_since was stamped by this statement (first flip only, never cleared). */
-async function storeInfo(sql: Sql, t: InfoTarget, d: Rec, sec: Security | null): Promise<boolean> {
-  const r = infoRow(d);
-  const has = sec !== null;
-  // One timestamp for the whole statement, as Postgres `now()` was: `flipped` compares against it.
-  const now = new Date().toISOString();
-  const honeypotAt = has && (sec.is_honeypot === true || sec.can_not_sell === true) ? now : null;
-  const [row] = await sql<{ flipped: number | null }[]>`
-    insert into token_info (network_id, token_key, symbol, name, price_usd, liquidity_usd,
-       market_cap_usd, total_supply, circulating_supply, max_supply, holder_count,
-       top_10_holder_rate, logo_url, raw, source, fetched_at,
-       is_honeypot, buy_tax, sell_tax, is_open_source, is_renounced, renounced_mint,
-       renounced_freeze, rug_ratio, burn_ratio, is_blacklisted, can_not_sell,
-       security_fetched_at, honeypot_since)
-     values (${t.network_id}, ${t.token_key}, ${r.symbol}, ${r.name}, ${r.price_usd}, ${r.liquidity_usd},
-             ${r.market_cap_usd}, ${r.total_supply}, ${r.circulating_supply}, ${r.max_supply}, ${r.holder_count},
-             ${r.top_10_holder_rate}, ${r.logo_url}, ${r.raw}, 'gmgn', ${now},
-             ${sec?.is_honeypot ?? null}, ${sec?.buy_tax ?? null}, ${sec?.sell_tax ?? null}, ${sec?.is_open_source ?? null},
-             ${sec?.is_renounced ?? null}, ${sec?.renounced_mint ?? null}, ${sec?.renounced_freeze ?? null},
-             ${sec?.rug_ratio ?? null}, ${sec?.burn_ratio ?? null}, ${sec?.is_blacklisted ?? null}, ${sec?.can_not_sell ?? null},
-             ${has ? now : null},
-             ${honeypotAt})
-     on conflict (network_id, token_key) do update set
-       symbol=excluded.symbol, name=excluded.name, price_usd=excluded.price_usd,
-       liquidity_usd=excluded.liquidity_usd, market_cap_usd=excluded.market_cap_usd,
-       total_supply=excluded.total_supply, circulating_supply=excluded.circulating_supply,
-       max_supply=excluded.max_supply, holder_count=excluded.holder_count,
-       top_10_holder_rate=excluded.top_10_holder_rate, raw=excluded.raw,
-       -- GMGN's logo wins; a DexScreener one (prices job) stands until GMGN has its own.
-       logo_url=coalesce(excluded.logo_url, token_info.logo_url),
-       fetched_at=${now},
-       -- Only overwrite security when this run actually fetched it: a failed call must leave yesterday's answer standing.
-       is_honeypot      = case when ${has} then excluded.is_honeypot      else token_info.is_honeypot end,
-       buy_tax          = case when ${has} then excluded.buy_tax          else token_info.buy_tax end,
-       sell_tax         = case when ${has} then excluded.sell_tax         else token_info.sell_tax end,
-       is_open_source   = case when ${has} then excluded.is_open_source   else token_info.is_open_source end,
-       is_renounced     = case when ${has} then excluded.is_renounced     else token_info.is_renounced end,
-       renounced_mint   = case when ${has} then excluded.renounced_mint   else token_info.renounced_mint end,
-       renounced_freeze = case when ${has} then excluded.renounced_freeze else token_info.renounced_freeze end,
-       rug_ratio        = case when ${has} then excluded.rug_ratio        else token_info.rug_ratio end,
-       burn_ratio       = case when ${has} then excluded.burn_ratio       else token_info.burn_ratio end,
-       is_blacklisted   = case when ${has} then excluded.is_blacklisted   else token_info.is_blacklisted end,
-       can_not_sell     = case when ${has} then excluded.can_not_sell     else token_info.can_not_sell end,
-       -- First flip only, never cleared (Rug Dodger, C3). Same guard: a failed security call carries no flag.
-       honeypot_since   = coalesce(token_info.honeypot_since,
-                            case when ${has} and (excluded.is_honeypot or excluded.can_not_sell) then ${now} end),
-       security_fetched_at = case when ${has} then ${now} else token_info.security_fetched_at end
-     returning (honeypot_since = ${now}) as flipped`;
-  return row?.flipped === 1;
-}
-
-/** GMGN had no document for this coin: remember when, so it leaves the head of the queue. */
-const recordMiss = (sql: Sql, t: InfoTarget, detail: string) => sql`
-  insert into token_info_misses (network_id, token_key, missed_at, detail)
-  values (${t.network_id}, ${t.token_key}, ${new Date().toISOString()}, ${detail.slice(0, 120)})
-  on conflict (network_id, token_key) do update set missed_at = excluded.missed_at, detail = excluded.detail`;
-
 async function refreshInfo(sql: Sql, env: Env, outOfTime: () => boolean): Promise<Phase & { flipped: number }> {
-  const targets = await infoTargets(sql, STALE_AGO, MISS_RETRY_AGO);
+  const targets = await infoTargets(sql, GMGN_STALE_AGO, GMGN_MISS_RETRY_AGO);
   const key = (env.GMGN_API_KEY ?? "").trim();
   if (targets.length && !key) throw new Error("GMGN_API_KEY is not set");
-  let attempted = 0, ok = 0, errored = 0, unresolved = 0, flipped = 0, secFailed = 0, refusedInARow = 0;
-  for (const t of targets) {
-    if (outOfTime()) break;
-    attempted += 1;
-    const code = CHAIN_CODE[t.chain];
-    // A chain GMGN does not cover is unresolved, not failed: no request was made and none will help.
-    if (!code) { unresolved += 1; continue; }
-    const read = await fetchInfo(key, code, t.address);
-    if ("refused" in read) {
-      errored += 1;
-      refusedInARow += 1;
-      console.error(`tokens: GMGN refused ${t.chain}/${t.address.slice(0, 12)}…: ${read.refused}`);
-      if (refusedInARow >= REFUSALS_IN_A_ROW) {
-        console.error(`tokens: GMGN refused ${refusedInARow} reads in a row (${read.refused}); leaving the rest of this run`);
-        break;
-      }
-      await sleep(GMGN_GAP_MS);
-      continue;
-    }
-    refusedInARow = 0;
-    if ("nothing" in read) {
-      unresolved += 1;
-      console.warn(`tokens: GMGN has nothing for ${t.chain}/${t.address.slice(0, 12)}…: ${read.nothing}`);
-      await recordMiss(sql, t, read.nothing);
-      await sleep(GMGN_GAP_MS);
-      continue;
-    }
-    // Security is a second endpoint, so a second request and a second second of pacing.
-    await sleep(GMGN_GAP_MS);
-    const sec = await fetchSecurity(key, t.chain, code, t.address);
-    if (!sec) secFailed += 1;
-    try {
-      if (await storeInfo(sql, t, read.data, sec)) flipped += 1;
-      ok += 1;
-    } catch (e) {
-      // One unstorable token must not end the run; `fetched_at` stays null so the next pass retries it.
-      errored += 1;
-      console.error(`tokens: ${t.chain}/${t.address.slice(0, 10)}… store failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    await sleep(GMGN_GAP_MS);
-  }
-  if (secFailed) console.log(`tokens: ${secFailed} token(s) stored without security`);
-  return { attempted, ok, errored, unresolved, remaining: targets.length - attempted, flipped };
+  return readCoins(targets, key, outOfTime, d1Sink(sql));
 }
 
 /**
