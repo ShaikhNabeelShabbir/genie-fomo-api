@@ -322,6 +322,10 @@ Field lists read out of traderReportSources.ts, fomoscan.ts and traderChainAum.t
 | `wallets.resolvedBy.{evm,solana}`, `wallets.fingerprintMatches` | /wallets | `fomoapi` \| `gmgn` \| `submitted`; `fingerprintMatches` is always null (no count is stored) |
 | `onChain.chainsCovered` | /traders/:handle | chains present in the stored transaction feed; all-zero counts outside this list mean "not covered" |
 | `health.staleFeeds[]` | /health | + `scorecards` when any scorecard is past its own `staleAfterHours`; `dataState` is then `degraded` |
+| `health.staleFeeds[]` | /health | vocabulary 13 (19 Sep 2026): + `prices` (no hourly price written for 3 h) and + `scheduler` (the /health snapshot is older than 30 min, i.e. our cron jobs are not running) |
+| `health.database` | /health | `{ answering: true, latencyMs }` from the one-row probe. When the database does not answer within 2 s the route answers 503 `unavailable` with `error.database.answering: false` instead of a 200 |
+| `health.computedAt`, `computeMs` | /health | when the scheduler computed the body (every 10 min) and how long it took; `cacheAgeSeconds` is its age |
+| `health.feeds.tokenInfo` | /health | `staleAfterHours: 48` (was 336). Also `stale` when `heldCoinsStaleShare` > 0.1. `heldCoins`, `heldCoinsStale`, `heldCoinsNeverRead` are counts over coins traders hold now; never-read coins are counted, not judged (GMGN does not cover every chain) |
 | `health.feeds.aum.chains.{chain}` | /health | `{ accepted36h, failed24h, newestAcceptedAt }` per chain |
 
 

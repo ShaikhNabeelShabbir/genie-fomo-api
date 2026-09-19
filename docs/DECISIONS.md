@@ -104,7 +104,14 @@ A consumer was once returned `bind message supplies 8 parameters, but prepared s
 requires 0`. That is a postgres wire-protocol detail: it names no route, suggests no
 action, and leaks how the service is built. Internal faults now answer `internal_error`
 with a fixed sentence and the detail goes to the log, where it belongs.
- 
+
+**19 Sep 2026 — the order of the tests is the rule.** `D1_ERROR` was matched before anything else,
+so `D1_ERROR: no such column: ps.last_usd … SQLITE_ERROR` — a missing join of ours — was served as
+503 "the database is not answering, retry shortly" for two days, and the consumer read an outage.
+A busy database was served as 429 `rate_limited` beside `RateLimit-Remaining: 240`. Now: (1) what
+SQLite rejects, what the shim refuses and a TypeError are OUR BUG, a loud 500 that no retry heals;
+(2) overloaded, queued too long or reset is 503 `unavailable` with `Retry-After: 15`; (3) not
+answering is 503 with `Retry-After: 5`. 429 means the caller's own window and nothing else.
 
 ## D008
 
@@ -3168,3 +3175,17 @@ identically from the Worker cron and from a psql backfill; the ceilings and floo
 literals there, with `value.ts` and `aum-rules.ts` named as the source of truth, because a
 function cannot import TypeScript and a table of constants for five numbers is more to keep
 in step than one comment.
+
+## D198
+
+**`api/routes/health.ts`** — /health reads one row; the scheduler computes the body.
+
+The body counts 1.29 M transactions and aggregates five tables. Computed per request (per isolate,
+every 30 s) it took 8.6 s, put that load on the database it was reporting on, and answered
+`status: ok` through an outage in which every other read failed (19 Sep 2026). The Worker now runs
+`health_snapshot` every 10 minutes and stores the JSON in `health_snapshot` (one row). A request
+reads that row under a 2 s deadline — the read is the probe (`database.answering`, `latencyMs`);
+no answer is a 503 that says so. A snapshot older than 30 minutes means the scheduler itself has
+stopped, which puts `scheduler` in `staleFeeds`. While the table is empty (once, after the
+migration) a request computes the body inline. Feed clocks are therefore up to 10 minutes old,
+against thresholds measured in hours.

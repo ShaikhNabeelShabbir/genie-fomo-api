@@ -17,6 +17,7 @@ import { runSwaps } from "./jobs/swaps";
 import { runGmgn } from "./jobs/gmgn";
 import { runDirectory } from "./jobs/directory";
 import { runAumLiveFlush } from "./jobs/aum_live_flush";
+import { runHealthSnapshot } from "./jobs/health_snapshot";
 
 /**
  * Every job is a sliced, resumable loader (worker/src/jobs/*). The strings must match
@@ -39,6 +40,7 @@ const JOBS: Readonly<Record<string, (env: Env, budgetMs: number) => Promise<unkn
   "15 2 * * *":   runGmgn,         // GMGN directory and its trades
   "0 1 * * *":    runDirectory,    // fomo leaderboard, wallets, fomo-reported holdings
   "*/5 * * * *":  runAumLiveFlush, // live value for traders whose wallet moved in the last minute
+  "2,12,22,32,42,52 * * * *": runHealthSnapshot, // the body /health serves; off the 5-minute marks the flush lands on
 };
 
 /** On-demand runs of the same jobs: `POST /jobs/<name>?budgetMs=&handles=&from=` with `x-job-secret`; only aum_history reads `handles`/`from`. */
@@ -47,7 +49,7 @@ const JOB_BY_NAME: Readonly<Record<string, (env: Env, budgetMs: number, opts: Jo
   prices: runPrices, aum_history: runAumHistory, transfers: runTransfers, quote_prices: runQuotePrices,
   balances: runBalances, tokens: runTokens, fees: runFees, swaps: runSwaps, scorecards: runScorecards,
   launches: runLaunches, wallets: runWallets, timing: runTiming, gmgn: runGmgn, directory: runDirectory,
-  aum_live_flush: runAumLiveFlush,
+  aum_live_flush: runAumLiveFlush, health_snapshot: runHealthSnapshot,
 };
 const MAX_BUDGET_MS = 600_000;
 

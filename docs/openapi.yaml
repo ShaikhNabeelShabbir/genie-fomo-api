@@ -8853,9 +8853,10 @@ paths:
                   - GET /chains
                   - GET /fields
         '429': &id009
-          description: The shared 240/min window is exhausted (or the Postgres pool is saturated, which
-            is also answered as 429). Back off for `Retry-After` seconds; the RateLimit-* headers are
-            reconstructed so this response still carries the budget.
+          description: The caller's own 240/min window is exhausted, and nothing else. Back off for
+            `Retry-After` seconds; the RateLimit-* headers are reconstructed so this response still carries
+            the budget. Until 19 Sep 2026 a busy DATABASE was also answered as 429, beside
+            `RateLimit-Remaining 240`; that is now a 503 `unavailable` with `Retry-After 15`.
           headers:
             x-request-id: *id002
             RateLimit-Limit: *id003
@@ -8889,8 +8890,10 @@ paths:
                   requestId: req_3f9c2a1b7d4e8f01
         '503': &id011
           description: 'Retry, keeping your last good copy. `timeout` when the route did not answer within
-            15 s (ROUTE_TIMEOUT_MS); `unavailable` when the database is unreachable or timing out. Both
-            carry Retry-After: 5.'
+            15 s (ROUTE_TIMEOUT_MS); `unavailable` when the database is unreachable (Retry-After 5) or busy
+            or reset under load (Retry-After 15). A fault in our own SQL or code is never a 503: it is a
+            500 `internal_error`, because retrying it cannot succeed. Every 5xx is logged with the
+            `requestId` it returns.'
           headers:
             x-request-id: *id002
             RateLimit-Limit: *id003
@@ -9296,11 +9299,21 @@ paths:
 
         carries its own `staleAfterHours` and a `state` of `current`, `stale` or `never`.
 
-        The body is computed at most every 30 s per isolate (`cached`, `cacheAgeSeconds`); its
+        The request reads ONE stored row under a 2 s deadline and that read is the probe:
 
-        four queries run sequentially on purpose. `rows.transactions` is a planner estimate
+        `database.answering` with `latencyMs`, or a 503 `unavailable` carrying
 
-        (`estimatedRows`). `apiVersion` says which deployment answered.
+        `error.database.answering false` when the database does not answer. The heavy body is
+
+        computed by the scheduler every 10 minutes (`computedAt`, `computeMs`, `cacheAgeSeconds`);
+
+        past 30 minutes `staleFeeds` gains `scheduler` and `dataState` is `degraded`. Feeds added
+
+        19 Sep 2026: `prices` (3 h), and `tokenInfo` is now 48 h and also `stale` when more than a
+
+        tenth of HELD coins carry details past that age (`heldCoinsStale`, `heldCoinsNeverRead`,
+
+        `heldCoinsStaleShare`); `positions` is 12 h. `apiVersion` says which deployment answered.
 
         '
       responses:

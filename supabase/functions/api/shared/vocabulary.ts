@@ -5,7 +5,7 @@
  */
 export const VOCABULARY = {
   closed: true,
-  version: 12,
+  version: 13,
   fields: {
     "aum.status": ["ready", "warming", "stale", "no_reading"],
     "aum.points[].basis": ["sampled", "rebuilt"],
@@ -47,7 +47,7 @@ export const VOCABULARY = {
     /* v3 fixes (R6): the sent-transaction count is Bitquery's realtime window, a lower bound on the nonce. */
     "positions.coverage.chains.*.basis": ["bitquery_realtime"],
     "wallets.resolvedBy.*": ["fomoapi", "gmgn", "submitted"],
-    "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards", "swaps"],
+    "health.staleFeeds[]": ["traders", "trades", "wallets", "positions", "transactions", "tokenInfo", "aum", "scorecards", "swaps", "prices", "scheduler"],
     /* 17 Sep 2026, v4: second wave (items 10, 11, 12, R6). */
     /* `unchanged`: fomo answered but the newest `captured_at` did not advance (v3 fixes, 18 Sep). */
     "scorecard.loadOutcome": ["loaded", "unchanged", "unavailable", "degraded", "not_found", "error"],

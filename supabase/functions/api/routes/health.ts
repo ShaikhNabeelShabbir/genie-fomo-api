@@ -1,28 +1,104 @@
 import { sql, n, round } from "../db.ts";
 import { cfg } from "../config.ts";
 import { get, requestVersion } from "../router.ts";
+import { ApiError, classify } from "../errors.ts";
 
 // ------------------------------------------------------------------ health
 
-/** The body is the same for every caller, so one isolate computes it at most every 30 s. */
-const HEALTH_CACHE_MS = 30_000;
-let healthCache: { at: number; body: Record<string, unknown> } | null = null;
+/*
+ * /health READS ONE ROW (19 Sep 2026). See docs/DECISIONS.md#d198
+ * The body below counts 1.29 M transactions and aggregates five tables; computed per request
+ * (per isolate, every 30 s) it took 8.6 s, loaded the database it was reporting on, and said
+ * `ok` while every other read failed. The scheduler now computes it (`refreshHealthSnapshot`,
+ * every 10 minutes) and a request reads the stored row under a deadline — that read IS the probe.
+ */
+export const PROBE_MS = 2000;
+/** Three missed runs: the scheduler is not running, which is itself a reason to distrust every feed. */
+export const SNAPSHOT_STALE_MINUTES = 30;
+
+interface Snapshot { readonly computed_at: string; readonly took_ms: number; readonly body: string }
+
+/** The stored row, or a 503 that says the database did not answer — never a hang. */
+async function readSnapshot(): Promise<Snapshot | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const started = Date.now();
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ApiError(503, "unavailable",
+      `the database did not answer the health probe within ${PROBE_MS / 1000}s`,
+      { database: { answering: false, waitedMs: PROBE_MS } }, 5)), PROBE_MS);
+  });
+  try {
+    const rows = await Promise.race([
+      sql<Snapshot[]>`select computed_at, took_ms, body from health_snapshot where id = 1`, expired]);
+    return rows[0];
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    const err = classify(e);
+    throw new ApiError(err.status, err.code, err.message,
+      { database: { answering: false, waitedMs: Date.now() - started } }, err.retryAfterSeconds);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Compute the body and store it. Called by the Worker's scheduler; by a request only while the table is empty. */
+export async function refreshHealthSnapshot(): Promise<Snapshot> {
+  const started = Date.now();
+  const body = JSON.stringify(await healthBody());
+  const snap: Snapshot = { computed_at: new Date().toISOString(), took_ms: Date.now() - started, body };
+  await sql`
+    insert into health_snapshot (id, computed_at, took_ms, body)
+    values (1, ${snap.computed_at}, ${snap.took_ms}, ${snap.body})
+    on conflict (id) do update set computed_at = excluded.computed_at, took_ms = excluded.took_ms, body = excluded.body`;
+  return snap;
+}
+
+/** A snapshot the scheduler stopped renewing degrades the verdict and says why. */
+export function withSnapshotAge(body: Record<string, unknown>, ageSeconds: number): Record<string, unknown> {
+  if (ageSeconds <= SNAPSHOT_STALE_MINUTES * 60) return body;
+  const staleFeeds = [...new Set([...(body.staleFeeds as string[] ?? []), "scheduler"])].sort();
+  return { ...body, dataState: "degraded", staleFeeds };
+}
 
 get("/v1/health", async (_p, url) => {
-  const now = Date.now();
-  const hit = healthCache && now - healthCache.at < HEALTH_CACHE_MS ? healthCache : null;
-  const body = hit?.body ?? await healthBody();
-  if (!hit) healthCache = { at: now, body };
+  const started = Date.now();
+  const stored = await readSnapshot();
+  const latencyMs = Date.now() - started;
+  const snap = stored ?? await refreshHealthSnapshot();
+  const ageSeconds = Math.max(0, Math.round((Date.now() - Date.parse(snap.computed_at)) / 1000));
   return {
     status: "ok",
     /** Which contract answered: `v1` on Supabase, `v2` on the Cloudflare Worker (same routes). */
     apiVersion: requestVersion(url.pathname),
-    /** Whether this answer was computed for this call; `cacheAgeSeconds` says how old it is. */
-    cached: hit !== null,
-    cacheAgeSeconds: hit ? Math.round((now - hit.at) / 1000) : 0,
-    ...body,
+    /** The probe: one indexed row read, under a deadline. A database that does not answer is a 503, not this body. */
+    database: { answering: true, latencyMs },
+    /** The body below is computed by the scheduler every 10 minutes; these say when, and how long it took. */
+    cached: stored !== undefined,
+    cacheAgeSeconds: ageSeconds,
+    computedAt: snap.computed_at,
+    computeMs: snap.took_ms,
+    ...withSnapshotAge(JSON.parse(snap.body), ageSeconds),
   };
 });
+
+/** A tenth of held coins past the limit is a feed that is not keeping up, whatever its clock says. */
+export const TOKEN_INFO_STALE_SHARE = 0.1;
+
+/** The tokenInfo feed, judged on the coins traders hold. A coin never read is counted, not judged: GMGN does not cover every chain. */
+export function tokenInfoFeed<F extends { readonly state: string }>(
+  clock: F, ti: Readonly<Record<string, unknown>>,
+) {
+  const held = Number(ti.held), stale = Number(ti.stale);
+  const staleShare = held ? Number((stale / held).toFixed(4)) : null;
+  return {
+    ...clock,
+    heldCoins: held,
+    heldCoinsStale: stale,
+    heldCoinsNeverRead: Number(ti.never_fetched),
+    heldCoinsStaleShare: staleShare,
+    state: clock.state === "current" && staleShare !== null && staleShare > TOKEN_INFO_STALE_SHARE ? "stale" : clock.state,
+  };
+}
 
 async function healthBody(): Promise<Record<string, unknown>> {
   /** Exact counts throughout: SQLite has no planner estimate to substitute. See docs/DECISIONS.md#d063 */
@@ -48,6 +124,8 @@ async function healthBody(): Promise<Record<string, unknown>> {
            (select max(captured_at) from holdings)                       as holdings_at,
            (select max(block_time)  from transactions)                   as transactions_at,
            (select max(fetched_at)  from token_info)                     as token_info_at,
+           -- The hourly prices job stamps last_at; DexScreener refused it for two days and no feed said so.
+           (select max(last_at)     from token_price_stats)              as prices_at,
            (select max(at)          from aum_samples)                    as sampler_at,
            (select max(sampled_at)  from aum_samples
               where basis = 'sampled')                                   as sampler_run_at,
@@ -112,6 +190,14 @@ async function healthBody(): Promise<Record<string, unknown>> {
     from traders t left join newest n using (handle) left join loads l using (handle)
       left join live v using (handle) left join attempts a using (handle)
     where t.listed = 1`;
+
+  /** Of the coins traders HOLD: how many carry GMGN details past the feed's limit, and how many none at all. */
+  const [ti] = await sql`
+    select count(*) as held,
+           count(case when i.fetched_at is null then 1 end) as never_fetched,
+           count(case when i.fetched_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-48 hours') then 1 end) as stale
+    from (select distinct network_id, token_key from holdings_current where human_amount > 0) h
+    left join token_info i on i.network_id = h.network_id and i.token_key = h.token_key`;
 
   /* Kept from the concurrent attempt: a correlated EXISTS per trader, replaced by one count. */
   const [m] = await sql`
@@ -190,9 +276,15 @@ async function healthBody(): Promise<Record<string, unknown>> {
     /** X1b. The wallet's own resolved swaps (`wallet_swaps`, what /trades and /events?kind=swap read): newest block time. */
     swaps:        feed(f.swaps_at, 6, { description: "on-chain swaps resolved from the wallet's transactions, newest block time" }),
     wallets:      feed(f.wallets_at, 36),
-    positions:    feed(f.holdings_at, 36),
+    /** The balance sweep takes about 9 h to go round; 12 h is one missed lap. It was 36. */
+    positions:    feed(f.holdings_at, 12),
     transactions: feed(f.transactions_at, 36),
-    tokenInfo:    feed(f.token_info_at, 24 * 14),
+    /**
+     * Two days, not fourteen — and judged per HELD coin as well as by the clock: the clock moves
+     * when any one coin is read, which is how every coin the app checked sat 9 days old under `current`.
+     */
+    tokenInfo:    tokenInfoFeed(feed(f.token_info_at, 48), ti),
+    prices:       feed(f.prices_at, 3, { description: "newest hourly token price written (token_price_stats.last_at)" }),
     /**
      * X3. The clock is the newest hour `aum_history` carries a figure for. The hourly sampler
      * that used to write this feed was unscheduled on 17 Sep 2026 and its last reading is
