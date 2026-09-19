@@ -37,6 +37,17 @@ const checks: ReadonlyArray<readonly [string, () => Promise<boolean>]> = [
     const entries = at(await get(`/${V}/traders?limit=1`), "entries");
     return Array.isArray(entries) && entries.length === 1;
   }],
+  /*
+   * The consumer's exact roster read, at ITS page size. Every check here used limit=1, so a page of
+   * 100 answered 500 for as long as the D1 port existed and the smoke stayed green (19 Sep 2026).
+   */
+  ["the app's roster page (100, wallets + scorecard) answers with a wallet on every trader", async () => {
+    const entries = at(await get(`/${V}/traders?include=wallets,scorecard&limit=100&offset=0`), "entries");
+    return Array.isArray(entries) && entries.length === 100 &&
+      entries.every((e) => at(at(e, "included"), "wallets") !== null && at(at(e, "included"), "wallets") !== undefined);
+  }],
+  ["health reports the database it probed", async () =>
+    at(at(await get(`/${V}/health`), "database"), "answering") === true],
   ["unknown handle is 404", async () => (await status(`/${V}/traders/__nope__/wallets`)) === 404],
   [`wallets resolves ${HANDLE}`, async () => {
     const body = await get(`/${V}/traders/${HANDLE}/wallets`);

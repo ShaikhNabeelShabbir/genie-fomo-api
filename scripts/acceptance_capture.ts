@@ -95,6 +95,9 @@ await capture("tokens", "GET", `/${V}/tokens?limit=25`);
 await capture("tokens_momentum", "GET", `/${V}/tokens/momentum`);
 await capture("traders", "GET", `/${V}/traders?limit=25`);
 await capture("traders_included", "GET", `/${V}/traders?limit=10&include=pnl,scorecard,wallets,trust`);
+// The app's page size, and one past the include cap: the sizes no capture exercised before 19 Sep.
+await capture("traders_roster_page", "GET", `/${V}/traders?include=wallets,scorecard&limit=100&offset=0`);
+await capture("traders_included_over_cap", "GET", `/${V}/traders?include=wallets&limit=500`);
 await capture("traders_search", "GET", `/${V}/traders?q=${HANDLES[0]}`);
 
 // health: shape only

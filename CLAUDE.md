@@ -87,8 +87,8 @@ The consumer's build fails on an unpublished word, so this order is a contract.
 deno task check                                    # typecheck gate: no NEW errors (baseline empty: keep it so)
 deno task test                                     # pure-function tests
 npx tsc -p worker/tsconfig.json                    # the Worker; `cd worker && npx wrangler deploy --dry-run --outdir dist` bundles it
-API_VERSION=v2 deno task smoke $WORKER_URL         # 8 checks (dataState degraded is by design while scorecards are stale)
-deno task capture $BASE captures/x                 # 72-file normalised capture; diff two runs
+API_VERSION=v2 deno task smoke $WORKER_URL         # 10 checks, incl. the app's roster page at limit=100 (dataState degraded is by design while scorecards are stale)
+deno task capture $BASE captures/x                 # 74-file normalised capture; diff two runs
 npx @redocly/cli lint docs/openapi.yaml
 ```
 
