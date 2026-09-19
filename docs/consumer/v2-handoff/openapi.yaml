@@ -4,16 +4,28 @@ info:
   version: 1.0.0
   description: "A read API over ~450 crypto traders across Robinhood Chain, Ethereum, BSC, Base and Solana:\n\
     who they are, what they hold, what they have made, and what their balance has done over time.\n\n\
-    Every route answers from Postgres; the request path makes no external call except the\n`/aum` live\
-    \ read-through to the balance sampler. Rules every answer follows:\n\n* `null` means absent, zero\
+    v2 answers from Cloudflare D1 (SQLite), filled by the Worker's scheduled jobs; v1 answers from the\n\
+    frozen Postgres that D1 was filled from on 17 Sep 2026. The request path makes no external call except\n\
+    the `/aum` live read-through, where a deployment configures one. Rules every answer follows:\n\n* `null` means absent, zero\
     \ means zero. No string ever stands in for a missing number.\n* Coverage travels with the figure:\
     \ any partial number carries how much it was computed from.\n* A partial answer says it is partial\
     \ (`partial: true` with a `partialReason` word).\n* Every refusal is a machine word published by `GET\
     \ /v1/fields`; a consumer's build should\n  fail on a word it has not seen.\n* A unit never changes\
-    \ under a stable name: `*At` is ISO-8601, `*Share` is 0–1, `*Usd` is dollars.\n\n**Versions.** The\
-    \ same routes are served as `/v1/*` by the Supabase deployment and as `/v2/*`\nby the Cloudflare Worker.\
-    \ Handlers are identical; only the links inside responses are spelled\nfor the requested version.\
-    \ The Worker refuses `/v1/*` with 404.\n"
+    \ under a stable name: `*At` is ISO-8601, `*Share` is 0–1, `*Usd` is dollars.\n\n**Versions.** v2 (`/v2/*`,\
+    \ the Cloudflare Worker) is the product. v1 (`/v1/*`, Supabase) is frozen: it still answers, from data\n\
+    that stopped being written on 17 Sep 2026, and gains nothing described here as new. Route names are\n\
+    the same; links inside responses are spelled for the requested version. The Worker refuses `/v1/*`\n\
+    with 404.\n\n**Errors (19 Sep 2026).** Every answer the API serves under `/v2`, 200s included, carries `x-request-id`;\n\
+    the Worker's own 404 for `/v1/*` and the CORS preflight do not. 500 `internal_error`\n\
+    is a fault of ours that no retry heals - report the id. 503 is worth retrying: `unavailable` with\n\
+    `Retry-After` 5 (database unreachable), 15 (busy, or reset under load) or 60 (`/health` before the\n\
+    scheduler has written its first snapshot), `timeout` with 15 when the\n\
+    WHOLE request passed 11 s. 429 `rate_limited` means the caller's own 240/min window and nothing else.\n\n**Send a `User-Agent`\
+    \ that names your app.** Cloudflare's bot protection in front of the v2 Worker refuses a\n\
+    default library `User-Agent` with HTTP 403 and `error code: 1010`. Python's `urllib`\n\
+    (`Python-urllib/3.x`) is the common case; `python-requests`, `aiohttp` and browsers send\n\
+    their own names and pass. Anything like `your-app/1.0` works, and the app itself is\n\
+    unaffected.\n"
   contact:
     name: genie-fomo-api
     url: https://github.com/ShaikhNabeelShabbir/genie-fomo-api
@@ -21,10 +33,10 @@ info:
     name: Proprietary
     url: https://github.com/ShaikhNabeelShabbir/genie-fomo-api
 servers:
+- url: https://genie-copy-trading-api.agent-73b.workers.dev
+  description: v2 — Cloudflare Worker over D1 (routes under /v2/*). The product.
 - url: https://gxnonqlmujmtgczvhvzp.supabase.co/functions/v1/api
-  description: v1 — Supabase Edge Function (live)
-- url: https://genie-copy-trading-api.<subdomain>.workers.dev
-  description: v2 — Cloudflare Worker (routes under /v2/*; not yet deployed)
+  description: v1 — Supabase Edge Function. Frozen; its data stopped being written on 17 Sep 2026.
 security:
 - ApiKey: []
 tags:
@@ -62,7 +74,9 @@ components:
         '
   headers:
     RequestId:
-      description: Per-request id, also echoed inside every error body as `error.requestId`.
+      description: Per-request id, on every answer the API serves under `/v2` (200s too, since 19 Sep 2026)
+        and echoed inside every error body as `error.requestId`. Every 5xx is logged under it. The Worker's
+        own 404 for `/v1/*` and the CORS preflight (204) do not carry it.
       schema:
         type: string
         example: req_2ec7c488bdf0413a
@@ -82,8 +96,8 @@ components:
         type: integer
         example: 41
     RateLimitScope:
-      description: '`global` when the Postgres-backed counter answered; `unlimited` when the limiter could
-        not be reached and the request was allowed through (logged server-side).
+      description: '`global` when the shared database-backed counter answered; `unlimited` when the limiter
+        could not be reached within 2 s and the request was allowed through (logged server-side).
 
         '
       schema:
@@ -92,7 +106,9 @@ components:
         - global
         - unlimited
     RetryAfter:
-      description: Seconds to wait before retrying (on 429 and 503).
+      description: Seconds to wait before retrying. On 429 the rest of the caller's window; on 503 it is 5
+        (database unreachable, `include_unavailable`), 15 (database busy, `timeout`) or 60 (`/health`
+        before the scheduler has written its first snapshot).
       schema:
         type: integer
         example: 5
@@ -147,6 +163,22 @@ components:
               type: integer
               nullable: true
               description: 'On 429 and 503: the same figure as the Retry-After header.'
+            database:
+              type: object
+              description: 'On a /health 503 only: the one-row probe. `{ answering: false, waitedMs }` when
+                the database did not answer it; `{ answering: true, latencyMs }` when it answered and the
+                scheduler has not yet written the first snapshot. Only `answering: false` is a database outage.'
+              required:
+              - answering
+              properties:
+                answering:
+                  type: boolean
+                waitedMs:
+                  type: integer
+                  description: How long the probe waited before giving up.
+                latencyMs:
+                  type: integer
+                  description: How long the probe took to answer.
             parameter:
               type: string
               description: 'On 400: the query or body parameter the route could not use.'
@@ -555,7 +587,8 @@ components:
       - transfers
       - inbound
       - outbound
-      - swaps
+      - swapsAppearedIn
+      - ownSwaps
       - tokensTouched
       - activeDays
       - evenness
@@ -582,9 +615,17 @@ components:
           type: integer
         outbound:
           type: integer
-        swaps:
+        swapsAppearedIn:
           type: integer
-          description: Transfers typed SWAP.
+          description: "W2 — REPLACES `swaps` on 17 Sep 2026, which counted transfer LEGS typed SWAP and
+            so counted one trade several times. Distinct transactions typed SWAP that touched this
+            wallet AT ALL: an upper bound on his trading, because measured on a random sample 5 in 6 are
+            the wallet receiving tokens inside someone else's trade."
+        ownSwaps:
+          type: integer
+          description: "W2 — the wallet's own trades as we resolved them (`wallet_swaps`), the same
+            store `/traders/{handle}/trades` serves. This is the honest trade count; compare it with
+            `swapsAppearedIn`, never the other way round."
         tokensTouched:
           type: integer
           description: Distinct tokens across the transfers.
@@ -1558,8 +1599,11 @@ components:
       required:
       - status
       - apiVersion
+      - database
       - cached
       - cacheAgeSeconds
+      - computedAt
+      - computeMs
       - runtime
       - source
       - build
@@ -1585,13 +1629,42 @@ components:
           - v1
           - v2
           description: '`v1` = Supabase, `v2` = the Cloudflare Worker.'
+        database:
+          type: object
+          description: The probe (19 Sep 2026) - this request's one-row read. A database that does not
+            answer within 2 s is a 503 `unavailable` carrying `error.database.answering false`, never
+            this body.
+          required:
+          - answering
+          - latencyMs
+          properties:
+            answering:
+              type: boolean
+              enum:
+              - true
+            latencyMs:
+              type: integer
+              minimum: 0
+              description: How long the one-row read took.
         cached:
           type: boolean
-          description: Whether this body came from the 30 s per-isolate cache.
+          description: Always true since 19 Sep 2026. The body is only ever the stored snapshot the scheduler
+            computes every 10 minutes; a request never computes it, and before the first snapshot exists
+            the answer is a 503, not this body.
         cacheAgeSeconds:
           type: integer
           minimum: 0
-          description: Age of the cached body; 0 when computed for this call.
+          description: Age of the snapshot, i.e. seconds since `computedAt`. Past 1800 `staleFeeds` gains
+            `scheduler`.
+        computedAt:
+          type: string
+          format: date-time
+          description: When the scheduler computed everything below; the feed clocks and counts are as
+            of this moment, not of the request.
+        computeMs:
+          type: integer
+          minimum: 0
+          description: How long that computation took.
         runtime:
           type: string
           enum:
@@ -1626,7 +1699,12 @@ components:
             - aum
             - scorecards
             - swaps
-          description: Sorted names of feeds that stopped; empty is healthy.
+            - prices
+            - scheduler
+          description: Sorted names of the feeds that are not `current`; empty is healthy. Two words are
+            not feeds - `scorecards` (any fomoapi.io trader's scorecard is past 72 h) and `scheduler`
+            (the snapshot is older than 30 minutes, so our cron jobs are not running and every clock
+            here is suspect). `tokenInfo` is in this list by design today, see `HealthTokenInfoFeed`.
         staleTraders:
           $ref: '#/components/schemas/HealthStaleTraders'
         measurements:
@@ -1639,7 +1717,8 @@ components:
           type: array
           items:
             type: string
-          description: Which `rows` entries are planner estimates (`transactions`).
+          description: Which `rows` entries are estimates. Always empty on v2 - SQLite counts every
+            row; v1 listed `transactions`.
         externalCallsPerRequest:
           $ref: '#/components/schemas/HealthExternalCalls'
         capabilities:
@@ -1667,6 +1746,7 @@ components:
       - positions
       - transactions
       - tokenInfo
+      - prices
       - aum
       - swaps
       properties:
@@ -1688,9 +1768,45 @@ components:
         transactions:
           $ref: '#/components/schemas/HealthFeed'
         tokenInfo:
-          $ref: '#/components/schemas/HealthFeed'
+          $ref: '#/components/schemas/HealthTokenInfoFeed'
+        prices:
+          allOf:
+          - $ref: '#/components/schemas/HealthFeed'
+          description: Newest hourly token price written (`token_price_stats.last_at`); stale after 3 h.
+            New 19 Sep 2026 - DexScreener refused the job for two days and no feed said so.
         aum:
           $ref: '#/components/schemas/HealthAumFeed'
+    HealthTokenInfoFeed:
+      description: GMGN coin details, judged on the coins traders HOLD as well as by the clock - the
+        clock moves when any one coin is read. `state` is also `stale` when `heldCoinsStaleShare` is
+        above 0.1. At GMGN's one request a second the queue can refresh at most roughly 1,100 coins a
+        day against ~31,000 held, most-held first, so this feed reads `stale` by design and a coin's
+        own `fetchedAt` is the truth about that coin.
+      allOf:
+      - $ref: '#/components/schemas/HealthFeed'
+      - type: object
+        required:
+        - heldCoins
+        - heldCoinsStale
+        - heldCoinsNeverRead
+        - heldCoinsStaleShare
+        properties:
+          heldCoins:
+            type: integer
+            description: Distinct coins any trader holds now.
+          heldCoinsStale:
+            type: integer
+            description: Of those, coins whose GMGN details are older than 48 h.
+          heldCoinsNeverRead:
+            type: integer
+            description: Of those, coins with no GMGN details at all. Counted, not judged - GMGN does not
+              know every coin.
+          heldCoinsStaleShare:
+            type: number
+            nullable: true
+            minimum: 0
+            maximum: 1
+            description: '`heldCoinsStale / heldCoins`, 4 dp; null when nothing is held.'
     HealthFeed:
       type: object
       required:
@@ -1715,8 +1831,9 @@ components:
           description: Seconds since `lastRefreshAt`; null when never.
         staleAfterHours:
           type: integer
-          description: 'This feed''s own allowance: traders/wallets/positions/transactions 36, trades
-            72, tokenInfo 336, swaps 6.'
+          description: 'This feed''s own allowance: traders/wallets/transactions/aum 36, trades 72,
+            tokenInfo 48 (was 336), positions 12 (was 36; the balance sweep takes about 9 h to go
+            round), swaps 6, prices 3.'
         state:
           type: string
           enum:
@@ -1726,7 +1843,8 @@ components:
           description: '`never` is not `stale`: different cause, different fix.'
         description:
           type: string
-          description: What the clock measures, on the feeds whose name alone is ambiguous (`trades`, `swaps`).
+          description: What the clock measures, on the feeds whose name alone is ambiguous (`trades`, `swaps`,
+            `prices`, `aum`).
     HealthAumFeed:
       allOf:
       - $ref: '#/components/schemas/HealthFeed'
@@ -1734,29 +1852,67 @@ components:
         required:
         - traders
         - newestReadingAt
-        - samplerLastRunAt
+        - lastBuiltAt
+        - newestLiveAt
+        - sampler
         - historyState
         - chains
         properties:
           traders:
             type: integer
-            description: Distinct traders with any sample row.
+            description: Distinct traders with any built hour (`aum_history`). `rowCount` is its rows.
           newestReadingAt:
             type: string
             format: date-time
             nullable: true
-            description: The newest reading's own time, accepted or not. `lastRefreshAt` is the newest
-              ACCEPTED reading and drives `state`.
-          samplerLastRunAt:
+            description: The newest hour `aum_history` carries a figure for; the same clock as
+              `lastRefreshAt`, which drives `state`.
+          lastBuiltAt:
             type: string
             format: date-time
             nullable: true
-            description: When the sampler last wrote anything.
+            description: When any hour of `aum_history` was last written, valued or not.
+          newestLiveAt:
+            type: string
+            format: date-time
+            nullable: true
+            description: The newest `/aum/now` figure across all traders.
+          sampler:
+            type: object
+            description: X3, 17 Sep 2026. The retired hourly sampler's clocks, kept apart so nobody reads
+              them as live. Replaces `samplerLastRunAt`, which v2 no longer emits.
+            required:
+            - retired
+            - retiredAt
+            - newestReadingAt
+            - lastRunAt
+            - note
+            properties:
+              retired:
+                type: boolean
+                enum:
+                - true
+              retiredAt:
+                type: string
+                format: date-time
+              newestReadingAt:
+                type: string
+                format: date-time
+                nullable: true
+                description: The newest `/aum` reading's own time. Does not move.
+              lastRunAt:
+                type: string
+                format: date-time
+                nullable: true
+                description: When the sampler last wrote anything. Does not move.
+              note:
+                type: string
           historyState:
             $ref: '#/components/schemas/HealthHistoryState'
           chains:
             type: object
-            description: Per-chain sampler health, keyed by chain name.
+            description: Per-chain counts over the RETIRED sampler's rows, keyed by chain name; nothing is
+              scheduled to write them since 17 Sep 2026, so `accepted36h` and `failed24h` normally read 0.
             additionalProperties:
               $ref: '#/components/schemas/HealthAumChain'
     HealthAumChain:
@@ -1797,6 +1953,10 @@ components:
       type: object
       description: Per-trader staleness over LISTED traders, which no feed clock can express.
       required:
+      - liveStale
+      - liveStaleAfterHours
+      - liveNever
+      - oldestLiveHours
       - readingStale
       - readingStaleAfterHours
       - noReading
@@ -1809,9 +1969,33 @@ components:
       - oldestScorecardHours
       - of
       properties:
+        liveStale:
+          type: integer
+          description: "Traders whose live figure (`/aum/now`) is older than an hour. NOT a fault
+            signal since 19 Sep 2026 - the hourly refresh of every trader's figure (A2, 17 Sep) was
+            WITHDRAWN: it ran 231-625 s every five minutes and reset the database. A figure is now
+            refreshed when the trader's Solana wallet moves (minutes) or when the balance sweep
+            reads him (about 9 h a lap), so this reads in the hundreds by design. Judge one figure
+            by its own `now.at` / `now.ageSeconds`."
+        liveStaleAfterHours:
+          type: integer
+          enum:
+          - 1
+        liveNever:
+          type: integer
+          description: Traders with a wallet and no `/aum/now` figure at all.
+        oldestLiveHours:
+          type: integer
+          nullable: true
+          description: Age of the oldest live figure, in hours; null when no trader has one. Rises by
+            design since 19 Sep 2026 - roughly one lap of the balance sweep (about 9 h), more while a
+            balance provider refuses us. We told you on 17 Sep that a value above 2 meant our job had
+            stopped - that no longer holds; `staleFeeds` carrying `scheduler` or `positions` is the signal.
         readingStale:
           type: integer
-          description: Traders whose newest accepted reading is past 36 h.
+          description: Traders whose newest accepted `/aum` reading is past 36 h. These are the RETIRED
+            sampler's readings (nothing writes them since 17 Sep 2026), so this now counts every trader
+            that ever had one. Not a fault signal; the balance clocks are `feeds.aum` and `feeds.positions`.
         readingStaleAfterHours:
           type: integer
           enum:
@@ -1867,7 +2051,7 @@ components:
           maximum: 1
     HealthRows:
       type: object
-      description: Row counts; `transactions` is a planner estimate.
+      description: Row counts, all exact on v2 (SQLite has no planner estimate); as of `computedAt`.
       required:
       - traders
       - delisted
@@ -1891,7 +2075,7 @@ components:
           type: integer
         transactions:
           type: integer
-          description: Estimated from pg_class.reltuples.
+          description: Counted on v2. v1 estimated it from pg_class.reltuples.
         wallets:
           type: integer
           description: Distinct traders with a wallet row.
@@ -1996,8 +2180,9 @@ components:
             type: string
         keyInThisProcess:
           type: boolean
-          description: Presence (never the value) of the provider key in this process; normally false
-            and not a fault.
+          description: Presence (never the value) of the provider key in the process that computed the
+            body. On v2 one Worker serves the API and runs the loaders, so this is normally true; on
+            v1 it was normally false. Not a fault either way - `state` is judged on the feeds.
     CreatorLedger:
       type: object
       required:
@@ -2015,7 +2200,8 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: When the nightly ledger last rebuilt this creator.
+          description: When the daily ledger job (03:35 UTC) last rebuilt this creator from the GMGN details
+            we hold; those are only as fresh as each coin's own `fetchedAt`.
         ledger:
           description: null when the ledger row carries no launch count.
           anyOf:
@@ -2426,6 +2612,11 @@ components:
           type: string
           enum:
           - nightly_read
+          - rolling_read
+          description: The route answers `nightly_read` today, and the word is no longer literal - the EVM
+            balance is read by the same sweep as every other, about 9 h a lap, not nightly. Vocabulary 14
+            publishes its replacement `rolling_read` ahead of the code and keeps `nightly_read` one more
+            version, so accept both. Each row's `balanceAt` says when.
     PositionsChainCoverage:
       type: object
       description: How much of one chain's activity the indexer holds, written by the balances job after
@@ -2438,15 +2629,20 @@ components:
           nullable: true
           description: Transactions the wallet sent within Bitquery's realtime window, a LOWER bound on
             its nonce.
-        rowsHeld:
+        transferRowsHeld:
           type: integer
           nullable: true
-        share:
+          description: "C1 — RENAMED from `rowsHeld` on 17 Sep 2026. Transfer LEGS we store for this
+            address on this chain. One sent transaction produces several, so this does not count the
+            same things `chainTxCount` counts."
+        rowsPerSentTx:
           type: number
           nullable: true
-          description: '`rowsHeld / chainTxCount`; null when either side is unknown or the wallet never
-            sent. An upper bound (the count is a lower bound) and may exceed 1. Below 0.5 makes the list
-            partial.'
+          description: "C1 — REPLACES `share`, which was never a share and read 2.2989 and 8.5 in the
+            field. `transferRowsHeld / chainTxCount`: transfer legs per sent transaction. Null when
+            either side is unknown or the wallet never sent. Legitimately above 1 — a swap moves
+            several tokens — and an upper bound, because `chainTxCount` is a lower bound. Below 0.5
+            makes the list partial."
         readAt:
           type: string
           format: date-time
@@ -2475,6 +2671,15 @@ components:
           type: integer
           minimum: 0
           description: Rows with `valueUsd` null.
+        pricedShare:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: "A1, new 17 Sep 2026. `pricedPositions / positions`: how much of the wallet
+            `totalValueUsd` is built from. The same figure `/aum/history` points and `/aum/now` carry,
+            so the three are comparable at a glance. A total under a quarter is a fragment of a
+            portfolio, not a portfolio."
         chains:
           type: object
           description: Keyed by chain name. Empty when no coverage row exists for the trader.
@@ -2633,13 +2838,19 @@ components:
             nullable: true
             enum:
             - pegged
-            - token_info
+            - token_price_stats
             - token_prices
+            - token_info
             - fomo_reported_entry
             - null
-            description: Which price ladder rung valued the holding (`pegged` = quote_assets.pegged_usd,
-              `token_info` = GMGN, `token_prices` = the newest daily row, `fomo_reported_entry` = the
-              directory build's reported price); null when unpriced.
+            description: "Which rung of the ONE price ladder valued the holding, AT REQUEST TIME. In
+              order: `pegged` = quote_assets.pegged_usd; `token_price_stats` = the hourly DexScreener
+              price, the freshest we hold; `token_prices` = the newest daily close inside seven days;
+              `token_info` = GMGN's, last because it carries no staleness stamp we trust;
+              `fomo_reported_entry` = the directory build's own reported price, the one rung the ladder
+              cannot reproduce. Null when no rung carries a price. Changed 17 Sep 2026 (A1/N1/R7): this
+              used to be the price frozen into `holdings` at the last balance read — up to nine hours
+              stale, and null for anything priced since — and `token_price_stats` is new."
           pricedAt:
             type: string
             format: date-time
@@ -2946,10 +3157,19 @@ components:
             nullable: true
             enum:
             - pegged
-            - token_info
+            - token_price_stats
             - token_prices
+            - token_info
             - fomo_reported_entry
             - null
+            description: "Which rung of the ONE price ladder valued the holding, AT REQUEST TIME. In
+              order: `pegged` = quote_assets.pegged_usd; `token_price_stats` = the hourly DexScreener
+              price, the freshest we hold; `token_prices` = the newest daily close inside seven days;
+              `token_info` = GMGN's, last because it carries no staleness stamp we trust;
+              `fomo_reported_entry` = the directory build's own reported price, the one rung the ladder
+              cannot reproduce. Null when no rung carries a price. Changed 17 Sep 2026 (A1/N1/R7): this
+              used to be the price frozen into `holdings` at the last balance read — up to nine hours
+              stale, and null for anything priced since — and `token_price_stats` is new."
           pricedAt:
             type: string
             format: date-time
@@ -3147,7 +3367,9 @@ components:
         nextLoadAt:
           type: string
           format: date-time
-          description: Next 06:00 UTC nightly slot.
+          description: The loader's next six-hourly tick (00/06/12/18 UTC) - when it next RUNS, not when it
+            next loads THIS trader. A fomoapi.io record is reloaded only once it is older than 72 h, and
+            gmgn-sourced traders are loaded by the daily 02:20 UTC job. Judge freshness on `loadedAt`.
         nextLoadBasis:
           type: string
           enum:
@@ -4200,7 +4422,9 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: First nightly read where the coin became honeypot / sell-blocked; never cleared.
+          description: The first GMGN read of ours that found the coin honeypot / sell-blocked; never
+            cleared. Reads are not nightly (see `TokenFundamentals.fetchedAt`), so the flag can predate
+            this by as long as the coin waited in the queue.
         coHolders:
           type: integer
           nullable: true
@@ -4795,7 +5019,15 @@ components:
           description: Opaque cursor for the next page; `null` on the last page.
         complete:
           type: boolean
-          description: '`!capped` — true on the last page.'
+          description: "W2 — true only when the page was not capped AND every chain this trader trades
+            on is `complete` in `coverage.byChain`. Until 17 Sep 2026 this was `!capped` alone, a
+            pagination fact: a six-row answer naming three chains `unresolved` still said true."
+        incompleteReason:
+          type: string
+          nullable: true
+          description: "Which of the three made `complete` false, joined with `_and_` as
+            `positions.partialReason` is: `page_capped`, `chains_unresolved`, `chains_truncated`. Null
+            when `complete` is true."
         scanned:
           type: integer
           description: Only with `?status=`. Rows the page held before the status filter was applied.
@@ -4999,9 +5231,12 @@ components:
           type: string
           enum:
           - complete
+          - truncated
           - unresolved
-          description: '`unresolved` means we resolved none of this wallet''s own trades there, not that
-            it made none.'
+          description: "`unresolved` means we resolved none of this wallet's own trades there, not that
+            it made none. `truncated` (W2, new 17 Sep 2026) means we hold trades but our record starts
+            at `horizonAt` and the loader is still walking backwards past it, so earlier trades exist
+            and are not here yet."
         from:
           type: string
           format: date-time
@@ -5010,6 +5245,15 @@ components:
           type: string
           format: date-time
           nullable: true
+        horizonAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: "W2 — the oldest transaction we hold for this wallet on this chain. The record
+            starts here; the trader may not have. A `state` of `truncated` means the loader is still
+            walking backwards past it. Since 19 Sep 2026 the Solana walk is three wallets an hour, up
+            to 500 signatures each, so a busy wallet takes weeks, not the week we first said - watch
+            this date move rather than expecting one."
         swaps:
           type: integer
           description: Resolved swaps held for this chain over the trader's whole record.
@@ -5508,8 +5752,13 @@ components:
           - no_prices
           - too_little_priced
           - price_suspect
+          - not_built
           - null
-          description: Hourly only. Why `totalUsd` is `null`; `null` when it is valued.
+          description: "Hourly only. Why `totalUsd` is `null`; `null` when it is valued. `not_built`
+            (A3, new 17 Sep 2026) is an hour inside the window the builder never wrote: it used to be
+            absent from the series altogether, so a chart could not tell a gap from the end of the
+            data. `too_little_priced` now also covers an hour priced from under 5% of the wallet — see
+            `pricedShare`."
         suspectUsd:
           type: number
           nullable: true
@@ -5526,6 +5775,25 @@ components:
         totalPositions:
           type: integer
           description: Hourly only.
+        pricedShare:
+          type: number
+          nullable: true
+          minimum: 0
+          description: "A4, new 17 Sep 2026. `pricedPositions / totalPositions`: HOW MUCH OF THE WALLET
+            THIS FIGURE IS BUILT FROM. Null when nothing is held. At or above 0.25 the figure stands;
+            between 0.05 and 0.25 it is published with `partial: true`; below 0.05 `totalUsd` is null,
+            `reason` is `too_little_priced` and `partialUsd` keeps what it would have been. Until this
+            date any figure over $100 was published whatever the coverage, and 78% of valued hours came
+            from under a quarter of the wallet."
+        partial:
+          type: boolean
+          description: "A4. `totalUsd` is real and drawable but built from under a quarter of the
+            wallet. Label it; do not treat it as a balance."
+        partialUsd:
+          type: number
+          nullable: true
+          description: "A4. What `totalUsd` would have been when the figure is withheld for coverage.
+            NOT a balance — it is the fragment we could price. Null whenever `totalUsd` is set."
         highUsd:
           type: number
           nullable: true
@@ -5625,9 +5893,12 @@ components:
             description: absent
     AumLiveNow:
       type: object
-      description: The trader's current value, refreshed when a watched wallet transacts (Solana push),
-        when a balance slice reads the wallet, and when prices land. The hourly series' last point is
-        refreshed with it. `totalUsd` is `null` when not valued (`reason` says why), never 0.
+      description: The trader's current value. Refreshed within about five minutes of a watched Solana
+        wallet transacting, and when the balance sweep reads the trader (about 9 h a lap). It is NOT
+        refreshed when prices land, and the hourly refresh of every trader (A2, 17 Sep 2026) was
+        withdrawn on 19 Sep 2026 - so an unmoved trader's figure is hours old by design, and `at` /
+        `ageSeconds` say how old. The hourly series' last point is refreshed with it. `totalUsd` is
+        `null` when not valued (`reason` says why), never 0.
       required:
       - at
       - totalUsd
@@ -5649,6 +5920,20 @@ components:
           type: integer
         totalPositions:
           type: integer
+        pricedShare:
+          type: number
+          nullable: true
+          minimum: 0
+          description: "A4, new 17 Sep 2026. The share of the wallet this figure was priced from, judged
+            by the same two floors as an `/aum/history` point — see `AumHistoryPoint.pricedShare`."
+        partial:
+          type: boolean
+          description: "A4. Built from under a quarter of the wallet: real, drawable, not a balance."
+        partialUsd:
+          type: number
+          nullable: true
+          description: "A4. What `totalUsd` would have been when the figure is withheld for coverage;
+            null whenever `totalUsd` is set. NOT a balance."
         reason:
           type: string
           nullable: true
@@ -5676,7 +5961,9 @@ components:
           - balances
           - prices
           - build
-          description: What last refreshed the figure (`aumHistory.now.source`).
+          description: What last refreshed the figure (`aumHistory.now.source`). As of 19 Sep 2026 every
+            refresh goes through the five-minute flush and is written `webhook`, whoever marked the
+            trader; the other three words remain on older figures.
         ageSeconds:
           type: integer
           minimum: 0
@@ -6633,7 +6920,9 @@ components:
         nextExpectedAt:
           type: string
           format: date-time
-          description: Next nightly slot (06:00 UTC).
+          nullable: true
+          description: DO NOT SCHEDULE ON THIS. The sampler was retired on 17 Sep 2026 and no run is
+            scheduled, yet the field still names the next 06:00 UTC. Read `/aum/history` and `/aum/now`.
         staleAfterHours:
           type: integer
           description: Always 36.
@@ -6676,7 +6965,8 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: Only while `warming`.
+          description: Only while `warming`. Names the next 06:00 UTC although no run is scheduled since
+            17 Sep 2026 - do not schedule on it.
         warming:
           type: boolean
     AumGap:
@@ -7284,7 +7574,7 @@ components:
           type: string
           nullable: true
           description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
-            source has one.
+            source has one, and until one of them has read the coin.
         priceUsd:
           type: number
           nullable: true
@@ -7412,7 +7702,7 @@ components:
           type: string
           nullable: true
           description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
-            source has one.
+            source has one, and until one of them has read the coin.
         holders:
           type: integer
           description: Distinct tracked leaders holding it (holdings snapshot).
@@ -7546,6 +7836,10 @@ components:
         fetchedAt:
           type: string
           format: date-time
+          description: When GMGN was last read for THIS coin - the only truth about its age. There is no
+            nightly refresh of every coin - at GMGN's one request a second the queue can read at most
+            roughly 1,100 coins a day against ~31,000 held, most-held first, so at best a widely held
+            coin stays about a day old and a coin one trader holds can be weeks old. Print this date.
     TokenPrice:
       type: object
       description: Latest hourly DexScreener sample and the ATH since sampling began. Null fields, never
@@ -7632,7 +7926,9 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: First nightly read that flagged it (honeypot or sell-blocked); never cleared.
+          description: The first GMGN read of ours that flagged it (honeypot or sell-blocked); never cleared.
+            Reads are not nightly (see `fetchedAt`), so the flag can predate this by as long as the coin
+            waited in the queue.
         buyTax:
           type: number
           nullable: true
@@ -7710,6 +8006,8 @@ components:
         fetchedAt:
           type: string
           format: date-time
+          description: When GMGN's security check was last read for THIS coin; see `TokenFundamentals.fetchedAt`
+            for the cadence. A `canSell` older than you would trust is yours to refuse.
     TokenLaunch:
       type: object
       description: On-chain launch metadata, Solana only. Every field null until the loader has read the
@@ -7897,7 +8195,7 @@ components:
             - null
             description: absent
         ledger:
-          description: Null until the nightly `creators` ledger has a row.
+          description: Null until the daily `creators` ledger (03:35 UTC) has a row.
           anyOf:
           - $ref: '#/components/schemas/TokenCreatorLedger'
           - type: object
@@ -7929,7 +8227,8 @@ components:
           nullable: true
     TokenCreatorLedger:
       type: object
-      description: The creator across every token we hold GMGN info for, rebuilt nightly.
+      description: The creator across every token we hold GMGN info for, rebuilt daily (03:35 UTC) from
+        those stored details - as fresh as each coin's own GMGN read, not re-asked of GMGN nightly.
       required:
       - launches
       - bestPeakMcapUsd
@@ -8290,7 +8589,7 @@ components:
           type: string
           nullable: true
           description: Token image URL, GMGN's `logo` else DexScreener's pair image; null when neither
-            source has one.
+            source has one, and until one of them has read the coin.
         holders:
           type: integer
         previousHolders:
@@ -8626,6 +8925,8 @@ paths:
         '200':
           description: The chain board.
           headers: &id007
+            x-request-id:
+              $ref: '#/components/headers/RequestId'
             RateLimit-Limit:
               $ref: '#/components/headers/RateLimitLimit'
             RateLimit-Remaining:
@@ -8635,8 +8936,10 @@ paths:
             RateLimit-Scope:
               $ref: '#/components/headers/RateLimitScope'
             x-cost-units:
-              description: 'How many budget units this call cost: 1 for every route in this fragment (the
-                batch POST routes report the number of ids asked for, capped at 50).'
+              description: 'The size of the work asked for - 1 on every route, except the batch POST routes,
+                which report the number of ids asked for, capped at 50. It is NOT what the rate limiter
+                charged - the 240/min window counts every request as 1, a batch of 50 included, so
+                `RateLimit-Remaining` drops by 1 beside `x-cost-units 50`.'
               schema:
                 type: integer
                 minimum: 1
@@ -8732,9 +9035,10 @@ paths:
                   - GET /chains
                   - GET /fields
         '429': &id009
-          description: The shared 240/min window is exhausted (or the Postgres pool is saturated, which
-            is also answered as 429). Back off for `Retry-After` seconds; the RateLimit-* headers are
-            reconstructed so this response still carries the budget.
+          description: The caller's own 240/min window is exhausted, and nothing else. Back off for
+            `Retry-After` seconds; the RateLimit-* headers are reconstructed so this response still carries
+            the budget. Until 19 Sep 2026 a busy DATABASE was also answered as 429, beside
+            `RateLimit-Remaining 240`; that is now a 503 `unavailable` with `Retry-After 15`.
           headers:
             x-request-id: *id002
             RateLimit-Limit: *id003
@@ -8754,8 +9058,10 @@ paths:
                   requestId: req_3f9c2a1b7d4e8f01
                   retryAfterSeconds: 57
         '500': &id010
-          description: An unclassified failure. Driver text is never returned; quote `requestId` when
-            reporting it.
+          description: OUR fault (19 Sep 2026) - a statement the database rejects, a bug in our code, or a
+            failure nothing classified. The same request fails the same way, so do not retry; quote
+            `requestId`, under which it is logged. Driver text is never returned. A database that is
+            down or busy is a 503, never this.
           headers: *id001
           content:
             application/json:
@@ -8767,9 +9073,11 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_3f9c2a1b7d4e8f01
         '503': &id011
-          description: 'Retry, keeping your last good copy. `timeout` when the route did not answer within
-            15 s (ROUTE_TIMEOUT_MS); `unavailable` when the database is unreachable or timing out. Both
-            carry Retry-After: 5.'
+          description: 'Retry, keeping your last good copy. `timeout` when the request did not answer within
+            11 s in all (ROUTE_TIMEOUT_MS; Retry-After 15 — the abandoned work is still running); `unavailable` when the database is unreachable (Retry-After 5) or busy
+            or reset under load (Retry-After 15). A fault in our own SQL or code is never a 503: it is a
+            500 `internal_error`, because retrying it cannot succeed. Every 5xx is logged with the
+            `requestId` it returns.'
           headers:
             x-request-id: *id002
             RateLimit-Limit: *id003
@@ -8787,9 +9095,9 @@ paths:
                   value:
                     error:
                       code: timeout
-                      detail: this route did not answer within 15s — retry
+                      detail: this request did not answer within 11s — retry after the stated delay
                       requestId: req_3f9c2a1b7d4e8f01
-                      retryAfterSeconds: 5
+                      retryAfterSeconds: 15
                 unavailable:
                   value:
                     error:
@@ -8797,13 +9105,21 @@ paths:
                       detail: the database is not answering — retry shortly
                       requestId: req_3f9c2a1b7d4e8f01
                       retryAfterSeconds: 5
+                busy:
+                  value:
+                    error:
+                      code: unavailable
+                      detail: the database is busy — retry after the stated delay
+                      requestId: req_3f9c2a1b7d4e8f01
+                      retryAfterSeconds: 15
   /v1/creators/{address}:
     get:
       operationId: getCreator
       tags:
       - Reference
       summary: The dev ledger for a token-creator address, across the tokens tracked leaders hold
-      description: 'Rebuilt nightly from GMGN (`tier: third_party`, `source: gmgn`). Without `?chain=`
+      description: 'Rebuilt daily (03:35 UTC) from the GMGN details we hold (`tier: third_party`, `source:
+        gmgn`); those are only as fresh as each coin''s own read, see `TokenFundamentals.fetchedAt`. Without `?chain=`
         an EVM
 
         address sums across every EVM chain (network/token pairs are distinct, so launches do not
@@ -8905,8 +9221,9 @@ paths:
         and the sampler''s balance readings (`aum_samples`, basis `sampled`), unioned and ordered `(at,
         kind, txHash | handle)` ascending, so a poller reads forward with the cursor it was last handed.
         Nothing is pushed. `since` defaults to now − 24 h. Solana transfers and swaps arrive in real time
-        from the Helius webhook; EVM transfers are backfilled nightly, so an EVM event can appear up to
-        a day after its `at` — poll with the cursor, not with `since = last poll`. `?chain=` excludes
+        from the Helius webhook; EVM transfers are pulled by an hourly job that works stalest wallet
+        first (the response `note` still says nightly), so an EVM event can appear up to a day after
+        its `at` — poll with the cursor, not with `since = last poll`. `?chain=` excludes
         readings, which are not per chain. `gates` is `null` when `token_info` holds no row for the token
         (unassessed, not safe). A reading''s `totalUsd: null` means refused, never zero. `nextCursor`
         is `null` on the last page; a full page only hints that more exist.'
@@ -9076,8 +9393,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -9085,9 +9403,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_5f1c9a3d2b7e4a10
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/fields:
     get:
       operationId: getFields
@@ -9119,7 +9437,7 @@ paths:
                 traders: 448
                 vocabulary:
                   closed: true
-                  version: 7
+                  version: 14
                   fields:
                     aum.status:
                     - ready
@@ -9175,11 +9493,25 @@ paths:
 
         carries its own `staleAfterHours` and a `state` of `current`, `stale` or `never`.
 
-        The body is computed at most every 30 s per isolate (`cached`, `cacheAgeSeconds`); its
+        The request reads ONE stored row under a 2 s deadline and that read is the probe:
 
-        four queries run sequentially on purpose. `rows.transactions` is a planner estimate
+        `database.answering` with `latencyMs`, or a 503 `unavailable` carrying
 
-        (`estimatedRows`). `apiVersion` says which deployment answered.
+        `error.database.answering false` when the database does not answer. The heavy body is
+
+        computed by the scheduler every 10 minutes (`computedAt`, `computeMs`, `cacheAgeSeconds`)
+
+        and never by a request: until the first snapshot exists the answer is a 503 `unavailable`
+
+        with `Retry-After 60` and `error.database.answering true` (the database is fine; wait);
+
+        past 30 minutes `staleFeeds` gains `scheduler` and `dataState` is `degraded`. Feeds added
+
+        19 Sep 2026: `prices` (3 h), and `tokenInfo` is now 48 h and also `stale` when more than a
+
+        tenth of HELD coins carry details past that age (`heldCoinsStale`, `heldCoinsNeverRead`,
+
+        `heldCoinsStaleShare`); `positions` is 12 h. `apiVersion` says which deployment answered.
 
         '
       responses:
@@ -9192,88 +9524,117 @@ paths:
                 $ref: '#/components/schemas/HealthReport'
               example:
                 status: ok
-                apiVersion: v1
-                cached: false
-                cacheAgeSeconds: 0
-                runtime: supabase edge function (deno)
-                source: postgres
+                apiVersion: v2
+                database:
+                  answering: true
+                  latencyMs: 41
+                cached: true
+                cacheAgeSeconds: 312
+                computedAt: '2026-09-19T12:02:09.000Z'
+                computeMs: 8420
+                runtime: cloudflare worker
+                source: cloudflare d1
                 build:
-                  capturedAt: '2026-09-17T06:04:12.000Z'
-                  window: 7d
+                  capturedAt: '2026-09-19T01:00:08.000Z'
+                  window: 30d
                 feeds:
                   traders:
-                    lastRefreshAt: '2026-09-17T06:04:12.000Z'
+                    lastRefreshAt: '2026-09-19T01:00:08.000Z'
                     rowCount: null
-                    ageSeconds: 21348
+                    ageSeconds: 39721
                     staleAfterHours: 36
                     state: current
                   trades:
-                    lastRefreshAt: '2026-09-16T06:10:02.000Z'
+                    lastRefreshAt: '2026-09-18T12:04:41.000Z'
                     rowCount: null
-                    ageSeconds: 107398
+                    ageSeconds: 86248
                     staleAfterHours: 72
                     state: current
                     description: fomoapi trade records, load time
                   swaps:
-                    lastRefreshAt: '2026-09-17T11:52:31.000Z'
+                    lastRefreshAt: '2026-09-19T11:52:31.000Z'
                     rowCount: null
-                    ageSeconds: 449
+                    ageSeconds: 578
                     staleAfterHours: 6
                     state: current
                     description: on-chain swaps resolved from the wallet's transactions, newest block time
                   wallets:
-                    lastRefreshAt: '2026-09-17T06:04:12.000Z'
+                    lastRefreshAt: '2026-09-19T01:00:08.000Z'
                     rowCount: null
-                    ageSeconds: 21348
+                    ageSeconds: 39721
                     staleAfterHours: 36
                     state: current
                   positions:
-                    lastRefreshAt: '2026-09-17T02:10:00.000Z'
+                    lastRefreshAt: '2026-09-19T11:33:40.000Z'
                     rowCount: null
-                    ageSeconds: 35400
-                    staleAfterHours: 36
+                    ageSeconds: 1709
+                    staleAfterHours: 12
                     state: current
                   transactions:
-                    lastRefreshAt: '2026-09-17T11:58:41.000Z'
+                    lastRefreshAt: '2026-09-19T11:58:41.000Z'
                     rowCount: null
-                    ageSeconds: 79
+                    ageSeconds: 208
                     staleAfterHours: 36
                     state: current
                   tokenInfo:
-                    lastRefreshAt: '2026-09-17T06:20:00.000Z'
+                    lastRefreshAt: '2026-09-19T10:09:55.000Z'
                     rowCount: null
-                    ageSeconds: 20400
-                    staleAfterHours: 336
+                    ageSeconds: 6734
+                    staleAfterHours: 48
+                    heldCoins: 31486
+                    heldCoinsStale: 12521
+                    heldCoinsNeverRead: 18965
+                    heldCoinsStaleShare: 0.3977
+                    state: stale
+                  prices:
+                    lastRefreshAt: '2026-09-19T11:19:02.000Z'
+                    rowCount: null
+                    ageSeconds: 2587
+                    staleAfterHours: 3
                     state: current
+                    description: newest hourly token price written (token_price_stats.last_at)
                   aum:
-                    lastRefreshAt: '2026-09-17T11:55:00.000Z'
+                    lastRefreshAt: '2026-09-19T11:00:00.000Z'
                     rowCount: 184320
-                    ageSeconds: 300
+                    ageSeconds: 3729
                     staleAfterHours: 36
                     state: current
-                    traders: 434
-                    newestReadingAt: '2026-09-17T11:55:00.000Z'
-                    samplerLastRunAt: '2026-09-17T11:55:00.000Z'
+                    traders: 443
+                    newestReadingAt: '2026-09-19T11:00:00.000Z'
+                    lastBuiltAt: '2026-09-19T11:27:14.000Z'
+                    newestLiveAt: '2026-09-19T12:00:31.000Z'
+                    description: hours BUILT from stored holdings and prices (aum_history); `now` from aum_live
+                    sampler:
+                      retired: true
+                      retiredAt: '2026-09-17T03:52:00.000Z'
+                      newestReadingAt: '2026-09-17T06:00:00.000Z'
+                      lastRunAt: '2026-09-17T03:51:12.000Z'
+                      note: the hourly sampler was unscheduled on 17 Sep 2026; these clocks do not move
                     historyState:
                       ready: 610
                       warming: 41
                       none: 120
                     chains:
                       bsc:
-                        accepted36h: 176
-                        failed24h: 12
-                        newestAcceptedAt: '2026-09-17T11:50:00.000Z'
+                        accepted36h: 0
+                        failed24h: 0
+                        newestAcceptedAt: '2026-09-17T03:50:00.000Z'
                         historyState:
                           ready: 181
                           warming: 9
                           none: 56
-                dataState: current
-                staleFeeds: []
+                dataState: degraded
+                staleFeeds:
+                - tokenInfo
                 staleTraders:
-                  readingStale: 14
+                  liveStale: 297
+                  liveStaleAfterHours: 1
+                  liveNever: 0
+                  oldestLiveHours: 9
+                  readingStale: 434
                   readingStaleAfterHours: 36
                   noReading: 14
-                  oldestReadingHours: 177
+                  oldestReadingHours: 230
                   scorecardStale: 0
                   scorecardStaleGmgn: 0
                   scorecardStaleAfterHours: 72
@@ -9288,10 +9649,10 @@ paths:
                 rows:
                   traders: 448
                   delisted: 4
-                  holdings: 6120
-                  tokens: 4102
+                  holdings: 46205
+                  tokens: 51320
                   trades: 21877
-                  transactions: 918233
+                  transactions: 1290412
                   wallets: 445
                   generations: 61
                 delistedTraders:
@@ -9299,15 +9660,14 @@ paths:
                   reason: absent_from_source
                   note: not deleted — their holdings, trades and history are intact, and the flag reverses
                     if the source lists them again. Ask for them with ?includeDelisted=true
-                estimatedRows:
-                - transactions
+                estimatedRows: []
                 externalCallsPerRequest:
                   typical: 0
                   max: 1
                   note: 0 on every route except /traders/:handle/aum, which fetches a live reading when
                     the stored one is past the freshness floor. Pass ?live=false to forbid it
                   liveAum:
-                    enabled: true
+                    enabled: false
                     freshnessFloorMinutes: 5
                 capabilities:
                   degraded: []
@@ -9319,7 +9679,7 @@ paths:
                     - positions
                     - aum
                     staleFeeds: []
-                    keyInThisProcess: false
+                    keyInThisProcess: true
                   basis: judged on whether each capability's feeds are still arriving, not on key presence
                     — the keys belong to the scheduled loaders and this function holds none of them by
                     design
@@ -9327,7 +9687,48 @@ paths:
         '404': *id012
         '429': *id009
         '500': *id010
-        '503': *id011
+        '503':
+          description: The database did not answer the one-row probe within 2 s (`Retry-After 5`), or is
+            busy (`Retry-After 15`). `error.database.answering` is `false` and `waitedMs` says how long
+            the probe waited. This, not a 200, is how /health reports an outage since 19 Sep 2026. One
+            other 503 is NOT an outage. Until the scheduler has written the first snapshot (the first ten
+            minutes after the snapshot table is created) the probe answers, so `error.database.answering`
+            is `true` with `latencyMs`, and `Retry-After` is 60.
+          headers:
+            x-request-id: *id002
+            RateLimit-Limit: *id003
+            RateLimit-Remaining: *id004
+            RateLimit-Reset: *id005
+            RateLimit-Scope: *id006
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                probe_failed:
+                  summary: The database did not answer the probe
+                  value:
+                    error:
+                      code: unavailable
+                      detail: the database did not answer the health probe within 2s
+                      requestId: req_3f9c2a1b7d4e8f01
+                      retryAfterSeconds: 5
+                      database:
+                        answering: false
+                        waitedMs: 2000
+                no_snapshot:
+                  summary: The database answers; the scheduler has not written the first snapshot yet
+                  value:
+                    error:
+                      code: unavailable
+                      detail: the health snapshot has not been computed yet — the scheduler writes it every 10 minutes
+                      requestId: req_5b1d9e0c2a7f4463
+                      retryAfterSeconds: 60
+                      database:
+                        answering: true
+                        latencyMs: 12
   /v1/market/regime:
     get:
       operationId: getMarketRegime
@@ -9428,8 +9829,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -9703,7 +10105,8 @@ paths:
                   detail: no route for GET /v1/token
                   requestId: req_5f1c9a2b7e3d4c60
         '429':
-          description: Rate limit or pool saturation. Honour `Retry-After`.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -9731,11 +10134,12 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a2b7e3d4c60
         '503':
-          description: '15 s route timeout (`timeout`) or database down (`unavailable`). `Retry-After:
-            5`.'
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           headers:
             Retry-After:
-              description: Always 5.
+              description: 5 or 15, see the description.
               schema:
                 type: integer
           content:
@@ -9745,9 +10149,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_5f1c9a2b7e3d4c60
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/tokens/momentum:
     get:
       operationId: getTokenMomentum
@@ -9787,8 +10191,7 @@ paths:
       - name: limit
         in: query
         required: false
-        description: Cap on `entries` after filtering. Whole number >= 1, no upper bound; omitted = all
-          moved rows.
+        description: Cap on `entries` after filtering. Whole number >= 1, no upper bound; omitted = all moved rows.
         schema:
           type: integer
           minimum: 1
@@ -9884,7 +10287,8 @@ paths:
                   detail: no route for GET /v1/tokens/momentum/x
                   requestId: req_5f1c9a2b7e3d4c60
         '429':
-          description: Rate limit or pool saturation. Honour `Retry-After`.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -9912,11 +10316,12 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a2b7e3d4c60
         '503':
-          description: '15 s route timeout (`timeout`) or database down (`unavailable`). `Retry-After:
-            5`.'
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           headers:
             Retry-After:
-              description: Always 5.
+              description: 5 or 15, see the description.
               schema:
                 type: integer
           content:
@@ -9926,9 +10331,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_5f1c9a2b7e3d4c60
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/tokens/{address}:
     get:
       operationId: getToken
@@ -9945,18 +10350,31 @@ paths:
 
         Each entry carries: leader holdings (`holders`, `holderShare`, `totalValueUsd`, `holders_detail`,
 
-        `leaderConcentration`), GMGN fundamentals and security (`tier: third_party`, `null` blocks before
+        `leaderConcentration`), GMGN fundamentals and security (`tier: third_party`; a `null` block means
 
-        the first fetch), the hourly DexScreener `price` block with rolling ATH (`null` fields, never
+        we hold no GMGN read for the coin - not asked yet, or GMGN has nothing for it; the payload cannot
+
+        yet tell the two apart), the hourly DexScreener `price` block with rolling ATH (`null` fields, never
         0,
 
         when unknown), on-chain `launch` metadata (Solana only; every field null until read),
 
         the trade-based `cohort`, GMGN `walletTags` (capped at 1000) and the `creator` block with the
 
-        nightly `ledger`. `security.honeypotSince` is the first nightly read that flagged the token and
+        daily `ledger`. `security.honeypotSince` is our first GMGN read that flagged the token and
 
         is never cleared. `security.canSell: null` means not assessed, never safe. Costs 1 unit.
+
+
+        GMGN DETAILS ARE NOT REFRESHED NIGHTLY FOR EVERY COIN (corrected 19 Sep 2026). GMGN allows one
+
+        request a second, which buys at most roughly 1,100 coins a day against ~31,000 held. The queue
+
+        is most-held first, so at best a widely held coin stays about a day old and a coin one or two
+
+        traders hold can be weeks old; a coin GMGN has nothing for is parked for 7 days. Each block''s
+
+        own `fetchedAt` is the truth - print it. Robinhood Chain coins are in the same queue.
 
         '
       parameters:
@@ -10170,7 +10588,8 @@ paths:
                   detail: no leader holds '0x0000000000000000000000000000000000000001' on ethereum
                   requestId: req_5f1c9a2b7e3d4c60
         '429':
-          description: Rate limit or pool saturation. Honour `Retry-After`.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -10198,11 +10617,12 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a2b7e3d4c60
         '503':
-          description: '15 s route timeout (`timeout`) or database down (`unavailable`). `Retry-After:
-            5`.'
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           headers:
             Retry-After:
-              description: Always 5.
+              description: 5 or 15, see the description.
               schema:
                 type: integer
           content:
@@ -10374,7 +10794,8 @@ paths:
                   detail: no leader holds 'So11111111111111111111111111111111111111112' on solana
                   requestId: req_5f1c9a2b7e3d4c60
         '429':
-          description: Rate limit or pool saturation. Honour `Retry-After`.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -10402,11 +10823,12 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a2b7e3d4c60
         '503':
-          description: '15 s route timeout (`timeout`) or database down (`unavailable`). `Retry-After:
-            5`.'
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           headers:
             Retry-After:
-              description: Always 5.
+              description: 5 or 15, see the description.
               schema:
                 type: integer
           content:
@@ -10416,9 +10838,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_5f1c9a2b7e3d4c60
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/traders:
     get:
       operationId: listTraders
@@ -10441,6 +10863,17 @@ paths:
         `include_unavailable`, never an empty block. `cursor` wins over `offset` when both are
 
         sent. `null` means absent, never zero. Without `limit` the plain list returns the whole visible set; with `include` it returns a page of 100 (at most 200) - see `limit`.
+
+
+        THE PLAIN LIST OUTLIVES THE DATABASE (19 Sep 2026). Without `include` the answer is cached for
+
+        60 s per query, and when the database throws or stalls for 3 s the last answer is served,
+
+        expired, instead of a 503. The cache is per Worker isolate - a fresh isolate has nothing to
+
+        serve and answers 503 - so keep your own stored copy as well. `capturedAt` is the daily
+
+        directory build''s stamp (01:00 UTC), not the cache''s. Pages WITH `include` are never cached.
 
         '
       parameters:
@@ -10651,9 +11084,9 @@ paths:
                   value:
                     error:
                       code: timeout
-                      detail: this route did not answer within 15s — retry
+                      detail: this request did not answer within 11s — retry after the stated delay
                       requestId: req_3f9c2a1b7d4e8f01
-                      retryAfterSeconds: 5
+                      retryAfterSeconds: 15
   /v1/traders/aum:
     post:
       operationId: batchTraderAum
@@ -10665,7 +11098,11 @@ paths:
 
         cannot disagree about a window, a step or a chain series. Never reads live: every row carries
 
-        `liveRead: { state: skipped, note }`.
+        `liveRead: { state: skipped, note }`. These readings stopped growing on 17 Sep 2026 (the
+
+        sampler was retired; `sampler.nextExpectedAt` still names a next run that is not scheduled) -
+
+        use `POST /v1/traders/aum/history` for charts and `POST /v1/traders/aum/now` for the current value.
 
 
         Batch envelope: `limit` (always 50), `asked` (ids sent), `capped` (always `false`: over the cap
@@ -10926,7 +11363,8 @@ paths:
                   requestId: req_5f1c9a2b7e3d4c60
                   hint: 'the handle is a parameter, not the first segment: /traders/<handle>/wallets'
         '429':
-          description: Rate limit or pool saturation. Honour `Retry-After`.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -10954,11 +11392,12 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a2b7e3d4c60
         '503':
-          description: '15 s route timeout (`timeout`) or database down (`unavailable`). `Retry-After:
-            5`.'
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           headers:
             Retry-After:
-              description: Always 5.
+              description: 5 or 15, see the description.
               schema:
                 type: integer
           content:
@@ -11113,8 +11552,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -11122,9 +11562,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_5f1c9a3d2b7e4a10
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/traders/positions:
     post:
       operationId: batchTraderPositions
@@ -11304,7 +11744,8 @@ paths:
                   detail: no route for POST /v1/traders/position
                   requestId: req_3f9c2a71b0e44d1a
         '429':
-          description: Over the 240/min window, or the connection pool is saturated.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -11345,9 +11786,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_3f9c2a71b0e44d1a
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/traders/{handle}:
     get:
       operationId: getTrader
@@ -11423,7 +11864,8 @@ paths:
                   transfers: 931
                   inbound: 470
                   outbound: 461
-                  swaps: 388
+                  swapsAppearedIn: 388
+                  ownSwaps: 61
                   tokensTouched: 57
                   activeDays: 59
                   evenness: 0.6312
@@ -11473,7 +11915,7 @@ paths:
       summary: Balance history for one trader
       description: "One trader's assets-under-management series over a window, thinned into step buckets,\n\
         with the newest reading (`now`), a per-chain split of that reading (`chains`), and the\nservice's\
-        \ own verdict on whether the series can be drawn (`drawing`).\n\nRules the consumer must respect:\n\
+        \ own verdict on whether the series can be drawn (`drawing`).\n\nTHESE READINGS STOPPED GROWING ON 17 SEP 2026: the sampler that wrote them was retired and no run is scheduled, whatever `sampler.nextExpectedAt` and `progress.nextRunAt` say. Draw charts from `/aum/history` and read the current value from `/aum/now`.\n\nRules the consumer must respect:\n\
         * `null` means absent, `0` means measured zero. `now.totalUsd: null` is a refused reading and\n\
         \  `refused` names why; it is never a drawdown.\n* Priced floor (`PRICED_FLOOR = 0.25`, a COUNT\
         \ share, applied at read time): a reading that\n  priced fewer than a quarter of its positions\
@@ -11810,8 +12252,8 @@ paths:
                   detail: no trader 'nobody' in the directory
                   requestId: req_5f1c9a2b7e3d4c60
         '429':
-          description: Over 240 requests/min on the global counter, or the database pool is saturated.
-            Honour `Retry-After`.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -11839,15 +12281,12 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a2b7e3d4c60
         '503':
-          description: '`timeout` when the route did not answer within 15 s (`ROUTE_TIMEOUT_MS`); `unavailable`
-            when
-
-            the database is not answering. Both carry `Retry-After: 5`. Retry and keep the last good copy.
-
-            '
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503. Retry and keep the last good copy.'
           headers:
             Retry-After:
-              description: Always 5.
+              description: 5 or 15, see the description.
               schema:
                 type: integer
           content:
@@ -11857,9 +12296,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_5f1c9a2b7e3d4c60
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/traders/{handle}/aum/history:
     get:
       operationId: getTraderAumHistory
@@ -12052,8 +12491,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -12226,8 +12666,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -12245,8 +12686,9 @@ paths:
       - AUM
       summary: The trader's live value, without the series
       description: The `now` block of `GET /v1/traders/{handle}/aum/history` on its own, for callers that
-        only want the current figure. Read from `aum_live`, which is refreshed when a watched wallet transacts
-        (Solana push), when a balance slice reads the wallet, and when prices land; the hourly series'
+        only want the current figure. Read from `aum_live`, which is refreshed within about five minutes of
+        a watched Solana wallet transacting and when the balance sweep reads the trader (about 9 h a lap) -
+        not when prices land, and not hourly for everyone (withdrawn 19 Sep 2026); the hourly series'
         last point is refreshed with it. `now` is `null` when the trader has no live figure yet; `now.totalUsd`
         is `null` when not valued (`reason` says why), never 0. `ageSeconds` is how old the figure was
         when answered.
@@ -12339,8 +12781,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -12484,8 +12927,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -12621,8 +13065,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -12745,7 +13190,8 @@ paths:
                   detail: no trader 'nobody' in the directory
                   requestId: req_3f9c2a71b0e44d1a
         '429':
-          description: Over the 240/min window, or the connection pool is saturated.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -12921,8 +13367,8 @@ paths:
                   detail: no trader 'nobody' in the directory
                   requestId: req_3f9c2a71b0e44d1a
         '429':
-          description: Over the 240/min window, or the connection pool is saturated. `Retry-After` is
-            set.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -12950,8 +13396,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_3f9c2a71b0e44d1a
         '503':
-          description: The route did not answer within 15 s (`timeout`) or the database is unreachable
-            (`unavailable`). Retry after `Retry-After` (5 s).
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -12964,17 +13411,18 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_3f9c2a71b0e44d1a
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/traders/{handle}/positions:
     get:
       operationId: getTraderPositions
       tags:
       - Positions
       summary: Every position one trader holds, priced where possible, with cost basis and timing
-      description: One row per holding from `holdings_live` (the nightly read plus, on Solana, transfers
-        rolled forward from the webhook feed since that read). Priced rows come first, descending by value;
+      description: One row per holding from `holdings_live` (the last balance read - a sweep of 25 traders
+        every half hour, about 9 h a lap - plus, on Solana, transfers rolled forward from the webhook
+        feed since that read). Priced rows come first, descending by value;
         unpriced rows trail rather than being dropped. Each row carries where its price came from and
         when it was true, whether the balance was read from chain or reported, what was paid for it (`cost*`,
         null when nothing stored says it was bought), and on-chain timing (null when no record predates
@@ -13055,8 +13503,8 @@ paths:
                   chains:
                     ethereum:
                       chainTxCount: 412
-                      rowsHeld: 380
-                      share: 0.9223
+                      transferRowsHeld: 380
+                      rowsPerSentTx: 0.9223
                       readAt: '2026-09-16T06:10:02.000Z'
                 chainHistory:
                   observedFrom: '2026-07-03T14:22:10.000Z'
@@ -13140,7 +13588,8 @@ paths:
                   detail: no trader 'nobody' in the directory
                   requestId: req_3f9c2a71b0e44d1a
         '429':
-          description: Over the 240/min window, or the connection pool is saturated.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -13688,7 +14137,8 @@ paths:
                       detail: no stored trades for '397397'
                       requestId: req_3f9c2a71b0e44d1a
         '429':
-          description: Over the 240/min window, or the connection pool is saturated.
+          description: The caller's own 240/min window is exhausted, and nothing else - a busy database is a 503
+            `unavailable`. Honour `Retry-After`.
           headers:
             Retry-After:
               description: Seconds to wait.
@@ -13730,9 +14180,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_3f9c2a71b0e44d1a
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/traders/{handle}/trades:
     get:
       operationId: getTraderTrades
@@ -13778,16 +14228,18 @@ paths:
       - name: since
         in: query
         required: false
-        description: Keep swaps with `block_time >= since`. Passed to Postgres as a timestamptz; an unparseable
-          value is a database error (500), not a 400.
+        description: Keep swaps with `block_time >= since`. Send ISO-8601 UTC ending in `Z`. The value is compared
+          as TEXT and is not validated - an unparseable value or an offset form (`+05:30`) answers 200
+          with wrong or no rows, not a 400 and not a 500.
         schema:
           type: string
           format: date-time
       - name: until
         in: query
         required: false
-        description: Keep swaps with `block_time <= until`. Passed to Postgres as a timestamptz; an unparseable
-          value is a database error (500), not a 400.
+        description: Keep swaps with `block_time <= until`. Send ISO-8601 UTC ending in `Z`. The value is compared
+          as TEXT and is not validated - an unparseable value or an offset form (`+05:30`) answers 200
+          with wrong or no rows, not a 400 and not a 500.
         schema:
           type: string
           format: date-time
@@ -13944,8 +14396,7 @@ paths:
                   requestId: req_5f1c9a3d2b7e4a10
                   retryAfterSeconds: 57
         '500':
-          description: Unclassified failure (includes an unparseable `since`/`until`, which reaches Postgres
-            uncast)
+          description: Unclassified failure.
           content:
             application/json:
               schema:
@@ -13956,8 +14407,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -14166,8 +14618,9 @@ paths:
                   detail: the service failed to answer this request
                   requestId: req_5f1c9a3d2b7e4a10
         '503':
-          description: Database unreachable (`unavailable`) or the 15 s route budget elapsed (`timeout`);
-            the `Retry-After` header is 5
+          description: '`timeout` when the WHOLE request did not answer within 11 s (`Retry-After: 15` - the abandoned
+            work is still running); `unavailable` when the database is unreachable (`Retry-After: 5`) or
+            busy (`Retry-After: 15`). Our own faults are a 500, never a 503.'
           content:
             application/json:
               schema:
@@ -14175,9 +14628,9 @@ paths:
               example:
                 error:
                   code: timeout
-                  detail: this route did not answer within 15s — retry
+                  detail: this request did not answer within 11s — retry after the stated delay
                   requestId: req_5f1c9a3d2b7e4a10
-                  retryAfterSeconds: 5
+                  retryAfterSeconds: 15
   /v1/traders/{handle}/trust:
     get:
       operationId: getTraderTrust
@@ -14516,9 +14969,9 @@ paths:
                   value:
                     error:
                       code: timeout
-                      detail: this route did not answer within 15s — retry
+                      detail: this request did not answer within 11s — retry after the stated delay
                       requestId: req_3f9c2a1b7d4e8f01
-                      retryAfterSeconds: 5
+                      retryAfterSeconds: 15
   /v1/tokens/{address}/prices:
     get:
       operationId: getTokenPrices

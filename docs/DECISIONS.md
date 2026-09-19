@@ -3189,3 +3189,33 @@ no answer is a 503 that says so. A snapshot older than 30 minutes means the sche
 stopped, which puts `scheduler` in `staleFeeds`. While the table is empty (once, after the
 migration) a request computes the body inline. Feed clocks are therefore up to 10 minutes old,
 against thresholds measured in hours.
+
+## D199
+
+**`tests/docs_contract_test.ts`** — the documents the app team holds are checked like code.
+
+Two drifts reached the consumer on 19 Sep 2026. The `/health` schema still REQUIRED
+`feeds.aum.samplerLastRunAt`, which v2 stopped emitting on 17 Sep (X3), refused the two words
+vocabulary 13 had just published (`prices`, `scheduler`) and named none of the eleven keys the probe
+and the snapshot added. The handoff copy of the spec sat two waves behind `docs/openapi.yaml` while
+its README called it "the same file", and its word list was version 11 against a service at 13. The
+test runs the real `/health` route against the real schema and validates the body against
+`HealthReport` (required, enum, type, nullable, and any key the spec does not name), fresh and with
+the scheduler stopped; asserts the `staleFeeds` enum is the vocabulary's; and asserts the handoff
+spec is byte-identical and `fields-v<version>.json` is `VOCABULARY`. The word list is generated from
+the vocabulary module, not captured live: a capture needs production, and the counts it carried were
+never the point. Validating every route's body against its schema is the larger job this does not do.
+
+The same pass withdrew three promises the reference still made: a nightly GMGN refresh of every
+coin (capacity is roughly 1,100 coins a day against ~31,000 held, most-held first, so `fetchedAt` is
+the truth), `oldestLiveHours` above 2 as a fault signal (A2's hourly refresh was switched off on
+19 Sep, so it rises by design), and `logoUrl` as "not yet published" (three routes serve it).
+
+Repaired the same day against the deployable branch, which had moved while the documents were
+written. Vocabulary 14 (e94901d) publishes 18 word sets the routes already emitted, so the handoff
+word list is `fields-v14.json` and every "version 13" became 14. And 8a1741c supersedes the sentence
+above that "a request computes the body inline": before the first snapshot `/health` answers 503
+`unavailable`, `Retry-After` 60, `error.database` `{ answering: true, latencyMs }`, and `cached` is
+always true. The test asks the empty table first and validates that 503 against `Error`, then seeds
+one dated row behind every nullable key, because a null passes any nullable schema whatever its type
+and an empty database therefore proved little; it fails if a seeded key comes back null.

@@ -1,5 +1,10 @@
 # Reply to the Genie app team — fix request v3, per ask
 
+> **Dated note, kept as sent (17 Sep 2026).** Superseded where it disagrees with `README.md` and
+> `openapi.yaml` in this folder (19 Sep 2026): the vocabulary is version 14 (`fields-v14.json`
+> replaces `fields-v11.json`); `logoUrl` IS served on the three `/tokens` routes; a 503 carries
+> `Retry-After` 5 or 15 (60 on `/health` before its first snapshot), a fault of ours is a 500, and 429 means your own window only.
+
 17 Sep 2026. One line per ask in the order of your §13. "Deployed" means live on v2 now;
 "after migration" means the code is live and the database change is applied within the hour;
 the vocabulary is now **version 11**, snapshot in `fields-v11.json`.
