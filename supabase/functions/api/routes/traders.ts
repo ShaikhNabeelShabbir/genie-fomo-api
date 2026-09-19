@@ -39,6 +39,8 @@ const INCLUDES = ["pnl", "scorecard", "wallets", "trust"] as const;
 const INCLUDE_PAGE_MAX = 200;
 /** The page a request with `include` gets when it names no `limit`. */
 const INCLUDE_PAGE_DEFAULT = 100;
+/** Below this, a page where nobody has trades is a search or a trader added last night, not a fault (D097). */
+const INCLUDE_FAULT_MIN_PAGE = 25;
 type Include = typeof INCLUDES[number];
 
 /*
@@ -241,7 +243,7 @@ async function listTraders(url: URL): Promise<unknown> {
   // deno-lint-ignore no-explicit-any
   const trBy = byHandle(trRows as any[]);
   /** A requested include that produced NOTHING is a failure, not an empty truth. See docs/DECISIONS.md#d097 */
-  if (page.length) {
+  if (page.length >= INCLUDE_FAULT_MIN_PAGE) {
     const empty: string[] = [];
     if (include.includes("wallets") && wRows.length === 0) empty.push("wallets");
     if (include.includes("pnl") && pnlRows.length === 0) empty.push("pnl");

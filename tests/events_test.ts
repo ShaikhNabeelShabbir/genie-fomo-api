@@ -6,7 +6,7 @@ import {
 } from "../supabase/functions/api/routes/events.ts";
 
 const row = (over: Partial<EventRow>): EventRow => ({
-  kind: "transfer", at: "2026-09-17T10:00:00.000Z", id: "0xabc",
+  kind: "transfer", at: "2026-09-17T10:00:00.000Z", id: "0xabc", sub: "unipcs|1|0xw|leg1",
   handle: "unipcs", display_handle: "Unipcs", trader_source: "fomoapi.io",
   chain: "solana", direction: "in", token_address: "So111", amount: "12.5",
   counterparty: "Cp1", source: "PUMP_FUN", tx_type: "SWAP",
@@ -17,12 +17,15 @@ const row = (over: Partial<EventRow>): EventRow => ({
 });
 
 Deno.test("event cursor: round-trips, and rejects shapes from other routes", () => {
-  const c = { at: "2026-09-17T10:00:00.000Z", kind: "swap" as const, id: "0xabc" };
+  const c = { at: "2026-09-17T10:00:00.000Z", kind: "swap" as const, id: "0xabc", sub: "unipcs|1|0xw" };
   assertEquals(decodeEventCursor(encodeEventCursor(c)), c);
+  /* A cursor handed out before `sub` existed still decodes, and resumes before every leg of its transaction. */
+  assertEquals(decodeEventCursor(encodeCursor([c.at, c.kind, c.id])), { ...c, sub: "" });
   for (const bad of [
     encodeCursor(["2026-09-17T10:00:00.000Z", "0xabc"]),          // transactions-shaped
     encodeCursor(["2026-09-17T10:00:00.000Z", "trade", "0xabc"]), // unknown kind
     encodeCursor(["not a date", "swap", "0xabc"]),
+    encodeCursor(["2026-09-17T10:00:00.000Z", "swap", "0xabc", 7]),
     "garbage!",
   ]) {
     const e = assertThrows(() => decodeEventCursor(bad), ApiError);

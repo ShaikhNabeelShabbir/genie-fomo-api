@@ -22,24 +22,28 @@ const DEFAULT_SINCE_MS = 24 * 3600 * 1000;
 
 const isKind = (v: unknown): v is EventKind => EVENT_KINDS.includes(v as EventKind);
 
-/** The keyset is (at, kind, id): id is the tx hash for transfers and swaps, the handle for readings. */
-export type EventCursor = { at: string; kind: EventKind; id: string };
+/**
+ * The keyset is (at, kind, id, sub): id is the tx hash for transfers and swaps, the handle for
+ * readings; sub tells one transaction's rows apart (its legs, and each watched wallet it touched).
+ */
+export type EventCursor = { at: string; kind: EventKind; id: string; sub: string };
 
-export const encodeEventCursor = (c: EventCursor): string => encodeCursor([c.at, c.kind, c.id]);
+export const encodeEventCursor = (c: EventCursor): string => encodeCursor([c.at, c.kind, c.id, c.sub]);
 
+/** A 3-part cursor predates `sub`: it resumes at '' and re-delivers the boundary transaction, never loses it. */
 export const decodeEventCursor = (raw: string): EventCursor => {
   const parts = decodeCursor(raw);
-  const [at, kind, id] = parts;
-  if (parts.length !== 3 || typeof at !== "string" || !isKind(kind) || typeof id !== "string"
-      || !Number.isFinite(Date.parse(at))) {
+  const [at, kind, id, sub = ""] = parts;
+  if ((parts.length !== 3 && parts.length !== 4) || typeof at !== "string" || !isKind(kind)
+      || typeof id !== "string" || typeof sub !== "string" || !Number.isFinite(Date.parse(at))) {
     throw badRequest("cursor does not belong to this route", { parameter: "cursor" });
   }
-  return { at, kind, id };
+  return { at, kind, id, sub };
 };
 
 /** One union row, as SQL returns it. Columns absent for a kind are null. */
 export type EventRow = {
-  kind: EventKind; at: string | Date; id: string;
+  kind: EventKind; at: string | Date; id: string; sub: string;
   handle: string; display_handle: string; trader_source: string;
   chain: string | null;
   direction: string | null; token_address: string | null; amount: unknown;
@@ -94,7 +98,8 @@ get("/v1/events", async (_p, url) => {
    */
   const rows = await sql<EventRow[]>`
     with ev as (
-      select 'transfer' as kind, tx.block_time as at, tx.tx_hash as id, w.handle,
+      select 'transfer' as kind, tx.block_time as at, tx.tx_hash as id,
+             w.handle || '|' || tx.network_id || '|' || tx.address_key || '|' || tx.transfer_key as sub, w.handle,
              tx.network_id, tx.direction, tx.token_key as token_address, tx.amount,
              tx.counterparty, tx.tx_source as source, tx.tx_type,
              null as token_delta, null as quote_delta, null as quote_usd,
@@ -103,7 +108,8 @@ get("/v1/events", async (_p, url) => {
       join wallets w on tx.address_key in (w.evm_address_key, w.sol_address_key)
       where tx.block_time is not null
       union all
-      select 'swap', ws.block_time, ws.tx_hash, w.handle,
+      select 'swap', ws.block_time, ws.tx_hash,
+             w.handle || '|' || ws.network_id || '|' || ws.address_key, w.handle,
              ws.network_id, null, ws.token_key, null, null, null, null,
              ws.token_delta, ws.quote_delta, ws.quote_usd, null, null
       from wallet_swaps ws
@@ -112,7 +118,7 @@ get("/v1/events", async (_p, url) => {
       union all
       -- JS cursors carry milliseconds; sampled_at is already stored to the millisecond,
       -- so date_trunc('milliseconds', …) has nothing left to do.
-      select 'reading', s.sampled_at, s.handle, s.handle,
+      select 'reading', s.sampled_at, s.handle, '', s.handle,
              null, null, null, null, null, null, null,
              null, null, null, s.total_usd, s.refused_reason
       from aum_samples s
@@ -130,8 +136,8 @@ get("/v1/events", async (_p, url) => {
       ${net === null ? sql`` : sql`and ev.network_id = ${net}`}
       ${handle === null ? sql`` : sql`and ev.handle = ${handle}`}
       ${cur === null ? sql``
-        : sql`and (ev.at, ev.kind, ev.id) > (${cur.at}, ${cur.kind}, ${cur.id})`}
-    order by ev.at, ev.kind, ev.id
+        : sql`and (ev.at, ev.kind, ev.id, ev.sub) > (${cur.at}, ${cur.kind}, ${cur.id}, ${cur.sub})`}
+    order by ev.at, ev.kind, ev.id, ev.sub
     limit ${limit}`;
 
   const last = rows.at(-1);
@@ -143,7 +149,7 @@ get("/v1/events", async (_p, url) => {
     filters: { kind, chain: net === null ? null : url.searchParams.get("chain"), handle },
     /** `null` on the last page; a full page is only a hint that more exist. */
     nextCursor: rows.length === limit && last
-      ? encodeEventCursor({ at: iso(last.at), kind: last.kind, id: last.id }) : null,
+      ? encodeEventCursor({ at: iso(last.at), kind: last.kind, id: last.id, sub: last.sub }) : null,
     events: rows.map(toEvent),
     note: "Solana transfers and swaps arrive in real time from the Helius webhook; EVM " +
           "transfers are backfilled nightly, so an EVM event can appear up to a day after " +

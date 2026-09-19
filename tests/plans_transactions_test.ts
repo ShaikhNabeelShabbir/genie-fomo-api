@@ -144,9 +144,11 @@ Deno.test("/trades: fees sought by (network_id, tx_hash) are the fees the hash-o
 
 // ------------------------------------------------------------------ /events
 type Filters = { kind?: string; net?: number; handle?: string };
+/* The statement that sought from since, carrying the fourth keyset column (sub) the route gained the same day: on three, both lost a transaction's legs at a page edge. */
 const OLD_EVENTS = (f: Filters, cur: EventCursor | null): string => `
     with ev as (
-      select 'transfer' as kind, tx.block_time as at, tx.tx_hash as id, w.handle,
+      select 'transfer' as kind, tx.block_time as at, tx.tx_hash as id,
+             w.handle || '|' || tx.network_id || '|' || tx.address_key || '|' || tx.transfer_key as sub, w.handle,
              tx.network_id, tx.direction, tx.token_key as token_address, tx.amount,
              tx.counterparty, tx.tx_source as source, tx.tx_type,
              null as token_delta, null as quote_delta, null as quote_usd,
@@ -155,7 +157,8 @@ const OLD_EVENTS = (f: Filters, cur: EventCursor | null): string => `
       join wallets w on tx.address_key in (w.evm_address_key, w.sol_address_key)
       where tx.block_time is not null
       union all
-      select 'swap', ws.block_time, ws.tx_hash, w.handle,
+      select 'swap', ws.block_time, ws.tx_hash,
+             w.handle || '|' || ws.network_id || '|' || ws.address_key, w.handle,
              ws.network_id, null, ws.token_key, null, null, null, null,
              ws.token_delta, ws.quote_delta, ws.quote_usd, null, null
       from wallet_swaps ws
@@ -164,7 +167,7 @@ const OLD_EVENTS = (f: Filters, cur: EventCursor | null): string => `
       union all
       -- JS cursors carry milliseconds; sampled_at is already stored to the millisecond,
       -- so date_trunc('milliseconds', …) has nothing left to do.
-      select 'reading', s.sampled_at, s.handle, s.handle,
+      select 'reading', s.sampled_at, s.handle, '', s.handle,
              null, null, null, null, null, null, null,
              null, null, null, s.total_usd, s.refused_reason
       from aum_samples s
@@ -180,14 +183,14 @@ const OLD_EVENTS = (f: Filters, cur: EventCursor | null): string => `
       ${f.kind === undefined ? "" : "and ev.kind = ?"}
       ${f.net === undefined ? "" : "and ev.network_id = ?"}
       ${f.handle === undefined ? "" : "and ev.handle = ?"}
-      ${cur === null ? "" : "and (ev.at, ev.kind, ev.id) > (?, ?, ?)"}
-    order by ev.at, ev.kind, ev.id
+      ${cur === null ? "" : "and (ev.at, ev.kind, ev.id, ev.sub) > (?, ?, ?, ?)"}
+    order by ev.at, ev.kind, ev.id, ev.sub
     limit ?`;
 
 const oldEvents = (f: Filters, since: string, cur: EventCursor | null, limit: number): EventRow[] =>
   all(OLD_EVENTS(f, cur),
     since, ...(f.kind === undefined ? [] : [f.kind]), ...(f.net === undefined ? [] : [f.net]),
-    ...(f.handle === undefined ? [] : [f.handle]), ...(cur === null ? [] : [cur.at, cur.kind, cur.id]), limit) as unknown as EventRow[];
+    ...(f.handle === undefined ? [] : [f.handle]), ...(cur === null ? [] : [cur.at, cur.kind, cur.id, cur.sub]), limit) as unknown as EventRow[];
 
 /** Pages the NEW route to its end, checking every page and every cursor against the OLD statement. */
 const walk = async (query: string, f: Filters, since: string, limit: number): Promise<number> => {
@@ -201,7 +204,7 @@ const walk = async (query: string, f: Filters, since: string, limit: number): Pr
     served += old.length;
     const last = old.at(-1);
     const next: EventCursor | null = old.length === limit && last
-      ? { at: new Date(String(last.at)).toISOString(), kind: last.kind, id: last.id } : null;
+      ? { at: new Date(String(last.at)).toISOString(), kind: last.kind, id: last.id, sub: last.sub } : null;
     assertEquals(body.nextCursor, next === null ? null : encodeEventCursor(next), `${query} cursor after page ${page}`);
     if (next === null) return served;
     cur = next;
@@ -220,7 +223,7 @@ Deno.test("/events: seeking from the cursor serves the pages, and hands out the 
 });
 
 Deno.test("/events: a cursor OLDER than since does not reopen the window", async () => {
-  const cur: EventCursor = { at: "2026-08-01T00:00:00.000Z", kind: "transfer", id: "" };
+  const cur: EventCursor = { at: "2026-08-01T00:00:00.000Z", kind: "transfer", id: "", sub: "" };
   const old = oldEvents({}, SINCE, cur, 500);
   const body = await getJson(`/v2/events?since=${SINCE}&limit=500&cursor=${encodeURIComponent(encodeEventCursor(cur))}`);
   assertEquals(body.events, JSON.parse(JSON.stringify(old.map(toEvent))));

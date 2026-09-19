@@ -11,7 +11,6 @@ export const ACCEPTED_WHOLE_READS: Record<string, string> = {
   "GET /health | aum_samples": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
   "GET /health | holdings": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
   "GET /health | tokens": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
-  "GET /health | trade_loads": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
   "GET /health | trades": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
   "GET /health | transactions": "scheduler only: the snapshot job computes this body every 10 min; a request reads one row (inline only while health_snapshot is empty)",
   "GET /market/regime | tokens": "baseline 19 Sep 2026 — not yet fixed",

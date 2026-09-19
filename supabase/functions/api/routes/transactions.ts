@@ -1,7 +1,7 @@
 import { sql, n, round } from "../db.ts";
 import { get, post } from "../router.ts";
 import { notFound, badRequest } from "../errors.ts";
-import { intParam } from "../shared/params.ts";
+import { intParam, isoParam } from "../shared/params.ts";
 import { cov, money } from "../shared/format.ts";
 import { NativePrice, nativePrices } from "../shared/prices.ts";
 import { chainWhere } from "../shared/chains.ts";
@@ -45,6 +45,8 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
   if (after && after.length !== 5) {
     throw badRequest("cursor does not belong to this route", { parameter: "cursor" });
   }
+  /** `null` when the page ended among the undated rows, which sort last: block_time is nullable. */
+  const afterAt = after === null || after[0] === null ? null : String(after[0]);
 
   const rows = await sql`
     select tx.network_id, c.name as chain, tx.tx_hash, tx.block_time, tx.direction,
@@ -56,10 +58,12 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
       ${kind === null ? sql`` : sql`and upper(tx.tx_type) = ${kind.toUpperCase()}`}
       ${
     after === null ? sql`` : sql`and (
-        tx.block_time < ${String(after[0])}
-        or (tx.block_time = ${String(after[0])}
+        tx.block_time < ${afterAt}
+        -- 'is' is the null-safe '=': a cursor from an undated row resumes among the undated rows.
+        or (tx.block_time is ${afterAt}
             and (tx.tx_hash, tx.network_id, tx.address_key, tx.transfer_key)
               > (${String(after[1])}, ${Number(after[2])}, ${String(after[3])}, ${String(after[4])}))
+        or (tx.block_time is null and ${afterAt} is not null)
       )`
   }
     -- The full primary key is the tiebreak. 23,916 (block_time, tx_hash) pairs carry more
@@ -147,7 +151,8 @@ get("/v1/traders/:handle/transactions", async ({ handle }, url) => {
      */
     nextCursor: rows.length === limit && rows.length > 0
       ? encodeCursor([
-        new Date(String(rows[rows.length - 1].block_time)).toISOString(),
+        // An undated last row used to throw here (new Date("null")): a 500 on every call for that trader.
+        rows[rows.length - 1].block_time ? new Date(String(rows[rows.length - 1].block_time)).toISOString() : null,
         String(rows[rows.length - 1].tx_hash),
         Number(rows[rows.length - 1].network_id),
         String(rows[rows.length - 1].address_key),
@@ -196,8 +201,10 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
   const addrs = [t.sol_key, t.evm_address_key].filter((a): a is string => !!a);
   const limit = intParam(url, "limit", { min: 1, max: 500, fallback: 100 })!;
   const chainQ = (url.searchParams.get("chain") ?? "").trim().toLowerCase() || null;
-  const since = url.searchParams.get("since");
-  const until = url.searchParams.get("until");
+  await chainWhere(chainQ); // an unknown chain is a 400, as on every other route; it answered an empty 200
+  /* block_time is ISO-8601 UTC TEXT: an unparsed bound compares as text, and answered 200 with the wrong rows. */
+  const since = isoParam(url, "since");
+  const until = isoParam(url, "until");
   /*
    * `status` filters on the PAIRING below, not on a stored column: a swap is a swap, and
    * whether it is still open is a fact about what happened afterwards.
@@ -215,6 +222,10 @@ get("/v1/traders/:handle/trades", async ({ handle }, url) => {
    */
   const cursorRaw = url.searchParams.get("cursor");
   const cur = cursorRaw ? decodeCursor(cursorRaw) : null;
+  if (cur && (cur.length !== 2 || typeof cur[0] !== "string" || typeof cur[1] !== "string"
+      || !Number.isFinite(Date.parse(cur[0])))) {
+    throw badRequest("cursor does not belong to this route", { parameter: "cursor" });
+  }
   const curAt = cur ? String(cur[0]) : null;
   const curHash = cur ? String(cur[1]) : null;
 
