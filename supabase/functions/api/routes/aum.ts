@@ -816,36 +816,34 @@ async function aumFor(
                null as priced_positions, null as total_positions,
                a.priced_share as value_share, a.basis, s.tier,
                null as chains_answered, null as chains_expected
-        from aum_chain_samples a
-        join aum_samples s
-          on s.handle = a.handle and s.at = a.at and s.basis = a.basis
-        -- unnest(handles, floors) is two json_each runs joined on the array index.
-        join (select jh.value as handle, jl.value as lo
+        -- unnest(handles, floors) is two json_each runs joined on the array index. It DRIVES, by
+        -- cross join: left to itself D1 walked a time index and read 2.3 M rows to answer 50 traders.
+        from (select jh.value as handle, jl.value as lo
                 from json_each(${lh}) jh
                 join json_each(${lo}) jl on jl.key = jh.key) u
-          on u.handle = a.handle and a.at >= u.lo
+        cross join aum_chain_samples a on a.handle = u.handle and a.at >= u.lo
+        cross join aum_samples s
+          on s.handle = a.handle and s.at = a.at and s.basis = a.basis
         where a.network_id = ${opts.chainFilter.network_id}
         order by a.handle, a.at asc`
       : sql`
         select s.handle, s.at, s.total_usd, s.refused_reason, s.priced_positions, s.total_positions,
                s.value_share, s.basis, s.tier, s.chains_answered, s.chains_expected
-        from aum_samples s
-        -- unnest(handles, floors) is two json_each runs joined on the array index.
-        join (select jh.value as handle, jl.value as lo
+        -- The asked traders drive (cross join pins the order): 507,000 rows were read per call without it.
+        from (select jh.value as handle, jl.value as lo
                 from json_each(${lh}) jh
                 join json_each(${lo}) jl on jl.key = jh.key) u
-          on u.handle = s.handle and s.at >= u.lo
+        cross join aum_samples s on s.handle = u.handle and s.at >= u.lo
         order by s.handle, s.at asc`,
     /** THE CHAIN SPLIT OF EVERY POINT, not only the newest -- because the seam that breaks a char… See docs/DECISIONS.md#d052 */
     sql`
         select a.handle, a.at, a.basis, c.name as chain, a.total_usd
-        from aum_chain_samples a
-        join chains c using (network_id)
-        -- unnest(handles, floors) is two json_each runs joined on the array index.
-        join (select jh.value as handle, jl.value as lo
+        -- The asked traders drive, then their samples by (handle, at), then the chain's name.
+        from (select jh.value as handle, jl.value as lo
                 from json_each(${lh}) jh
                 join json_each(${lo}) jl on jl.key = jh.key) u
-          on u.handle = a.handle and a.at >= u.lo
+        cross join aum_chain_samples a on a.handle = u.handle and a.at >= u.lo
+        cross join chains c on c.network_id = a.network_id
         order by a.handle, a.at asc`,
     /** Window-independent chain list, one query for the whole batch. */
     knownChainsFor(present),
@@ -893,14 +891,13 @@ async function aumFor(
   const chainRows = nh.length
     ? await sql`
         select a.handle, c.name as chain, a.network_id, a.total_usd, a.priced_share, a.reason
-        from aum_chain_samples a
-        join chains c using (network_id)
-        -- unnest(handles, ats, bases) is three json_each runs joined on the array index.
-        join (select jh.value as handle, ja.value as at, jb.value as basis
+        -- unnest(handles, ats, bases) is three json_each runs joined on the array index; it drives.
+        from (select jh.value as handle, ja.value as at, jb.value as basis
                 from json_each(${nh}) jh
                 join json_each(${na}) ja on ja.key = jh.key
                 join json_each(${nb}) jb on jb.key = jh.key) u
-          on u.handle = a.handle and u.at = a.at and u.basis = a.basis
+        cross join aum_chain_samples a on a.handle = u.handle and a.at = u.at and a.basis = u.basis
+        cross join chains c on c.network_id = a.network_id
         order by a.handle, a.total_usd desc nulls last`
     : [];
   const chainsBy = new Map<string, Record<string, unknown>[]>();
