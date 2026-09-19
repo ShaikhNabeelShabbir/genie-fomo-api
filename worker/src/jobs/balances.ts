@@ -345,10 +345,14 @@ export async function runBalances(env: Env, budgetMs: number): Promise<BalancesS
         // The capture is in; mark this trader so the 5-minute flush revalues his live AUM.
         // Mark, do not revalue here: a per-trader revaluation inside the slice was one of the
         // loads that saturated the database on 17 Sep 08:5x UTC.
-        await sql`
-          insert into aum_live_dirty (handle, marked_at) values (${t.handle}, ${new Date().toISOString()})
-          on conflict (handle) do update set marked_at = excluded.marked_at`;
-        liveRefreshed += 1;
+        // Only when a chain ANSWERED: with Helius refusing every read (19 Sep) this marked 50
+        // traders an hour for whom nothing had been learned, and the flush revalued them anyway.
+        if (answers.some((a) => a.status === "fulfilled")) {
+          await sql`
+            insert into aum_live_dirty (handle, marked_at) values (${t.handle}, ${new Date().toISOString()})
+            on conflict (handle) do update set marked_at = excluded.marked_at`;
+          liveRefreshed += 1;
+        }
       } catch (e) {
         console.error(`balances: ${t.handle} write failed: ${e instanceof Error ? e.message : String(e)}`);
       }
